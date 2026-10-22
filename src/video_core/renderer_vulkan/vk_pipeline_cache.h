@@ -72,15 +72,6 @@ struct DrawIndirectParams {
     bool tessellate_quads{};
 };
 
-/// PERF-098: progress of building the stored pipelines (the precompile shown over the splash).
-struct PrecompileProgress {
-    u64 total;   ///< stored pipelines found
-    u64 done;    ///< built, already present or unusable
-    bool active; ///< still going
-};
-PrecompileProgress GetPrecompileProgress();
-/// PERF-102: the game waits on the splash screen for the precompile.
-bool PrecompileHoldsGame();
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.
 bool CompileSlowMotion();
 /// FIX-104: pipeline creations in progress.
@@ -173,11 +164,6 @@ public:
         return profile;
     }
 
-    /// PERF-098: on the command thread while it has no commands: takes prepared stored
-    /// pipelines and queues their builds (all of them as fast as the workers go while the
-    /// splash screen shows).
-    void IdlePrewarm(bool splash);
-
 private:
     bool RefreshGraphicsKey();
     /// Registers the pipeline keys are built from: the current ones, or during read-ahead the
@@ -201,7 +187,7 @@ private:
     /// PERF-034: with the draw pipe, starts builds for the upcoming draw states the command
     /// thread queued. During a draw (`restore`), its key is computed again afterwards.
     void BuildQueuedStates(const DrawIndirectParams params, bool restore);
-    /// PERF-038: claims a build nobody started, so it is never built; false if one started.
+    /// Claims a build nobody started, so it is never built; false if one started.
     static bool CancelBuild(PipelineBuild& build);
     /// FIX-110: in the menus draws wait for new pipelines instead of being skipped.
     static bool MenusWait();
@@ -209,23 +195,8 @@ private:
     static std::chrono::microseconds QuickWait();
     /// FIX-119: whether this draw's old-renderer (D10) pipeline is waited for.
     bool LegacyWaits() const;
-    /// PB-1: SHADGT_REPLAY_TEST, see the constructor.
-    void ReplayTest(const std::string& dir);
-    /// PB-2: SHADGT_TEMPLATE_TEST, see the constructor.
-    void TemplateTest(const std::string& dir);
-    /// PB-4: SHADGT_DUMP_STORE, see the constructor.
-    void DumpStore(const std::string& dir);
-    /// PB-1: translates stored shader records that have no SPIR-V yet from this PC's programs.
-    void RebuildFromPrograms();
-    /// PERF-038: queues a stored pipeline's build behind all other builds.
-    void QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build);
-    /// PERF-038: on this thread, between draws: takes stored pipelines the reader thread
-    /// prepared and queues their background builds.
-    void InstallPrewarmed(bool force = false);
-    struct PrewarmRecord;
-    bool InstallPrewarmRecord(PrewarmRecord& record);
-    void PrewarmRead(std::stop_token stop);
-    void ReportPrewarm(std::chrono::steady_clock::time_point now);
+    /// PERF-076: logs the background pipeline counts every 2 s.
+    void ReportAsyncPipelines(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Returns at once if no worker took the build, which
     /// FinishBuild then does on this thread.
@@ -286,12 +257,12 @@ private:
     std::filesystem::path else_scope_fixed_path;
     void LoadElseScopeFixed();
     void SaveElseScopeFixed() const;
-    /// PERF-032: stored translations are loaded when their program is first used (no startup
-    /// precompile), and new ones are stored.
+    /// PERF-032: stored translations are loaded when their program is first used, and new ones
+    /// are stored.
     bool use_stored_shaders{};
     void ListStoredPermutations(u64 pgm_hash, Program& program);
-    /// PERF-038: a program's stored permutations as read from the store (any thread), and their
-    /// insertion into the program (this thread).
+    /// A program's stored permutations as read from the store, and their insertion into the
+    /// program.
     struct StoredListing {
         u64 pgm_hash{};
         struct Entry {
@@ -419,16 +390,6 @@ private:
         std::chrono::steady_clock::time_point since{};
     } queued_state_stats;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
-    // PERF-038: stored pipelines built in the background (opt-in, SHADGT_PREWARM=1).
-    bool prewarm_enabled{};
-    std::mutex prewarm_mutex;
-    std::condition_variable_any prewarm_cv;
-    std::deque<std::unique_ptr<PrewarmRecord>> prewarm_records;
-    std::atomic<size_t> prewarm_queued{};
-    std::atomic<u64> prewarm_built{};
-    std::atomic<u64> prewarm_read{};
-    std::atomic<u64> prewarm_total{};
-    std::atomic<bool> prewarm_reader_done{};
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
@@ -438,23 +399,13 @@ private:
         u64 installed{};
         u64 skipped_draws{};
         u64 skipped_translating{}; ///< SHD-005
+        std::chrono::steady_clock::time_point since{};
     } async_stats;
     /// SHD-005: a draw of a race skipped while its new shader translates on a worker, instead of
     /// the command thread waiting for the translation.
     bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
     bool translation_skipped{};
-    struct PrewarmStats {
-        u64 installed{};
-        u64 skipped{};
-        u64 hits{};
-        u64 cancelled{};
-        u64 promoted{};
-        u64 built_before{};
-        double ms{};
-        std::chrono::steady_clock::time_point since{};
-    } prewarm_stats;
-    std::jthread prewarm_reader;
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a

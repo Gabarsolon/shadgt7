@@ -1630,3 +1630,22 @@ are left to Ryty's handler.
     - No crashes. Installed only in `E:\Development\RyGT\autotest` (backup
       `libSceVideoOut.prx.bak-pre-perf095`).
     - Worth one try where the recorder is the limit (Kyoto menu, recorder 98-99% busy).
+
+## PERF-104: shader precompilation removed (October 22, branch `linux-proton`)
+
+Lance asked (October 22) for shader precompilation to be deleted completely, from the renderer
+and the launcher. Removed from the renderer:
+
+- PERF-098: the `GPU.precompile_shaders` setting, the progress bar over the splash screen and the
+  command thread's idle pipeline builds while the splash shows.
+- PERF-102: the guest clock hold while the precompile runs (the splash screen also no longer
+  waits for it).
+- PERF-038: the background builds of stored pipelines (reader thread, background build queue,
+  `SHADGT_PREWARM`, perf id 52), and the stored pipeline records only they read (pipeline keys
+  are no longer written to the store).
+- PB-1 to PB-4: the shader pack rebuild (`RebuildFromPrograms`), its replay translation hooks in
+  the recompiler, and the `SHADGT_REPLAY_TEST`, `SHADGT_TEMPLATE_TEST`, `SHADGT_DUMP_STORE` and
+  `RYGT_SCAN_READS` research tools.
+
+Kept: PERF-032's shader store (this PC's own translations, loaded when a draw first uses them),
+PERF-076/PERF-103 compile modes and FIX-044's clock pause, which handle compiles at run time.

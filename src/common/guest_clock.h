@@ -12,10 +12,10 @@
 
 // FIX-044: the guest's monotonic clocks (TSC, process time counter, process time, monotonic
 // clock_gettime) stand still while the GPU command thread is blocked translating shaders or
-// building pipelines. A PS4 runs precompiled shaders, so these host pauses never happen there;
-// without this the game sees frames hundreds of milliseconds long. GT Sport's car thumbnail
-// script then polls a shot request after one 0.1 s sleep before the game loop could post it,
-// and shows BREAK!. Real (wall) time and host waits are unchanged.
+// building pipelines. A PS4's shaders are compiled ahead of time, so these host pauses never
+// happen there; without this the game sees frames hundreds of milliseconds long. GT Sport's car
+// thumbnail script then polls a shot request after one 0.1 s sleep before the game loop could
+// post it, and shows BREAK!. Real (wall) time and host waits are unchanged.
 namespace Common::GuestClock {
 
 /// A host counter as the guest sees it: frozen while paused, and minus all paused time after.
@@ -107,8 +107,8 @@ bool IsPaused();
 /// Marks the calling thread as the GPU command thread, whose compile waits hold the clocks.
 void MarkGpuCommandThread();
 
-/// PERF-102: holds the guest clocks from any thread until ReleaseHold (the shader precompile
-/// on the splash screen). No-op when FIX-044 is off.
+/// Holds the guest clocks from any thread until ReleaseHold (PERF-103 compile slow motion).
+/// No-op when FIX-044 is off.
 void TakeHold();
 void ReleaseHold();
 

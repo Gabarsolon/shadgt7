@@ -10,9 +10,9 @@
 
 #include "shader_recompiler/ir/passes/srt.h"
 
-// PERF-038: the background pipeline reader decoded shader metadata on its own thread, which
-// registers SRT walker code, while the GPU thread did the same; the shared code buffer and its
-// map were corrupted (Lance's 20:12 run: a reader spinning at 98% of a core, then a crash).
+// SRT walker code is registered from several threads (FIX-078's translation workers and the GPU
+// thread); unlocked, the shared code buffer and its map were corrupted (Lance's 20:12 run: a
+// thread spinning at 98% of a core, then a crash).
 TEST(SrtWalkerRegistry, ConcurrentRegistrationKeepsEveryCopy) {
     constexpr u32 Threads = 4;
     constexpr u32 PerThread = 3000;

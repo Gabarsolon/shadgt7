@@ -426,11 +426,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (Common::GuestClock::IsPaused()) {
             // FIX-044: no vblank passes while the guest clocks are held for a shader or
             // pipeline compile, as no time passes for the game. PERF-100: the last frame is
-            // shown again, with the compile notice drawn over it (PERF-102: or the splash
-            // screen, before the game's first frame).
+            // shown again, with the compile notice drawn over it (or the splash screen, before
+            // the game's first frame).
             if (timer.GetTotalWait().count() < 0) {
-                // Before the game's first frame a blank frame, which shows the splash screen
-                // and the precompile bar; after it the last frame (skipped while it is taken).
+                // Before the game's first frame a blank frame, which shows the splash screen;
+                // after it the last frame (skipped while it is taken).
                 // DIAG-126 (SHADGT_NO_LAST_FRAME=1): compile pauses after the first frame keep
                 // what is on screen instead of showing the last frame again.
                 static const bool no_last_frame = [] {

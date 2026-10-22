@@ -21,7 +21,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 #include <windows.h>
 #include <fmt/format.h>
@@ -691,67 +690,6 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     return read;
 }
 
-// PB-3 (RYGT_SCAN_READS=1): the game's other file reads (all calls of the read function but the
-// script streams') are scanned for PS4 shader programs, to see which shaders a loading screen
-// brings in before anything is drawn with them.
-constexpr u64 kOtherReadCalls[] = {
-    0x5cc8ea,  0x5cc91b,  0x5d84c5,  0xf25606,  0xf25701,  0xf257ff,  0xf2ed8a,  0x1392444,
-    0x180f065, 0x180f140, 0x18142cc, 0x183950f, 0x1839580, 0x1839c58, 0x183a258, 0x183ca63,
-    0x183cc19, 0x183d377, 0x1877647, 0x18776a9, 0x18776db, 0x18777c4, 0x18c3de5, 0x18ddc63,
-    0x1a5c9dd, 0x1a5d5ba, 0x1a5d9a0, 0x1a5e39c, 0x1a5e404, 0x1a5e4fd, 0x1a5e887, 0x1a5e8d3,
-    0x1a5ecbf, 0x1be2785, 0x1be75eb, 0x1be8458, 0x1beea2a, 0x1beea91, 0x1beebf1, 0x1beecd5,
-    0x1bef7d0, 0x1bef8cb, 0x1ca59cb};
-std::mutex g_scan_mutex;
-std::unordered_set<u64> g_scanned_programs;
-u64 g_scan_reads = 0, g_scan_bytes = 0, g_scan_programs = 0;
-auto g_scan_window = std::chrono::steady_clock::now();
-
-s64 PS4_SYSV_ABI ScanReadHook(void* file, GuestIoVec* iov) {
-    const s64 read = g_file_read(file, iov);
-    if (read <= 0 || !iov || !iov->base) {
-        return read;
-    }
-    const std::string_view data{reinterpret_cast<const char*>(iov->base), size_t(read)};
-    u64 found = 0, fresh = 0;
-    for (size_t at = data.find("OrbShdr"); at != std::string_view::npos && at + 32 <= data.size();
-         at = data.find("OrbShdr", at + 7)) {
-        u64 hash;
-        std::memcpy(&hash, data.data() + at + 16, sizeof(hash));
-        ++found;
-        std::scoped_lock lock{g_scan_mutex};
-        fresh += g_scanned_programs.insert(hash).second ? 1 : 0;
-    }
-    std::scoped_lock lock{g_scan_mutex};
-    ++g_scan_reads;
-    g_scan_bytes += u64(read);
-    g_scan_programs += fresh;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - g_scan_window >= std::chrono::seconds{2} && g_scan_reads != 0) {
-        std::fprintf(stderr, "[patch] PB-3 reads in 2 s: %llu (%llu MB), %llu new shader programs (%zu in all)\n",
-                     static_cast<unsigned long long>(g_scan_reads),
-                     static_cast<unsigned long long>(g_scan_bytes >> 20),
-                     static_cast<unsigned long long>(g_scan_programs), g_scanned_programs.size());
-        g_scan_reads = g_scan_bytes = g_scan_programs = 0;
-        g_scan_window = now;
-    }
-    return read;
-}
-
-void InstallShaderLoadScan(u8* base) {
-    if (!(std::getenv("RYGT_SCAN_READS") && std::getenv("RYGT_SCAN_READS")[0] == '1')) {
-        return;
-    }
-    u8* stubs = AllocNear(base);
-    if (!stubs) {
-        return;
-    }
-    g_file_read = reinterpret_cast<FileReadFn>(base + kFileRead + kTextRvaShift);
-    for (size_t i = 0; i < std::size(kOtherReadCalls); ++i) {
-        RedirectCall(base, stubs + i * 16, kOtherReadCalls[i], kFileRead,
-                     reinterpret_cast<void*>(&ScanReadHook), "PB-3 file reads");
-    }
-}
-
 void InstallScriptPatches(u8* base) {
     const char* livery = std::getenv("RYGT_LIVERY");
     if (!(livery && livery[0] == '0')) {
@@ -778,7 +716,6 @@ void InstallScriptPatches(u8* base) {
         RedirectCall(base, stubs + i * 16, kStreamRefillCalls[i], kFileRead,
                      reinterpret_cast<void*>(&StreamRefillHook), "GTS-003 script reads");
     }
-    InstallShaderLoadScan(base);
 }
 
 void InstallMiscHooks(u8* base) {

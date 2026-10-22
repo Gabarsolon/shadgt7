@@ -428,8 +428,6 @@ struct GPUSettings {
     Setting<bool> framegen_enabled{false};
     // ryGT: NVIDIA DLSS frame generation through Streamline (dlss\sl.*.dll); replaces the AMD one.
     Setting<bool> dlssg_enabled{false};
-    // ryGT: builds every stored shader pipeline while the splash screen shows (PERF-098).
-    Setting<bool> precompile_shaders{true};
     // ryGT: pauses the game while a new shader pipeline compiles, instead of drawing on without
     // the objects that need it (PERF-100).
     Setting<bool> compile_freeze{true};
@@ -466,7 +464,6 @@ struct GPUSettings {
             make_override<GPUSettings>("fsr3_enabled", &GPUSettings::fsr3_enabled),
             make_override<GPUSettings>("framegen_enabled", &GPUSettings::framegen_enabled),
             make_override<GPUSettings>("dlssg_enabled", &GPUSettings::dlssg_enabled),
-            make_override<GPUSettings>("precompile_shaders", &GPUSettings::precompile_shaders),
             make_override<GPUSettings>("compile_freeze", &GPUSettings::compile_freeze),
             make_override<GPUSettings>("compile_batch_ms", &GPUSettings::compile_batch_ms),
             make_override<GPUSettings>("compile_mode", &GPUSettings::compile_mode),
@@ -492,7 +489,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    fullscreen_refresh_rate, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
                                    dlss_enabled, fsr3_enabled, framegen_enabled, dlssg_enabled,
-                                   precompile_shaders,
                                    compile_freeze, compile_batch_ms, compile_mode,
                                    particle_effects,
                                    userfaultfd, inline_fetch_shader)
@@ -764,7 +760,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, Fsr3Enabled, fsr3_enabled)
     SETTING_FORWARD_BOOL(m_gpu, FrameGenEnabled, framegen_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DlssgEnabled, dlssg_enabled)
-    SETTING_FORWARD_BOOL(m_gpu, PrecompileShaders, precompile_shaders)
     SETTING_FORWARD_BOOL(m_gpu, CompileFreeze, compile_freeze)
     SETTING_FORWARD(m_gpu, CompileBatchMs, compile_batch_ms)
     SETTING_FORWARD(m_gpu, CompileMode, compile_mode)

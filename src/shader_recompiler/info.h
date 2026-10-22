@@ -28,17 +28,6 @@ struct Archive;
 
 namespace Shader {
 
-/// PB-1 (shader pre-build): a translation replayed outside the game. What the translator would
-/// read from guest memory comes from a stored shader record instead: the flattened user data
-/// (the SRT walker's output), the parsed fetch shader and the vertex attribute V#s.
-struct ReplayInputs {
-    const std::vector<u32>* flat{};
-    const void* fetch{};                    // Gcn::FetchShaderData
-    const std::vector<std::array<u32, 4>>* attrib_sharps{}; // one V# per fetch attribute
-    const void* tess_constants{};           // TessellationDataConstantBuffer
-};
-inline thread_local const ReplayInputs* t_replay = nullptr;
-
 enum class Qualifier : u8 {
     None,
     Smooth,
@@ -206,12 +195,6 @@ struct Info : InfoPersistent {
     }
 
     void RefreshFlatBuf() {
-        if (t_replay && t_replay->flat) { // PB-1
-            flattened_ud_buf = *t_replay->flat;
-            flattened_ud_buf.resize(std::max<size_t>(flattened_ud_buf.size(), srt_info.flattened_bufsize_dw));
-            flattened_ud_src.assign(flattened_ud_buf.size(), 0);
-            return;
-        }
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         flattened_ud_src.assign(srt_info.flattened_bufsize_dw, 0);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
@@ -223,10 +206,6 @@ struct Info : InfoPersistent {
     }
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
-        if (t_replay && t_replay->tess_constants) { // PB-1: from the stored runtime info
-            std::memcpy(&tess_constants, t_replay->tess_constants, sizeof(tess_constants));
-            return;
-        }
         ASSERT(tess_consts_dword_offset >= 0); // We've already tracked the V# UD
         auto buf = ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(tess_consts_ptr_base),
                                              static_cast<u32>(tess_consts_dword_offset));

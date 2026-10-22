@@ -78,9 +78,10 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
 #ifdef RYTY_GPU
     // FIX-102: frame generation starts once the splash screen is gone. With it on during the
-    // splash precompile, its presenter thread and the window thread deadlocked inside the NVIDIA
-    // driver (the presenter held the driver lock while DWM waited on a window message, the window
-    // thread waited for the lock), and every pipeline build then waited for that lock too.
+    // splash screen's pipeline builds, its presenter thread and the window thread deadlocked
+    // inside the NVIDIA driver (the presenter held the driver lock while DWM waited on a window
+    // message, the window thread waited for the lock), and every pipeline build then waited for
+    // that lock too.
     framegen_deferred =
         RytyFrameGen::Requested() && Libraries::SystemService::IsSplashVisible();
     // ryGT: FSR 3.1 frame generation makes the swapchain when it is on.

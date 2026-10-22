@@ -34,25 +34,6 @@ namespace Shader::Gcn {
  * We take the reverse way, extract the original input semantics from these instructions.
  **/
 
-AmdGpu::Buffer VertexAttribute::GetSharp(const Shader::Info& info) const noexcept {
-    if (t_replay && t_replay->fetch && t_replay->attrib_sharps) { // PB-1: the V# stored for it
-        const auto& stored = *static_cast<const FetchShaderData*>(t_replay->fetch);
-        for (size_t i = 0; i < stored.attributes.size() && i < t_replay->attrib_sharps->size(); ++i) {
-            if (stored.attributes[i] == *this) {
-                AmdGpu::Buffer buffer;
-                std::memcpy(&buffer, (*t_replay->attrib_sharps)[i].data(), sizeof(buffer));
-                buffer.base_address += inst_offset;
-                if (data_format) {
-                    buffer.data_format = data_format;
-                    buffer.num_format = num_format;
-                }
-                return buffer;
-            }
-        }
-    }
-    return GetSharpFromMemory(info);
-}
-
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     const u32* code;
     std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
@@ -64,10 +45,6 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
         return false;
     }
 
-    if (t_replay && t_replay->fetch) { // PB-1: the fetch shader parsed in the game
-        out_fetch_data = *static_cast<const FetchShaderData*>(t_replay->fetch);
-        return true;
-    }
     out_fetch_data.attributes.clear();
 
     struct VsharpLoad {

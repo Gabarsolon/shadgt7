@@ -40,7 +40,6 @@
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
-#include "core/libraries/system/systemservice.h"
 #include "ryty_gpu/ryty_diag.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/shadow.h"
@@ -1315,19 +1314,6 @@ void Liverpool::Process(std::stop_token stoken) {
         {
             std::unique_lock lk{submit_mutex};
             const auto has_work = [this] { return num_commands || num_tasks || submit_done; };
-            // PERF-098: while the splash screen shows, or stored pipelines remain, the idle
-            // command thread queues stored pipeline builds every few milliseconds.
-            while (!has_work() && !stoken.stop_requested() && rasterizer &&
-                   (Libraries::SystemService::IsSplashVisible() ||
-                    Vulkan::GetPrecompileProgress().active)) {
-                if (submit_cv.wait_for(lk, stoken, std::chrono::milliseconds{5}, has_work)) {
-                    break;
-                }
-                lk.unlock();
-                rasterizer->GetPipelineCache().IdlePrewarm(
-                    Libraries::SystemService::IsSplashVisible());
-                lk.lock();
-            }
             Common::CondvarWait(submit_cv, lk, stoken, has_work);
         }
         if (stoken.stop_requested()) {

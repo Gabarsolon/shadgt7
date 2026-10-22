@@ -122,71 +122,8 @@ void StartFirstDrawWatcher() {
     }).detach();
 }
 
-// The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
-// type in the window's top left corner, over the game and the splash screen.
-// PERF-098: the precompile of stored shaders and pipelines, as a translucent blue bar with
-// shadowed white text near the bottom of the splash screen (and of the game, if it is still
-// going when the game starts drawing).
-void DrawPrecompileProgress() {
-    using Clock = std::chrono::steady_clock;
-    const auto progress = Vulkan::GetPrecompileProgress();
-    static Clock::time_point finished{};
-    static bool shown = false;
-    if (progress.total == 0) {
-        return;
-    }
-    float alpha = 1.0f;
-    if (progress.active) {
-        shown = true;
-        finished = {};
-    } else {
-        if (!shown) {
-            return; // nothing was left to build: no bar at all
-        }
-        if (finished == Clock::time_point{}) {
-            finished = Clock::now();
-        }
-        // "Done" stays a moment, then fades out.
-        const float since = std::chrono::duration<float>(Clock::now() - finished).count();
-        alpha = std::clamp(1.0f - (since - 1.5f) / 0.5f, 0.0f, 1.0f);
-        if (alpha <= 0.0f) {
-            return;
-        }
-    }
-    const auto a = [alpha](float value) { return static_cast<int>(value * alpha); };
-    const float fraction =
-        progress.total ? float(progress.done) / float(progress.total) : 0.0f;
-    char text[96];
-    if (progress.active) {
-        std::snprintf(text, sizeof(text), "Precompiling shaders   %llu / %llu   %.0f%%",
-                      static_cast<unsigned long long>(progress.done),
-                      static_cast<unsigned long long>(progress.total), fraction * 100.0f);
-    } else {
-        std::snprintf(text, sizeof(text), "Shaders ready");
-    }
-    auto* draw = ImGui::GetForegroundDrawList();
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const float width = std::clamp(viewport->Size.x * 0.36f, 240.0f, 720.0f);
-    const float bar_height = 6.0f;
-    const ImVec2 bar_min{viewport->Pos.x + (viewport->Size.x - width) * 0.5f,
-                         viewport->Pos.y + viewport->Size.y * 0.90f};
-    const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
-    draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, a(70)), bar_height * 0.5f);
-    if (fraction > 0.0f) {
-        draw->AddRectFilled(bar_min, {bar_min.x + width * fraction, bar_max.y},
-                            IM_COL32(70, 150, 255, a(175)), bar_height * 0.5f);
-    }
-    const ImVec2 size = ImGui::CalcTextSize(text);
-    const ImVec2 at{bar_min.x + (width - size.x) * 0.5f, bar_min.y - size.y - 6.0f};
-    for (const ImVec2 offset : {ImVec2{-1, 0}, ImVec2{1, 0}, ImVec2{0, -1}, ImVec2{0, 1},
-                                ImVec2{1, 1}, ImVec2{2, 2}}) {
-        draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, a(150)), text);
-    }
-    draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
-}
-
-// PERF-100: while a new shader compiles and the game is held, the same translucent style: a
-// notice with a moving bar over the last frame. Not for compiles shorter than 0.15 s.
+// PERF-100: while a new shader compiles and the game is held, a translucent notice with a
+// moving bar over the last frame. Not for compiles shorter than 0.15 s.
 void DrawCompileNotice() {
     using Clock = std::chrono::steady_clock;
     static Clock::time_point paused_since{};
@@ -230,12 +167,11 @@ void DrawCompileNotice() {
     draw->AddText(at, IM_COL32(255, 255, 255, 235), text);
 }
 
+// The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
+// type in the window's top left corner, over the game and the splash screen.
 void DrawFpsCounter() {
     Ryty::DrawControllerOverlay();
-    DrawPrecompileProgress();
-    if (!Vulkan::GetPrecompileProgress().active) {
-        DrawCompileNotice();
-    }
+    DrawCompileNotice();
     if (!EmulatorSettings.IsShowFpsCounter()) {
         return;
     }

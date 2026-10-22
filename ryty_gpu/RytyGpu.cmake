@@ -232,5 +232,5 @@ target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
 
 # Non-renderer libraries do not link the Vulkan shader compiler.
 foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap ryty_screenshot ryty_np)
-    target_sources(${target} PRIVATE ryty_gpu/ryty_hle_precompile.cpp)
+    target_sources(${target} PRIVATE ryty_gpu/ryty_hle_overlay_stub.cpp)
 endforeach()

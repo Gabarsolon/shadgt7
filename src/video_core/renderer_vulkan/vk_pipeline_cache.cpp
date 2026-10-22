@@ -164,26 +164,6 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
 #endif
 
-// PERF-098: precompile progress.
-static std::atomic<u64> g_precompile_total{};
-static std::atomic<u64> g_precompile_done{};
-static std::atomic<bool> g_precompile_reading{};
-
-// PERF-102: while the precompile runs at start, the game waits on the splash screen (its clocks
-// held, so it sees no time pass), as if the splash screen were frozen until it is done.
-static std::atomic<bool> g_precompile_hold{};
-
-bool PrecompileHoldsGame() {
-    return g_precompile_hold.load(std::memory_order_relaxed);
-}
-
-static void ReleasePrecompileHold() {
-    if (g_precompile_hold.exchange(false)) {
-        Common::GuestClock::ReleaseHold();
-        LOG_WARNING(Render_Vulkan, "PERF-102: precompile done; the game continues");
-    }
-}
-
 // PERF-103: compile slow motion. While draws are skipped because their pipeline is still being
 // built, the guest clocks run at a quarter speed: held 3 ms of every 4 (no vblank passes while
 // held, so the game's frame rate drops with it), so a long compile looks like slow motion.
@@ -236,21 +216,12 @@ static void SlowMotionThread(std::stop_token stop) {
     }
 }
 
-PrecompileProgress GetPrecompileProgress() {
-    const u64 total = g_precompile_total.load(std::memory_order_relaxed);
-    const u64 done = std::min(total, g_precompile_done.load(std::memory_order_relaxed));
-    return {total, done, total != 0 && done < total};
-}
-
 // PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
-// PERF-038: stored pipelines are built in the background on a few of them, at low priority.
 class PipelineCache::PipelineBuildWorkers {
 public:
-    PipelineBuildWorkers()
-        : queue{CompileConcurrency(), std::max(1u, NumWorkers() / 4), CompileConcurrency()} {
-        // PERF-102: extra workers precompile on the splash screen (the queue's boost), but keep
-        // concurrent driver pipeline compilations bounded. Large bursts can overwhelm the driver
-        // while the game and its pipeline linker are already using the GPU.
+    PipelineBuildWorkers() : queue{CompileConcurrency()} {
+        // Concurrent driver pipeline compilations stay bounded (the queue's limit): large bursts
+        // can overwhelm the driver while the game and its pipeline linker use the GPU.
         for (u32 i = 0; i < AllCores(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
@@ -264,18 +235,6 @@ public:
 
     void Push(std::function<void()>&& job, bool urgent) {
         queue.Push(std::move(job), urgent ? BuildQueue::Kind::Urgent : BuildQueue::Kind::Normal);
-    }
-    void PushBackground(std::function<void()>&& job) {
-        queue.Push(std::move(job), BuildQueue::Kind::Background);
-    }
-    void PauseBackground(BuildQueue::Clock::time_point until) {
-        queue.PauseBackground(until);
-    }
-    void SetBoost(bool on) {
-        queue.SetBoost(on);
-    }
-    size_t BackgroundQueued() {
-        return queue.BackgroundQueued();
     }
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
@@ -313,13 +272,9 @@ private:
         static const bool backlog_cores = Common::PerfFeatureEnabled(160);
         while (true) {
             BuildQueue::Job job;
-            bool background = false;
-            if (!queue.Pop(job, background, stop)) {
+            if (!queue.Pop(job, stop)) {
                 return;
             }
-            // PERF-102: while the game waits on the splash screen for the precompile, every core
-            // builds (and at normal priority); afterwards only the efficiency cores.
-            const bool boosted = queue.Boosted();
             if (backlog_cores) {
                 const size_t pending = queue.Pending();
                 if (pending >= 16) {
@@ -328,27 +283,21 @@ private:
                     backlog = false;
                 }
             }
-            const bool wide = boosted || backlog;
-            if (wide != all_cores) {
-                all_cores = wide;
+            if (backlog != all_cores) {
+                all_cores = backlog;
                 if (all_cores) {
                     Common::AllowAllCores();
                 } else {
                     Common::PreferEfficiencyCores();
                 }
             }
-            const bool low = !boosted && (background || backlog);
-            if (low != low_priority) {
-                low_priority = low;
+            if (backlog != low_priority) {
+                low_priority = backlog;
                 Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
                                                               : Common::ThreadPriority::Normal);
             }
             job();
-            if (background) {
-                queue.FinishedBackground();
-            } else {
-                queue.FinishedForeground();
-            }
+            queue.Finished();
         }
     }
 
@@ -372,8 +321,6 @@ struct PipelineCache::PipelineBuild {
     std::shared_future<void> done;
     std::chrono::steady_clock::time_point queued;
     bool urgent{};
-    // PERF-038: a stored pipeline built in the background (no runtime shader state needed).
-    bool preloading{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
     bool async{};
     // Whoever sets this first builds the pipeline: a worker, or the command thread when a
@@ -742,9 +689,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     CreateDriverCache();
     LoadElseScopeFixed();
-    // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
-    // a program's stored translations are read when a draw first uses it, and new translations
-    // are stored. -DisablePerf 47 leaves the store closed.
+    // PERF-032: the shader store: a program's stored translations are read when a draw first
+    // uses it, and new translations are stored. -DisablePerf 47 leaves the store closed.
     // FIX-186 (RyGT): at any RAM setting. The launcher's 16 GB setting turns
     // pipeline_cache_enabled off for the driver's cache file, and that closed the store too, so
     // with 16 GB nothing was written to or read from the shaders folder (Lance, 2026-10-21).
@@ -776,43 +722,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             LOG_WARNING(Render_Vulkan,
                         "PERF-032: shader translations are loaded from the store on first use");
-            // PERF-038: opt-in (SHADGT_PREWARM=1): the stored pipelines are built in the
-            // background while the game runs, most recently used first. -DisablePerf 52. ryGT
-            // turns it on unless SHADGT_PREWARM=0, so GTSport.exe runs without a launcher.
-            const char* prewarm = std::getenv("SHADGT_PREWARM");
-#ifdef RYTY_GPU
-            // PERF-098: GPU.precompile_shaders (on by default) unless the variable says otherwise.
-            const bool prewarm_on =
-                prewarm ? prewarm[0] != '0' : EmulatorSettings.IsPrecompileShaders();
-#else
-            const bool prewarm_on = prewarm && prewarm[0] == '1';
-#endif
-            if (prewarm_on && Common::PerfFeatureEnabled(52)) {
-                if (!instance.IsVertexInputDynamicState()) {
-                    LOG_WARNING(Render_Vulkan, "PERF-038: background pipeline builds need dynamic "
-                                               "vertex input; not available here");
-                } else {
-                    prewarm_enabled = true;
-                    prewarm_stats.since = std::chrono::steady_clock::now();
-                    prewarm_reader =
-                        std::jthread{[this](std::stop_token stop) { PrewarmRead(stop); }};
-                }
-            }
         }
     }
     if (CompileMode() == 1 && AsyncPipelines()) {
         static std::jthread slow_motion{SlowMotionThread}; // PERF-103
-    }
-    // PB-1 (SHADGT_REPLAY_TEST=<folder of <hash>.bin programs>): translates every stored shader
-    // again from its program and its stored record, and counts how many match the stored SPIR-V.
-    if (const char* codes = std::getenv("SHADGT_REPLAY_TEST"); codes && *codes) {
-        static std::jthread replay_test{[this, dir = std::string{codes}] { ReplayTest(dir); }};
-    }
-    if (const char* dir = std::getenv("SHADGT_TEMPLATE_TEST"); dir && *dir) {
-        static std::jthread template_test{[this, d = std::string{dir}] { TemplateTest(d); }};
-    }
-    if (const char* dir = std::getenv("SHADGT_DUMP_STORE"); dir && *dir) {
-        static std::jthread dump_store{[this, d = std::string{dir}] { DumpStore(d); }};
     }
     // FIX-078: a quarter of the hardware threads (at least 2) translate read-ahead shaders.
     if (Common::PerfFeatureEnabled(102)) {
@@ -1049,8 +962,7 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
     if (!build.started.exchange(true)) {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
-            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata,
-            build.preloading);
+            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata);
         // The copies were only needed while building; draws use the cached infos.
         build.pipeline->SetStageInfos(build.canonical);
         build.info_copies = {};
@@ -1077,651 +989,6 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
     build->urgent = urgent;
     QueueBuild(build, urgent);
     return build;
-}
-
-// PB-1: one stored shader translated again outside the game, from its program's bytes and the
-// shader record. False when it could not be translated.
-bool ReplayTranslate(const Shader::Profile& profile, Shader::Pools& pools,
-                     const std::vector<u8>& program, const Shader::Info& stored,
-                     const Shader::StageSpecialization& spec, std::vector<u32>& spv,
-                     const std::function<void(const Shader::Info&)>& inspect = {}) {
-    if (program.size() < 64 || stored.flattened_ud_buf.size() < 16) {
-        return false;
-    }
-    const u8* footer = program.data() + program.size() - 32;
-    u32 bits;
-    std::memcpy(&bits, footer + 8, 4);
-    const u32 length = bits >> 8;
-    if (length == 0 || length > program.size() - 32) {
-        return false;
-    }
-    std::vector<u32> code((program.size() + 3) / 4);
-    std::memcpy(code.data(), program.data(), program.size());
-    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
-    std::copy_n(stored.flattened_ud_buf.begin(), user_data.size(), user_data.begin());
-    const Shader::ShaderParams params{
-        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
-        .code = std::span<const u32>{code.data(), length / sizeof(u32)},
-        .hash = stored.pgm_hash,
-    };
-    Shader::Info info(stored.hw_stage, stored.sw_stage, params);
-    // The vertex attribute V#s, from what the record kept of them (number class, swizzle).
-    std::vector<std::array<u32, 4>> sharps;
-    for (const auto& attrib : spec.vs_attribs) {
-        AmdGpu::Buffer buffer{};
-        buffer.base_address = 0x1000;
-        buffer.num_records = 1;
-        buffer.data_format = 14; // 32_32_32_32
-        buffer.num_format = attrib.num_class == AmdGpu::NumberClass::Sint   ? 5
-                            : attrib.num_class == AmdGpu::NumberClass::Uint ? 4
-                                                                            : 7;
-        buffer.dst_sel_x = u32(attrib.dst_select.r);
-        buffer.dst_sel_y = u32(attrib.dst_select.g);
-        buffer.dst_sel_z = u32(attrib.dst_select.b);
-        buffer.dst_sel_w = u32(attrib.dst_select.a);
-        auto& out = sharps.emplace_back();
-        std::memcpy(out.data(), &buffer, sizeof(buffer));
-    }
-    // Tessellation constants: the parts translation uses are in the stored runtime info.
-    Shader::TessellationDataConstantBuffer tess{};
-    if (stored.sw_stage == Shader::SwStage::TessellationControl) {
-        tess.ls_stride = spec.runtime_info.sw.tcs.ls_stride;
-        tess.hs_cp_stride = spec.runtime_info.sw.tcs.hs_output_cp_stride;
-        tess.hs_output_base = spec.runtime_info.sw.tcs.hs_output_base;
-    } else if (stored.sw_stage == Shader::SwStage::TessellationEval) {
-        tess.hs_cp_stride = spec.runtime_info.sw.tes.hs_output_cp_stride;
-    }
-    const Shader::ReplayInputs replay{
-        .flat = &stored.flattened_ud_buf,
-        .fetch = spec.fetch_shader_data.Empty() ? nullptr : &spec.fetch_shader_data,
-        .attrib_sharps = &sharps,
-        .tess_constants = &tess,
-    };
-    Shader::t_replay = &replay;
-    struct Reset {
-        ~Reset() {
-            Shader::t_replay = nullptr;
-        }
-    } reset;
-    auto runtime_info = spec.runtime_info;
-    auto binding = spec.start;
-    try {
-        Common::RecoverableScope recoverable;
-        const auto ir = Shader::TranslateProgram(params.code, pools, info, runtime_info, profile);
-        spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir, binding);
-        if (inspect) {
-            // PB-4: the translation's resources (their sharps come from the record's user data).
-            inspect(info);
-        }
-    } catch (...) {
-        return false;
-    }
-    return true;
-}
-
-// PB-1: shader records without their SPIR-V (put in the store by RyGT's Set up, with the
-// programs they were made from in <cache>\<serial>-programs) are translated here, on this PC,
-// before the stored pipelines are built.
-void PipelineCache::RebuildFromPrograms() {
-    const auto& serial = Common::ElfInfo::Instance().GameSerial();
-    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-                     (std::string{serial} + "-programs");
-    std::error_code ec;
-    if (!std::filesystem::is_directory(dir, ec)) {
-        return;
-    }
-    auto& store = Storage::DataBase::Instance();
-    const auto start = std::chrono::steady_clock::now();
-    const auto metas = store.ListBlobs(Storage::BlobType::ShaderMeta);
-    std::atomic<u64> rebuilt = 0, failed = 0, no_program = 0;
-    std::atomic<size_t> next = 0;
-    // PERF-161: translated on several threads (a first boot with RyGT's shader pack translated
-    // 12,590 shaders in 36 s on one). -DisablePerf 161 uses one.
-    static const bool parallel = Common::PerfFeatureEnabled(161);
-    const u32 threads =
-        parallel ? std::clamp(std::thread::hardware_concurrency() - 2, 1u, 12u) : 1u;
-    const auto work = [&] {
-        Shader::Pools pools;
-        for (size_t i = next++; i < metas.size(); i = next++) {
-            const auto& name = metas[i].first;
-            std::vector<u8> blob;
-            store.Load(Storage::BlobType::ShaderMeta, name, blob);
-            Shader::Info info{};
-            Shader::StageSpecialization spec{};
-            spec.info = &info;
-            size_t perm_idx{};
-            Serialization::Archive ar{std::move(blob)};
-            try {
-                Common::RecoverableScope recoverable;
-                if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, info, spec, perm_idx)) {
-                    continue;
-                }
-            } catch (...) {
-                continue;
-            }
-            const auto spv_name = fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx);
-            if (store.Exists(Storage::BlobType::ShaderBinary, spv_name)) {
-                continue;
-            }
-            std::vector<u8> program;
-            if (Common::FS::IOFile file{dir / fmt::format("{:016x}.bin", info.pgm_hash),
-                                        Common::FS::FileAccessMode::Read};
-                file.IsOpen()) {
-                program.resize(file.GetSize());
-                file.ReadSpan(std::span{program});
-            }
-            if (program.empty()) {
-                ++no_program;
-                continue;
-            }
-            std::vector<u32> spv;
-            if (!ReplayTranslate(profile, pools, program, info, spec, spv)) {
-                ++failed;
-                continue;
-            }
-            RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
-            ++rebuilt;
-        }
-    };
-    {
-        std::vector<std::jthread> workers;
-        for (u32 t = 1; t < threads; ++t) {
-            workers.emplace_back([&] {
-                Common::SetCurrentThreadName("shadGT:PackTranslate");
-                work();
-            });
-        }
-        work();
-    }
-    if (rebuilt + failed + no_program != 0) {
-        LOG_WARNING(Render_Vulkan,
-                    "PB-1: {} shaders translated from this PC's game files in {:.1f} s on {} "
-                    "threads ({} failed, {} without their program)",
-                    rebuilt.load(),
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
-                    threads, failed.load(), no_program.load());
-    }
-}
-
-// PB-2 (SHADGT_TEMPLATE_TEST=<folder>): for the programs in <folder>\unseen.txt, how many of
-// their stored records have the same specialization as a record of another program (a
-// "template" an unseen program could borrow), and for pipelines of two unseen programs, how far
-// apart the vertex and fragment programs sit in their file (<folder>\slots.tsv: hash, path,
-// slot). Results in the log.
-void PipelineCache::TemplateTest(const std::string& dir) {
-    Common::SetCurrentThreadName("shadGT:TemplateTest");
-    std::unordered_set<u64> unseen;
-    {
-        std::ifstream in{std::filesystem::path{dir} / "unseen.txt"};
-        std::string line;
-        while (std::getline(in, line)) {
-            if (!line.empty()) unseen.insert(std::stoull(line, nullptr, 16));
-        }
-    }
-    std::unordered_map<u64, std::pair<std::string, int>> slots;
-    {
-        std::ifstream in{std::filesystem::path{dir} / "slots.tsv"};
-        std::string h, path, slot;
-        while (std::getline(in, h, '\t') && std::getline(in, path, '\t') && std::getline(in, slot)) {
-            slots[std::stoull(h, nullptr, 16)] = {path, std::stoi(slot)};
-        }
-    }
-    struct Record {
-        u64 pgm;
-        std::unique_ptr<Shader::Info> info;
-        Shader::StageSpecialization spec;
-    };
-    std::vector<Record> records;
-    std::unordered_map<u64, u64> perm_to_pgm;
-    auto& store = Storage::DataBase::Instance();
-    for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
-        std::vector<u8> blob;
-        store.Load(Storage::BlobType::ShaderMeta, name, blob);
-        Record r;
-        r.info = std::make_unique<Shader::Info>();
-        r.spec.info = r.info.get();
-        size_t perm_idx{};
-        Serialization::Archive ar{std::move(blob)};
-        try {
-            Common::RecoverableScope recoverable;
-            if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, *r.info, r.spec, perm_idx)) continue;
-        } catch (...) {
-            continue;
-        }
-        r.spec.info = r.info.get();
-        r.pgm = r.info->pgm_hash;
-        perm_to_pgm[std::stoull(name, nullptr, 16)] = r.pgm;
-        records.push_back(std::move(r));
-    }
-    u64 tried = 0, matched = 0, by_stage_tried[8]{}, by_stage_matched[8]{};
-    std::map<std::string, u64> reasons;
-    for (const auto& p : records) {
-        if (!unseen.contains(p.pgm)) continue;
-        ++tried;
-        const u32 stage = std::min<u32>(u32(p.info->sw_stage), 7);
-        ++by_stage_tried[stage];
-        bool found = false;
-        const char* best_reason = "no record of that stage";
-        for (const auto& t : records) {
-            if (unseen.contains(t.pgm) || t.info->sw_stage != p.info->sw_stage) continue;
-            if (t.spec == p.spec) {
-                found = true;
-                break;
-            }
-            u32 index{};
-            if (const char* why = t.spec.FirstDifference(p.spec, index)) best_reason = why;
-        }
-        if (found) {
-            ++matched;
-            ++by_stage_matched[stage];
-        } else {
-            ++reasons[best_reason];
-        }
-    }
-    std::string why_text;
-    for (const auto& [why, n] : reasons) why_text += fmt::format(" {}={}", why, n);
-    LOG_WARNING(Render_Vulkan,
-                "PB-2 templates: {} records of unseen programs, {} have the specialization of a "
-                "record of another program; by stage (same/all) fs {}/{} vs {}/{} cs {}/{}; last "
-                "difference of the others:{}",
-                tried, matched, by_stage_matched[0], by_stage_tried[0], by_stage_matched[3],
-                by_stage_tried[3], by_stage_matched[5], by_stage_tried[5], why_text);
-    // Vertex/fragment pairs of unseen programs: their distance in the file.
-    std::map<int, u64> distance;
-    u64 pairs = 0, other_file = 0, no_slot = 0, fs_unseen_pipelines = 0, fs_unseen_vs_known = 0;
-    std::unordered_map<u64, u64> known_vs;
-    for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::PipelineKey)) {
-        if (!name.starts_with("g_")) continue;
-        std::vector<u8> blob;
-        store.Load(Storage::BlobType::PipelineKey, name, blob);
-        GraphicsPipelineKey key{};
-        GraphicsPipeline::SerializationSupport sdata{};
-        try {
-            Common::RecoverableScope recoverable;
-            if (!LoadStoredGraphicsPipeline(std::move(blob), key, sdata)) continue;
-        } catch (...) {
-            continue;
-        }
-        const auto vs = perm_to_pgm.find(key.stage_hashes[u32(Shader::SwStage::Vertex)]);
-        const auto fs = perm_to_pgm.find(key.stage_hashes[u32(Shader::SwStage::Fragment)]);
-        if (vs != perm_to_pgm.end() && fs != perm_to_pgm.end() && unseen.contains(fs->second)) {
-            ++fs_unseen_pipelines;
-            if (!unseen.contains(vs->second)) {
-                ++fs_unseen_vs_known;
-                known_vs[vs->second]++;
-            }
-        }
-        if (vs == perm_to_pgm.end() || fs == perm_to_pgm.end() || !unseen.contains(vs->second) ||
-            !unseen.contains(fs->second)) {
-            continue;
-        }
-        ++pairs;
-        const auto a = slots.find(vs->second);
-        const auto b = slots.find(fs->second);
-        if (a == slots.end() || b == slots.end()) {
-            ++no_slot;
-        } else if (a->second.first != b->second.first) {
-            ++other_file;
-        } else {
-            ++distance[std::clamp(b->second.second - a->second.second, -9, 9)];
-        }
-    }
-    std::string dist_text;
-    for (const auto& [d, n] : distance) dist_text += fmt::format(" {}:{}", d, n);
-    LOG_WARNING(Render_Vulkan,
-                "PB-2 pairs: {} pipelines of two unseen programs; {} in different files, {} "
-                "without a slot; fragment slot minus vertex slot (count):{}",
-                pairs, other_file, no_slot, dist_text);
-    // Simulation of the loading-screen rule: a pipeline of an unseen fragment program P and a
-    // known vertex permutation V is predicted when a known pipeline with the same V and the same
-    // state (everything but the fragment stage) has a fragment record whose specialization is
-    // P's. Counts how many of the real pipelines would have been predicted, and how many
-    // candidates the rule makes.
-    {
-        std::unordered_map<u64, const Record*> rec_by_perm;
-        for (const auto& [perm, pgm] : perm_to_pgm) {
-            (void)pgm;
-        }
-        // perm hash -> record (records are in ListBlobs order; rebuild a map from names)
-        std::unordered_map<u64, size_t> perm_index;
-        {
-            size_t i = 0;
-            for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
-                (void)time;
-                if (i < records.size()) {
-                    perm_index[std::stoull(name, nullptr, 16)] = i;
-                }
-                ++i;
-            }
-        }
-        struct Known {
-            GraphicsPipelineKey key;
-        };
-        std::unordered_map<u64, std::vector<GraphicsPipelineKey>> known_by_vs;
-        std::vector<GraphicsPipelineKey> wanted;
-        const u32 vs_i = u32(Shader::SwStage::Vertex), fs_i = u32(Shader::SwStage::Fragment);
-        for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::PipelineKey)) {
-            if (!name.starts_with("g_")) continue;
-            std::vector<u8> blob;
-            store.Load(Storage::BlobType::PipelineKey, name, blob);
-            GraphicsPipelineKey key{};
-            GraphicsPipeline::SerializationSupport sdata{};
-            try {
-                Common::RecoverableScope recoverable;
-                if (!LoadStoredGraphicsPipeline(std::move(blob), key, sdata)) continue;
-            } catch (...) {
-                continue;
-            }
-            const auto vs = perm_to_pgm.find(key.stage_hashes[vs_i]);
-            const auto fs = perm_to_pgm.find(key.stage_hashes[fs_i]);
-            if (vs == perm_to_pgm.end() || fs == perm_to_pgm.end() || unseen.contains(vs->second)) {
-                continue;
-            }
-            if (unseen.contains(fs->second)) {
-                wanted.push_back(key);
-            } else {
-                known_by_vs[key.stage_hashes[vs_i]].push_back(key);
-            }
-        }
-        u64 predicted = 0, candidates = 0;
-        for (const auto& want : wanted) {
-            const auto it = known_by_vs.find(want.stage_hashes[vs_i]);
-            if (it == known_by_vs.end()) continue;
-            const auto pi = perm_index.find(want.stage_hashes[fs_i]);
-            if (pi == perm_index.end() || pi->second >= records.size()) continue;
-            const auto& p_spec = records[pi->second].spec;
-            bool hit = false;
-            for (const auto& known : it->second) {
-                GraphicsPipelineKey a = want, b = known;
-                a.stage_hashes[fs_i] = 0;
-                b.stage_hashes[fs_i] = 0;
-                if (!(a == b)) continue;
-                ++candidates;
-                const auto ti = perm_index.find(known.stage_hashes[fs_i]);
-                if (ti != perm_index.end() && ti->second < records.size() &&
-                    records[ti->second].spec == p_spec) {
-                    hit = true;
-                }
-            }
-            predicted += hit ? 1 : 0;
-        }
-        LOG_WARNING(Render_Vulkan,
-                    "PB-2 prediction: {} pipelines of unseen fragment and known vertex programs; "
-                    "{} predicted by a known pipeline with the same vertex permutation and state "
-                    "and an equal fragment specialization ({} same-state candidates in all)",
-                    wanted.size(), predicted, candidates);
-    }
-    std::vector<std::pair<u64, u64>> top(known_vs.begin(), known_vs.end());
-    std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second > b.second; });
-    std::string top_text;
-    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
-        const auto s = slots.find(top[i].first);
-        top_text += fmt::format(" {:#x}x{} ({})", top[i].first, top[i].second,
-                                s != slots.end() ? s->second.first : "not in the files");
-    }
-    LOG_WARNING(Render_Vulkan,
-                "PB-2 unseen fragment shaders: {} pipelines, {} with a vertex shader seen before "
-                "({} different ones); most used:{}",
-                fs_unseen_pipelines, fs_unseen_vs_known, known_vs.size(), top_text);
-}
-
-void PipelineCache::ReplayTest(const std::string& dir) {
-    Common::SetCurrentThreadName("shadGT:ReplayTest");
-    auto& store = Storage::DataBase::Instance();
-    const auto metas = store.ListBlobs(Storage::BlobType::ShaderMeta);
-    Shader::Pools pools;
-    u64 tested = 0, same = 0, differ = 0, failed = 0, no_program = 0, by_stage_same[8]{}, by_stage_all[8]{};
-    std::vector<std::string> identical, not_identical;
-    for (const auto& [name, time] : metas) {
-        std::vector<u8> blob;
-        store.Load(Storage::BlobType::ShaderMeta, name, blob);
-        Shader::Info info{};
-        Shader::StageSpecialization spec{};
-        spec.info = &info;
-        size_t perm_idx{};
-        Serialization::Archive ar{std::move(blob)};
-        try {
-            Common::RecoverableScope recoverable;
-            if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, info, spec, perm_idx)) {
-                continue;
-            }
-        } catch (...) {
-            continue;
-        }
-        const auto path = std::filesystem::path{dir} / fmt::format("{:016x}.bin", info.pgm_hash);
-        std::vector<u8> program;
-        if (Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read}; file.IsOpen()) {
-            program.resize(file.GetSize());
-            file.ReadSpan(std::span{program});
-        }
-        if (program.empty()) {
-            ++no_program;
-            not_identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
-            continue;
-        }
-        std::vector<u32> stored_spv;
-        store.Load(Storage::BlobType::ShaderBinary, fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx),
-                   stored_spv);
-        std::vector<u32> spv;
-        ++tested;
-        const u32 stage = std::min<u32>(u32(info.sw_stage), 7);
-        ++by_stage_all[stage];
-        if (!ReplayTranslate(profile, pools, program, info, spec, spv)) {
-            ++failed;
-            not_identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
-        } else if (spv == stored_spv) {
-            ++same;
-            ++by_stage_same[stage];
-            identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
-        } else {
-            ++differ;
-            not_identical.push_back(fmt::format("{}\t{:016x}", name, info.pgm_hash));
-            if (differ <= 10) {
-                LOG_WARNING(Render_Vulkan, "PB-1: {} differs (stage {}, {} vs {} words)", name,
-                            stage, spv.size(), stored_spv.size());
-            }
-        }
-    }
-    LOG_WARNING(Render_Vulkan,
-                "PB-1 replay test: {} shaders tested, {} identical, {} different, {} failed, {} "
-                "without a program file; identical by stage (sw stage: same/all): {}/{} {}/{} {}/{} "
-                "{}/{} {}/{} {}/{}",
-                tested, same, differ, failed, no_program, by_stage_same[0], by_stage_all[0],
-                by_stage_same[1], by_stage_all[1], by_stage_same[2], by_stage_all[2],
-                by_stage_same[3], by_stage_all[3], by_stage_same[4], by_stage_all[4],
-                by_stage_same[5], by_stage_all[5]);
-    // The records that translate back exactly, for RyGT's shader pack.
-    std::ofstream list{Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "replay_identical.txt"};
-    for (const auto& name : identical) {
-        list << name << '\n';
-    }
-    // The others: a program is shipped only with all of its permutations (their indices are
-    // the store's, and a gap made the renderer build one pipeline again and again).
-    std::ofstream other{Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "replay_other.txt"};
-    for (const auto& name : not_identical) {
-        other << name << '\n';
-    }
-}
-
-// PB-4 (SHADGT_DUMP_STORE=<folder>): writes the store's shader records and pipeline keys as
-// text, for research on predicting them from the game's files: <folder>\metas.tsv (each record
-// translated again from <folder>\programs\<hash>.bin, with every resource's sharp read from the
-// record's user data) and <folder>\keys.tsv.
-void PipelineCache::DumpStore(const std::string& dir) {
-    Common::SetCurrentThreadName("shadGT:DumpStore");
-    const auto hex = [](const void* data, size_t size) {
-        std::string out;
-        const auto* bytes = static_cast<const u8*>(data);
-        for (size_t i = 0; i < size; ++i) {
-            out += fmt::format("{:02x}", bytes[i]);
-        }
-        return out;
-    };
-    auto& store = Storage::DataBase::Instance();
-    Shader::Pools pools;
-    u64 written = 0, no_program = 0, failed = 0;
-    {
-        std::ofstream out{std::filesystem::path{dir} / "metas.tsv"};
-        out << "name\tpgm\tperm\tstage\tflat_dw\truntime\tvs_attribs\tfetch\tbuffers\timages\tsamplers"
-               "\tspec_buffers\tspec_images\tspec_samplers\n";
-        for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
-            std::vector<u8> blob;
-            store.Load(Storage::BlobType::ShaderMeta, name, blob);
-            Shader::Info stored{};
-            Shader::StageSpecialization spec{};
-            spec.info = &stored;
-            size_t perm_idx{};
-            Serialization::Archive ar{std::move(blob)};
-            try {
-                Common::RecoverableScope recoverable;
-                if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, stored, spec, perm_idx)) continue;
-            } catch (...) {
-                continue;
-            }
-            std::string runtime;
-            const auto& rt = spec.runtime_info;
-            if (stored.sw_stage == Shader::SwStage::Fragment) {
-                const auto& fs = rt.hw.fs;
-                runtime = fmt::format("fs en={} addr={} inputs={} [",
-                                      hex(&fs.en_flags, sizeof(fs.en_flags)),
-                                      hex(&fs.addr_flags, sizeof(fs.addr_flags)), fs.num_inputs);
-                for (u32 i = 0; i < fs.num_inputs && i < fs.inputs.size(); ++i) {
-                    const auto& in = fs.inputs[i];
-                    runtime += fmt::format("{}{}{}{},", in.param_index, in.is_default ? "d" : "",
-                                           in.is_flat ? "f" : "", in.is_default ? in.default_value : 0);
-                }
-                runtime += "] cb=[";
-                for (const auto& cb : fs.color_buffers) {
-                    runtime += fmt::format("{}/{}/{}/{}/{},", u32(cb.data_format), u32(cb.num_format),
-                                           u32(cb.num_conversion), u32(cb.export_format),
-                                           hex(&cb.swizzle, sizeof(cb.swizzle)));
-                }
-                runtime += fmt::format("] z={} samples={} mrtz={} dual={}", u32(fs.z_export_format),
-                                       fs.num_samples, fs.mrtz_mask, fs.dual_source_blending);
-            } else if (stored.hw_stage == Shader::HwStage::Vertex) {
-                const auto& vs = rt.hw.vs;
-                runtime = fmt::format("vs outputs={} map={} clip_disable={} ucp={}", vs.num_outputs,
-                                      hex(vs.outputs.data(), sizeof(vs.outputs)), vs.clip_disable,
-                                      vs.user_clip_plane_mask);
-            } else {
-                runtime = fmt::format("stage{} {}", u32(stored.hw_stage), hex(&rt, sizeof(rt)));
-            }
-            runtime += fmt::format(" ud={} vgprs={}/{}", rt.props.num_user_data,
-                                   rt.props.num_input_vgprs, rt.props.num_allocated_vgprs);
-            std::string vs_attribs;
-            for (const auto& a : spec.vs_attribs) {
-                vs_attribs += fmt::format("{}/{}/{},", a.divisor, u32(a.num_class),
-                                          hex(&a.dst_select, sizeof(a.dst_select)));
-            }
-            std::string fetch;
-            for (const auto& a : spec.fetch_shader_data.attributes) {
-                fetch += hex(&a, sizeof(a)) + ",";
-            }
-            std::string spec_buffers, spec_images, spec_samplers;
-            for (const auto& b : spec.buffers) {
-                spec_buffers += fmt::format("{}/{}/{}/{}/{},", u32(b.stride), u32(b.is_formatted),
-                                            u32(b.data_format), u32(b.num_format),
-                                            u32(b.swizzle_enable));
-            }
-            for (const auto& i : spec.images) {
-                spec_images += fmt::format("{}/{}/{}/{}/{}/{},", u32(i.type), i.is_integer,
-                                           i.is_storage, i.is_srgb, u32(i.num_conversion),
-                                           i.num_bindings);
-            }
-            for (const auto& s : spec.samplers) {
-                spec_samplers += fmt::format("{}/{},", u32(s.force_unnormalized), u32(s.force_degamma));
-            }
-            std::string buffers = "-", images = "-", samplers = "-";
-            std::vector<u8> program;
-            if (Common::FS::IOFile file{std::filesystem::path{dir} / "programs" /
-                                            fmt::format("{:016x}.bin", stored.pgm_hash),
-                                        Common::FS::FileAccessMode::Read};
-                file.IsOpen()) {
-                program.resize(file.GetSize());
-                file.ReadSpan(std::span{program});
-            }
-            if (program.empty()) {
-                ++no_program;
-            } else {
-                std::vector<u32> spv;
-                const bool ok = ReplayTranslate(
-                    profile, pools, program, stored, spec, spv, [&](const Shader::Info& info) {
-                        buffers.clear();
-                        images.clear();
-                        samplers.clear();
-                        for (const auto& b : info.buffers) {
-                            const auto sharp = b.GetSharp(info);
-                            buffers += fmt::format("{}/{}/{}/{}:{},", u32(b.buffer_type), b.is_written,
-                                                   b.is_formatted, u32(b.used_types),
-                                                   hex(&sharp, sizeof(sharp)));
-                        }
-                        for (const auto& i : info.images) {
-                            const auto sharp = i.GetSharp(info);
-                            images += fmt::format("{}{}{}{}:{},", i.is_depth ? "d" : "",
-                                                  i.is_array ? "a" : "", i.is_written ? "w" : "",
-                                                  i.is_r128 ? "r" : "", hex(&sharp, sizeof(sharp)));
-                        }
-                        for (const auto& s : info.samplers) {
-                            const auto sharp = s.GetSharp(info);
-                            samplers += hex(&sharp, sizeof(sharp)) + ",";
-                        }
-                    });
-                if (!ok) {
-                    ++failed;
-                }
-            }
-            out << name << '\t' << fmt::format("{:016x}", stored.pgm_hash) << '\t' << perm_idx << '\t'
-                << u32(stored.sw_stage) << '\t' << stored.flattened_ud_buf.size() << '\t' << runtime
-                << '\t' << vs_attribs << '\t' << fetch << '\t' << buffers << '\t' << images << '\t'
-                << samplers << '\t' << spec_buffers << '\t' << spec_images << '\t' << spec_samplers
-                << '\n';
-            ++written;
-        }
-    }
-    u64 keys = 0;
-    {
-        std::ofstream out{std::filesystem::path{dir} / "keys.tsv"};
-        out << "name\tstages\tvertex_formats\tcolor\tblend\twrite_masks\tmisc\n";
-        for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::PipelineKey)) {
-            if (!name.starts_with("g_")) continue;
-            std::vector<u8> blob;
-            store.Load(Storage::BlobType::PipelineKey, name, blob);
-            GraphicsPipelineKey key{};
-            GraphicsPipeline::SerializationSupport sdata{};
-            try {
-                Common::RecoverableScope recoverable;
-                if (!LoadStoredGraphicsPipeline(std::move(blob), key, sdata)) continue;
-            } catch (...) {
-                continue;
-            }
-            std::string stages, formats, color, blend, masks;
-            for (const auto h : key.stage_hashes) stages += fmt::format("{:x},", h);
-            for (const auto f : key.vertex_buffer_formats) {
-                if (f != vk::Format::eUndefined) formats += fmt::format("{},", u32(f));
-            }
-            for (u32 i = 0; i < key.num_color_attachments && i < key.color_buffers.size(); ++i) {
-                const auto& cb = key.color_buffers[i];
-                color += fmt::format("{}/{}/{}/{},", u32(cb.data_format), u32(cb.num_format),
-                                     u32(cb.num_conversion), u32(cb.export_format));
-                blend += hex(&key.blend_controls[i], sizeof(key.blend_controls[i])) + ",";
-                masks += fmt::format("{},", u32(key.write_masks[i]));
-            }
-            out << name << '\t' << stages << '\t' << formats << '\t' << color << '\t' << blend << '\t'
-                << masks << '\t'
-                << fmt::format("cbmask={} samples={}/{} mrt={:x} z={} stencil={} prim={} poly={} "
-                               "patch={}",
-                               hex(&key.cb_shader_mask, sizeof(key.cb_shader_mask)),
-                               key.num_samples, key.depth_samples, key.mrt_mask, u32(key.z_format),
-                               u32(key.stencil_format), u32(key.prim_type), u32(key.polygon_mode),
-                               key.patch_control_points)
-                << '\n';
-            ++keys;
-        }
-    }
-    LOG_WARNING(Render_Vulkan,
-                "PB-4 store dump: {} shader records ({} without a program, {} failed), {} pipeline "
-                "keys in {}",
-                written, no_program, failed, keys, dir);
 }
 
 bool PipelineCache::LegacyWaits() const {
@@ -1790,19 +1057,6 @@ bool PipelineCache::CancelBuild(PipelineBuild& build) {
     }
     build.promise.set_value();
     return true;
-}
-
-void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build) {
-    if (!build_workers) {
-        build_workers = std::make_unique<PipelineBuildWorkers>();
-    }
-    build_workers->PushBackground([this, build] {
-        if (!build->started.load()) {
-            FinishBuild(*build);
-            ++prewarm_built;
-        }
-        ++g_precompile_done; // PERF-098
-    });
 }
 
 void PipelineCache::ReadAheadAtBufferStart() {
@@ -1937,23 +1191,11 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             continue;
         }
-        if (const auto pending = pending_builds.find(S().graphics_key);
-            pending != pending_builds.end()) {
-            // PERF-038: a stored pipeline still waiting in the background queue is needed soon;
-            // build it now from this draw's state instead.
-            if (pending->second->preloading && CancelBuild(*pending->second)) {
-                pending.value() = StartPipelineBuild(false);
-                ++prewarm_stats.promoted;
-                ++started;
-            }
+        if (pending_builds.contains(S().graphics_key)) {
             continue;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
         ++started;
-    }
-    if (started > 0 && build_workers) {
-        // PERF-038: the game needs pipelines; background builds wait.
-        build_workers->PauseBackground(std::chrono::steady_clock::now() + std::chrono::seconds{2});
     }
     S().draw_indirect_params = params;
     if (restore && evaluated > 0) {
@@ -2014,8 +1256,7 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
     BuildQueuedStates(params, false);
-    // PERF-038: then, while no draw waits for pipelines, stored ones go to the background.
-    InstallPrewarmed();
+    ReportAsyncPipelines(std::chrono::steady_clock::now());
     S().draw_indirect_params = params;
     ++draws_since_scan;
     // FIX-078: missing translations of this draw's stages are queued together first; then the
@@ -2287,25 +1528,18 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
         auto pending = pending_builds.find(S().graphics_key);
-        if (pending != pending_builds.end() &&
-            (pending->second->preloading || pending->second->async)) {
+        if (pending != pending_builds.end() && pending->second->async) {
             auto stored = pending->second;
-            if (stored->done.wait_for(stored->async ? QuickWait() : std::chrono::microseconds{0}) ==
-                std::future_status::ready) {
-                // PERF-038: built in the background before the draw needed it; no miss.
+            if (stored->done.wait_for(QuickWait()) == std::future_status::ready) {
+                // PERF-076: built by a worker since an earlier draw skipped; no miss.
                 pending_builds.erase(pending);
                 stored->pipeline->SetStageInfos(S().infos);
                 sdata = stored->sdata;
                 it.value() = std::move(stored->pipeline);
-                ++(stored->async ? async_stats.installed : prewarm_stats.hits);
-                // Stored again, so the next session builds it among the first.
-                if (!S().key_uses_legacy) {
-                    RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
-                }
+                ++async_stats.installed;
                 return it->second.get();
             }
-            if ((stored->async || (CompileMode() == 2 && AsyncPipelines())) &&
-                !LegacyWaits() && !WritesMemory(S().infos) && !NeverSkipped(S().infos) &&
+            if (!LegacyWaits() && !WritesMemory(S().infos) && !NeverSkipped(S().infos) &&
                 !MenusWait()) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
@@ -2314,15 +1548,10 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 return nullptr;
             }
             if (CancelBuild(*stored)) {
-                // Not started in the background yet: built now the usual way.
+                // No worker has started it yet: built now the usual way.
                 pending_builds.erase(pending);
                 pending = pending_builds.end();
-                ++prewarm_stats.cancelled;
             }
-        }
-        if (build_workers && CompileMode() != 2) {
-            build_workers->PauseBackground(std::chrono::steady_clock::now() +
-                                           std::chrono::seconds{2});
         }
         ++Common::GetWorkCounters().pipelines_compiled;
         last_pipeline_miss = std::chrono::steady_clock::now();
@@ -2418,9 +1647,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 S().runtime_infos, S().fetch_shader, S().modules, sdata);
         }
 
-        if (!S().key_uses_legacy) { // D10: old translations are not in this store
-            RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
-        } else {
+        if (S().key_uses_legacy) { // D10
             ++legacy_stats.pipelines;
         }
         ++num_new_pipelines;
@@ -2468,9 +1695,6 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *S().infos[0],
                                                        S().modules[0], sdata);
-        if (!S().key_uses_legacy) { // D10
-            RegisterPipelineData(compute_key, sdata);
-        }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
 
@@ -2879,8 +2103,8 @@ namespace Vulkan {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
-    // FIX-044: translating a shader on the GPU thread holds the guest clocks; a PS4 runs
-    // precompiled shaders, so the game never sees this time pass.
+    // FIX-044: translating a shader on the GPU thread holds the guest clocks; a PS4's shaders
+    // are compiled ahead of time, so the game never sees this time pass.
     Common::GuestClock::CompilePause hold;
     ++Common::GetWorkCounters().shaders_compiled;
     RYDIAG_SCOPE(ShaderCompile, info.pgm_hash);
@@ -2953,8 +2177,7 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
                                                               Storage::DataBase& store) {
     // Each permutation is stored as <perm hash>.meta (key and shader info) and
     // <program hash>_<index>.spv; indices are dense from 0 (PERF-013 numbers runtime ones after
-    // the stored ones), so the listing stops after a run of missing indices. Only file reads, so
-    // the PERF-038 reader thread can do it too.
+    // the stored ones), so the listing stops after a run of missing indices.
     StoredListing listing{.pgm_hash = pgm_hash};
     u32 missing = 0;
     for (size_t perm_idx = 0; perm_idx < 512 && missing < 8; ++perm_idx) {
@@ -3030,271 +2253,6 @@ void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
     ApplyStoredListing(ReadStoredListing(pgm_hash), program);
 }
 
-// PERF-038: one stored pipeline, read and parsed by the reader thread.
-struct PipelineCache::PrewarmRecord {
-    GraphicsPipelineKey key{};
-    GraphicsPipeline::SerializationSupport sdata{};
-    std::array<u64, MaxShaderStages> pgm{};
-    std::array<size_t, MaxShaderStages> perm{};
-    std::array<std::vector<u32>, MaxShaderStages> spv{};
-    std::vector<StoredListing> listings;
-};
-
-void PipelineCache::PrewarmRead(std::stop_token stop) {
-    Common::SetCurrentThreadName("shadGT:PrewarmRead");
-    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-#ifdef RYTY_GPU
-    // PERF-102: the game waits on the splash screen until the precompile is done.
-    if (!g_precompile_hold.exchange(true)) {
-        Common::GuestClock::TakeHold();
-        LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
-    }
-#endif
-    auto& store = Storage::DataBase::Instance();
-    RebuildFromPrograms(); // PB-1
-    // The profile file is written only when missing (by the removed precompile), so it can be
-    // older than most entries: GT Sport's is from October 6, the store's entries from October 6
-    // to 9. A draw's first use loads the same stored SPIR-V without checking it (PERF-032), so
-    // a background build makes the pipeline that draw would make; differences are only logged.
-    std::vector<u8> stored_profile;
-    if (store.Exists(Storage::BlobType::ShaderProfile, "profile")) {
-        store.Load(Storage::BlobType::ShaderProfile, "profile", stored_profile);
-    }
-    if (!stored_profile.empty()) {
-        std::string differences;
-        const auto* current = reinterpret_cast<const u8*>(&profile);
-        for (size_t i = 0; i < std::min(stored_profile.size(), sizeof(profile)); ++i) {
-            if (stored_profile[i] != current[i]) {
-                differences += fmt::format(" [{}] {:#x}->{:#x}", i, stored_profile[i], current[i]);
-            }
-        }
-        if (!differences.empty() || stored_profile.size() != sizeof(profile)) {
-            LOG_WARNING(Render_Vulkan,
-                        "PERF-038: the store's profile file ({} bytes) differs from this "
-                        "profile ({} bytes):{}",
-                        stored_profile.size(), sizeof(profile), differences);
-        }
-    }
-    auto keys = store.ListBlobs(Storage::BlobType::PipelineKey);
-    std::erase_if(keys, [](const auto& key) { return !key.first.starts_with("g_"); });
-    // Most recently used first: a pipeline's key is stored again each session that uses it.
-    std::ranges::sort(keys, [](const auto& a, const auto& b) { return a.second > b.second; });
-    if (const char* limit = std::getenv("SHADGT_PREWARM_LIMIT"); limit && *limit) {
-        keys.resize(std::min<size_t>(keys.size(), std::strtoull(limit, nullptr, 10)));
-    }
-    prewarm_total = keys.size();
-    g_precompile_total = keys.size(); // PERF-098
-    g_precompile_done = 0;
-    LOG_WARNING(Render_Vulkan, "PERF-038: building {} stored pipelines in the background",
-                keys.size());
-    std::unordered_set<u64> listed;
-    u64 skipped = 0;
-    for (const auto& [name, time] : keys) {
-        if (stop.stop_requested()) {
-            return;
-        }
-        ++prewarm_read;
-        auto record = std::make_unique<PrewarmRecord>();
-        bool valid = false;
-        try {
-            Common::RecoverableScope recoverable;
-            std::vector<u8> blob;
-            store.Load(Storage::BlobType::PipelineKey, name, blob);
-            valid = LoadStoredGraphicsPipeline(std::move(blob), record->key, record->sdata);
-            // Only pipelines whose every stage input is stored (see InstallPrewarmRecord).
-            valid = valid && record->key.stage_hashes[u32(SwStage::Vertex)] != 0 &&
-                    record->key.stage_hashes[u32(SwStage::Fragment)] != 0;
-            for (u32 stage = 0; valid && stage < MaxShaderStages; ++stage) {
-                const u64 perm_hash = record->key.stage_hashes[stage];
-                if (perm_hash == 0) {
-                    continue;
-                }
-                std::vector<u8> meta_blob;
-                store.Load(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash),
-                           meta_blob);
-                // Only the program hash and index: the full decode is the GPU thread's
-                // (ApplyStoredListing), as it registers SRT walker code.
-                u64 pgm_hash{};
-                size_t perm_idx{};
-                if (meta_blob.size() < 24 ||
-                    !PeekShaderMeta(std::move(meta_blob), pgm_hash, perm_idx) ||
-                    HashCombine(pgm_hash, perm_idx) != perm_hash) {
-                    valid = false;
-                    break;
-                }
-                record->pgm[stage] = pgm_hash;
-                record->perm[stage] = perm_idx;
-                if (listed.insert(pgm_hash).second) {
-                    record->listings.push_back(ReadStoredListing(pgm_hash));
-                }
-                store.Load(Storage::BlobType::ShaderBinary,
-                           fmt::format("{:#018x}_{}", pgm_hash, perm_idx), record->spv[stage]);
-            }
-        } catch (const std::exception&) {
-            // RecoverableFailure, or a corrupt entry (std::bitset rejects bad text).
-            valid = false;
-        }
-        if (!valid) {
-            ++skipped;
-            ++g_precompile_done; // PERF-098
-            continue;
-        }
-        std::unique_lock lk{prewarm_mutex};
-        prewarm_cv.wait(lk, stop, [this] { return prewarm_records.size() < 32; });
-        if (stop.stop_requested()) {
-            return;
-        }
-        prewarm_records.push_back(std::move(record));
-        ++prewarm_queued;
-    }
-    LOG_WARNING(Render_Vulkan,
-                "PERF-038: reader done: {} stored pipelines read, {} skipped (other key version, "
-                "missing stages or files)",
-                keys.size(), skipped);
-    prewarm_reader_done = true;
-    if (keys.empty()) {
-        ReleasePrecompileHold(); // nothing stored yet (first start)
-    }
-}
-
-void PipelineCache::IdlePrewarm(bool splash) {
-    if (!prewarm_enabled) {
-        ReleasePrecompileHold();
-        return;
-    }
-    // PERF-102: released once every stored pipeline is built (or after 15 minutes at most).
-    static const auto first_call = std::chrono::steady_clock::now();
-    if (PrecompileHoldsGame() &&
-        ((prewarm_reader_done && !GetPrecompileProgress().active) ||
-         std::chrono::steady_clock::now() - first_call > std::chrono::minutes{15})) {
-        ReleasePrecompileHold();
-    }
-    if (build_workers) {
-        build_workers->SetBoost(splash);
-    } else if (splash) {
-        build_workers = std::make_unique<PipelineBuildWorkers>();
-        build_workers->SetBoost(true);
-    }
-    std::scoped_lock lk{lookup_mutex};
-    InstallPrewarmed(splash);
-}
-
-void PipelineCache::InstallPrewarmed(bool force) {
-    if (!prewarm_enabled) {
-        return;
-    }
-    using namespace std::chrono_literals;
-    const auto start = std::chrono::steady_clock::now();
-    ReportPrewarm(start);
-    // Not while new pipelines are being needed: the draws come first (PERF-098: unless forced,
-    // while the splash screen shows).
-    if (prewarm_queued.load(std::memory_order_relaxed) == 0 ||
-        (!force && start - last_pipeline_miss < 2s)) {
-        return;
-    }
-    // The members a key is computed in are restored, so the draw sees what it would have.
-    const auto saved_key = S().graphics_key;
-    const auto saved_infos = S().infos;
-    const auto saved_modules = S().modules;
-    const auto saved_runtime_infos = S().runtime_infos;
-    auto* const saved_fetch = S().fetch_shader;
-    const auto budget = start + (force ? 20000us : 300us);
-    do {
-        std::unique_ptr<PrewarmRecord> record;
-        {
-            std::scoped_lock lk{prewarm_mutex};
-            if (prewarm_records.empty()) {
-                break;
-            }
-            record = std::move(prewarm_records.front());
-            prewarm_records.pop_front();
-        }
-        --prewarm_queued;
-        prewarm_cv.notify_one();
-        if (InstallPrewarmRecord(*record)) {
-            ++prewarm_stats.installed;
-        } else {
-            ++prewarm_stats.skipped;
-            ++g_precompile_done; // PERF-098
-        }
-    } while (std::chrono::steady_clock::now() < budget);
-    S().graphics_key = saved_key;
-    S().infos = saved_infos;
-    S().modules = saved_modules;
-    S().runtime_infos = saved_runtime_infos;
-    S().fetch_shader = saved_fetch;
-    prewarm_stats.ms +=
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-}
-
-bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
-    for (auto& listing : record.listings) {
-        auto [it, is_new] = program_cache.try_emplace(listing.pgm_hash);
-        if (is_new) {
-            it.value() = std::make_unique<Program>();
-            ApplyStoredListing(std::move(listing), *it.value());
-        }
-    }
-    if (graphics_pipelines.contains(record.key) || pending_builds.contains(record.key)) {
-        return false;
-    }
-    const bool tess_emulated = record.key.prim_type == AmdGpu::PrimitiveType::RectList ||
-                               record.key.prim_type == AmdGpu::PrimitiveType::QuadList;
-    S().infos.fill(nullptr);
-    S().modules.fill(nullptr);
-    S().fetch_shader = nullptr;
-    for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
-        if (record.pgm[stage] == 0) {
-            continue;
-        }
-        const auto it = program_cache.find(record.pgm[stage]);
-        if (it == program_cache.end() || record.perm[stage] >= it->second->modules.size()) {
-            return false;
-        }
-        auto& permutation = it->second->modules[record.perm[stage]];
-        if (!permutation.info) {
-            return false;
-        }
-        if (permutation.stored) {
-            // The same SPIR-V a draw's first use would load (PERF-032), read on the reader thread.
-            if (!IsCompleteSpirv(record.spv[stage])) {
-                return false;
-            }
-            permutation.module = CompileSPV(record.spv[stage], instance.GetDevice());
-            permutation.stored = false;
-        }
-        if (!permutation.module) {
-            return false;
-        }
-        // Tessellation helpers are made from the vertex outputs, which old metadata lacks; a draw
-        // recovers them from the guest code, a background build cannot.
-        if (tess_emulated && stage == u32(SwStage::Vertex) &&
-            !permutation.info->attribute_flags_known) {
-            return false;
-        }
-        // A mip fallback indexed at runtime takes its descriptor count from the draw's T#.
-        if (std::ranges::any_of(permutation.info->images, [](const auto& image) {
-                return image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
-            })) {
-            return false;
-        }
-        S().infos[stage] = permutation.info.get();
-        S().modules[stage] = permutation.module;
-        // The runtime info a draw passes is the one the permutation was specialized with.
-        S().runtime_infos[stage] = permutation.spec.runtime_info;
-        if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
-            S().fetch_shader = &fetch;
-        }
-    }
-    S().graphics_key = record.key;
-    auto build = MakePipelineBuild();
-    build->preloading = true;
-    build->sdata = record.sdata;
-    pending_builds.emplace(record.key, build);
-    QueueBackgroundBuild(build);
-    return true;
-}
-
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
     // Keep going: rendering must not wait for a cosmetic pipeline.
     if (CompileMode() == 2) return false;
@@ -3357,9 +2315,8 @@ bool PipelineCache::AsyncPipelines() {
     return enabled;
 }
 
-void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
-    auto& stats = prewarm_stats;
-    if (now - stats.since < std::chrono::seconds{2}) {
+void PipelineCache::ReportAsyncPipelines(std::chrono::steady_clock::time_point now) {
+    if (now - async_stats.since < std::chrono::seconds{2}) {
         return;
     }
     if (async_stats.deferred + async_stats.installed + async_stats.skipped_draws +
@@ -3369,29 +2326,12 @@ void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
                     "PERF-076 background pipelines in {:.1f} s: {} new ones built without a wait, "
                     "{} ready and installed, {} draws skipped meanwhile; SHD-005: {} draws "
                     "skipped while their shaders translated",
-                    std::chrono::duration<double>(now - stats.since).count(),
+                    std::chrono::duration<double>(now - async_stats.since).count(),
                     async_stats.deferred, async_stats.installed, async_stats.skipped_draws,
                     async_stats.skipped_translating);
-        async_stats = {};
     }
-    const u64 built = prewarm_built.load();
-    if (stats.installed + stats.hits + stats.cancelled + stats.promoted != 0 ||
-        built != stats.built_before) {
-        LOG_WARNING(Render_Vulkan,
-                    "PERF-038 background builds in {:.1f} s: {} queued ({} skipped, {:.1f} ms on "
-                    "this thread), {} built ({} in all), {} used by draws without waiting, {} "
-                    "built for a draw instead, {} moved ahead by the read-ahead; {} waiting; "
-                    "reader {}/{}{}",
-                    std::chrono::duration<double>(now - stats.since).count(), stats.installed,
-                    stats.skipped, stats.ms, built - stats.built_before, built, stats.hits,
-                    stats.cancelled, stats.promoted,
-                    build_workers ? build_workers->BackgroundQueued() : 0, prewarm_read.load(),
-                    prewarm_total.load(), prewarm_reader_done.load() ? " (done)" : "");
-    }
-    const u64 built_now = built;
-    stats = {};
-    stats.built_before = built_now;
-    stats.since = now;
+    async_stats = {};
+    async_stats.since = now;
 }
 
 vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx) {
