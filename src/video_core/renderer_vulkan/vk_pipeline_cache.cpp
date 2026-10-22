@@ -3831,6 +3831,51 @@ bool PipelineCache::AsyncTranslation() const {
     return enabled && translate_workers != nullptr;
 }
 
+// FIX-189: a vertex shader's fetch shader, copied for a translation worker as FIX-160 copies the
+// shader's code. The worker read it through the address in the user data, and the game can
+// release it first: Brand Central's showroom swaps car models while their shaders wait in the
+// queue, and the read crashed the worker (ParseFetchShader). The job's user data then points at
+// the copy. False when it is gone already.
+static bool CopyFetchShader(std::span<u32, Shader::ShaderParams::NumShaderUserData> user_data,
+                            std::span<const u32> code, std::vector<u32>& copy) {
+    const auto base = Shader::FetchShaderSgprBase(code);
+    if (!base || *base + 1 >= user_data.size()) {
+        return true;
+    }
+    u64 address;
+    std::memcpy(&address, &user_data[*base], sizeof(address));
+    if (address == 0) {
+        return true;
+    }
+    // The page holding its start, then more pages until its s_setpc_b64 is in the copy; two
+    // zero dwords after the copied words keep the decoder's literal reads inside the vector.
+    constexpr u64 PageSize = 4096;
+    constexpr size_t Padding = 2;
+    std::vector<u32> words;
+    u64 end = (address & ~(PageSize - 1)) + PageSize;
+    for (int pages = 0; pages < 4; ++pages, end += PageSize) {
+        const size_t count = (end - address) / sizeof(u32);
+        words.resize(count + Padding);
+#ifdef RYTY_GPU
+        if (!Core::RytyMemory::GuardedCopy(words.data(), reinterpret_cast<const void*>(address),
+                                           count * sizeof(u32))) {
+            return false;
+        }
+#else
+        std::memcpy(words.data(), reinterpret_cast<const void*>(address), count * sizeof(u32));
+#endif
+        std::fill(words.begin() + count, words.end(), 0u);
+        if (const auto length = Shader::FetchShaderLength({words.data(), count})) {
+            words.resize(*length + Padding);
+            copy = std::move(words);
+            const u64 pointer = reinterpret_cast<u64>(copy.data());
+            std::memcpy(&user_data[*base], &pointer, sizeof(pointer));
+            return true;
+        }
+    }
+    return false;
+}
+
 bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
@@ -3860,6 +3905,11 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     std::ranges::copy(params.code, job->code_copy.begin());
 #endif
     job->code = job->code_copy;
+    if ((hw_stage == HwStage::Vertex || hw_stage == HwStage::Export ||
+         hw_stage == HwStage::Local) &&
+        !CopyFetchShader(job->user_data, job->code, job->fetch_copy)) {
+        return false; // as above
+    }
     job->start = start;
     jobs.push_back(job);
     ++translate_stats.queued;

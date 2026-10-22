@@ -133,6 +133,37 @@ bool HasLaneReadsAndLoop(std::span<const u32> code) {
     return lane_reads && loop;
 }
 
+std::optional<u32> FetchShaderSgprBase(std::span<const u32> code) {
+    using namespace Gcn;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Opcode::S_SWAPPC_B64) {
+            return inst.src[0].code;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<size_t> FetchShaderLength(std::span<const u32> code) {
+    using namespace Gcn;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    size_t bytes = 0;
+    while (!slice.atEnd() && bytes < code.size_bytes()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        bytes += inst.length;
+        if (inst.opcode == Opcode::S_SETPC_B64) {
+            return bytes <= code.size_bytes() ? std::optional{bytes / sizeof(u32)} : std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
 bool HasMemoryWrites(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
