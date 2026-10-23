@@ -728,6 +728,16 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {merged_image_id, -1, -1};
         }
 
+        // FIX-191: the same surface with more padding in its guest size (GT7's 960x540 R11G11B10
+        // buffer at 0x100a0b0000: 0x240000 bytes as one descriptor, 0x400000 as another; same
+        // format, size, pitch, tiling, mips and layers). The cached image holds every texel, so
+        // it serves both; this was an assertion that ended the Deep Forest flyover.
+        if (image_info.type == cache_image.info.type && image_info.size == cache_image.info.size &&
+            image_info.pitch == cache_image.info.pitch &&
+            image_info.resources == cache_image.info.resources) {
+            return {merged_image_id ? merged_image_id : cache_image_id, -1, -1};
+        }
+
         // Enhanced debug logging for unreachable case
         // Calculate expected size based on format and dimensions
         u64 expected_size =
