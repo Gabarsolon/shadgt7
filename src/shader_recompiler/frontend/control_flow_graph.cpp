@@ -68,6 +68,134 @@ static bool IgnoresExecMask(const GcnInst& inst) {
     return false;
 }
 
+static bool ChangesExec(const GcnInst& inst) {
+    switch (inst.opcode) {
+    case Opcode::S_AND_SAVEEXEC_B64:
+    case Opcode::S_OR_SAVEEXEC_B64:
+    case Opcode::S_XOR_SAVEEXEC_B64:
+    case Opcode::S_ANDN2_SAVEEXEC_B64:
+    case Opcode::S_ORN2_SAVEEXEC_B64:
+    case Opcode::S_NAND_SAVEEXEC_B64:
+    case Opcode::S_NOR_SAVEEXEC_B64:
+    case Opcode::S_XNOR_SAVEEXEC_B64:
+        return true;
+    default:
+        break;
+    }
+    if (inst.IsCmpx()) {
+        return true;
+    }
+    for (u32 i = 0; i < inst.dst_count; ++i) {
+        if (inst.dst[i].field == OperandField::ExecLo || inst.dst[i].field == OperandField::ExecHi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsWholeWaveEnable(const GcnInst& inst) {
+    if (inst.opcode == Opcode::S_ORN2_SAVEEXEC_B64) {
+        // exec = src | ~exec: every lane when src is exec.
+        return inst.src[0].field == OperandField::ExecLo;
+    }
+    if (inst.opcode == Opcode::S_OR_SAVEEXEC_B64) {
+        return inst.src[0].field == OperandField::SignedConstIntNeg &&
+               inst.src[0].code == static_cast<u32>(OperandField::SignedConstIntNeg); // -1
+    }
+    return false;
+}
+
+// FIX-190: invocations stand for lanes, and s_cbranch_execz took an invocation whose lane is off
+// past the branch body. GCN branches only when every lane is off, so a body that turns every lane
+// on to sum a value over the wave runs on all of them: GT7's Hi-Z test (cs 0xc959ee53) sums its
+// per-lane votes this way, and without the inactive invocations the sum missed lanes, visible
+// terrain was marked occluded and mountains floated. Such a branch is dropped: every invocation
+// goes through the body, the part before the enable and after the restore in exec scopes. Only
+// bodies that stay one block until a later s_cbranch_execz to the same target qualify, so the
+// invocations whose lane is off leave there and every other path keeps its branch.
+std::vector<WholeWaveRegion> FindWholeWaveRegions(std::span<const GcnInst> list) {
+    std::vector<u32> pcs(list.size() + 1);
+    for (size_t i = 0; i < list.size(); ++i) {
+        pcs[i + 1] = pcs[i] + list[i].length;
+    }
+    std::vector<u32> targets;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const auto& inst = list[i];
+        if (inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64) {
+            return {}; // targets not known here
+        }
+        if (inst.IsConditionalBranch() || inst.IsUnconditionalBranch()) {
+            targets.push_back(inst.BranchTarget(pcs[i]));
+        }
+    }
+    const auto is_branch = [](const GcnInst& inst) {
+        return inst.IsConditionalBranch() || inst.IsUnconditionalBranch() ||
+               inst.opcode == Opcode::S_ENDPGM;
+    };
+    const auto opens_scope = [](const GcnInst& inst) {
+        return inst.opcode == Opcode::S_AND_SAVEEXEC_B64 || inst.IsCmpx();
+    };
+
+    std::vector<WholeWaveRegion> regions;
+    for (size_t branch = 1; branch < list.size(); ++branch) {
+        const auto& inst = list[branch];
+        if (inst.opcode != Opcode::S_CBRANCH_EXECZ || !opens_scope(list[branch - 1])) {
+            continue;
+        }
+        const u32 target = inst.BranchTarget(pcs[branch]);
+        if (target <= pcs[branch]) {
+            continue;
+        }
+        // The body up to the enable and on to the restore: no branch and no other exec change.
+        size_t index = branch + 1;
+        while (index < list.size() && !is_branch(list[index]) && !ChangesExec(list[index])) {
+            ++index;
+        }
+        if (index == list.size() || !IsWholeWaveEnable(list[index])) {
+            continue;
+        }
+        const size_t enable = index;
+        const auto& saved = list[enable].dst[0];
+        ++index;
+        while (index < list.size() && !is_branch(list[index]) && !ChangesExec(list[index])) {
+            ++index;
+        }
+        if (index == list.size() || list[index].opcode != Opcode::S_MOV_B64 ||
+            list[index].dst[0].field != OperandField::ExecLo ||
+            list[index].src[0].field != saved.field || list[index].src[0].code != saved.code) {
+            continue;
+        }
+        const size_t restore = index;
+        // Exec-masked instructions after the restore are scoped by it, unless another scope opens
+        // after them (that opening would end the restore's scope unwrapped).
+        bool masked = false;
+        bool reopened = false;
+        ++index;
+        while (index < list.size() && !is_branch(list[index])) {
+            if (opens_scope(list[index])) {
+                reopened = true;
+            } else if (ChangesExec(list[index])) {
+                break;
+            } else if (!IgnoresExecMask(list[index]) && !reopened) {
+                masked = true;
+            }
+            ++index;
+        }
+        if (index == list.size() || list[index].opcode != Opcode::S_CBRANCH_EXECZ ||
+            list[index].BranchTarget(pcs[index]) != target || (masked && reopened)) {
+            continue;
+        }
+        // One block from the scope's opening to that branch: no branch lands inside.
+        const u32 first = pcs[branch];
+        const u32 last = pcs[index];
+        if (std::ranges::any_of(targets, [&](u32 t) { return t > first && t <= last; })) {
+            continue;
+        }
+        regions.push_back({branch, enable, restore});
+    }
+    return regions;
+}
+
 static std::optional<u32> ResolveSetPcTarget(std::span<const GcnInst> list, u32 setpc_index,
                                              std::span<const u32> pc_map) {
     if (setpc_index < 3) {
@@ -119,11 +247,19 @@ void CFG::EmitLabels() {
     u32 pc = 0;
     AddLabel(pc);
 
+    // FIX-190: branches around whole-wave regions are dropped, so they end no block.
+    const auto regions = FindWholeWaveRegions(inst_list);
+    const auto dropped = [&](u32 index) {
+        return std::ranges::any_of(regions, [index](const auto& r) { return r.branch == index; });
+    };
+
     // Iterate instruction list and add labels to branch targets.
     for (u32 i = 0; i < inst_list.size(); i++) {
         index_to_pc[i] = pc;
         const GcnInst inst = inst_list[i];
-        if (inst.IsUnconditionalBranch()) {
+        if (inst.IsConditionalBranch() && dropped(i)) {
+            LOG_DEBUG(Render_Recompiler, "FIX-190: branch at {:#x} kept for every invocation", pc);
+        } else if (inst.IsUnconditionalBranch()) {
             u32 target = inst.BranchTarget(pc);
             if (inst.opcode == Opcode::S_SETPC_B64) {
                 if (auto t = ResolveSetPcTarget(inst_list, i, index_to_pc)) {
@@ -160,7 +296,13 @@ void CFG::EmitLabels() {
 }
 
 void CFG::SplitDivergenceScopes() {
-    const auto is_open_scope = [](const GcnInst& inst) {
+    // FIX-190: in a whole-wave region the dropped branch closes nothing, the enable closes the
+    // body's scope (every invocation runs the region) and the restore opens the next one.
+    const auto regions = FindWholeWaveRegions(inst_list);
+    const auto in_regions = [&](size_t WholeWaveRegion::* member, size_t index) {
+        return std::ranges::any_of(regions, [&](const auto& r) { return r.*member == index; });
+    };
+    const auto is_open_scope = [&](const GcnInst& inst, size_t index) {
         // An open scope instruction is an instruction that modifies EXEC
         // but also saves the previous value to restore later. This indicates
         // we are entering a scope.
@@ -169,9 +311,12 @@ void CFG::SplitDivergenceScopes() {
                // with SAVEEXEC to mask the threads that didn't pass the condition
                // of initial branch.
                (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
-               inst.IsCmpx();
+               inst.IsCmpx() || in_regions(&WholeWaveRegion::restore, index);
     };
-    const auto is_close_scope = [](const GcnInst& inst) {
+    const auto is_close_scope = [&](const GcnInst& inst, size_t index) {
+        if (in_regions(&WholeWaveRegion::branch, index)) {
+            return false;
+        }
         // Closing an EXEC scope can be either a branch instruction
         // (typical case when S_AND_SAVEEXEC_B64 is right before a branch)
         // or by a move instruction to EXEC that restores the backup.
@@ -180,7 +325,8 @@ void CFG::SplitDivergenceScopes() {
                // Those instructions need to be wrapped in the condition as well so allow branch
                // as end scope instruction.
                inst.opcode == Opcode::S_CBRANCH_EXECZ || inst.opcode == Opcode::S_ENDPGM ||
-               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo);
+               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
+               in_regions(&WholeWaveRegion::enable, index);
     };
 
     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
@@ -188,13 +334,13 @@ void CFG::SplitDivergenceScopes() {
         s32 curr_begin = -1;
         for (size_t index = blk->begin_index; index <= blk->end_index; index++) {
             const auto& inst = inst_list[index];
-            const bool is_close = is_close_scope(inst);
+            const bool is_close = is_close_scope(inst, index);
             if ((is_close || index == blk->end_index) && curr_begin != -1) {
                 // If there are no instructions inside scope don't do anything. The closing
                 // instruction can open the next scope (an else after an empty if); keep it.
                 // FIX-018, from upstream shadPS4 c34ca21f.
                 if (index - curr_begin == 1 && is_close) {
-                    curr_begin = is_open_scope(inst) ? static_cast<s32>(index) : -1;
+                    curr_begin = is_open_scope(inst, index) ? static_cast<s32>(index) : -1;
                     continue;
                 }
                 // If all instructions in the scope ignore exec masking, we shouldn't insert a
@@ -275,7 +421,7 @@ void CFG::SplitDivergenceScopes() {
                 curr_begin = -1;
             }
             // Mark a potential start of an exec scope.
-            if (is_open_scope(inst)) {
+            if (is_open_scope(inst, index)) {
                 curr_begin = index;
             }
         }

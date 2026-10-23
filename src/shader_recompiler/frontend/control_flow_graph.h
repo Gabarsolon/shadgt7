@@ -99,4 +99,17 @@ public:
     BlockList blocks;
 };
 
+/// FIX-190: a branch body that turns every lane of the wave on, as a wave-wide sum does:
+/// s_cbranch_execz right after the exec scope opens, then s_orn2_saveexec_b64 sX, exec (or
+/// s_or_saveexec_b64 sX, -1) and s_mov_b64 exec, sX in the same block. Indices into the
+/// instruction list.
+struct WholeWaveRegion {
+    size_t branch;
+    size_t enable;
+    size_t restore;
+};
+
+/// FIX-190: the whole-wave regions of a program (see WholeWaveRegion).
+[[nodiscard]] std::vector<WholeWaveRegion> FindWholeWaveRegions(std::span<const GcnInst> inst_list);
+
 } // namespace Shader::Gcn

@@ -207,6 +207,16 @@ bool HasLegacyMad(std::span<const u32> code) {
     return false;
 }
 
+bool HasWholeWaveRegions(std::span<const u32> code) {
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    std::vector<Gcn::GcnInst> list;
+    while (!slice.atEnd()) {
+        list.emplace_back(decoder.decodeInstruction(slice));
+    }
+    return !Gcn::FindWholeWaveRegions(list).empty();
+}
+
 bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());

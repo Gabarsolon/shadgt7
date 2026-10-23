@@ -3182,6 +3182,11 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             Shader::HasLaneReadsAndLoop(params.code)) {
             needed_fixes |= 8u; // FIX-020 v3 (conditions behind ConditionRef); v1/v2 were 2/4
         }
+        if (Shader::HasWholeWaveRegions(params.code)) {
+            needed_fixes |= 32u; // FIX-190
+            LOG_INFO(Render_Vulkan, "FIX-190: {}_{:#x} turns every lane on inside a branch",
+                     hw_stage, params.hash);
+        }
     }
     const auto known = else_scope_fixed.find(params.hash);
     const u32 applied_fixes = known != else_scope_fixed.end() ? known->second.fixes : 0u;

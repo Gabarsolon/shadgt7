@@ -40,6 +40,10 @@ struct Pools {
 /// in compute shaders with more than 32 invocations per workgroup.
 [[nodiscard]] bool HasLaneReadsAndLoop(std::span<const u32> code);
 
+/// FIX-190: true when a branch body turns every lane on (a wave-wide sum, see
+/// Gcn::FindWholeWaveRegions). Translations before FIX-190 left the inactive lanes out of it.
+[[nodiscard]] bool HasWholeWaveRegions(std::span<const u32> code);
+
 /// FIX-101: true when the code uses V_MAD_LEGACY_F32 or V_MAC_LEGACY_F32, whose translations
 /// before FIX-101 made NaN from 0 * Inf.
 [[nodiscard]] bool HasLegacyMad(std::span<const u32> code);
