@@ -1237,6 +1237,10 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
 
     const auto& queue = liverpool->asc_queues[vqid];
     *queue.read_addr = 0u;
+    // A new ring starts at its beginning. GT7 unmaps compute queues and maps others that reuse the
+    // vqueue; with the previous ring's end offset kept, the first ding-dong submitted the new
+    // ring's unwritten tail (Invalid PM4 type 0).
+    asc_next_offs_dw[vqid.index] = 0;
 
     return gnm_vqid;
 }
