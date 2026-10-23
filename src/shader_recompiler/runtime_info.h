@@ -75,6 +75,7 @@ struct SwVertexRuntimeInfo {
     u16 vertex_sgpr_offset{};
     u16 instance_sgpr_offset{};
     bool tess_emulated_primitive{};
+    bool is_indirect{}; ///< FIX-192: last, in the padding, so the other fields keep their offsets
 
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
 };

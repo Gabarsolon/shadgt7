@@ -2242,6 +2242,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .instance_sgpr_offset = instance_sgpr_offset,
         // PERF-028: the vertex count is in GPU memory, so quads cannot be expanded here.
         .tessellate_quads = true,
+        .is_indirect = true, // FIX-192
     };
     const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
     if (!pipeline || !pipeline->Handle()) {

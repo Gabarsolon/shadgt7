@@ -18,8 +18,10 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
-static constexpr u32 ShaderBinaryVersion = 15u;
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 16u;
+// 17/18 (FIX-192): vertex runtime info has is_indirect; stored translations of indirect draws
+// left their ids biased, and older entries could read the padding it now uses.
+static constexpr u32 ShaderBinaryVersion = 17u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 18u;
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
