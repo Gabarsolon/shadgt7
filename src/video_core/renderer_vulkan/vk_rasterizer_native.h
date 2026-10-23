@@ -75,7 +75,18 @@ public:
     NativeRenderer(const NativeRenderer&) = delete;
     NativeRenderer& operator=(const NativeRenderer&) = delete;
 
-    void Draw(bool is_indexed, u32 index_offset);
+    /// NAT-161: an indirect draw's arguments in memory (DRAW_INDIRECT, DRAW_INDEX_INDIRECT and
+    /// their MULTI and COUNT_MULTI forms), as Rasterizer::DrawIndirect gets them.
+    struct IndirectDraw {
+        VAddr address = 0;            ///< the first draw's arguments
+        u32 stride = 0;               ///< from one draw's arguments to the next
+        u32 max_count = 0;            ///< draws (at most, with a count in memory)
+        VAddr count_address = 0;      ///< the number of draws in memory, or 0
+        u16 vertex_sgpr_offset = 0;   ///< where the CP writes the base vertex (0: nowhere)
+        u16 instance_sgpr_offset = 0; ///< where it writes the first instance (0: nowhere)
+    };
+    /// `indirect` (NAT-161): the draw's counts and offsets are its arguments in memory.
+    void Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect = nullptr);
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -375,6 +386,20 @@ private:
     bool ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
                         bool quad_triangles, VertexIndexState& v);
     void RecordVertexIndex(const VertexIndexState& v);
+    /// NAT-161: the buffers an indirect draw reads its arguments (and count) from.
+    struct IndirectBuffers {
+        vk::Buffer args{};
+        u64 args_offset = 0;
+        vk::Buffer count{}; ///< none: max_count draws
+        u64 count_offset = 0;
+        u32 max_count = 0; ///< the draw's max_count, less when its arguments end sooner
+    };
+    /// NAT-161: none when the device can't draw it as the GPU would, or its arguments are not
+    /// where the GPU can read them (each case logged once).
+    std::optional<IndirectBuffers> ResolveIndirect(const IndirectDraw& indirect, bool is_indexed);
+    /// NAT-161: the draw commands, counts and offsets read from the arguments by the GPU.
+    void RecordIndirect(const IndirectDraw& indirect, const IndirectBuffers& buffers,
+                        bool is_indexed);
     bool NeedsBarrierFor(const DrawBindings& b) const;
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
@@ -671,6 +696,7 @@ private:
         u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
+        u64 indirect_draws = 0, indirect_skipped = 0; ///< NAT-161: recorded, and not
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,

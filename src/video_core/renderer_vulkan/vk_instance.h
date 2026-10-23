@@ -291,6 +291,21 @@ public:
         return features.tessellationShader;
     }
 
+    /// NAT-161: indirect draws may take their count from a buffer.
+    bool IsDrawIndirectCountSupported() const {
+        return vk12_features.drawIndirectCount;
+    }
+
+    /// NAT-161: indirect draws may start at an instance other than 0.
+    bool IsDrawIndirectFirstInstanceSupported() const {
+        return features.drawIndirectFirstInstance;
+    }
+
+    /// NAT-161: the most draws one indirect draw command makes (1 without multiDrawIndirect).
+    u32 MaxDrawIndirectCount() const {
+        return features.multiDrawIndirect ? properties.limits.maxDrawIndirectCount : 1u;
+    }
+
     /// Returns true when the shaderSubgroupClock feature of
     /// VK_KHR_shader_clock is supported.
     bool IsShaderSubgroupClockSupported() const {

@@ -18,6 +18,9 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
@@ -2856,7 +2859,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     }
 }
 
-void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     std::scoped_lock lock{mutex};
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
@@ -2871,6 +2874,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     t_timed = (++timing_tick & 15) == 0; // OPT-001
     stats.timed_draws += t_timed ? 1 : 0;
     r.scheduler.PopPendingOperations();
+    // NAT-161: an indirect draw that returns before its draw command is counted as skipped.
+    struct IndirectSkip {
+        u64* skipped;
+        ~IndirectSkip() {
+            if (skipped) {
+                ++*skipped;
+            }
+        }
+    } indirect_skip{indirect ? &stats.indirect_skipped : nullptr};
     const auto& regs = r.liverpool->DrawRegs();
     switch (Classify(regs)) {
     case Filter::EliminateFastClear: {
@@ -2923,12 +2935,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
-    bool quad_triangles = quad_list && Common::PerfFeatureEnabled(28) &&
+    // NAT-161: an indirect draw's vertex count is in GPU memory, so its quads are drawn through
+    // the tessellation helpers (as the old path's DrawIndirect does).
+    bool quad_triangles = quad_list && !indirect && Common::PerfFeatureEnabled(28) &&
                           u64(regs.num_indices) / 4 * 6 * sizeof(u32) <= MaxQuadIndexBytes;
-    // OPT-010: the draw a game job thread prepared, if any.
+    // OPT-010: the draw a game job thread prepared, if any (job threads prepare direct draws).
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
-    if (prepare && !r.FrameDumpCollecting()) {
+    if (prepare && !indirect && !r.FrameDumpCollecting()) {
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         stats.prepared_missing += prepared ? 0 : 1;
     }
@@ -2951,6 +2965,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 trusted = true;
                 return installed;
             }
+        }
+        if (indirect) {
+            // NAT-161: as the old path's DrawIndirect: the vertex shader reads the base vertex
+            // and first instance the CP would write into its user data SGPRs from the
+            // BaseVertex and BaseInstance built-ins, i.e. from the draw's arguments.
+            return r.AcquireGraphicsPipeline(
+                {
+                    .vertex_sgpr_offset = indirect->vertex_sgpr_offset,
+                    .instance_sgpr_offset = indirect->instance_sgpr_offset,
+                    .tessellate_quads = true,
+                    .is_indirect = true, // FIX-192
+                },
+                false);
         }
         return r.AcquireGraphicsPipeline(
             {
@@ -2985,7 +3012,40 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             return;
         }
     }
+    if (indirect) {
+        // DIAG-162: the first kinds of indirect draws, by shaders and argument layout.
+        static std::mutex seen_mutex;
+        static std::set<std::tuple<u64, u64, bool, u32, bool, u32>> seen;
+        const auto& stages = pipeline->GetStages();
+        const Shader::Info* vs = stages[u32(Shader::SwStage::Vertex)];
+        const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
+        const auto key = std::make_tuple(vs ? vs->pgm_hash : 0, fs ? fs->pgm_hash : 0, is_indexed,
+                                         indirect->max_count, indirect->count_address != 0,
+                                         indirect->stride);
+        std::scoped_lock lock{seen_mutex};
+        if (seen.size() < 64 && seen.insert(key).second) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-162: indirect draw vs {:#x} ps {:#x} {} max_count {} count {:#x} "
+                        "stride {} args {:#x} sgprs {}/{}",
+                        std::get<0>(key), std::get<1>(key), is_indexed ? "indexed" : "arrays",
+                        indirect->max_count, indirect->count_address, indirect->stride,
+                        indirect->address, indirect->vertex_sgpr_offset,
+                        indirect->instance_sgpr_offset);
+        }
+    }
     Stream& s = Begin();
+    // NAT-161: the arguments are looked up before the draw's other buffers, as DispatchIndirect
+    // does: a region a later lookup makes takes theirs in and leaves it as it was, holding what
+    // the GPU wrote there; made last, their region could take in one this draw binds for
+    // writing, whose writes would then go to the buffer left behind.
+    std::optional<IndirectBuffers> arguments;
+    if (indirect) {
+        arguments = ResolveIndirect(*indirect, is_indexed);
+        if (!arguments) {
+            ++stats.skipped;
+            return;
+        }
+    }
     Targets targets;
     {
         PhaseClock clock{stats.phase_ns[1]};
@@ -3021,11 +3081,35 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         } else {
             vertex_index = {};
             ResolveVertexBuffers(*pipeline, regs, vertex_index);
+            // NAT-161: an indexed indirect draw's indices start at the index base; num_indices
+            // is then the index buffer's size (INDEX_BUFFER_SIZE), as the old path binds it.
             if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
+                if (indirect && is_indexed) {
+                    static const bool logged = [&] {
+                        LOG_WARNING(Render_Vulkan,
+                                    "NAT-161: indexed indirect draw skipped: its {} indices at "
+                                    "{:#x} can't be bound",
+                                    regs.num_indices, regs.index_base_address.Address());
+                        return true;
+                    }();
+                }
                 ++stats.skipped;
                 return;
             }
-            CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
+            if (indirect && is_indexed && regs.index_offset != 0) {
+                // The GPU adds VGT_INDX_OFFSET to every index it fetches; the arguments have
+                // their own base vertex, and nothing adds this one (as in the old path).
+                static const bool logged = [&] {
+                    LOG_WARNING(Render_Vulkan,
+                                "NAT-161: indexed indirect draw with VGT_INDX_OFFSET {} drawn "
+                                "without it",
+                                regs.index_offset);
+                    return true;
+                }();
+            }
+            if (!indirect) { // NAT-161: an indirect draw's counts are in GPU memory
+                CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
+            }
         }
     }
     {
@@ -3062,11 +3146,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
             return targets.depth && std::ranges::find(list, targets.depth) != list.end();
         };
+        // NAT-161: an indirect draw reads its arguments (and count) at the draw-indirect stage.
+        // Buffers written since the last global barrier (by the dispatch that wrote them) get
+        // one now, whose second scope (all commands, all memory reads) takes in indirect command
+        // reads; NeedsBarrierFor asks for it too, but the arguments keep it whatever that checks.
+        const bool reads_arguments = indirect && s.buffers_written;
         if (!pass_barriers) {
-            if (pass_change || NeedsBarrierFor(b)) {
+            if (pass_change || NeedsBarrierFor(b) || reads_arguments) {
                 GlobalBarrier();
             }
-        } else if (NeedsBarrierFor(b) || (pass_change && targets_in(s.read))) {
+        } else if (NeedsBarrierFor(b) || reads_arguments || (pass_change && targets_in(s.read))) {
             GlobalBarrier();
         } else if (pass_change && targets_in(s.attach_dirty)) {
             PassBarrier();
@@ -3112,20 +3201,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
     {
         PhaseClock part{stats.record_ns[6]};
-        const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
-        const auto [vertex_offset, instance_offset] =
-            DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
-        const u32 instances = regs.num_instances.NumInstances();
-        if (quad_triangles) {
-            if (index_count != 0) {
-                cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
-                                   instance_offset);
-            }
-        } else if (is_indexed) {
-            cmdbuf.drawIndexed(regs.num_indices, instances, 0, s32(vertex_offset),
-                               instance_offset);
+        if (indirect) {
+            RecordIndirect(*indirect, *arguments, is_indexed); // NAT-161
         } else {
-            cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
+            const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+            const auto [vertex_offset, instance_offset] =
+                DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
+            const u32 instances = regs.num_instances.NumInstances();
+            if (quad_triangles) {
+                if (index_count != 0) {
+                    cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
+                                       instance_offset);
+                }
+            } else if (is_indexed) {
+                cmdbuf.drawIndexed(regs.num_indices, instances, 0, s32(vertex_offset),
+                                   instance_offset);
+            } else {
+                cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
+            }
         }
     }
     {
@@ -3133,9 +3226,144 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         NoteWrites(&targets, b);
     }
     ++stats.draws;
+    if (indirect) {
+        indirect_skip.skipped = nullptr;
+        ++stats.indirect_draws;
+    }
     ++s.commands;
     ChunkFlushCheck();
     Report();
+}
+
+std::optional<NativeRenderer::IndirectBuffers> NativeRenderer::ResolveIndirect(
+    const IndirectDraw& indirect, bool is_indexed) {
+    // What Vulkan can't draw as the GPU would is skipped, rather than drawn wrong.
+    const u32 command_size =
+        is_indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+    if (indirect.max_count == 0) {
+        return std::nullopt; // no draws (none on the GPU either)
+    }
+    if (!r.instance.IsDrawIndirectFirstInstanceSupported()) {
+        // The shaders read the first instance from the arguments (BaseInstance), which Vulkan
+        // leaves undefined there without the feature unless it is 0.
+        static const bool logged = [] {
+            LOG_WARNING(Render_Vulkan, "NAT-161: indirect draws skipped: the device can't start "
+                                       "them at an instance other than 0 "
+                                       "(drawIndirectFirstInstance)");
+            return true;
+        }();
+        return std::nullopt;
+    }
+    if (indirect.count_address != 0 && (!r.instance.IsDrawIndirectCountSupported() ||
+                                        indirect.max_count > r.instance.MaxDrawIndirectCount())) {
+        static const bool logged = [&] {
+            LOG_WARNING(
+                Render_Vulkan,
+                "NAT-161: indirect draw of up to {} draws counted at {:#x} skipped: the "
+                "device can't take that many draws from a count in memory "
+                "(drawIndirectCount, at most {})",
+                indirect.max_count, indirect.count_address,
+                r.instance.IsDrawIndirectCountSupported() ? r.instance.MaxDrawIndirectCount() : 0u);
+            return true;
+        }();
+        return std::nullopt;
+    }
+    // Several draws step through the arguments by the stride, which Vulkan wants 4-byte aligned
+    // and no shorter than one draw's arguments (one draw's stride is ignored).
+    if ((indirect.max_count > 1 || indirect.count_address != 0) &&
+        (indirect.stride % 4 != 0 || indirect.stride < command_size)) {
+        static const bool logged = [&] {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-161: indirect draw of up to {} draws with arguments {} bytes apart "
+                        "skipped (Vulkan needs a multiple of 4, at least {})",
+                        indirect.max_count, indirect.stride, command_size);
+            return true;
+        }();
+        return std::nullopt;
+    }
+    // With a count in memory, max_count is only an upper bound (the GPU reads min(count,
+    // max_count) draws), so the arguments looked up end where the mapping does, and at most
+    // MaxCountArgs in: a huge bound would otherwise make GuestBuffer merge and drop regions for
+    // a range that cannot exist.
+    constexpr u64 MaxCountArgs = 16_MB;
+    u32 max_count = indirect.max_count;
+    u64 size = u64(indirect.stride) * (max_count - 1) + command_size;
+    if (indirect.count_address != 0) {
+        const u64 reach = std::min(r.memory->ClampRangeSize(indirect.address, size), MaxCountArgs);
+        if (reach < command_size) {
+            static const bool logged = [&] {
+                LOG_WARNING(Render_Vulkan,
+                            "NAT-161: indirect draw skipped: its arguments at {:#x} are not mapped",
+                            indirect.address);
+                return true;
+            }();
+            return std::nullopt;
+        }
+        if (reach < size) {
+            max_count = static_cast<u32>((reach - command_size) / indirect.stride + 1);
+            size = u64(indirect.stride) * (max_count - 1) + command_size;
+        }
+    }
+    // The arguments where the GPU has them: in their region when shaders wrote them (NAT-114;
+    // GT7's come from compute shader 850c97f9), else guest memory read in place.
+    const auto args = GuestBuffer(indirect.address, size, false);
+    if (!args || args->second % 4 != 0) {
+        static const bool logged = [&] {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-161: indirect draw skipped: its arguments at {:#x}+{:#x} are {}",
+                        indirect.address, size,
+                        args ? "not 4-byte aligned" : "not readable by the GPU");
+            return true;
+        }();
+        return std::nullopt;
+    }
+    IndirectBuffers buffers{.args = args->first, .args_offset = args->second, .max_count = max_count};
+    if (indirect.count_address != 0) {
+        const auto count = GuestBuffer(indirect.count_address, sizeof(u32), false);
+        if (!count || count->second % 4 != 0) {
+            static const bool logged = [&] {
+                LOG_WARNING(Render_Vulkan,
+                            "NAT-161: indirect draw skipped: its draw count at {:#x} is {}",
+                            indirect.count_address,
+                            count ? "not 4-byte aligned" : "not readable by the GPU");
+                return true;
+            }();
+            return std::nullopt;
+        }
+        buffers.count = count->first;
+        buffers.count_offset = count->second;
+    }
+    return buffers;
+}
+
+void NativeRenderer::RecordIndirect(const IndirectDraw& indirect, const IndirectBuffers& buffers,
+                                    bool is_indexed) {
+    // The guest's argument structures are Vulkan's (pm4_cmds.h): index or vertex count,
+    // instance count, first index or vertex, (base vertex,) first instance.
+    const CmdBuf cmdbuf{stream.cmd};
+    if (buffers.count) {
+        if (is_indexed) {
+            cmdbuf.drawIndexedIndirectCount(buffers.args, buffers.args_offset, buffers.count,
+                                            buffers.count_offset, buffers.max_count,
+                                            indirect.stride);
+        } else {
+            cmdbuf.drawIndirectCount(buffers.args, buffers.args_offset, buffers.count,
+                                     buffers.count_offset, buffers.max_count, indirect.stride);
+        }
+        return;
+    }
+    // A command makes at most maxDrawIndirectCount draws (1 without multiDrawIndirect).
+    const u32 per_command = std::max(r.instance.MaxDrawIndirectCount(), 1u);
+    for (u32 first = 0; first < buffers.max_count;) {
+        const u32 count = std::min(per_command, buffers.max_count - first);
+        const u64 offset = buffers.args_offset + u64(first) * indirect.stride;
+        if (is_indexed) {
+            cmdbuf.drawIndexedIndirect(buffers.args, offset, count, indirect.stride);
+        } else {
+            cmdbuf.drawIndirect(buffers.args, offset, count, indirect.stride);
+        }
+        first += count;
+    }
 }
 
 bool NativeRenderer::PrepareEnabled() {
@@ -5437,7 +5665,8 @@ void NativeRenderer::Report() {
              busiest.empty() ? std::string{" none"} : busiest);
     report_base = {uploads, upload_bytes, evicted, stale};
     LOG_INFO(Render_Vulkan,
-             "NAT-100 native (10 s): {} draws, {} dispatches, {} skipped, {} without pipeline; "
+             "NAT-100 native (10 s): {} draws, {} dispatches, {} skipped, {} without pipeline, "
+             "{} indirect draws ({} not drawn, NAT-161); "
              "{} passes, {} barriers ({} pass barriers, {} passes unblocked, NAT-140), {} lists "
              "run; {} reads copied ({:.1f} MB), {} ranges bound "
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
@@ -5461,7 +5690,8 @@ void NativeRenderer::Report() {
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
              "reason (none/unmapped/format/geometry/outside/FIX-081/no image) {}; us per draw in "
              "pipeline/targets/buffers/textures(sources)/vertices/prepare/record {}",
-             stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline, stats.passes,
+             stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline,
+             stats.indirect_draws, stats.indirect_skipped, stats.passes,
              stats.barriers, stats.pass_barriers, stats.passes_unblocked, stats.splices,
              stats.copied_reads, stats.copied_bytes / 1048576.0,
              stats.unbound, stats.null_images, stats.fills, stats.copies, stats.meta_clears,
@@ -5532,6 +5762,7 @@ void NativeRenderer::Report() {
     }
     const u64 cpu_writes = stats.cpu_writes.load();
     stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;
+    stats.indirect_draws = stats.indirect_skipped = 0;
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;
     stats.null_images = stats.fills = stats.copies = stats.meta_clears = stats.inline_writes = 0;
     stats.source_copies = stats.draw_ns = stats.dispatch_ns = 0;

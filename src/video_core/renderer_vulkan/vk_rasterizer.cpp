@@ -2221,11 +2221,18 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ++Common::GetWorkCounters().draws;
 #ifdef RYTY_GPU
     if (native) {
-        // NAT-100: GT Sport has no indirect draws (static analysis); not drawn in native mode.
-        static std::atomic<u32> logged{};
-        if (logged++ < 8) {
-            LOG_WARNING(Render_Vulkan, "NAT-102: indirect draw skipped in native mode");
-        }
+        // NAT-161: GT Sport has no indirect draws; GT7 draws its GPU-driven vegetation and
+        // ground cover (and their depth prepass and shadow passes) with DRAW_INDEX_INDIRECT,
+        // with arguments compute shaders write just before.
+        const NativeRenderer::IndirectDraw indirect{
+            .address = arg_address + offset,
+            .stride = stride,
+            .max_count = max_count,
+            .count_address = count_address,
+            .vertex_sgpr_offset = vertex_sgpr_offset,
+            .instance_sgpr_offset = instance_sgpr_offset,
+        };
+        native->Draw(is_indexed, 0, &indirect);
         return;
     }
 #endif

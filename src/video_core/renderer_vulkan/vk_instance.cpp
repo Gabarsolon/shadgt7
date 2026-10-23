@@ -434,6 +434,9 @@ bool Instance::CreateDevice() {
                 .dualSrcBlend = features.dualSrcBlend,
                 .logicOp = features.logicOp,
                 .multiDrawIndirect = features.multiDrawIndirect,
+                // NAT-161: GT7's indirect draws (their arguments written by compute shaders)
+                // may start at an instance other than 0, which the shaders read as BaseInstance.
+                .drawIndirectFirstInstance = features.drawIndirectFirstInstance,
                 .depthClamp = features.depthClamp,
                 .depthBiasClamp = features.depthBiasClamp,
                 .fillModeNonSolid = features.fillModeNonSolid,
