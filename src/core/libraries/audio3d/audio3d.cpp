@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
@@ -79,6 +85,79 @@ static s32 DrainAssociatedPorts(Port& port) {
             return ret;
         }
     }
+}
+
+// The PS4 plays a port's pushed frames on its own, at the output's pace, and
+// sceAudio3dPortGetQueueLevel reports the frames still waiting. GT7 keeps a few frames queued and
+// advances again only once the level falls; with frames leaving the queue only when it was full,
+// the level never fell and GT7 played nothing. A port with an output now has a thread that plays
+// its queued frames (sceAudioOutOutput blocks until the device can take another buffer).
+struct PortDrain {
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable played;
+    bool stop = false;
+};
+
+static std::mutex drains_mutex;
+static std::unordered_map<OrbisAudio3dPortId, std::unique_ptr<PortDrain>> drains;
+
+static void RunPortDrain(Port* port, PortDrain* drain) {
+    std::unique_lock lock{drain->mutex};
+    while (!drain->stop) {
+        AudioData frame{};
+        s32 handle = -1;
+        {
+            std::scoped_lock port_lock{port->mutex};
+            if (!port->mixed_queue.empty()) {
+                frame = port->mixed_queue.front();
+                port->mixed_queue.pop_front();
+                handle = port->audio_out_handle;
+            }
+        }
+        if (frame.sample_buffer == nullptr) {
+            // Pushes wake the thread; the timeout covers a push made just before this wait.
+            drain->wake.wait_for(lock, std::chrono::milliseconds(2));
+            continue;
+        }
+        lock.unlock();
+        AudioOut::sceAudioOutOutput(handle, frame.sample_buffer);
+        std::free(frame.sample_buffer);
+        lock.lock();
+        drain->played.notify_all();
+    }
+}
+
+static PortDrain* StartPortDrain(const OrbisAudio3dPortId port_id, Port& port) {
+    std::scoped_lock lock{drains_mutex};
+    auto& drain = drains[port_id];
+    if (!drain) {
+        drain = std::make_unique<PortDrain>();
+        drain->thread = std::thread(RunPortDrain, &port, drain.get());
+        LOG_INFO(Lib_Audio3d, "port {}: frames play from their own thread (queue depth {})",
+                 port_id, port.parameters.queue_depth);
+    }
+    return drain.get();
+}
+
+static void StopPortDrain(const OrbisAudio3dPortId port_id) {
+    std::unique_ptr<PortDrain> drain;
+    {
+        std::scoped_lock lock{drains_mutex};
+        const auto it = drains.find(port_id);
+        if (it == drains.end()) {
+            return;
+        }
+        drain = std::move(it->second);
+        drains.erase(it);
+    }
+    {
+        std::scoped_lock lock{drain->mutex};
+        drain->stop = true;
+    }
+    drain->wake.notify_all();
+    drain->thread.join();
 }
 
 s32 PS4_SYSV_ABI sceAudio3dAudioOutClose(const s32 handle) {
@@ -741,6 +820,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         return ORBIS_AUDIO3D_ERROR_NOT_SUPPORTED;
     }
 
+    // Mixing reads the objects other threads set and adds to the queue the port's thread plays.
+    std::scoped_lock lock{port.mutex};
     if (port.mixed_queue.size() >= port.parameters.queue_depth) {
         LOG_WARNING(Lib_Audio3d, "mixed queue full (depth={}), dropping advance",
                     port.parameters.queue_depth);
@@ -756,6 +837,9 @@ s32 PS4_SYSV_ABI sceAudio3dPortClose(const OrbisAudio3dPortId port_id) {
         LOG_ERROR(Lib_Audio3d, "!state->ports.contains(port_id)");
         return ORBIS_AUDIO3D_ERROR_INVALID_PORT;
     }
+
+    // The port's thread stops before its output closes.
+    StopPortDrain(port_id);
 
     auto& port = state->ports[port_id];
     {
@@ -1107,6 +1191,9 @@ s32 PS4_SYSV_ABI sceAudio3dPortOpen(const Libraries::UserService::OrbisUserServi
     port.parameters = effective;
 
     *port_id = id;
+    LOG_INFO(Lib_Audio3d, "port {}: granularity {}, queue depth {}, buffer mode {}, {} objects", id,
+             effective.granularity, effective.queue_depth,
+             magic_enum::enum_name(effective.buffer_mode), effective.max_objects);
 
     return ORBIS_OK;
 }
@@ -1147,66 +1234,18 @@ s32 PS4_SYSV_ABI sceAudio3dPortPush(const OrbisAudio3dPortId port_id,
             return port.audio_out_handle;
     }
 
-    auto submit_one_frame = [&](bool& submitted) -> s32 {
-        AudioData frame;
-        {
-            std::scoped_lock lock{port.mutex};
-
-            if (port.mixed_queue.empty()) {
-                submitted = false;
-                return ORBIS_OK;
-            }
-
-            frame = port.mixed_queue.front();
-            port.mixed_queue.pop_front();
-        }
-
-        const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
-
-        std::free(frame.sample_buffer);
-
-        if (ret < 0)
-            return ret;
-
-        submitted = true;
-        return ORBIS_OK;
-    };
-
-    {
-        std::scoped_lock lock{port.mutex};
-        if (port.mixed_queue.size() < depth) {
-            return ORBIS_OK;
-        }
-    }
-
-    bool submitted = false;
-    s32 ret = submit_one_frame(submitted);
-    if (ret < 0)
-        return ret;
-
-    if (!submitted)
-        return ORBIS_OK;
-
+    // The port's thread plays the queued frames (PortDrain); a blocking push returns once the
+    // queue has room again.
+    PortDrain* drain = StartPortDrain(port_id, port);
+    drain->wake.notify_all();
     if (blocking == OrbisAudio3dBlocking::ORBIS_AUDIO3D_BLOCKING_ASYNC) {
         return ORBIS_OK;
     }
-
-    while (true) {
-        {
-            std::scoped_lock lock{port.mutex};
-            if (port.mixed_queue.size() < depth)
-                break;
-        }
-
-        bool drained = false;
-        ret = submit_one_frame(drained);
-        if (ret < 0)
-            return ret;
-
-        if (!drained)
-            break;
-    }
-
+    std::unique_lock lock{drain->mutex};
+    drain->played.wait(lock, [&] {
+        std::scoped_lock port_lock{port.mutex};
+        return port.mixed_queue.size() < depth;
+    });
     return ORBIS_OK;
 }
 s32 PS4_SYSV_ABI sceAudio3dPortQueryDebug() {
