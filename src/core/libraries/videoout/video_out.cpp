@@ -361,8 +361,13 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
             ASSERT_MSG(result, "EOP flip submission failed");
         });
+    driver->NoteEopFlipRequested(); // PERF-111
 
     return ORBIS_OK;
+}
+
+void PaceFlipSubmit() {
+    driver->PaceFlipSubmit();
 }
 
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(

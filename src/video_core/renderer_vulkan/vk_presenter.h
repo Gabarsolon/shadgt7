@@ -114,6 +114,10 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
 
+    /// FIX-193: in native mode, waits until the GPU has drawn the frame (a flip is only
+    /// reported to the game after that).
+    void WaitFrameDrawn(const Frame* frame);
+
 private:
     Frame* GetRenderFrame();
 

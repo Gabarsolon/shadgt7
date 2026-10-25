@@ -245,8 +245,35 @@ struct FlipStats {
     std::chrono::steady_clock::time_point window{};
     u32 flips{}, vblanks{}, idle_vblanks{}, max_queue{};
     double latency_ms{}, max_latency_ms{}, present_ms{}, max_present_ms{};
+    u32 paced{}, pace_timeouts{}; // PERF-111
+    double paced_ms{};
 };
 FlipStats g_flip_stats;
+
+// PERF-075: SHADGT_FPS_LOCK=<fps> (30 in run_gt7.cmd and Run-GTSportPerformance.ps1) paces
+// flips evenly at that rate; GT Sport's races vary between 25 and 40 FPS, which shows as judder.
+u32 FpsLock() {
+    static const u32 fps_lock = [] {
+        const char* env = std::getenv("SHADGT_FPS_LOCK");
+        const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
+        if (fps != 0) {
+            LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
+        }
+        return fps;
+    }();
+    return fps_lock;
+}
+
+// SHADGT_FPS_LOCK_AFTER=<seconds>: the lock starts that long after the first vblank or flip (a
+// test can go through the menus at full rate first).
+bool FpsLockActive() {
+    static const auto lock_from = [] {
+        const char* env = std::getenv("SHADGT_FPS_LOCK_AFTER");
+        return std::chrono::steady_clock::now() +
+               std::chrono::seconds(env ? std::strtoul(env, nullptr, 10) : 0);
+    }();
+    return FpsLock() != 0 && std::chrono::steady_clock::now() >= lock_from;
+}
 
 void ReportFlipStats() {
     auto& s = g_flip_stats;
@@ -260,12 +287,16 @@ void ReportFlipStats() {
     }
     LOG_WARNING(Lib_VideoOut,
                 "Flips in {:.1f} s: {} flips, {} vblanks ({} with no flip ready), max queued {}, "
-                "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms",
+                "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms; "
+                "PERF-111: {} submits paced, avg wait {:.2f} ms, {} timeouts",
                 std::chrono::duration<double>(now - s.window).count(), s.flips, s.vblanks,
                 s.idle_vblanks, s.max_queue, s.flips ? s.latency_ms / s.flips : 0.0,
-                s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms);
+                s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms,
+                s.paced, s.paced ? s.paced_ms / s.paced : 0.0, s.pace_timeouts);
     s.flips = s.vblanks = s.idle_vblanks = s.max_queue = 0;
     s.latency_ms = s.max_latency_ms = s.present_ms = s.max_present_ms = 0;
+    s.paced = s.pace_timeouts = 0;
+    s.paced_ms = 0;
     s.window = now;
 }
 } // namespace
@@ -273,6 +304,10 @@ void ReportFlipStats() {
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
+    // FIX-193: the game learns of the flip once the GPU has drawn the frame.
+    if (req.index != -1) {
+        presenter->WaitFrameDrawn(req.frame);
+    }
 
     // Present the frame.
     const auto present_start = std::chrono::steady_clock::now();
@@ -331,6 +366,50 @@ void VideoOutDriver::Flip(const Request& req) {
     }
     // save to prev buf index
     port->prev_index = req.index;
+
+    if (req.eop) {
+        // PERF-111: a submit-and-flip waiting for this frame to be shown goes on.
+        if (eop_flips_in_flight.fetch_sub(1, std::memory_order_acq_rel) <= 0) {
+            eop_flips_in_flight.store(0, std::memory_order_release);
+        }
+        std::scoped_lock lk{pace_mutex};
+        pace_cv.notify_all();
+    }
+}
+
+void VideoOutDriver::NoteEopFlipRequested() {
+    eop_flips_in_flight.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void VideoOutDriver::PaceFlipSubmit() {
+    // Opt-in while untested: SHADGT_FPS_PACE=1.
+    static const bool pace = [] {
+        const char* env = std::getenv("SHADGT_FPS_PACE");
+        return env && env[0] == '1';
+    }();
+    if (!pace || !FpsLockActive()) {
+        return;
+    }
+    // The frame just submitted may stay in flight; the ones before it must be on screen. A flip
+    // that does not come (frames held for a compile, a closed port) holds the game a few frames
+    // at most.
+    const auto start = std::chrono::steady_clock::now();
+    bool shown = true;
+    {
+        std::unique_lock lk{pace_mutex};
+        shown = pace_cv.wait_for(lk, std::chrono::milliseconds(250), [this] {
+            return eop_flips_in_flight.load(std::memory_order_acquire) <= 1;
+        });
+    }
+    const double waited_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+    std::scoped_lock lk{g_flip_stats.mutex};
+    ++g_flip_stats.paced;
+    g_flip_stats.paced_ms += waited_ms;
+    if (!shown) {
+        ++g_flip_stats.pace_timeouts;
+    }
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -449,18 +528,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        // PERF-075: SHADGT_FPS_LOCK=<fps> (30 in Run-GTSportPerformance.ps1) paces flips evenly
-        // at that rate; GT Sport's races vary between 25 and 40 FPS, which shows as judder.
-        static const u32 fps_lock = [] {
-            const char* env = std::getenv("SHADGT_FPS_LOCK");
-            const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
-            if (fps != 0) {
-                LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
-            }
-            return fps;
-        }();
-        const int flip_rate =
-            LockedFlipRate(main_port.flip_rate, fps_lock, EmulatorSettings.GetVblankFrequency());
+        const bool locked = FpsLockActive(); // PERF-075
+        const int flip_rate = LockedFlipRate(main_port.flip_rate, locked ? FpsLock() : 0,
+                                             EmulatorSettings.GetVblankFrequency());
         if (vblank_status.count % (flip_rate + 1) == 0) {
             {
                 std::scoped_lock lk{mutex, g_flip_stats.mutex};

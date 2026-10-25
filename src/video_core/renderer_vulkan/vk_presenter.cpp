@@ -1060,6 +1060,48 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         },
     }};
     draw_scheduler.EndRendering();
+    // DIAG-164: game-only screenshots of native frames, one per frame, so a test script's
+    // "burstN" captures N consecutive frames (one-frame glitches); before, native frames had
+    // none. The display picture is still in the general layout here.
+    std::optional<ScreenshotReadback> pending_screenshot;
+    if (VideoCore::ConsumeGameOnlyScreenshotRequests() > 0 && display->width != 0 &&
+        display->height != 0) {
+        auto& readback = pending_screenshot.emplace(
+            instance, ScreenshotKind::GameOnly, BuildScreenshotPaths(ScreenshotKind::GameOnly, 1),
+            display->width, display->height, view_format,
+            attribute.attrib.pixel_format ==
+                Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+        LOG_INFO(Render_Vulkan, "DIAG-164: screenshot of {:#x} (frame {})", cpu_address,
+                 DebugState.GetFrameNum());
+        const auto cmdbuf = draw_scheduler.CommandBuffer();
+        const vk::MemoryBarrier2 written{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &written});
+        const vk::BufferImageCopy region{
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageExtent = {display->width, display->height, 1},
+        };
+        cmdbuf.copyImageToBuffer(display->image, vk::ImageLayout::eGeneral,
+                                 readback.buffer.Handle(), region);
+        const vk::MemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &to_host});
+    }
     draw_scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
@@ -1113,6 +1155,12 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     });
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
+    if (pending_screenshot) { // DIAG-164
+        draw_scheduler.DeferPriorityOperation(
+            [deferred_screenshot = std::move(pending_screenshot)]() {
+                SavePendingScreenshot(deferred_screenshot.value());
+            });
+    }
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     frame->ready_scheduler = &draw_scheduler;
@@ -1121,6 +1169,27 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     return frame;
 }
 #endif
+
+void Presenter::WaitFrameDrawn(const Frame* frame) {
+#ifdef RYTY_GPU
+    // FIX-193: native mode reads guest memory in place when the GPU runs the work, not when it
+    // is recorded. A flip reported (flip status, events, the previous buffer's label) before
+    // the GPU drew that frame let GT7 refill the frame's UI vertex data while the GPU had yet
+    // to read it: on the title screen, the background picture or its blurred copy drawn back
+    // over it went missing on about one frame in four (the World Map scene behind it or black
+    // showing). RYGT_NATIVE_FLIP_WAIT=0 reports flips at once as before (diagnosis).
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FLIP_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || !frame || !frame->ready_scheduler || !rasterizer->Native()) {
+        return;
+    }
+    frame->ready_scheduler->GetWorkSemaphore()->Wait(frame->ready_tick);
+#else
+    (void)frame;
+#endif
+}
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
