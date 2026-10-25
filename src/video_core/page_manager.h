@@ -41,6 +41,9 @@ public:
     /// Updates watches in the pages touching the specified region.
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
 
+    /// PERF-105: the native renderer's own write watch of the pages (at most one a page).
+    void UpdateNativeWatch(VAddr addr, u64 size, bool watch) const;
+
     /// Updates watches in the pages touching the inclusive bounds using a mask.
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,

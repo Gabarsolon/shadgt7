@@ -54,6 +54,8 @@ namespace Rhi {
 class Buffer;
 class CommandList;
 class Device;
+class Pipeline;
+class PipelineLayout;
 class Fence;
 } // namespace Rhi
 } // namespace Native
@@ -138,10 +140,19 @@ private:
         u64 retire_tick = 0;
     };
 
+    /// FIX-208: the mips and layers a draw renders into (mips == 0: all of the picture).
+    struct DrawnRange {
+        u16 mip = 0;
+        u16 mips = 0;
+        u16 layer = 0;
+        u16 layers = 0;
+    };
+
     /// What a draw renders into (the scheduler's RenderState, in the general layout).
     struct Targets {
         RenderState state{};
         std::array<const Native::ImageEntry*, 8> colors{};
+        std::array<DrawnRange, 8> color_ranges{}; ///< FIX-208
         const Native::ImageEntry* depth = nullptr;
     };
 
@@ -162,6 +173,8 @@ private:
         u64 fill_size = 0;
         bool writes_buffers = false;
         bool failed = false;
+        /// DIAG-214 (diagnosis): a 144-byte-stride buffer this work reads (GT7's crowd records).
+        VAddr diag_records = 0;
         void Clear();
     };
 
@@ -218,7 +231,9 @@ private:
     /// NAT-140: attachment writes before it finish before attachment access after it (a pass
     /// drawing into what an earlier pass drew), without waiting for anything else.
     void PassBarrier();
-    void PrepareImages();
+    /// PERF-109: `bound` are the pictures the work about to be recorded uses.
+    void PrepareImages(std::span<const Native::ImageEntry* const> bound = {});
+    void PrepareImages(const DrawBindings& b);
     void ChunkFlushCheck();
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
@@ -234,6 +249,10 @@ private:
         VAddr end = 0;
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         std::vector<VAddr> dirty_pages; ///< written by the CPU since the last use
+        /// FIX-194: pages the CPU wrote, with the frame of the last write, whose bytes in
+        /// guest memory are what the region holds except for the CPU's new writes (what
+        /// FIX-173's compare needs). Pages not here are copied in whole at the next write.
+        std::unordered_map<VAddr, u64> cpu_pages;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
@@ -247,6 +266,42 @@ private:
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size);
     void RefreshRegion(Region& region);
+    /// FIX-194: the GPU wrote [address, address + size) (in GPU order, just recorded): where a
+    /// region holds it over pages the CPU writes too, guest memory gets the bytes as well.
+    /// FIX-203: the region bytes a range a draw or dispatch writes through a storage buffer held
+    /// before it (whole pages), for NoteRegionWrite to write back only what the work changed.
+    struct WrittenBefore {
+        VAddr address = 0; ///< the written range
+        u64 size = 0;
+        VAddr begin = 0; ///< the pages copied
+        VAddr end = 0;
+        std::unique_ptr<Native::Rhi::Buffer> copy;
+    };
+    std::vector<WrittenBefore> written_befores;
+    std::unique_ptr<Native::Rhi::PipelineLayout> writeback_layout;
+    std::unique_ptr<Native::Rhi::Pipeline> writeback_pipeline;
+    void SnapshotBeforeWrite(VAddr address, u64 size);
+    void DropWrittenBefores();
+    void NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before = nullptr);
+    /// FIX-198: whether a draw whose pipeline is still building must wait for it: it draws
+    /// into a picture no recent frame drew into.
+    bool DrawMustNotSkip(const AmdGpu::Regs& regs);
+    /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
+    /// yet run by the GPU (guest range, GPU tick), and CPU writes that met one.
+    struct PendingWriteback {
+        VAddr begin;
+        VAddr end;
+        u64 tick;
+        u64 frame;
+    };
+    std::mutex writeback_race_mutex;
+    std::deque<PendingWriteback> pending_writebacks;
+    std::atomic<u64> writeback_race_hits{0};
+    std::atomic<u64> writeback_race_faults{0};
+    static bool WritebackRaceDiag();
+    static bool RegionWritebackOn();
+    /// FIX-194: how long (frames) a page the CPU wrote counts as one it writes.
+    static constexpr u64 RegionRecentFrames = 600;
     /// NAT-150: copies in video memory of guest memory the GPU reads as vertices and indices
     /// and the CPU leaves alone (meshes), instead of reading it over PCIe at every draw. A range
     /// bound in a second frame is copied at the start of the next list; CPU writes to its pages
@@ -414,6 +469,10 @@ private:
     /// FIX-157 (diagnosis): a T# at a watched address and the picture it resolved to.
     void WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp, bool storage,
                    bool memo, u64 program);
+    /// DIAG-208 (diagnosis): whether the work on this picture is logged in this frame.
+    bool SeqTraced(const Native::ImageEntry* entry) const;
+    void SeqBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp, bool storage,
+                 u64 program);
     struct Probe {
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         u64 tick;
@@ -429,6 +488,161 @@ private:
     std::vector<Probe> probes;
     /// FIX-175 (diagnosis): rectangles of presented pictures on their way back from the GPU.
     std::vector<Probe> display_probes;
+    /// DIAG-170 (diagnosis): blocks of a watched draw's target read back right after it.
+    struct DrawProbe {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u64 frame;
+        u32 draw;          ///< the watched draw's number in its frame
+        VAddr sampled;     ///< what it sampled (DIAG-169's match)
+        u32 sampled_width, sampled_height;
+        VAddr target;
+        u32 width, height, bits;
+        std::array<u32, 2> y; ///< the rows probed (at x RYGT_PROBE_AT's)
+        std::string bound;    ///< the draw's images (views, empty ones)
+        std::string recorded; ///< hashes of its buffers' bytes when it was recorded
+        u32 extra = 0;        ///< bytes after the blocks: its buffers, then the texture's
+        std::array<u32, 2> lengths{}; ///< of its buffers' copies
+        u32 texture_bytes = 0;
+        std::array<u32, 2> vertex_lengths{}; ///< of its vertex buffers' copies
+        bool depth = false; ///< 16x16 floats of its depth buffer at the end
+    };
+    struct ProbeVertex {
+        VAddr base;
+        u64 size;
+        vk::Buffer buffer;
+        u64 offset;
+        u64 hash; ///< of guest memory's bytes when the draw was recorded
+        u32 how;  ///< Bound (or 9: near a mirror, OPT-004)
+        std::array<u32, 4> head; ///< its first bytes then
+    };
+    std::vector<ProbeVertex> probe_vertices; ///< DIAG-170: the draw's vertex buffers
+    std::string probe_bound;
+    std::vector<std::pair<VAddr, u64>> probe_buffers; ///< DIAG-170: the draw's buffers
+    std::string probe_bound_hashes;
+    std::vector<DrawProbe> draw_probes;
+    const Native::ImageEntry* probe_sampled = nullptr; ///< DIAG-169's match for this draw
+    u32 probe_draw = 0;
+    u64 probe_frame = 0;
+    void ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs);
+    /// DIAG-173 (diagnosis): one frame's pixel history along a strip of rows of one target.
+    struct StripProbe {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u32 draw;
+        std::string what; ///< the draw's shaders and images
+    };
+    std::vector<StripProbe> strip_probes;
+    u64 strip_frame = ~u64{0}; ///< the frame being recorded with strips
+    u64 strip_written = 0;     ///< strips of that frame written out
+    bool strip_screenshot = false;
+    std::string strip_what;    ///< BindStages: the current draw's shaders and images
+    void StripDraw(const Targets& targets);
+    /// DIAG-178 (diagnosis): the work of one frame that writes or samples a watched address.
+    std::string diag_what;
+    u32 diag_lines = 0;
+    static VAddr DiagWritesAt();
+    bool DiagFrame() const;
+    void DiagWrites(const Targets* targets, const DrawBindings& b);
+    void StripDispatch(const DrawBindings& b);
+    void StripImage(const Native::ImageEntry& target, bool dispatch);
+    void StripFrameEnd();
+    /// DIAG-175 (diagnosis): one texel of every layer of a dispatch's stored image, before and
+    /// after it.
+    struct DispatchProbe {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u32 layers;
+        u32 mips;
+        VAddr address;
+        std::string what;
+    };
+    std::vector<DispatchProbe> dispatch_probes;
+    void ProbeDispatch(const Shader::Info& stage, const DrawBindings& b, bool after);
+    /// DIAG-179 (diagnosis): a traced R32F texture read back right after its sources were
+    /// copied in (RYGT_DIAG_REFRESH_READ=<width>x<height>).
+    struct RefreshProbe {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u64 frame;
+        std::string what;
+    };
+    std::vector<RefreshProbe> refresh_probes;
+    void ProbeRefresh(const Native::ImageEntry& texture, const std::string& what);
+    void ReadRefreshProbes();
+    /// DIAG-211 (diagnosis): a watched shader's buffer bound from a region, as the GPU holds it
+    /// at the draw, against guest memory when the draw was recorded.
+    struct RegionCompare {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u64 frame;
+        VAddr address;
+        u64 size;
+        u32 stride;
+        std::vector<u8> cpu;
+        std::string what;
+        bool always = false; ///< indirect arguments: logged, the first draws' words too
+    };
+    std::vector<RegionCompare> region_compares;
+    void CompareRegion(VAddr base, u64 size, u32 stride, vk::Buffer buffer, u64 offset,
+                       u64 program, bool always = false);
+    /// DIAG-211: a watched shader's flattened user data against what the regions it was read
+    /// from hold at the draw (GPU-written constants the CPU walk could not see).
+    void CompareFlatSources(const Shader::Info& stage);
+    /// DIAG-212 (diagnosis): a target right before a given program first draws into it, and the
+    /// frame's display picture, written out raw (where a glitch enters a frame).
+    struct Capture {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u64 frame;
+        std::string what;
+        u32 width;
+        u32 height;
+        u32 format;
+    };
+    std::vector<Capture> captures;
+    u64 capture_frame = ~u64{0};
+    void CaptureImage(const Native::ImageEntry& entry, u64 at_frame, const std::string& what);
+    void WriteCaptures();
+    void ReadRegionCompares();
+    /// DIAG-180 (diagnosis, RYGT_DIAG_VOLUME=<hex address>): an RGBA16F volume read back every
+    /// 300 frames, summarized per slice.
+    std::unique_ptr<Native::Rhi::Buffer> volume_probe;
+    u64 volume_tick = 0;
+    u32 volume_width = 0, volume_height = 0, volume_depth = 0;
+    void ProbeVolume();
+    /// DIAG-182 (diagnosis, RYGT_DIAG_STALE_SMALL=1): small textures in use whose guest bytes
+    /// differ from what was last uploaded while nothing asks for an upload.
+    void CheckSmallTextures();
+    /// DIAG-184 (diagnosis, RYGT_DIAG_PROGRAM_TEXTURES=<hex hash>): the small textures that
+    /// program samples, and every 120 frames what memory holds there against what was uploaded.
+    std::vector<Native::ImageEntry*> diag_program_textures;
+    void NoteProgramTextures(u64 program, const DrawBindings& b);
+    void ReportProgramTextures();
+    /// DIAG-185 (diagnosis): writes over the DIAG-184 textures' memory.
+    void NoteProgramTextureWrites(const Targets* targets, const DrawBindings& b);
+    void NoteProgramTextureWrite(VAddr address, u64 size, const char* kind);
+    u32 diag185_lines = 0;
+    /// DIAG-187 (diagnosis, RYGT_DIAG_WRITE_HISTORY=1): GPU writes, region events and CPU write
+    /// faults in a ring; DIAG-184 prints those over each of its textures when it first sees it.
+    struct WriteNote {
+        VAddr begin = 0;
+        u64 size = 0;
+        u64 frame = 0;
+        u64 program = 0;
+        u32 kind = 0;
+    };
+    std::vector<WriteNote> write_history;
+    std::vector<WriteNote> kept_history; ///< over RYGT_DIAG_HISTORY_RANGES, from the start
+    u64 write_history_count = 0;
+    std::mutex write_history_mutex;
+    u64 history_program = 0;
+    void NoteHistory(VAddr begin, u64 size, u32 kind, u64 program);
+    void PrintHistory(VAddr begin, u64 size);
+    static const std::vector<std::pair<VAddr, VAddr>>& HistoryRanges();
+    void WatchHistoryRanges();
+    void ReadDispatchProbes();
+    void ReadDrawProbes();
     std::array<double, 3> display_last_part{}; ///< FIX-182
     std::vector<u8> display_last_bytes;        ///< FIX-182
     u32 display_glitch_dumps = 0;              ///< FIX-182
@@ -459,8 +673,23 @@ private:
     /// NAT-104: the picture was written now (in GPU order).
     /// `at` != 0: the version is that clock value (NAT-148: a rewrite applied late).
     void Written(const Native::ImageEntry* entry, u64 at = 0);
+    /// FIX-208: as Written, for a draw into some mips and layers only (their versions).
+    void WrittenRange(const Native::ImageEntry* entry, const DrawnRange& range);
+    void WrittenSubresources(const Native::ImageEntry* entry, u64 at, const DrawnRange* range);
+    /// FIX-208: the version of one subresource (the picture's when it keeps none of its own).
+    static u64 SubVersion(Native::ImageEntry& entry, u32 mip, u32 layer);
+    static bool SubVersionsOn();
     /// NAT-104: copies the newer pictures of the render targets a texture is made of into it.
     void RefreshSources(Native::ImageEntry& texture);
+    /// FIX-210: before a draw into a target that is mips or layers of a larger one (FIX-197),
+    /// the subresources of the drawn view that the larger one holds newer pictures for are
+    /// copied in (RYGT_NATIVE_PART_SYNC=0 off).
+    void SyncPartFromWholes(Native::ImageEntry& part, const DrawnRange& range);
+    static bool PartSyncOn();
+    /// FIX-207: textures made of targets made of targets (RYGT_NATIVE_WHOLE_SOURCES=0 off), and
+    /// the version of such a whole: that of its newest part.
+    static bool WholeSourcesOn();
+    static u64 WholeVersion(Native::ImageEntry& source);
 
     void ResolveDraw(const AmdGpu::Regs& regs);
     bool MetaClearDispatch(const Shader::Info& cs);
@@ -658,11 +887,6 @@ private:
     u64 write_clock = 0;
     std::unordered_map<const Native::ImageEntry*, std::unordered_map<u32, u64>> held_versions;
 
-    /// NAT-105: the pages native textures watch (each watched once in the page manager, which
-    /// counts at most 255 watchers a page; many textures share pages).
-    std::mutex watch_mutex;
-    std::unordered_set<VAddr> watched_pages;
-
     /// CMASK / HTILE addresses the game cleared: the next pass into their target clears it.
     std::unordered_set<VAddr> cleared_meta;
     /// Color targets by their CMASK address, depth targets by their HTILE address (so a clear
@@ -675,6 +899,8 @@ private:
         u64 pass_barriers = 0, passes_unblocked = 0; ///< NAT-140
         u64 region_refresh_pages = 0, region_refresh_ns = 0; ///< NAT-145
         u64 region_partial_pages = 0, region_partial_bytes = 0; ///< FIX-173
+        u64 region_whole_pages = 0, region_writebacks = 0;       ///< FIX-194
+        u64 region_writeback_bytes = 0, region_pages_forgotten = 0;
         u64 mirror_untrapped = 0;                               ///< FIX-176
         u64 mirror_checks = 0, mirror_check_differ = 0;         ///< FIX-179
         u64 reach_checks = 0, reach_past_sharp = 0, reach_past_mirror = 0; ///< FIX-181
@@ -697,6 +923,13 @@ private:
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
         u64 indirect_draws = 0, indirect_skipped = 0; ///< NAT-161: recorded, and not
+        u64 one_off_waits = 0; ///< FIX-198: draws that waited for their new pipeline
+        u64 writeback_befores = 0, precise_writebacks = 0; ///< FIX-203
+        /// DIAG-188: a direct dispatch's recorder time by part (pipeline, bindings, images,
+        /// barrier with write-backs, recording, notes), and the write-backs' share.
+        std::array<u64, 6> dispatch_part_ns{};
+        u64 writeback_ns = 0;
+        u64 small_rewrites = 0; ///< FIX-202: small textures uploaded again after big writes
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,

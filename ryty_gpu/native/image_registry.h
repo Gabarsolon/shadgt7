@@ -84,6 +84,11 @@ public:
     std::vector<SourceLink> sources;
     /// NAT-111: on a render target, the textures made of it (guarded by its sources_mutex).
     std::vector<ImageEntry*> dependents;
+    /// FIX-208: per subresource (mip * layers + layer) the clock of the newest picture a draw
+    /// put there (a draw into some layers of a layered target writes only those); empty until
+    /// such a draw, and kept for pictures of up to 16 mips and 64 layers only. Other writes
+    /// (storage, clears) count for every subresource. Guarded by sources_mutex.
+    std::vector<u64> sub_versions;
     /// NAT-111: on a texture, a source was drawn since the renderer last copied them in.
     std::atomic<bool> sources_dirty{false};
     /// NAT-108: uploads since the renderer last looked (its report of busy textures).
@@ -106,6 +111,16 @@ public:
     /// goes. `foreign_clock`: the renderer's write clock when GPU work last wrote its memory
     /// other than into the picture.
     u64 made_frame = 0;
+    /// DIAG-197 (diagnosis): why it was last marked stale (Stale, or 255: not yet).
+    u8 last_stale = 255;
+    /// FIX-202: the renderer's write clock when a storage buffer much larger than this small
+    /// texture last wrote over it, and the clock it was uploaded again for.
+    std::atomic<u64> gpu_rewritten{0};
+    u64 rewrite_seen = 0;
+    /// FIX-198: the native renderer's frame the picture was last written in, and the last frame
+    /// before that one it was written in (0: none).
+    std::atomic<u64> written_frame{0};
+    std::atomic<u64> written_frame_before{0};
     std::atomic<bool> kept{false};
     std::atomic<bool> reused{false};
     std::atomic<u64> foreign_clock{0};
@@ -179,7 +194,10 @@ public:
     }
     struct UploadStats {
         std::atomic<u64> gpu, cpu, unchanged;
+        std::atomic<u64> sanitized; ///< FIX-204
     };
+    /// DIAG-197 (diagnosis): the textures uploaded most since the last report, by bytes.
+    void ReportUploadTally();
     UploadStats& GetUploadStats() {
         return upload_stats;
     }
@@ -238,6 +256,11 @@ public:
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);
     }
+    /// FIX-202: a small texture a larger storage write went over since its last upload is
+    /// uploaded again (true when it was asked for).
+    bool RewrittenSmall(ImageEntry& entry);
+    static bool SmallRewritesOn();
+    static constexpr u64 SmallRewriteSize = 64 * 1024;
 
     /// NAT-109: CPU writes to [address, address + size) (a page fault: the page stops being
     /// watched); `exact` is the bytes the instruction wrote there (0: unknown). Small textures
@@ -259,7 +282,11 @@ public:
 
     /// Records the uploads queued since the last call (copy from guest memory, untile, copy
     /// into the images). Returns how many images were uploaded.
-    u32 RecordUploads(Rhi::CommandList& list);
+    /// PERF-109: `bound` are the pictures the work about to be recorded uses: textures waiting
+    /// for an upload are uploaded only then (other uploads at once, as before).
+    u32 RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* const> bound = {});
+    /// PERF-109: whether textures are uploaded when work uses them (else when marked stale).
+    static bool LazyUploads();
 
     /// Records copying an image back into a buffer in its guest layout (tiled again), for
     /// guest memory the CPU reads after the GPU wrote it.
@@ -272,6 +299,7 @@ public:
         std::atomic<u64> reused_larger; ///< NAT-113
         std::array<std::atomic<u64>, 3> stale; ///< textures marked, by Stale
         std::atomic<u64> targets_rewritten; ///< NAT-119
+        std::atomic<u64> target_parts;      ///< FIX-197: targets linked as parts of targets
     };
     const Stats& GetStats() const {
         return stats;
@@ -312,6 +340,14 @@ private:
     std::function<void(ImageEntry&)> upload_hook;
     std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> upload_source;
     UploadStats upload_stats{};
+    struct UploadTally {
+        VAddr address = 0;
+        u32 width = 0, height = 0, levels = 0;
+        vk::Format format{};
+        u64 uploads = 0, bytes = 0, forced = 0;
+        std::array<u64, 4> why{}; ///< CPU write, unmap, GPU write, new
+    };
+    std::unordered_map<const ImageEntry*, UploadTally> upload_tally; ///< DIAG-197
     std::array<Shard, NumShards> shards;
     std::mutex upload_mutex;
     std::vector<ImageEntry*> pending_uploads;
@@ -343,5 +379,12 @@ std::vector<Rhi::BufferImageCopy> MipCopies(const VideoCore::ImageInfo& info);
 bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b);
 
 SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture);
+
+/// FIX-197: where `part` (a target of one mip) is a mip or layers of `whole` (a target of several
+/// mips or layers); mip -1: it isn't.
+SourcePlace PartOf(const VideoCore::ImageInfo& part, const VideoCore::ImageInfo& whole);
+
+/// FIX-197: RYGT_NATIVE_TARGET_PARTS=0 turns target-of-targets links off (diagnosis).
+bool TargetPartsOn();
 
 } // namespace Native

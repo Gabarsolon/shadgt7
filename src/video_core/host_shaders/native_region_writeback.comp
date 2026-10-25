@@ -1,0 +1,52 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// FIX-203: the native renderer's write-back of a region's bytes a draw or dispatch changed
+// (vk_rasterizer_native.cpp, NoteRegionWrite). A shader's storage buffer covers more than it
+// writes; the words that differ from the copy taken before the work go to guest memory, the
+// others stay as the CPU left them there.
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Now {
+    uvec4 words[];
+} now;
+
+layout(set = 0, binding = 1, std430) readonly buffer Before {
+    uvec4 words[];
+} before;
+
+layout(set = 0, binding = 2, std430) buffer Guest {
+    uvec4 words[];
+} guest;
+
+layout(push_constant) uniform Params {
+    uint count; // in uvec4s
+} params;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= params.count) {
+        return;
+    }
+    const uvec4 value = now.words[i];
+    const bvec4 changed = notEqual(value, before.words[i]);
+    if (all(changed)) {
+        guest.words[i] = value;
+        return;
+    }
+    if (changed.x) {
+        guest.words[i].x = value.x;
+    }
+    if (changed.y) {
+        guest.words[i].y = value.y;
+    }
+    if (changed.z) {
+        guest.words[i].z = value.z;
+    }
+    if (changed.w) {
+        guest.words[i].w = value.w;
+    }
+}

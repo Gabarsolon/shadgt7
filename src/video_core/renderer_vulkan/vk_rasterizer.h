@@ -242,6 +242,15 @@ public:
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// FIX-079: see BufferCache::CanWriteThrough; never over images.
     bool CanWriteThrough(VAddr addr, u64 size);
+    /// PERF-106: whether CPU writes can ever go through to tracked pages (FIX-079): never in
+    /// native mode, which watches every write.
+    bool WritesThrough() const {
+#ifdef RYTY_GPU
+        return native == nullptr;
+#else
+        return true;
+#endif
+    }
     void FinishWriteThrough(VAddr page, std::span<const u8> before, VAddr store, u64 store_size);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -336,8 +345,11 @@ public:
     /// NAT-130: whether [address, address + size) meets the traced range.
     static bool Traced(VAddr address, u64 size) {
         const auto [lo, hi] = TraceRange();
-        return lo != hi && address < hi && address + std::max<u64>(size, 1) > lo;
+        return lo != hi && ((address < hi && address + std::max<u64>(size, 1) > lo) ||
+                            TracedElsewhere(address, size));
     }
+    /// DIAG-168: more ranges after the first, separated by commas.
+    static bool TracedElsewhere(VAddr address, u64 size);
     /// NAT-117: the dumped frame's work in GPU order (passes with the targets the registers name
     /// and whether they start cleared, fills, metadata clears), written as events.txt next to
     /// the dump. Consecutive draws into the same targets are one line.
@@ -505,6 +517,9 @@ private:
     /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
     const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
                                                     bool selected_allowed);
+    /// FIX-198: as AcquireGraphicsPipeline selecting here, but a pipeline (and its shaders)
+    /// still building is waited for instead of the draw being skipped.
+    const GraphicsPipeline* AcquireGraphicsPipelineWaiting(const DrawIndirectParams& params);
     /// Points the pipeline's stages at copies holding the given user data; with `validate`,
     /// false if a stage's flattened user data now differs from what selection used.
     /// PERF-065: the selection's flattened user data is moved into the stage (swapped).

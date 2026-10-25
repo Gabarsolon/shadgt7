@@ -55,6 +55,10 @@ public:
     /// Imports the views covering [address, address + size) not imported yet. True when every
     /// page of the range is now mapped for the GPU.
     bool EnsureImported(VAddr address, u64 size);
+    /// FIX-205: views dropped at unmaps from now on are freed only after the work of the next
+    /// list ReleaseHeldAfter is told of (the native renderer's lists).
+    static void HoldReleasesForSplice();
+    static void ReleaseHeldAfter(u64 tick);
 
     /// D6: the imported buffer holding the whole range and the range's offset in it, when one
     /// view holds it (call EnsureImported first).

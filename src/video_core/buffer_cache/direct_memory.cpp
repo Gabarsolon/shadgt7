@@ -61,6 +61,9 @@ struct PendingRelease {
 std::mutex g_pending_mutex;
 std::vector<PendingRelease> g_pending;
 std::atomic<bool> g_has_pending{false}; // checked on every bind without the lock
+// FIX-205: in native mode views dropped at an unmap wait for the native renderer's next list.
+std::atomic<bool> g_hold_for_splice{false};
+constexpr u64 HeldForSplice = ~u64{0};
 // D7: views a thread found lately, valid while no view was unmapped since (lock-free check).
 std::atomic<u64> g_unmap_generation{1};
 struct RecentView {
@@ -403,13 +406,35 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
         }
         {
             std::scoped_lock pending_lk{g_pending_mutex};
-            g_pending.push_back({tick, view.alias, view.memory, std::move(view.wrapper)});
+            // FIX-205: the native renderer records into lists of its own and puts each into the
+            // scheduler's work when it splices it, which can be a submission later than the one
+            // current now: a view freed after this tick could still be used by work the list
+            // holds. In native mode it is freed after the work of the native list spliced next.
+            const u64 release_tick =
+                g_hold_for_splice.load(std::memory_order_relaxed) ? HeldForSplice : tick;
+            g_pending.push_back({release_tick, view.alias, view.memory, std::move(view.wrapper)});
             g_has_pending.store(true, std::memory_order_relaxed);
         }
         it = views.erase(it);
     }
     // A view base unmapped may be mapped again with other memory.
     std::erase_if(failed, [&](VAddr base) { return base >= address && base < end; });
+}
+
+void DirectMemory::HoldReleasesForSplice() {
+    g_hold_for_splice.store(true, std::memory_order_relaxed);
+}
+
+void DirectMemory::ReleaseHeldAfter(u64 tick) {
+    if (!g_has_pending.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::scoped_lock lk{g_pending_mutex};
+    for (PendingRelease& p : g_pending) {
+        if (p.tick == HeldForSplice) {
+            p.tick = tick; // FIX-205: after the spliced list's submission
+        }
+    }
 }
 
 DirectMemory::Stats DirectMemory::GetStats() const {

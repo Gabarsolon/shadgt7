@@ -35,6 +35,7 @@ std::atomic<std::uint64_t> g_address{0};
 std::array<Hit, 2048> g_hits{};
 std::atomic<std::uint32_t> g_num_hits{0};
 std::atomic<std::int64_t> g_start_ns{0};
+std::atomic<bool> g_ring{false}; // DIAG-193
 PVOID g_handler = nullptr;
 
 std::int64_t NowNs() {
@@ -54,7 +55,10 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* pointers) {
     context->Dr6 &= ~0xFull;
     if (g_active.load(std::memory_order_acquire)) {
         const std::uint64_t address = g_address.load(std::memory_order_relaxed);
-        const std::uint32_t index = g_num_hits.fetch_add(1, std::memory_order_relaxed);
+        // DIAG-193: with a ring watch, the newest hits are kept.
+        const std::uint32_t count = g_num_hits.fetch_add(1, std::memory_order_relaxed);
+        const std::uint32_t index =
+            g_ring.load(std::memory_order_relaxed) ? count % g_hits.size() : count;
         if (index < g_hits.size()) {
             // Reading the watched address here would trap again in read/write mode.
             const std::uint64_t value =
@@ -163,6 +167,30 @@ std::string ThreadName(DWORD tid) {
 } // namespace
 
 namespace Vulkan {
+// DIAG-193 (diagnosis): the newest hits of the running watch, oldest first, into a file.
+void RytyWatchDump(std::string label) {
+    const std::uint32_t total = g_num_hits.load();
+    const std::uint32_t kept = std::min<std::uint32_t>(total, g_hits.size());
+    static int dump_index = 0;
+    const std::string path = fmt::format("watch_dump_{}.txt", dump_index++);
+    if (FILE* file = std::fopen(path.c_str(), "w")) {
+        for (std::uint32_t i = total - kept; i < total; ++i) {
+            const auto& hit = g_hits[i % g_hits.size()];
+            std::fprintf(file,
+                         "+%.2f ms thread %s at %s wrote %016llx (rcx %llx rdx %llx rsi %llx "
+                         "rdi %llx r8 %llx)\n",
+                         (hit.ns - g_start_ns.load()) / 1e6, ThreadName(hit.tid).c_str(),
+                         Describe(hit.rip).c_str(), (unsigned long long)hit.value,
+                         (unsigned long long)hit.rcx, (unsigned long long)hit.rdx,
+                         (unsigned long long)hit.rsi, (unsigned long long)hit.rdi,
+                         (unsigned long long)hit.r8);
+        }
+        std::fclose(file);
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-193: {}: {} writes to {:#x} so far, the newest {} in {}", label,
+                total, g_address.load(), kept, path);
+}
+
 // Watches address for ms milliseconds from now and logs the writes, unless a watch is running.
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label) {
     bool expected = false;
@@ -181,6 +209,7 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
         address &= ~7ull;
     }
     g_address.store(address);
+    g_ring.store(label.starts_with("ring")); // DIAG-193
     g_num_hits.store(0);
     g_start_ns.store(NowNs());
     const std::uint64_t value = *reinterpret_cast<const volatile std::uint64_t*>(address);

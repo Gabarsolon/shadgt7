@@ -1160,6 +1160,24 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     return pipeline;
 }
 
+const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
+    const DrawIndirectParams& params) {
+    std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+    const GraphicsPipeline* pipeline;
+    {
+        std::scoped_lock lk{pipeline_cache.LookupMutex()};
+        pipeline_cache.SetForceWait(true);
+        pipeline = pipeline_cache.GetGraphicsPipeline(params);
+        pipeline_cache.SetForceWait(false);
+        if (!pipeline || !SelectsPipelinesAhead()) {
+            return pipeline;
+        }
+        CopySelectedStages(stages);
+    }
+    InstallDrawStages(pipeline, stages, false);
+    return pipeline;
+}
+
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
@@ -3090,7 +3108,24 @@ void Rasterizer::FrameDumpFlip() {
         }
         frame_dump_mem.clear();
     }
-    if ((dump_at < 0 && !exposure_dump_requested && !frame_dump_collecting) || frame_dump_done) {
+    // DIAG-172 (diagnosis): a file named dump.now next to the user folder dumps the next frame
+    // (for scenes that come up at no fixed time), into dump-<old|native>-now<n>; removed when
+    // taken. Checked every 30 flips.
+    static u32 now_dumps = 0;
+    static u32 now_checks = 0;
+    static bool now_request = false;
+    if (!frame_dump_collecting && !now_request && ++now_checks % 30 == 0) {
+        std::error_code error;
+        const auto trigger =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() / "dump.now";
+        if (std::filesystem::remove(trigger, error)) {
+            now_request = true;
+            frame_dump_done = false;
+            ++now_dumps;
+        }
+    }
+    if ((dump_at < 0 && !exposure_dump_requested && !now_request && !frame_dump_collecting) ||
+        frame_dump_done) {
         return;
     }
     const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -3102,7 +3137,7 @@ void Rasterizer::FrameDumpFlip() {
     }();
     static u32 frames_seen = 0;
     if (!frame_dump_collecting) {
-        if ((dump_at >= 0 && now >= dump_at) || exposure_dump_requested) {
+        if ((dump_at >= 0 && now >= dump_at) || exposure_dump_requested || now_request) {
             frame_dump_collecting = true; // the next frame's targets are noted
             frame_dump_old.clear();
             frames_seen = 0;
@@ -3123,8 +3158,10 @@ void Rasterizer::FrameDumpFlip() {
 #endif
     const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
                      fmt::format("dump-{}-{}", native ? "native" : "old",
-                                 dump_at >= 0 ? fmt::format("{:g}", dump_at)
-                                              : std::string{"exp"});
+                                 now_request    ? fmt::format("now{}", now_dumps)
+                                 : dump_at >= 0 ? fmt::format("{:g}", dump_at)
+                                                : std::string{"exp"});
+    now_request = false;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     FrameDumpWriteEvents(dir);
@@ -3182,11 +3219,25 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
         trace_last_pass = text;
         TraceText(text); // NAT-130
     }
-    if (!frame_dump_collecting) {
+    // DIAG-168 (diagnosis, RYGT_TRACE_DRAWS=1): every draw into a traced pass, as below.
+    static const bool trace_draws = [] {
+        const char* env = std::getenv("RYGT_TRACE_DRAWS");
+        return env && env[0] == '1';
+    }();
+    bool traced_draw = false;
+    if (trace_draws && TraceRange().first != TraceRange().second) {
+        for (size_t at = text.find("0x"); at != std::string::npos; at = text.find("0x", at + 2)) {
+            if (Traced(std::strtoull(text.c_str() + at + 2, nullptr, 16), 1)) {
+                traced_draw = true;
+                break;
+            }
+        }
+    }
+    if (!frame_dump_collecting && !traced_draw) {
         return;
     }
-    if (!frame_dump_events.empty() && frame_dump_events.back().draws != 0 &&
-        frame_dump_events.back().key == text) {
+    if (frame_dump_collecting && !traced_draw && !frame_dump_events.empty() &&
+        frame_dump_events.back().draws != 0 && frame_dump_events.back().key == text) {
         ++frame_dump_events.back().draws;
         return;
     }
@@ -3230,6 +3281,23 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
         u32(dc.depth_write_enable), u32(dc.depth_func),
         u32(dc.stencil_enable), u32(regs.depth_render_control.depth_clear_enable),
         u32(regs.depth_render_control.stencil_clear_enable), vs, ps, sampled);
+    if (traced_draw) {
+        const auto& blend = regs.blend_control[0];
+        LOG_WARNING(Render_Vulkan, "DIAG-168: {} draw: {} blend {} {}/{}/{} {}/{}/{} mask {:#x} "
+                    "(frame {})", text, detail, u32(blend.enable), u32(blend.color_src_factor),
+                    u32(blend.color_func), u32(blend.color_dst_factor),
+                    u32(blend.alpha_src_factor), u32(blend.alpha_func),
+                    u32(blend.alpha_dst_factor), regs.color_target_mask.raw,
+                    DebugState.GetFrameNum());
+        if (!frame_dump_collecting) {
+            return;
+        }
+        if (!frame_dump_events.empty() && frame_dump_events.back().draws != 0 &&
+            frame_dump_events.back().key == text) {
+            ++frame_dump_events.back().draws;
+            return;
+        }
+    }
     frame_dump_events.push_back({std::move(text), std::move(detail), 1});
 }
 
@@ -3255,6 +3323,28 @@ std::pair<VAddr, VAddr> Rasterizer::TraceRange() {
         return std::pair<VAddr, VAddr>{lo, std::max(hi, lo)};
     }();
     return range;
+}
+
+bool Rasterizer::TracedElsewhere(VAddr address, u64 size) {
+    static const std::vector<std::pair<VAddr, VAddr>> ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> list;
+        const char* env = std::getenv("RYGT_TRACE_RANGE");
+        const char* at = env ? std::strchr(env, ',') : nullptr;
+        while (at && *at == ',') {
+            char* end = nullptr;
+            const VAddr lo = std::strtoull(at + 1, &end, 16);
+            const VAddr hi = end && *end == '-' ? std::strtoull(end + 1, &end, 16) : lo + 1;
+            list.emplace_back(lo, std::max(hi, lo));
+            at = end;
+        }
+        return list;
+    }();
+    for (const auto& [lo, hi] : ranges) {
+        if (address < hi && address + std::max<u64>(size, 1) > lo) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Rasterizer::TraceText(const std::string& text) {
