@@ -144,6 +144,60 @@ Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1,
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
+// FIX-199: a cube map is sampled as a 2D array of its faces (FixImageCoords), and with an implicit
+// level the GPU takes the level from the derivatives of the face coordinates, which jump across a
+// face edge (from one side of a layer to the other): the pixels along the cube's edges sampled the
+// smallest mips, a dark line where the sky cube's faces meet (GT7). The gradients come from the
+// direction the face coordinates stand for instead (continuous across faces), projected onto the
+// pixel's own face, as cube sampling does on the hardware. The face coordinates are the game's
+// V_CUBESC/V_CUBETC (EmitCubeFaceCoordS/T) divided by the major axis, in [1, 2].
+static std::pair<Id, Id> CubeGradients(EmitContext& ctx, Id coords) {
+    const Id f32 = ctx.F32[1];
+    const Id x = ctx.OpCompositeExtract(f32, coords, 0U);
+    const Id y = ctx.OpCompositeExtract(f32, coords, 1U);
+    const Id face_slice = ctx.OpCompositeExtract(f32, coords, 2U);
+    // The face (0-5) without a cube array's slice (face + 8 * slice).
+    const Id face = ctx.OpFma(f32,
+                              ctx.OpFloor(f32, ctx.OpFMul(f32, face_slice, ctx.ConstF32(0.125f))),
+                              ctx.ConstF32(-8.f), face_slice);
+    const Id u = ctx.OpFma(f32, x, ctx.ConstF32(2.f), ctx.ConstF32(-3.f)); // S / |M|, in [-1, 1]
+    const Id v = ctx.OpFma(f32, y, ctx.ConstF32(2.f), ctx.ConstF32(-3.f)); // T / |M|
+    const auto is = [&](float n) { return ctx.OpFOrdEqual(ctx.U1[1], face, ctx.ConstF32(n)); };
+    const auto pick = [&](Id condition, Id a, Id b) { return ctx.OpSelect(f32, condition, a, b); };
+    const Id f0 = is(0.f), f1 = is(1.f), f2 = is(2.f), f3 = is(3.f), f4 = is(4.f), f5 = is(5.f);
+    const Id one = ctx.ConstF32(1.f);
+    const Id minus_one = ctx.ConstF32(-1.f);
+    const Id neg_u = ctx.OpFNegate(f32, u);
+    const Id neg_v = ctx.OpFNegate(f32, v);
+    // The direction, its major axis 1: +X (1,-v,-u), -X (-1,-v,u), +Y (u,1,v), -Y (u,-1,-v),
+    // +Z (u,-v,1), -Z (-u,-v,-1).
+    const Id dx = pick(f0, one, pick(f1, minus_one, pick(f5, neg_u, u)));
+    const Id dy = pick(f2, one, pick(f3, minus_one, neg_v));
+    const Id dz = pick(f0, neg_u, pick(f1, u, pick(f2, v, pick(f3, neg_v, pick(f4, one, minus_one)))));
+    const Id direction = ctx.OpCompositeConstruct(ctx.F32[3], dx, dy, dz);
+    const auto project = [&](Id d) {
+        const Id ddx = ctx.OpCompositeExtract(f32, d, 0U);
+        const Id ddy = ctx.OpCompositeExtract(f32, d, 1U);
+        const Id ddz = ctx.OpCompositeExtract(f32, d, 2U);
+        const Id neg_ddx = ctx.OpFNegate(f32, ddx);
+        const Id neg_ddy = ctx.OpFNegate(f32, ddy);
+        const Id neg_ddz = ctx.OpFNegate(f32, ddz);
+        // The derivatives of the face's S, T and major axis M (S = u, T = v, M = 1 here):
+        // +X (-z, -y, x), -X (z, -y, -x), +Y (x, z, y), -Y (x, -z, -y), +Z (x, -y, z),
+        // -Z (-x, -y, -z).
+        const Id ds = pick(f0, neg_ddz, pick(f1, ddz, pick(f5, neg_ddx, ddx)));
+        const Id dt = pick(f2, ddz, pick(f3, neg_ddz, neg_ddy));
+        const Id dm =
+            pick(f0, ddx, pick(f1, neg_ddx, pick(f2, ddy, pick(f3, neg_ddy, pick(f4, ddz, neg_ddz)))));
+        // The layer coordinate is (S / M + 1) / 2: its derivative (dS - S dM) / 2 at M = 1.
+        const Id half = ctx.ConstF32(0.5f);
+        const Id gs = ctx.OpFMul(f32, half, ctx.OpFSub(f32, ds, ctx.OpFMul(f32, u, dm)));
+        const Id gt = ctx.OpFMul(f32, half, ctx.OpFSub(f32, dt, ctx.OpFMul(f32, v, dm)));
+        return ctx.OpCompositeConstruct(ctx.F32[2], gs, gt);
+    };
+    return {project(ctx.OpDPdx(ctx.F32[3], direction)), project(ctx.OpDPdy(ctx.F32[3], direction))};
+}
+
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
                               const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
@@ -152,6 +206,20 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
     const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type);
+    if (texture.view_type == AmdGpu::ImageType::Cube && ctx.hw_stage == HwStage::Fragment) {
+        auto [grad_x, grad_y] = CubeGradients(ctx, coords); // FIX-199
+        if (Sirit::ValidId(bias)) {
+            const Id scale = ctx.OpExp2(ctx.F32[1], bias);
+            grad_x = ctx.OpVectorTimesScalar(ctx.F32[2], grad_x, scale);
+            grad_y = ctx.OpVectorTimesScalar(ctx.F32[2], grad_y, scale);
+        }
+        ImageOperands operands;
+        operands.AddDerivatives(ctx, texture.view_type, grad_x, grad_y);
+        operands.AddOffset(ctx, texture.view_type, offset);
+        const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, fixed_coords,
+                                                       operands.mask, operands.operands);
+        return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+    }
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Bias, bias);
     operands.AddOffset(ctx, texture.view_type, offset);

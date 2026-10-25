@@ -20,8 +20,9 @@ namespace Serialization {
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
 // 17/18 (FIX-192): vertex runtime info has is_indirect; stored translations of indirect draws
 // left their ids biased, and older entries could read the padding it now uses.
-static constexpr u32 ShaderBinaryVersion = 17u;
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 18u;
+// 19/20 (FIX-199): cube samples with an implicit level take their gradients from the direction.
+static constexpr u32 ShaderBinaryVersion = 19u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 20u;
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
