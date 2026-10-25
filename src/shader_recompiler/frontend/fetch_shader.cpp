@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <utility>
+#include <fmt/format.h>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/opcodes.h"
@@ -55,57 +58,87 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     const u32* ptr = code;
+    // FIX-211: what the user data points at is not always a fetch shader when the command
+    // thread reads it ahead of the GPU: GT7 crashed here (an instruction no fetch shader has)
+    // right after the shader resource walker faulted on unmapped tables. Code that isn't one
+    // counts as no fetch shader, with a warning, instead of stopping the game.
+    const auto reject = [&](u32 word) {
+        static std::atomic<u32> logged{};
+        if (const u32 n = logged++; n < 20 || n % 1000 == 0) {
+            LOG_WARNING(Render_Recompiler,
+                        "FIX-211: vs {:#x}: no fetch shader at {} (word {:08x} at dword {}), "
+                        "drawn without one ({} so far)",
+                        info.pgm_hash, fmt::ptr(code), word, ptr - code - 1, n + 1);
+        }
+        out_fetch_data = {};
+        return false;
+    };
+    constexpr std::ptrdiff_t MaxDwords = 256;
     while (true) {
+        if (ptr - code >= MaxDwords) {
+            return reject(0);
+        }
         const u32 word0 = *(ptr++);
         const auto encoding = GetInstructionEncoding(word0);
 
         if (encoding == InstEncoding::SOP1) {
             const auto opcode = OpcodeSOP1((word0 >> 8) & 0xff);
-            ASSERT(opcode == OpcodeSOP1::S_SETPC_B64);
+            if (opcode != OpcodeSOP1::S_SETPC_B64) {
+                return reject(word0);
+            }
             break;
         } else if (encoding == InstEncoding::SMRD) {
             const auto opcode = OpcodeSMRD((word0 >> 22) & 0x1f);
             const u32 sdst = (word0 >> 15) & 0x7f;
             const u32 sbase = (word0 >> 9) & 0x3f;
             const u32 offset = word0 & 0xff;
-            ASSERT(opcode == OpcodeSMRD::S_LOAD_DWORDX4);
+            if (opcode != OpcodeSMRD::S_LOAD_DWORDX4 || sdst >= loads.size()) {
+                return reject(word0);
+            }
             loads[sdst] = VsharpLoad{offset, sbase * 2};
         } else if (encoding == InstEncoding::VOP2) {
             const auto opcode = OpcodeVOP2((word0 >> 25) & 0x3f);
             const u32 src0 = word0 & 0x1ff;
             const u32 vsrc1 = (word0 >> 9) & 0xff;
             const u32 vdst = (word0 >> 17) & 0xff;
-            ASSERT(opcode == OpcodeVOP2::V_ADD_I32 && src0 < 16 && vsrc1 == vdst);
+            if (opcode != OpcodeVOP2::V_ADD_I32 || src0 >= 16 || vsrc1 != vdst ||
+                (vdst != 0 && vdst != 3)) {
+                return reject(word0);
+            }
             if (vdst == 0) {
                 // V0 is always the vertex offset
                 out_fetch_data.vertex_offset_sgpr = src0;
-            } else if (vdst == 3) {
+            } else {
                 // V3 is always the instance offset
                 out_fetch_data.instance_offset_sgpr = src0;
-            } else {
-                UNREACHABLE();
             }
         } else if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
             // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
             const u32 word1 = *(ptr++);
             const u32 srsrc = ((word1 >> 16) & 0x1f) * 4;
-            auto& attrib = out_fetch_data.attributes.emplace_back();
-            attrib.dest_vgpr = (word1 >> 8) & 0xff;
+            u32 num_elements = 0;
             if (encoding == InstEncoding::MUBUF) {
                 const auto opcode = OpcodeMUBUF((word0 >> 18) & 0x7f);
-                ASSERT(opcode >= OpcodeMUBUF::BUFFER_LOAD_FORMAT_X &&
-                       opcode <= OpcodeMUBUF::BUFFER_LOAD_FORMAT_XYZW);
-                attrib.num_elements = (std::to_underlying(opcode) -
-                                       std::to_underlying(OpcodeMUBUF::BUFFER_LOAD_FORMAT_X)) +
-                                      1;
+                if (opcode < OpcodeMUBUF::BUFFER_LOAD_FORMAT_X ||
+                    opcode > OpcodeMUBUF::BUFFER_LOAD_FORMAT_XYZW) {
+                    return reject(word0);
+                }
+                num_elements = (std::to_underlying(opcode) -
+                                std::to_underlying(OpcodeMUBUF::BUFFER_LOAD_FORMAT_X)) +
+                               1;
             } else {
                 const auto opcode = OpcodeMTBUF((word0 >> 16) & 0x7);
-                ASSERT(opcode >= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X &&
-                       opcode <= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_XYZW);
-                attrib.num_elements = (std::to_underlying(opcode) -
-                                       std::to_underlying(OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X)) +
-                                      1;
+                if (opcode < OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X ||
+                    opcode > OpcodeMTBUF::TBUFFER_LOAD_FORMAT_XYZW) {
+                    return reject(word0);
+                }
+                num_elements = (std::to_underlying(opcode) -
+                                std::to_underlying(OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X)) +
+                               1;
             }
+            auto& attrib = out_fetch_data.attributes.emplace_back();
+            attrib.dest_vgpr = (word1 >> 8) & 0xff;
+            attrib.num_elements = num_elements;
             attrib.sgpr_base = loads[srsrc].base_sgpr;
             attrib.dword_offset = loads[srsrc].dword_offset;
             attrib.inst_offset = word0 & 0xfff;
@@ -119,15 +152,19 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
             }
         } else if (encoding == InstEncoding::SOPP) {
             const auto opcode = OpcodeSOPP((word0 >> 16) & 0x7f);
-            ASSERT(opcode == OpcodeSOPP::S_WAITCNT);
+            if (opcode != OpcodeSOPP::S_WAITCNT) {
+                return reject(word0);
+            }
         } else if (encoding == InstEncoding::VOP1) {
             const auto opcode = OpcodeVOP1((word0 >> 9) & 0xff);
             const u32 src0 = word0 & 0x1ff;
             const u32 vdst = (word0 >> 17) & 0xff;
-            ASSERT(opcode == OpcodeVOP1::V_MOV_B32 && src0 == 242);
+            if (opcode != OpcodeVOP1::V_MOV_B32 || src0 != 242) {
+                return reject(word0);
+            }
             LOG_WARNING(Render_Recompiler, "Fetch shader has V{} = 1.0 which is ignored", vdst);
         } else {
-            UNREACHABLE_MSG("Unexpected instruction encoding in fetch shader {}", u32(encoding));
+            return reject(word0);
         }
     }
 

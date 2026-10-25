@@ -1160,7 +1160,10 @@ void Translator::EmitFetch(const GcnInst& inst) {
 
     info.has_fetch_shader = true;
     info.fetch_shader_sgpr_base = code_sgpr_base;
-    ASSERT(ParseFetchShader(info, fetch_data));
+    if (!ParseFetchShader(info, fetch_data)) {
+        fetch_data = {}; // FIX-211: not a fetch shader there (logged): no attributes
+        return;
+    }
 
     if (EmulatorSettings.IsDumpShaders()) {
         using namespace Common::FS;
