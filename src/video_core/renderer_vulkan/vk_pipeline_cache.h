@@ -137,6 +137,12 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
+    /// FIX-198: while set (the lookup lock held), GetGraphicsPipeline waits for a pipeline and
+    /// shaders still building instead of skipping the draw.
+    void SetForceWait(bool on) {
+        force_wait = on;
+    }
+
     /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
     /// registers installed with Liverpool::SetThreadDrawState), or nullptr. Nothing is
     /// translated, loaded, built or waited for, and the selection made by the threads above is
@@ -409,6 +415,7 @@ private:
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
     bool translation_skipped{};
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
+    bool force_wait = false; ///< FIX-198
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of

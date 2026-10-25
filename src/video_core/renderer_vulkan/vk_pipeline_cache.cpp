@@ -1540,8 +1540,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 ++async_stats.installed;
                 return it->second.get();
             }
-            if (!LegacyWaits() && !WritesMemory(S().infos) && !NeverSkipped(S().infos) &&
-                !MenusWait()) {
+            if (!force_wait && !LegacyWaits() && !WritesMemory(S().infos) &&
+                !NeverSkipped(S().infos) && !MenusWait()) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
                 ++async_stats.skipped_draws;
@@ -1595,8 +1595,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         // and the game goes on in slow motion until it is built.
         // D10: a pipeline of old translations is built right away (the driver usually has it
         // from the old renderer's sessions, so it takes milliseconds).
-        if (build && AsyncPipelines() && !LegacyWaits() && !WritesMemory(S().infos) &&
-            !NeverSkipped(S().infos) && !MenusWait() &&
+        if (build && !force_wait && AsyncPipelines() && !LegacyWaits() &&
+            !WritesMemory(S().infos) && !NeverSkipped(S().infos) && !MenusWait() &&
             build->done.wait_for(QuickWait()) != std::future_status::ready) {
             build->async = true;
             pending_builds[S().graphics_key] = build;
@@ -1630,6 +1630,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             if (WritesMemory(S().infos)) why += " writes-memory";
             if (NeverSkipped(S().infos)) why += " tessellation";
             if (MenusWait()) why += " menus";
+            if (force_wait) why += " one-off target"; // FIX-198
             LOG_WARNING(Render_Vulkan,
                         "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
                         "{:.1f} ms (DIAG-124:{})",
@@ -2180,6 +2181,23 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
     // <program hash>_<index>.spv; indices are dense from 0 (PERF-013 numbers runtime ones after
     // the stored ones), so the listing stops after a run of missing indices.
     StoredListing listing{.pgm_hash = pgm_hash};
+    // DIAG-191 (diagnosis, SHADGT_RETRANSLATE=<hex hash>,...): these programs are translated
+    // again (and dumped with GPU.dump_shaders) instead of loaded from the store.
+    static const std::vector<u64> retranslate = [] {
+        std::vector<u64> hashes;
+        if (const char* env = std::getenv("SHADGT_RETRANSLATE"); env && *env) {
+            const std::string list{env};
+            for (size_t start = 0; start < list.size();) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                hashes.push_back(std::stoull(list.substr(start, end - start), nullptr, 16));
+                start = end + 1;
+            }
+        }
+        return hashes;
+    }();
+    if (std::ranges::find(retranslate, pgm_hash) != retranslate.end()) {
+        return listing;
+    }
     u32 missing = 0;
     for (size_t perm_idx = 0; perm_idx < 512 && missing < 8; ++perm_idx) {
         const auto name = fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx));
@@ -2751,7 +2769,7 @@ bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderPa
     // dozen new shaders came at once). Not compute, and not a shader that writes memory (later
     // work reads what it writes). -DisablePerf 171 waits as before.
     static const bool enabled = Common::PerfFeatureEnabled(171);
-    if (!enabled || regs_override != nullptr || sw_stage == SwStage::Compute ||
+    if (!enabled || force_wait || regs_override != nullptr || sw_stage == SwStage::Compute ||
         !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
         return false;
     }
@@ -3181,7 +3199,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             wg[0] * wg[1] * wg[2] > 32 && Common::PerfFeatureEnabled(31) &&
             Shader::HasLaneReadsAndLoop(params.code)) {
-            needed_fixes |= 8u; // FIX-020 v3 (conditions behind ConditionRef); v1/v2 were 2/4
+            needed_fixes |= 8u | 128u; // Wave64 invocation-guard lowering, including stored loops.
+        }
+        if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
+            wg[0] * wg[1] * wg[2] == 64 && Common::PerfFeatureEnabled(31)) {
+            // Wave-aligned guards can contain lane reads with or without a loop.
+            needed_fixes |= 128u;
         }
         if (Shader::HasWholeWaveRegions(params.code)) {
             needed_fixes |= 32u; // FIX-190
