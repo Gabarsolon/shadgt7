@@ -15,7 +15,9 @@
 #include <vector>
 
 #include "common/guest_clock.h"
+#include "common/io_file.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
@@ -40,6 +42,7 @@
 #include "imgui.h"
 #ifdef ENABLE_DISCORD_RPC
 #include "common/discord_rpc_handler.h"
+#include "core/file_format/psf.h"
 #endif
 #include <chrono>
 #include <cmath>
@@ -64,8 +67,22 @@ void RunWindowThread() {
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
-                                      "ryGT - Gran Turismo Sport");
-    window.SetIcon({}); // shadGT's Gran Turismo Sport icon
+                                      "ryGT7 - Gran Turismo 7");
+    // Use the installed game's icon rather than embedding game artwork in the renderer.
+    const auto icon_path = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                           "app0" / "sce_sys" / "icon0.png";
+    Common::FS::IOFile icon_file{icon_path, Common::FS::FileAccessMode::Read};
+    std::vector<u8> icon;
+    if (icon_file.IsOpen()) {
+        const auto size = icon_file.GetSize();
+        if (size > 0 && size <= 16 * 1024 * 1024) {
+            icon.resize(size);
+            if (icon_file.ReadSpan<u8>(icon) != size) {
+                icon.clear();
+            }
+        }
+    }
+    window.SetIcon(icon);
     {
         std::scoped_lock lock{g_window_mutex};
         g_window = &window;
@@ -89,6 +106,8 @@ void RunWindowThread() {
         (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
+    std::fprintf(stderr, "[window] closed: the game ends\n");
+    std::fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
@@ -446,9 +465,31 @@ void Ryty::RytyLibraryInitialize() {
     Ryty::SetOverlayDraw(&DrawFpsCounter);
 #ifdef ENABLE_DISCORD_RPC
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
+        // The game's title and id from app0\sce_sys\param.sfo next to the exe (GT7's runtime
+        // has one; GT Sport's when there is none), so GT7 shows as GT7.
+        std::string title = "Gran Turismo Sport";
+        std::string serial = "CUSA03220";
+        const auto sfo = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                         "app0" / "sce_sys" / "param.sfo";
+        std::error_code error;
+        if (PSF psf; std::filesystem::exists(sfo, error) && psf.Open(sfo)) {
+            if (const auto name = psf.GetString("TITLE")) {
+                title.assign(name->begin(), name->end());
+                // "Gran Turismo® 7": without the mark.
+                for (const std::string_view mark : {"\xC2\xAE", "\xE2\x84\xA2"}) {
+                    for (size_t at; (at = title.find(mark)) != std::string::npos;) {
+                        title.erase(at, mark.size());
+                    }
+                }
+            }
+            if (const auto id = psf.GetString("TITLE_ID")) {
+                serial.assign(id->begin(), id->end());
+            }
+        }
+        LOG_INFO(Render_Vulkan, "Discord presence: {} ({})", title, serial);
         auto* rpc = Common::Singleton<DiscordRPCHandler::RPC>::Instance();
-        rpc->init();
-        rpc->setStatusPlaying("Gran Turismo Sport", "CUSA03220");
+        rpc->init(title, serial);
+        rpc->setStatusPlaying(title, serial);
     }
 #endif
     {
