@@ -21,10 +21,10 @@ and hardware may still have rendering errors or crashes.
 Clone with submodules. In a Visual Studio x64 developer environment with clang-cl, CMake,
 Ninja, Python and the Windows SDK:
 
-`
+```
 cmake --preset x64-Clang-Release -DSHADGT_RYTY_GPU=ON -DHAVE_ENDIAN_H=OFF
 cmake --build Build/x64-Clang-Release --target ryty_gpu --parallel 8
-`
+```
 
 This builds libSceVideoOut.prx. The companion runtime and packaging instructions are in
 [ryGT7 build-support](https://github.com/mlgprorektm8/RyGT7/tree/main/build-support).
