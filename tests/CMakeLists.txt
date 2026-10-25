@@ -545,6 +545,8 @@ set(WAVE64_INSPECT_SOURCES ${GCN_TEST_SOURCES})
 list(FILTER WAVE64_INSPECT_SOURCES EXCLUDE REGEX "/shader_recompiler/|gcn/|test_|resource_tracking_pass_stub")
 add_executable(shadgt_wave64_inspect tools/wave64_inspect.cpp ${WAVE64_INSPECT_RECOMPILER}
                ${WAVE64_INSPECT_SOURCES})
+add_executable(shadgt_wave64_guard_regression tools/wave64_guard_regression.cpp
+               ${WAVE64_INSPECT_RECOMPILER} ${WAVE64_INSPECT_SOURCES})
 target_include_directories(shadgt_wave64_inspect PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
 target_compile_features(shadgt_wave64_inspect PRIVATE cxx_std_23)
 target_link_libraries(shadgt_wave64_inspect PRIVATE fmt::fmt nlohmann_json::nlohmann_json
@@ -556,3 +558,11 @@ if (WIN32)
     target_compile_definitions(shadgt_wave64_inspect PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
         NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00 _CRT_SECURE_NO_WARNINGS)
 endif()
+
+foreach(property INCLUDE_DIRECTORIES COMPILE_FEATURES COMPILE_DEFINITIONS LINK_LIBRARIES)
+    get_target_property(value shadgt_wave64_inspect ${property})
+    if(value)
+        set_property(TARGET shadgt_wave64_guard_regression PROPERTY ${property} "${value}")
+    endif()
+endforeach()
+add_test(NAME wave64_guard_regression COMMAND shadgt_wave64_guard_regression)

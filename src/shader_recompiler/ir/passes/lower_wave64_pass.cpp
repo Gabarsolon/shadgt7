@@ -16,6 +16,66 @@
 
 namespace Shader::Optimization {
 
+// A global X index in a workgroup whose X dimension is a multiple of 64 has
+// the form 64 * wave + lane. Comparing it with a wave-aligned boundary cannot
+// split a guest wave, even though the index itself varies between invocations.
+static bool IsWaveIndex(const IR::Value& value, const RuntimeInfo& runtime) {
+    if (value.IsImmediate()) {
+        return false;
+    }
+    const auto* inst = value.Inst();
+    if (inst->GetOpcode() == IR::Opcode::GetAttributeU32) {
+        const auto attr = inst->Arg(0).Attribute();
+        return attr == IR::Attribute::LocalInvocationIndex ||
+               (attr == IR::Attribute::LocalInvocationId && inst->Arg(1).IsImmediate() &&
+                inst->Arg(1).U32() == 0 && runtime.hw.cs.workgroup_size[0] % 64 == 0);
+    }
+    if (inst->GetOpcode() != IR::Opcode::IAdd32) {
+        return false;
+    }
+    const auto aligned_group_offset = [](const IR::Value& v) {
+        if (v.IsImmediate()) {
+            return v.U32() % 64 == 0;
+        }
+        const auto* shift = v.Inst();
+        if (shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+            !shift->Arg(1).IsImmediate() || shift->Arg(1).U32() < 6 ||
+            shift->Arg(1).U32() >= 32 || shift->Arg(0).IsImmediate()) {
+            return false;
+        }
+        const auto* group = shift->Arg(0).Inst();
+        return group->GetOpcode() == IR::Opcode::GetAttributeU32 &&
+               group->Arg(0).Attribute() == IR::Attribute::WorkgroupId;
+    };
+    return (aligned_group_offset(inst->Arg(0)) && IsWaveIndex(inst->Arg(1), runtime)) ||
+           (aligned_group_offset(inst->Arg(1)) && IsWaveIndex(inst->Arg(0), runtime));
+}
+
+static bool IsWaveUniformComparison(const IR::Inst& inst, const RuntimeInfo& runtime) {
+    const auto& wg = runtime.hw.cs.workgroup_size;
+    // The lowering exchanges the two halves through workgroup barriers. A guard
+    // that selects whole waves can still split a workgroup containing several waves.
+    if (wg[0] * wg[1] * wg[2] != 64) {
+        return false;
+    }
+    using IR::Opcode;
+    const auto op = inst.GetOpcode();
+    if (op != Opcode::ULessThan32 && op != Opcode::ULessThanEqual32 &&
+        op != Opcode::UGreaterThan32 && op != Opcode::UGreaterThanEqual32) {
+        return false;
+    }
+    const bool constant_left = inst.Arg(0).IsImmediate();
+    const IR::Value boundary = inst.Arg(constant_left ? 0 : 1);
+    const IR::Value index = inst.Arg(constant_left ? 1 : 0);
+    if (!boundary.IsImmediate() || !IsWaveIndex(index, runtime)) {
+        return false;
+    }
+    const bool starts_wave = constant_left
+                                ? op == Opcode::UGreaterThan32 || op == Opcode::ULessThanEqual32
+                                : op == Opcode::ULessThan32 || op == Opcode::UGreaterThanEqual32;
+    return (boundary.U32() & 63) == (starts_wave ? 0u : 63u);
+}
+
 static bool IsDivergentCondition(const IR::U1& condition) {
     if (condition.IsImmediate()) {
         return false;
@@ -57,7 +117,7 @@ static bool TraceDivergence(const IR::Inst* inst) {
     return true;
 }
 
-static bool IsDivergentLoopCondition(const IR::U1& condition) {
+static bool IsDivergentLoopCondition(const IR::U1& condition, const RuntimeInfo& runtime) {
     if (condition.IsImmediate()) {
         return false;
     }
@@ -75,6 +135,9 @@ static bool IsDivergentLoopCondition(const IR::U1& condition) {
     while (!stack.empty()) {
         const IR::Inst* inst = stack.back();
         stack.pop_back();
+        if (IsWaveUniformComparison(*inst, runtime)) {
+            continue;
+        }
         switch (inst->GetOpcode()) {
         case IR::Opcode::LaneId:
         case IR::Opcode::MaskedBitCount32:
@@ -130,7 +193,8 @@ static bool IsDivergentLoopCondition(const IR::U1& condition) {
     return false;
 }
 
-static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
+static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program,
+                                               const RuntimeInfo& runtime) {
     using Type = IR::AbstractSyntaxNode::Type;
     static const bool uniform_loops_enabled = Common::PerfFeatureEnabled(31);
 
@@ -148,7 +212,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
             *g_wave64_trace += repeat ? "Repeat:" : "Break:";
         }
         const IR::U1 cond = repeat ? node.data.repeat.cond : node.data.break_node.cond;
-        const bool divergent = !uniform_loops_enabled || IsDivergentLoopCondition(cond);
+        const bool divergent = !uniform_loops_enabled || IsDivergentLoopCondition(cond, runtime);
         if (g_wave64_trace) {
             *g_wave64_trace += divergent ? " divergent;" : " uniform;";
         }
@@ -176,7 +240,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
                 *g_wave64_trace += "If:";
             }
             const bool divergent = uniform_loops_enabled
-                                       ? IsDivergentLoopCondition(node.data.if_node.cond)
+                                       ? IsDivergentLoopCondition(node.data.if_node.cond, runtime)
                                        : IsDivergentCondition(node.data.if_node.cond);
             if (g_wave64_trace) {
                 *g_wave64_trace += divergent ? " divergent;" : " uniform;";
@@ -246,7 +310,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     }
 
     std::vector<IR::Inst*> worklist;
-    const auto uniform_blocks = FindUniformBlocks(program);
+    const auto uniform_blocks = FindUniformBlocks(program, runtime_info);
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
         const auto push_worklist = [&](IR::Inst& inst) {
