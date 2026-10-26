@@ -464,15 +464,30 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-        .submitted = std::chrono::steady_clock::now(),
-    });
+    {
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+            .submitted = std::chrono::steady_clock::now(),
+        });
+    }
+    requests_cv.notify_one(); // GT-FF
+}
+
+// GT-FF: RYGT_FAST_FLIPS=1 shows each frame as soon as it is submitted (no faster than the
+// flip rate) instead of at the next vblank, which held a frame up to a vblank period and made
+// frame times alternate between one and two periods whenever the game ran below the refresh
+// rate. Vblanks still tick at their own rate for the game.
+static bool FastFlips() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_FAST_FLIPS");
+        return env && env[0] == '1';
+    }();
+    return on;
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -496,6 +511,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
+        const auto tick_start = std::chrono::steady_clock::now(); // GT-FF
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -542,7 +558,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
                 ReportFlipStats();
             }
-            const auto request = receive_request();
+            // GT-FF: with fast flips a frame shown since the last vblank counts against the rate.
+            const auto flip_interval = vblank_period * (flip_rate + 1);
+            const bool may_flip = !FastFlips() || std::chrono::steady_clock::now() -
+                                                          last_flip_time >=
+                                                      flip_interval - std::chrono::milliseconds(1);
+            const auto request = may_flip ? receive_request() : Request{};
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
@@ -554,6 +575,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             } else {
                 Flip(request);
                 FRAME_END;
+                last_flip_time = std::chrono::steady_clock::now();
             }
         }
 
@@ -579,6 +601,35 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
+        }
+
+        if (FastFlips()) {
+            // GT-FF: until the next vblank, frames are shown as they arrive, no closer together
+            // than the flip rate allows (the timer below keeps the vblank period exact).
+            const auto flip_interval = vblank_period * (flip_rate + 1) - std::chrono::milliseconds(1);
+            const auto deadline = tick_start + vblank_period - std::chrono::microseconds(500);
+            while (!token.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+                {
+                    std::unique_lock lk{mutex};
+                    if (!requests_cv.wait_until(lk, deadline, [this] { return !requests.empty(); })) {
+                        break;
+                    }
+                }
+                const auto allowed = last_flip_time + flip_interval;
+                if (std::chrono::steady_clock::now() < allowed) {
+                    if (allowed >= deadline) {
+                        break; // the next vblank takes it
+                    }
+                    std::this_thread::sleep_until(allowed);
+                }
+                const auto request = receive_request();
+                if (!request) {
+                    continue;
+                }
+                Flip(request);
+                FRAME_END;
+                last_flip_time = std::chrono::steady_clock::now();
+            }
         }
 
         timer.End();

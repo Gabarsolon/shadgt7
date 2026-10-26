@@ -132,6 +132,10 @@ private:
     std::atomic<s32> eop_flips_in_flight{0};
     std::mutex pace_mutex;
     std::condition_variable pace_cv;
+    // GT-FF: fast flips (RYGT_FAST_FLIPS=1): a flip request wakes the present thread, which
+    // shows the frame at once instead of at the next vblank (still at the flip rate at most).
+    std::condition_variable requests_cv;
+    std::chrono::steady_clock::time_point last_flip_time{};
 };
 
 } // namespace Libraries::VideoOut
