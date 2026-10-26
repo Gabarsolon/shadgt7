@@ -168,6 +168,7 @@ bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
            a.size == b.size && a.pitch == b.pitch && a.tile_mode == b.tile_mode &&
            a.resources == b.resources && a.num_samples == b.num_samples &&
            a.props.is_depth == b.props.is_depth && a.props.is_block == b.props.is_block &&
+           a.props.is_bgr_packed_float == b.props.is_bgr_packed_float &&
            a.type == b.type;
 }
 
@@ -336,6 +337,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
                     c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
                     c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
+                    c.props.is_bgr_packed_float == info.props.is_bgr_packed_float &&
                     c.resources.levels >= info.resources.levels &&
                     c.resources.layers >= info.resources.layers &&
                     c.size.width >= info.size.width && c.size.height >= info.size.height &&
@@ -538,6 +540,7 @@ ImageEntry* ImageRegistry::FindExisting(VAddr address,
 SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture) {
     if (target.props.is_depth || texture.props.is_depth || target.props.is_block ||
         texture.props.is_block || target.num_bits != texture.num_bits ||
+        target.props.is_bgr_packed_float != texture.props.is_bgr_packed_float ||
         target.num_samples != texture.num_samples) {
         return {};
     }
@@ -583,6 +586,7 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
 SourcePlace PartOf(const VideoCore::ImageInfo& part, const VideoCore::ImageInfo& whole) {
     if (part.props.is_depth || whole.props.is_depth || part.props.is_block ||
         whole.props.is_block || part.num_bits != whole.num_bits ||
+        part.props.is_bgr_packed_float != whole.props.is_bgr_packed_float ||
         part.num_samples != whole.num_samples || part.resources.levels != 1 ||
         (whole.resources.levels <= 1 && whole.resources.layers <= 1) ||
         part.size.depth != 1 || whole.size.depth != 1) {
@@ -1018,7 +1022,10 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             MarkStale(entry, why);
-        } else if (entry.kept.load(std::memory_order_relaxed)) {
+        } else if (why == Stale::Unmap || entry.kept.load(std::memory_order_relaxed)) {
+            // An unmap ends the backing allocation's lifetime even for active targets.
+            // Reusing those images after a fixed-address remap hides the new allocation's
+            // contents behind pixels from its previous owner.
             MarkReused(entry); // FIX-157
         }
     });
@@ -1284,7 +1291,8 @@ std::unique_ptr<Rhi::Buffer> ImageRegistry::TilingParamsBuffer(const VideoCore::
 }
 
 const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& info, bool tiler) {
-    const u64 key = (u64(tiler) << 48) | (u64(info.tile_mode) << 40) | (u64(info.num_bits) << 8) |
+    const u64 key = (u64(info.props.is_bgr_packed_float) << 49) |
+                    (u64(tiler) << 48) | (u64(info.tile_mode) << 40) | (u64(info.num_bits) << 8) |
                     info.num_samples;
     std::scoped_lock lock{untile_mutex};
     if (const auto it = untile_pipelines.find(key); it != untile_pipelines.end()) {
@@ -1292,7 +1300,7 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
     }
     const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
     const bool macro = AmdGpu::IsMacroTiled(info.array_mode);
-    std::array<Rhi::SpecConstant, 12> constants{};
+    std::array<Rhi::SpecConstant, 14> constants{};
     for (u32 i = 0; i < constants.size(); ++i) {
         constants[i].id = i;
     }
@@ -1300,6 +1308,8 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
     constants[1].value = u32(micro_tile_mode);
     constants[2].value = AmdGpu::GetMicroTileThickness(info.array_mode);
     constants[3].value = tiler ? 1 : 0;
+    constants[12].value = info.props.is_bgr_packed_float;
+    constants[13].value = !info.props.is_tiled;
     if (macro) {
         const auto macro_tile_mode =
             AmdGpu::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
@@ -1320,7 +1330,7 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
     auto pipeline = device.CreateComputePipeline({
         .layout = untile_layout.get(),
         .shader = {Rhi::ShaderStage::Compute, code, "main",
-                   std::span<const Rhi::SpecConstant>{constants.data(), macro ? 12u : 4u}},
+                   std::span<const Rhi::SpecConstant>{constants}},
     });
     const Rhi::Pipeline* result = pipeline.get();
     untile_pipelines.emplace(key, std::move(pipeline));
@@ -1596,7 +1606,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         }
         const Rhi::Buffer* linear = bytes;
         u64 linear_offset = bytes_offset;
-        if (info.props.is_tiled) {
+        if (info.props.is_tiled || info.props.is_bgr_packed_float) {
             const Rhi::Pipeline* untile = TilingPipeline(info, false);
             auto params_buffer = TilingParamsBuffer(info);
             auto out = device.CreateBuffer({.size = size,
@@ -1672,7 +1682,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
     if (size == 0 || out.Size() < out_offset + size) {
         return false;
     }
-    if (!info.props.is_tiled) {
+    if (!info.props.is_tiled && !info.props.is_bgr_packed_float) {
         auto copies = MipCopies(info);
         for (auto& copy : copies) {
             copy.buffer_offset += out_offset;

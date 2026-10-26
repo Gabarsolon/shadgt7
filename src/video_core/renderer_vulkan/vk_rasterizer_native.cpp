@@ -67,6 +67,21 @@ void RytyWatchDump(std::string label);                                          
 
 namespace {
 
+std::pair<u32, u64> DiagnosticPassOptions(u64 frame) {
+    static const char* path = std::getenv("RYGT_DIAG_PASS_FILE");
+    static u64 last_frame = ~u64{0};
+    static unsigned flags = 0;
+    static unsigned long long skip = 0;
+    if (path && last_frame != frame) {
+        last_frame = frame;
+        if (auto* file = std::fopen(path, "r")) {
+            std::fscanf(file, "%u %llx", &flags, &skip);
+            std::fclose(file);
+        }
+    }
+    return {flags, skip};
+}
+
 /// DIAG-193 (diagnosis, RYGT_DIAG_HW_WATCH=<hex address>,<seconds>): a hardware write watch over
 /// that address from that many seconds on, dumped when DIAG-184 meets a texture there.
 u64 HwWatchAddress() {
@@ -185,6 +200,9 @@ vk::ImageUsageFlags UsageOf(const Instance& instance, const VideoCore::ImageInfo
                                 vk::ImageUsageFlagBits::eTransferDst |
                                 vk::ImageUsageFlagBits::eSampled;
     if (!info.props.is_block) {
+        if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+            usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+        }
         if (info.props.is_depth) {
             usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
         } else {
@@ -638,8 +656,12 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     return handle;
 }
 
-vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& sharp,
+vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+    auto sharp = original;
+    if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
+        sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
+    }
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(border.Address()) << 1);
     std::scoped_lock lock{sampler_mutex};
@@ -5734,10 +5756,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         return hashes;
     }();
-    if (!skip_ps.empty()) {
+    const u64 diagnostic_skip = DiagnosticPassOptions(frame).second;
+    if (!skip_ps.empty() || diagnostic_skip) {
         const auto& stages = pipeline->GetStages();
         const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
-        if (fs && std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end()) {
+        if (fs && (fs->pgm_hash == diagnostic_skip ||
+                   std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end())) {
             ++stats.skipped;
             return;
         }
@@ -6039,6 +6063,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         DynamicState* const saved = Rasterizer::t_dynamic_state;
         Rasterizer::t_dynamic_state = &s.dynamic;
         r.ctx->attachment_feedback_loop = {};
+        for (const auto* color : targets.colors) {
+            if (color && std::ranges::find(b.sampled, color) != b.sampled.end()) {
+                r.ctx->attachment_feedback_loop |= vk::ImageAspectFlagBits::eColor;
+            }
+        }
+        if (targets.depth &&
+            std::ranges::find(b.sampled, targets.depth) != b.sampled.end()) {
+            r.ctx->attachment_feedback_loop |= vk::ImageAspectFlagBits::eDepth;
+        }
         r.UpdateViewportScissorState();
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
@@ -7142,6 +7175,14 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
     const u64 bytes = u64(desc.width) * height0 * texel * (rows ? 1u : layers * depth);
+    if (info.props.is_bgr_packed_float) {
+        const auto repack = [](u32 value) {
+            return (value >> 21) | (((value >> 10) & 0x7ffu) << 11) |
+                   ((value & 0x3ffu) << 22);
+        };
+        lo = repack(lo);
+        hi = repack(hi);
+    }
     const Native::Rhi::Buffer* pattern = PatternBuffer(lo, hi, bytes);
     if (!pattern || pattern->Size() < bytes) {
         return false;
@@ -8601,6 +8642,8 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         u32 index;
     };
     std::vector<Readback> readbacks;
+    std::vector<std::unique_ptr<Native::Rhi::Image>> resolved_images;
+    std::vector<std::unique_ptr<Native::Rhi::ImageView>> resolved_views;
     Stream& s = Begin();
     GlobalBarrier();
     // NAT-123: the sampled GPU-written textures follow the targets (named tex_<key>).
@@ -8677,21 +8720,66 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             continue;
         }
         const auto& desc = entry->image->Desc();
-        const u32 texel = entry->info.props.is_depth ? 4u : std::max(entry->info.num_bits / 8, 1u);
+        const u32 texel = std::max(entry->info.num_bits / 8, 1u);
         // NAT-125: every layer of the first mip (cube faces, layered targets), one after another.
         const u32 layers = desc.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max(desc.layers, 1u);
+        const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
         // FIX-152 (diagnosis): block-compressed images give their blocks (4x4 texels each).
         const bool block = entry->info.props.is_block;
         const u32 row = block ? Common::AlignUp(desc.width, 4u) : desc.width;
         const u32 rows = block ? Common::AlignUp(desc.height, 4u) : desc.height;
-        const u64 size = block ? u64(row / 4) * (rows / 4) * texel * layers
-                               : u64(desc.width) * desc.height * texel * layers;
+        const u64 size = block ? u64(row / 4) * (rows / 4) * texel * layers * depth
+                               : u64(desc.width) * desc.height * texel * layers * depth;
         auto buffer = device->CreateBuffer({.size = size,
                                             .usage = Native::Rhi::BufferUsageTransferDst,
                                             .memory = Native::Rhi::MemoryKind::Readback,
                                             .name = "native dump"});
-        if (!buffer || !buffer->Mapped() || desc.samples != 1) {
+        if (!buffer || !buffer->Mapped()) {
             continue;
+        }
+        vk::Image source{Handle<VkImage_T>(entry->image->NativeHandle())};
+        if (desc.samples != 1) {
+            if (!entry->info.props.is_depth || layers != 1) continue;
+            auto resolved_desc = desc;
+            resolved_desc.samples = 1;
+            auto resolved = device->CreateImage(resolved_desc);
+            if (!resolved) continue;
+            const vk::Image destination{Handle<VkImage_T>(resolved->NativeHandle())};
+            const vk::ImageMemoryBarrier2 transition{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = destination,
+                .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eDepth |
+                    (entry->info.props.has_stencil ? vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlags{}),
+                    .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1},
+            };
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                    .pImageMemoryBarriers = &transition});
+            Native::Rhi::ImageViewDesc view_desc{.aspect = Native::Rhi::AspectDepth};
+            auto source_view = device->CreateImageView(entry->image.get(), view_desc);
+            auto resolve_view = device->CreateImageView(resolved.get(), view_desc);
+            const vk::RenderingAttachmentInfo attachment{
+                .imageView = vk::ImageView{Handle<VkImageView_T>(source_view->NativeHandle())},
+                .imageLayout = vk::ImageLayout::eGeneral,
+                .resolveMode = vk::ResolveModeFlagBits::eSampleZero,
+                .resolveImageView = vk::ImageView{Handle<VkImageView_T>(resolve_view->NativeHandle())},
+                .resolveImageLayout = vk::ImageLayout::eGeneral,
+                .loadOp = vk::AttachmentLoadOp::eLoad,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+            };
+            s.cmd.beginRendering(vk::RenderingInfo{
+                .renderArea{.extent = {desc.width, desc.height}}, .layerCount = 1,
+                .pDepthAttachment = &attachment,
+            });
+            s.cmd.endRendering();
+            GlobalBarrier();
+            source = destination;
+            resolved_images.push_back(std::move(resolved));
+            resolved_views.push_back(std::move(source_view));
+            resolved_views.push_back(std::move(resolve_view));
         }
         const vk::BufferImageCopy copy{
             .bufferOffset = 0,
@@ -8704,9 +8792,9 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
                               .baseArrayLayer = 0,
                               .layerCount = layers},
             .imageOffset = {0, 0, 0},
-            .imageExtent = {desc.width, desc.height, 1},
+            .imageExtent = {desc.width, desc.height, depth},
         };
-        s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+        s.cmd.copyImageToBuffer(source,
                                 vk::ImageLayout::eGeneral,
                                 vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, copy);
         readbacks.push_back({entry, std::move(buffer), size, order});

@@ -1064,9 +1064,9 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
         color.float32[2] = NumberUtils::Uf10ToF32((c0 >> 22) & 0x3ff);
         break;
     case AmdGpu::DataFormat::Format11_11_10:
-        color.float32[0] = NumberUtils::Uf10ToF32(c0 & 0x3ff);
+        color.float32[0] = NumberUtils::Uf11ToF32((c0 >> 21) & 0x7ff);
         color.float32[1] = NumberUtils::Uf11ToF32((c0 >> 10) & 0x7ff);
-        color.float32[2] = NumberUtils::Uf11ToF32((c0 >> 21) & 0x7ff);
+        color.float32[2] = NumberUtils::Uf10ToF32(c0 & 0x3ff);
         break;
     case AmdGpu::DataFormat::Format5_9_9_9: {
         int exponent;

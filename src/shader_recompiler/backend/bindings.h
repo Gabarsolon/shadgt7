@@ -27,8 +27,8 @@ constexpr u32 MaxDescriptorSets = 5;
 constexpr u32 StageSet(u32 sw_stage) {
     return sw_stage < MaxDescriptorSets ? sw_stage : 0;
 }
-constexpr std::array<u32, 6> StageBufferOffsetBase{0, 32, 44, 16, 56, 0};
-constexpr std::array<u32, 6> StageBufferOffsetCount{16, 12, 12, 16, 8, 64};
+constexpr std::array<u32, 6> StageBufferOffsetBase{0, 32, 56, 16, 80, 0};
+constexpr std::array<u32, 6> StageBufferOffsetCount{16, 24, 24, 16, 16, 96};
 constexpr Bindings StageStart(u32 sw_stage) {
     return {0, sw_stage < StageBufferOffsetBase.size() ? StageBufferOffsetBase[sw_stage] : 0};
 }

@@ -272,15 +272,15 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
-    /// After the four buffer-offset vectors (SHD-002).
-    static constexpr u32 QuadSampleMaskIndex = 8;
+    /// After the six buffer-offset vectors.
+    static constexpr u32 QuadSampleMaskIndex = 10;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
-    /// SHD-002: 64 offsets, each stage with its own range (Backend::StageBufferOffsetBase).
-    std::array<u8, 64> buf_offsets;
+    /// Each stage has its own range (Backend::StageBufferOffsetBase).
+    std::array<u8, 96> buf_offsets;
     std::array<u32, 2> quad_sample_mask{~0u, ~0u};
 
     void AddOffset(u32 binding, u32 offset) {
@@ -288,7 +288,7 @@ struct PushData {
         buf_offsets[binding] = offset;
     }
 };
-static_assert(offsetof(PushData, quad_sample_mask) == 80 && sizeof(PushData) == 88);
+static_assert(offsetof(PushData, quad_sample_mask) == 112 && sizeof(PushData) == 120);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

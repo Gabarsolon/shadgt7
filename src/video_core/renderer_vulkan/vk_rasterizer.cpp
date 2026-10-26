@@ -3206,8 +3206,9 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
     }
     const auto& db = state.depth_stencil_attachment;
     if (db.image_view) {
-        text += fmt::format(" z={:#x} stencil={:#x} htile={:#x}{}{}",
+        text += fmt::format(" z={:#x} stencil={:#x} zw={:#x} sw={:#x} htile={:#x}{}{}",
                             regs.depth_buffer.DepthAddress(), regs.depth_buffer.StencilAddress(),
+                            regs.depth_buffer.DepthWriteAddress(), regs.depth_buffer.StencilWriteAddress(),
                             regs.depth_htile_data_base.GetAddress(),
                             db.depth_clear ? fmt::format(" ZCLEAR {}", regs.depth_clear)
                                            : std::string{},
@@ -3281,6 +3282,11 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
         u32(dc.depth_write_enable), u32(dc.depth_func),
         u32(dc.stencil_enable), u32(regs.depth_render_control.depth_clear_enable),
         u32(regs.depth_render_control.stencil_clear_enable), vs, ps, sampled);
+    const auto& viewport = regs.viewports[0];
+    detail += fmt::format(" | viewport scale {},{},{} offset {},{},{} cull {}",
+                          viewport.xscale, viewport.yscale, viewport.zscale,
+                          viewport.xoffset, viewport.yoffset, viewport.zoffset,
+                          u32(regs.polygon_control.CullingMode()));
     if (traced_draw) {
         const auto& blend = regs.blend_control[0];
         LOG_WARNING(Render_Vulkan, "DIAG-168: {} draw: {} blend {} {}/{}/{} {}/{}/{} mask {:#x} "
