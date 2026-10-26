@@ -490,6 +490,81 @@ NativeRenderer::~NativeRenderer() {
     samplers.clear();
 }
 
+// GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
+namespace {
+std::array<std::atomic<VAddr>, 16> g_display_addresses{};
+} // namespace
+
+void NoteDisplayAddress(VAddr address) {
+    for (auto& slot : g_display_addresses) {
+        VAddr expected = 0;
+        if (slot.load(std::memory_order_relaxed) == address ||
+            slot.compare_exchange_strong(expected, address)) {
+            return;
+        }
+    }
+}
+
+static bool IsDisplayAddress(VAddr address) {
+    for (const auto& slot : g_display_addresses) {
+        const VAddr value = slot.load(std::memory_order_relaxed);
+        if (value == 0) {
+            return false;
+        }
+        if (value == address) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
+
+bool NativeRenderer::HudSplitOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HUD_SPLIT");
+        return RytyDisplayAspect() > 0.0f && !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like) {
+    auto* entry = new Native::ImageEntry{};
+    entry->info = like.info;
+    Native::MadeImage made = MakeImage(entry->info, true);
+    if (!made.image) {
+        delete entry;
+        return nullptr;
+    }
+    entry->image = std::move(made.image);
+    entry->backend_usage = made.usage;
+    entry->backend_features = made.features;
+    // New pictures start undefined; native mode keeps its pictures in the general layout.
+    Stream& s = Begin();
+    EndRendering();
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        },
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                              .pImageMemoryBarriers = &barrier});
+    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{})",
+             like.info.guest_address, like.info.size.width, like.info.size.height);
+    return entry;
+}
+
 Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
     Native::MadeImage made{};
     if (info.pixel_format == vk::Format::eUndefined) {
@@ -5926,6 +6001,42 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[1]};
         ResolveTargets(regs, *pipeline, targets);
     }
+    // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
+    // drawn into the display's black and white HUD pictures instead.
+    std::optional<RenderState> hud_black_state;
+    std::optional<RenderState> hud_white_state;
+    if (HudSplitOn() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+        HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
+        if (layer.composite_frame != frame) {
+            layer.composite_frame = frame;
+            layer.clear_pending = true;
+            if (!layer.black) {
+                layer.black = MakeHudPicture(*targets.colors[0]);
+                layer.white = MakeHudPicture(*targets.colors[0]);
+            }
+        } else if (layer.black && layer.white) {
+            const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                          r.liverpool->DrawCbExtent(0)};
+            const vk::ImageView black = View(*layer.black, desc.view_info, ViewUse::Attachment);
+            const vk::ImageView white = View(*layer.white, desc.view_info, ViewUse::Attachment);
+            if (black && white) {
+                hud_black_state = targets.state;
+                hud_white_state = targets.state;
+                auto& b0 = hud_black_state->color_attachments[0];
+                auto& w0 = hud_white_state->color_attachments[0];
+                b0.image_view = black;
+                w0.image_view = white;
+                b0.is_clear = w0.is_clear = layer.clear_pending ? 1u : 0u;
+                b0.clear_value = {};
+                const u32 one = std::bit_cast<u32>(1.0f);
+                w0.clear_value = layer.clear_pending ? std::array<u32, 4>{one, one, one, one}
+                                                     : std::array<u32, 4>{};
+                layer.clear_pending = false;
+                layer.hud_frame = frame;
+            }
+        }
+    }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
@@ -6160,7 +6271,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     {
         PhaseClock part{stats.record_ns[1]};
-        BeginRendering(targets.state);
+        BeginRendering(hud_black_state ? *hud_black_state : targets.state);
     }
 
     // The renderer's dynamic state code, filling this list's state.
@@ -6203,8 +6314,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock part{stats.record_ns[5]};
         PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
     }
-    {
-        PhaseClock part{stats.record_ns[6]};
+    const auto record_draw = [&] {
         if (indirect) {
             RecordIndirect(*indirect, *arguments, is_indexed); // NAT-161
         } else {
@@ -6223,6 +6333,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             } else {
                 cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
             }
+        }
+    };
+    {
+        PhaseClock part{stats.record_ns[6]};
+        record_draw();
+        if (hud_white_state) {
+            // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
+            // stay bound across the change of attachment).
+            BeginRendering(*hud_white_state);
+            record_draw();
         }
     }
     {
@@ -8541,8 +8661,19 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         ReadDrawProbes();
     }
     Splice();
-    const Display display{vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
-                          entry->info.size.width, entry->info.size.height};
+    Display display{vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
+                    entry->info.size.width, entry->info.size.height};
+    // GT7-UW: the HUD drawn into this display in the frame just finished (frame counted it).
+    if (HudSplitOn()) {
+        const auto it = hud_layers.find(info.guest_address);
+        if (it != hud_layers.end() && it->second.black && it->second.white &&
+            it->second.hud_frame + 1 == frame) {
+            VideoCore::ImageViewInfo hud_view{};
+            hud_view.format = view_format;
+            display.hud_black = View(*it->second.black, hud_view, ViewUse::Sampled);
+            display.hud_white = View(*it->second.white, hud_view, ViewUse::Sampled);
+        }
+    }
     VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
     return display;

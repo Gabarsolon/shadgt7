@@ -1137,7 +1137,23 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     }
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings);
+    // GT7-UW: the HUD at 16:9, centred over the stretched picture.
+    auto hud_settings = pp_settings;
+    if (display->hud_black && display->hud_white && frame->width > 0) {
+        const float hud_width = std::min(1.0f, float(frame->height) * 16.0f / 9.0f / float(frame->width));
+        hud_settings.hud_x0 = 0.5f - hud_width / 2.0f;
+        hud_settings.hud_x1 = 0.5f + hud_width / 2.0f;
+        const vk::MemoryBarrier2 hud_written{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        };
+        pass_cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                        .pMemoryBarriers = &hud_written});
+    }
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, display->hud_black,
+                   display->hud_white);
     const vk::ImageMemoryBarrier2 back{
         .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                         vk::PipelineStageFlagBits2::eComputeShader,

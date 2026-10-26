@@ -113,6 +113,9 @@ public:
         vk::ImageView view;
         u32 width;
         u32 height;
+        /// GT7-UW: the frame's HUD drawn over black and over white (both null without one).
+        vk::ImageView hud_black{};
+        vk::ImageView hud_white{};
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
 
@@ -219,6 +222,21 @@ private:
     };
 
     Native::MadeImage MakeImage(const VideoCore::ImageInfo& info, bool render_target);
+
+    /// GT7-UW: with a wider-than-16:9 screen (GPU.aspect_ratio), the draws into a display
+    /// buffer after the frame's first one (the picture of the 3D scene) are the HUD. They go
+    /// to two pictures of the display's layout instead, one cleared black and one white, so the
+    /// presenter can stretch the scene over the window and lay the HUD over it at 16:9.
+    struct HudLayer {
+        Native::ImageEntry* black = nullptr; ///< made once, kept for the run
+        Native::ImageEntry* white = nullptr;
+        u64 composite_frame = ~u64{0}; ///< the frame the scene was drawn in
+        u64 hud_frame = ~u64{0};       ///< the frame HUD draws went to the layer in
+        bool clear_pending = false;    ///< the next HUD draw clears both pictures first
+    };
+    std::unordered_map<VAddr, HudLayer> hud_layers;
+    static bool HudSplitOn();
+    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like);
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,

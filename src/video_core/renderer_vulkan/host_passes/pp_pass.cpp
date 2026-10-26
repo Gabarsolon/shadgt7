@@ -16,9 +16,21 @@
 namespace Vulkan::HostPasses {
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
-    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 2> bindings{
+    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 3> bindings{
         {
             .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        { // GT7-UW: the HUD over black
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        { // GT7-UW: the HUD over white
+            .binding = 2,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
@@ -182,7 +194,8 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 }
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                                vk::Extent2D input_size, Frame& frame, Settings settings) {
+                                vk::Extent2D input_size, Frame& frame, Settings settings,
+                                vk::ImageView hud_black, vk::ImageView hud_white) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -219,6 +232,20 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .imageView = input,
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
+    // GT7-UW: the HUD pictures stay in the general layout native mode keeps its pictures in;
+    // without a HUD the input stands in (the shader does not read it then).
+    const bool hud = hud_black && hud_white;
+    settings.hud = hud ? 1u : 0u;
+    const vk::DescriptorImageInfo hud_black_info{
+        .sampler = *sampler,
+        .imageView = hud ? hud_black : input,
+        .imageLayout = hud ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    const vk::DescriptorImageInfo hud_white_info{
+        .sampler = *sampler,
+        .imageView = hud ? hud_white : input,
+        .imageLayout = hud ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
 
     const std::array set_writes{
         vk::WriteDescriptorSet{
@@ -228,6 +255,22 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &image_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &hud_black_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &hud_white_info,
         },
     };
 
