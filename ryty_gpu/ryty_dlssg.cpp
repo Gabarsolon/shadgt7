@@ -391,13 +391,13 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!g_sl.options_set) {
         sl::DLSSGOptions options{};
         options.mode = sl::DLSSGMode::eOn;
-        // GT-MFG: frames generated between game frames, RYGT_DLSSG_FRAMES=1..3 (2x to 4x;
-        // default 1; multi-frame generation needs an RTX 50). DLSS-G reports what the GPU
-        // supports only once it runs, so the request goes in as asked and falls back to one
-        // generated frame when refused.
+        // GT-MFG: frames generated between game frames, RYGT_DLSSG_FRAMES=1..5 (2x to 6x;
+        // default 1; multi-frame generation needs an RTX 50, 6x a recent driver). DLSS-G
+        // reports what the GPU supports only once it runs, so the request goes in as asked and
+        // falls back to one generated frame when refused.
         u32 frames = 1;
         if (const char* env = std::getenv("RYGT_DLSSG_FRAMES"); env && *env) {
-            frames = std::clamp<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 3u);
+            frames = std::clamp<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 5u);
         }
         options.numFramesToGenerate = frames;
         sl::Result set = g_sl.dlssg_set_options(viewport, options);
