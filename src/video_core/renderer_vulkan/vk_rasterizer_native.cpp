@@ -6006,7 +6006,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     std::optional<RenderState> hud_black_state;
     std::optional<RenderState> hud_white_state;
     HudLayer* hud_layer = nullptr;
+    // (Multisampled, as a race's track and course maps are; a menu's small pictures drawn with
+    // depth, like the World Map's 256x256 probe, are not.)
     if (HudSplitOn() && targets.colors[0] && targets.depth &&
+        targets.colors[0]->info.num_samples > 1 &&
         targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
         hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
     }
