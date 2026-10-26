@@ -424,7 +424,7 @@ struct RegisterDiff {
 std::unordered_map<u32, RegisterDiff> g_register_diffs; // sampled draws only
 std::unordered_map<u32, RegisterDiff> g_relevant_diffs; // sampled draws, registers that matter
 
-constexpr u32 kContextDcb = 0x780; // a PGL context's Gnm DrawCommandBuffer
+u32 kContextDcb = 0x780; // a PGL context's Gnm DrawCommandBuffer (GT7: 0x778, SetPglContextDcb)
 
 const u32* DcbBegin(const u8* dcb) {
     return *reinterpret_cast<const u32* const*>(dcb); // Gnm CommandBuffer::m_beginptr
@@ -858,6 +858,10 @@ std::atomic<bool> g_reporter_started{false};
 
 bool ShadowEnabled() {
     return g_enabled;
+}
+
+void SetPglContextDcb(u32 offset) {
+    kContextDcb = offset;
 }
 
 bool ShadowComparing() {

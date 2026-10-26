@@ -22,6 +22,8 @@ namespace Native {
 /// Whether render jobs are walked on their threads (shadow mode, or OPT-010 native prepare mode:
 /// RYGT_NATIVE_PREPARE=1).
 bool ShadowEnabled();
+/// GT7-PREP: where a PGL context keeps its Gnm DrawCommandBuffer (GT Sport 0x780, GT7 0x778).
+void SetPglContextDcb(u32 offset);
 /// Whether the command processor compares its state with the jobs' (RYGT_NATIVE_SHADOW=1).
 bool ShadowComparing();
 

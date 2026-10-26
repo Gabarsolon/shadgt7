@@ -179,10 +179,13 @@ GuestTls FindGuestTls(u8* exe_base) {
     return {};
 }
 
+u32 g_context_slot = 8; // GT-PREP: GT7 keeps the current context at tp - 0x18
+u32 g_context_dcb = kPglContextDcb;
+
 u8* CurrentPglContext() {
     auto* const* blocks = reinterpret_cast<u8* const*>(__readgsqword(0x58));
     u8* const tp = blocks[*g_tls.index] + g_tls.block_size;
-    return *reinterpret_cast<u8**>(tp - 8);
+    return *reinterpret_cast<u8**>(tp - g_context_slot);
 }
 
 // PGL creates a job by forking the current context (returns the child context): the parent's
@@ -226,6 +229,64 @@ u64 PS4_SYSV_ABI ForkHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     const u64 child = g_fork(a, b, c, d, e, f);
     ShadowFork(parent, slot, run_begin, run_limit, reinterpret_cast<const u8*>(child), caller);
     return child;
+}
+
+// GT7-PREP: GT7 (CUSA24769 1.00) has the same PGL job functions with a job object between
+// them: fork(out, ...) puts the child context at out[0] (it returns nothing), job begin(out)
+// makes out[0] current (and returns nothing). Job end is GT Sport's. Found by their use of the
+// PGL context slot (tp - 0x18): begin saves the previous context at +0xa30 and sets the new one,
+// end puts it back, fork marks the parent (+0x636 = 0x3f, GT Sport +0x63e). The context's Gnm
+// DrawCommandBuffer is at +0x778 (end writes its link through +0x788, the write pointer).
+constexpr u64 kGt7JobBegin = 0x26b6260;
+constexpr u64 kGt7JobEnd = 0x26b77a0;
+constexpr u64 kGt7Fork = 0x26b4150;
+// The first bytes of GT7's job begin: hooks go in only for this executable.
+constexpr std::array<u8, 24> kGt7JobBeginBytes = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+    0x53, 0x48, 0x83, 0xec, 0x18, 0x4c, 0x8b, 0x3f, 0x48, 0x89, 0xfb, 0x4d};
+
+bool IsGt7(u8* exe_base) {
+    u8* const function = exe_base + 0x10000 + kGt7JobBegin;
+    MEMORY_BASIC_INFORMATION info;
+    return VirtualQuery(function, &info, sizeof(info)) && info.State == MEM_COMMIT &&
+           reinterpret_cast<u8*>(info.BaseAddress) + info.RegionSize >=
+               function + kGt7JobBeginBytes.size() &&
+           std::memcmp(function, kGt7JobBeginBytes.data(), kGt7JobBeginBytes.size()) == 0;
+}
+
+u64 PS4_SYSV_ABI Gt7JobBeginHook(u64 job, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    const u64 context = job ? *reinterpret_cast<const u64*>(job) : 0;
+    const u64 result = g_job_begin(job, b, c, d, e, f);
+    g_jobs.fetch_add(1, std::memory_order_relaxed);
+    if (ShadowEnabled() && context != 0) {
+        if (g_tls_ok.load(std::memory_order_relaxed) &&
+            CurrentPglContext() != reinterpret_cast<u8*>(context) &&
+            g_tls_mismatches.fetch_add(1) == 0) {
+            g_tls_ok = false;
+            LOG_ERROR(Lib_GnmDriver, "GT7-PREP: guest TLS lookup gives {} at job begin, not {}; "
+                                     "forks are not followed",
+                      fmt::ptr(CurrentPglContext()), fmt::ptr(reinterpret_cast<u8*>(context)));
+        }
+        ShadowJobBegin(reinterpret_cast<const u8*>(context) + g_context_dcb);
+    }
+    return result;
+}
+
+u64 PS4_SYSV_ABI Gt7ForkHook(u64 out, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    if (!ShadowEnabled() || !g_tls_ok.load(std::memory_order_relaxed) || out == 0) {
+        return g_fork(out, b, c, d, e, f);
+    }
+    const u8* parent = CurrentPglContext();
+    const auto* dcb = parent ? reinterpret_cast<const u32* const*>(parent + g_context_dcb)
+                             : nullptr;
+    const u32* run_begin = dcb ? dcb[0] : nullptr;
+    const u32* run_limit = dcb ? dcb[1] : nullptr;
+    const u32* slot = dcb ? dcb[2] : nullptr;
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0)) - g_exe_base - 0x10000;
+    const u64 result = g_fork(out, b, c, d, e, f);
+    const u64 child = *reinterpret_cast<const u64*>(out);
+    ShadowFork(parent, slot, run_begin, run_limit, reinterpret_cast<const u8*>(child), caller);
+    return result;
 }
 
 u64 PS4_SYSV_ABI JobEndHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
@@ -325,6 +386,37 @@ void InstallGtsHooks(u8* exe_base) {
         return;
     }
     static NearCode code{exe_base};
+    // GT7-PREP: GT7's job functions only (its draw functions are not known); prepared draws
+    // need them, so only with shadow or prepare mode.
+    if (IsGt7(exe_base)) {
+        if (!ShadowEnabled()) {
+            return;
+        }
+        g_context_slot = 0x18;
+        g_context_dcb = 0x778;
+        SetPglContextDcb(0x778);
+        int hooked = 0;
+        g_job_begin = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kGt7JobBegin, kPushR15,
+                                                        reinterpret_cast<void*>(&Gt7JobBeginHook),
+                                                        "GT7 PGL job begin"));
+        g_job_end = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kGt7JobEnd, kPushR15,
+                                                      reinterpret_cast<void*>(&JobEndHook),
+                                                      "GT7 PGL job end"));
+        hooked += (g_job_begin != nullptr) + (g_job_end != nullptr);
+        g_exe_base = reinterpret_cast<u64>(exe_base);
+        g_tls = FindGuestTls(exe_base);
+        if (g_tls.index != nullptr) {
+            g_fork = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kGt7Fork, kPushR15,
+                                                       reinterpret_cast<void*>(&Gt7ForkHook),
+                                                       "GT7 PGL fork (job creation)"));
+            g_tls_ok = g_fork != nullptr;
+            hooked += g_fork != nullptr;
+        }
+        std::fprintf(stderr, "[native] GT7-PREP: %d of 3 job hooks installed (TLS index %p, "
+                     "block size %#x)\n", hooked, static_cast<const void*>(g_tls.index),
+                     g_tls.block_size);
+        return;
+    }
     void* const hooks[kDrawKinds] = {
         reinterpret_cast<void*>(&DrawHook<Arrays>),
         reinterpret_cast<void*>(&DrawHook<ArraysInstanced>),
