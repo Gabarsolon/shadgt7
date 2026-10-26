@@ -3568,6 +3568,14 @@ void NativeRenderer::WatchHistoryRanges() {
             WatchPages(from, to - from);
         }
     }
+    // DIAG-214 (diagnosis): a frame dump also prints the kept ranges' histories.
+    static u64 printed_at = 0;
+    if (r.FrameDumpCollecting() && frame > printed_at + 30) {
+        printed_at = frame;
+        for (const auto& [from, to] : HistoryRanges()) {
+            PrintHistory(from, to - from);
+        }
+    }
 }
 
 void NativeRenderer::PrintHistory(VAddr begin, u64 size) {
