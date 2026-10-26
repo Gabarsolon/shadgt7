@@ -681,6 +681,10 @@ private:
     static bool SubVersionsOn();
     /// NAT-104: copies the newer pictures of the render targets a texture is made of into it.
     void RefreshSources(Native::ImageEntry& texture);
+    /// FIX-212: a depth target and a colour target of its layout at its address (D16/R16,
+    /// D32/R32) are one picture: the other's newer one is copied in before either is used
+    /// (RYGT_NATIVE_DEPTH_TWINS=0 off).
+    void SyncDepthTwin(Native::ImageEntry& entry);
     /// FIX-210: before a draw into a target that is mips or layers of a larger one (FIX-197),
     /// the subresources of the drawn view that the larger one holds newer pictures for are
     /// copied in (RYGT_NATIVE_PART_SYNC=0 off).

@@ -2193,6 +2193,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             entry ? View(*entry, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
         if (view) {
             ApplyRewrite(*entry); // NAT-120
+            SyncDepthTwin(*entry); // FIX-212
             if (regs.depth_buffer.StencilValid() && entry->info.props.has_stencil) {
                 auto& owners = stencil_owners[regs.depth_buffer.StencilAddress()];
                 if (std::ranges::find(owners, entry) == owners.end()) {
@@ -4177,6 +4178,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 }
                 SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
                 ApplyRewrite(*entry); // NAT-120
+                SyncDepthTwin(*entry); // FIX-212
                 if (!storage) {
                     if (entry->from_cpu && registry->RewrittenSmall(*entry)) {
                         ++stats.small_rewrites; // FIX-202
@@ -4241,6 +4243,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         }
         SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
+        SyncDepthTwin(*entry); // FIX-212
         if (!storage && r.FrameDumpCollecting()) {
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
             static const bool dump_all = [] {
@@ -5248,6 +5251,101 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     }
     stats.source_copies += picks.size();
     ++s.commands;
+}
+
+void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
+    // FIX-212: on the PS4 a depth buffer and a colour picture of its layout at its address are
+    // the same memory. GT7 double-buffers its 5120x5120 static shadow map (D16 at 0x2900000000
+    // and 0x2920000000): each frame a compute pass reprojects the last map into the other
+    // through an R16 storage image, then draws a few tiles into it as a depth buffer and samples
+    // it the next frame. The stores went into an R16 image of their own; the depth buffer, made
+    // from memory (which never holds what the GPU wrote), stayed zero, so one map in two put the
+    // whole scene in shadow: the flickering dark band at Alsace. Vulkan copies no colour image
+    // into a depth one, so the picture goes through a buffer.
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_DEPTH_TWINS");
+        return !(env && env[0] == '0');
+    }();
+    const auto& info = entry.info;
+    if (!on || entry.from_cpu || !entry.image || info.num_samples != 1 ||
+        info.props.has_stencil ||
+        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
+        return;
+    }
+    Native::ImageEntry* twin =
+        registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& other) {
+            const auto& o = other.info;
+            return &other != &entry && !other.from_cpu && other.image &&
+                   o.props.is_depth != info.props.is_depth && !o.props.has_stencil &&
+                   o.num_samples == 1 && o.num_bits == info.num_bits &&
+                   o.size.width == info.size.width && o.size.height == info.size.height &&
+                   o.resources.levels == info.resources.levels &&
+                   o.resources.layers == info.resources.layers && o.type == info.type &&
+                   (o.props.is_depth || LiverpoolToVK::IsFormatDepthCompatible(o.pixel_format));
+        });
+    if (!twin) {
+        return;
+    }
+    const u64 version = twin->write_version.load(std::memory_order_relaxed);
+    if (version == 0 || version <= entry.write_version.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u32 texel = std::max<u32>(info.num_bits / 8, 1);
+    const u32 mips = std::max<u32>(info.resources.levels, 1);
+    const u32 layers = std::max<u32>(info.resources.layers, 1);
+    const auto aspect = [](const Native::ImageEntry& e) {
+        return e.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                     : vk::ImageAspectFlagBits::eColor;
+    };
+    boost::container::small_vector<vk::BufferImageCopy, 16> from, into;
+    u64 offset = 0;
+    for (u32 m = 0; m < mips; ++m) {
+        const u32 width = std::max(info.size.width >> m, 1u);
+        const u32 height = std::max(info.size.height >> m, 1u);
+        vk::BufferImageCopy copy{
+            .bufferOffset = offset,
+            .imageSubresource{.mipLevel = m, .baseArrayLayer = 0, .layerCount = layers},
+            .imageExtent = {width, height, 1},
+        };
+        copy.imageSubresource.aspectMask = aspect(*twin);
+        from.push_back(copy);
+        copy.imageSubresource.aspectMask = aspect(entry);
+        into.push_back(copy);
+        offset += u64(width) * height * layers * texel;
+    }
+    auto staging = device->CreateBuffer({.size = offset,
+                                         .usage = Native::Rhi::BufferUsageTransferSrc |
+                                                  Native::Rhi::BufferUsageTransferDst,
+                                         .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                         .name = "native depth twin copy"});
+    if (!staging) {
+        return;
+    }
+    Stream& s = Begin();
+    ApplyRewrite(*twin);
+    ApplyRewrite(entry);
+    // Their own uploads first (a new target starts with what memory holds, NAT-127).
+    const std::array<const Native::ImageEntry*, 2> both{&entry, twin};
+    PrepareImages(std::span<const Native::ImageEntry* const>{both});
+    GlobalBarrier(); // the twin's picture is written
+    const vk::Buffer buffer{Handle<VkBuffer_T>(staging->NativeHandle())};
+    s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(twin->image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, buffer, from);
+    GlobalBarrier();
+    s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, into);
+    s.keep.push_back(std::move(staging)); // freed once the GPU ran this list
+    s.written.push_back(&entry);          // read after the next barrier
+    ++s.commands;
+    WrittenSubresources(&entry, version, nullptr);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+        LOG_INFO(Render_Vulkan, "FIX-212: {} {:#x} {}x{} {} <- {} {} (version {}, frame {})",
+                 info.props.is_depth ? "depth" : "colour", info.guest_address, info.size.width,
+                 info.size.height, vk::to_string(info.pixel_format),
+                 twin->info.props.is_depth ? "depth" : "colour",
+                 vk::to_string(twin->info.pixel_format), version, frame);
+    }
 }
 
 bool NativeRenderer::PartSyncOn() {
@@ -7062,11 +7160,13 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
         entry.last_use.store(frame, std::memory_order_relaxed);
         ApplyRewrite(entry); // NAT-120
+        SyncDepthTwin(entry); // FIX-212
     }
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
         entry.last_use.store(frame, std::memory_order_relaxed);
         ApplyRewrite(entry); // NAT-120, NAT-133
+        SyncDepthTwin(entry); // FIX-212
         if (entry.from_cpu && registry->RewrittenSmall(entry)) {
             ++stats.small_rewrites; // FIX-202
         }
