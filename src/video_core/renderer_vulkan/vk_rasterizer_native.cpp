@@ -528,6 +528,70 @@ bool NativeRenderer::HudSplitOn() {
     return on;
 }
 
+bool NativeRenderer::HudStreamOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HUD_STREAM");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// Called with the HUD list swapped in as the stream.
+void NativeRenderer::BeginHudStream() {
+    Stream& s = stream;
+    if (s.list) {
+        return;
+    }
+    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+    s.list->Begin();
+    s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+    s.rendering = false;
+    s.dynamic.Invalidate();
+    s.pipeline = vk::Pipeline{};
+    s.vertex_state_known = false;
+    s.commands = 0;
+    // It runs after the main list: what that list wrote is finished first.
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                              .pMemoryBarriers = &barrier});
+}
+
+// Runs the HUD list after the main one (in the same command buffer, at the same tick).
+void NativeRenderer::SpliceHudStream(u64 tick) {
+    Stream& s = hud_stream;
+    if (!s.list) {
+        return;
+    }
+    if (s.rendering) {
+        s.cmd.endRendering();
+        s.rendering = false;
+    }
+    s.list->End();
+    r.scheduler.CommandBuffer().executeCommands(s.cmd);
+    device->MarkExecuted(s.list, {timeline.get(), tick});
+    {
+        std::scoped_lock chunk_lock{chunk_mutex};
+        for (auto& chunk : s.chunks) {
+            chunk.retire_tick = tick;
+            retiring_chunks.push_back(std::move(chunk));
+        }
+        for (const auto pool : s.pools) {
+            retiring_pools.emplace_back(tick, pool);
+        }
+    }
+    s.chunks.clear();
+    s.chunk_used = 0;
+    s.pools.clear();
+    s.keep.clear();
+    s.list = nullptr;
+    s.cmd = vk::CommandBuffer{};
+}
+
 Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like) {
     auto* entry = new Native::ImageEntry{};
     entry->info = like.info;
@@ -6134,7 +6198,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             const char* env = std::getenv("RYGT_NATIVE_PASS_BARRIERS");
             return !(env && env[0] == '0');
         }();
-        const bool pass_change = !s.rendering || !(s.render == targets.state);
+        const bool pass_change =
+            !s.rendering || !(s.render == (hud_black_state ? *hud_black_state : targets.state));
         // FIX-183 (diagnosis, RYGT_NATIVE_DRAW_BARRIER=1): a full barrier before every draw.
         static const bool draw_barrier = [] {
             const char* env = std::getenv("RYGT_NATIVE_DRAW_BARRIER");
@@ -6297,6 +6362,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
 
     // The renderer's dynamic state code, filling this list's state.
+    const auto bind_state = [&] {
     {
         PhaseClock part{stats.record_ns[2]};
         DynamicState* const saved = Rasterizer::t_dynamic_state;
@@ -6323,12 +6389,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock part{stats.record_ns[3]};
         RecordVertexIndex(*vi);
     }
-    const u32 index_count = vi->index_count;
-    const CmdBuf cmdbuf{s.cmd};
     {
         PhaseClock part{stats.record_ns[4]};
         if (s.pipeline != pipeline->Handle()) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
             s.pipeline = pipeline->Handle();
         }
     }
@@ -6336,7 +6400,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock part{stats.record_ns[5]};
         PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
     }
+    };
+    bind_state();
+    const u32 index_count = vi->index_count;
     const auto record_draw = [&] {
+        const CmdBuf cmdbuf{stream.cmd}; // the HUD list's when it is swapped in
         if (indirect) {
             RecordIndirect(*indirect, *arguments, is_indexed); // NAT-161
         } else {
@@ -6361,7 +6429,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     {
         PhaseClock part{stats.record_ns[6]};
         record_draw();
-        if (hud_white_state) {
+        if (hud_white_state && HudStreamOn() && !stream.wrapped_list) {
+            // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
+            std::swap(stream, hud_stream);
+            BeginHudStream();
+            BeginRendering(*hud_white_state);
+            bind_state();
+            record_draw();
+            std::swap(stream, hud_stream);
+        } else if (hud_white_state) {
             // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
             // stay bound across the change of attachment).
             BeginRendering(*hud_white_state);
@@ -8578,6 +8654,7 @@ void NativeRenderer::Splice() {
         r.scheduler.CommandBuffer().executeCommands(secondary);
     }
     const u64 tick = r.scheduler.CurrentTick();
+    SpliceHudStream(tick); // GT7-UW
     if (!wrapped) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
     }

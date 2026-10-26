@@ -863,6 +863,13 @@ private:
 
     std::recursive_mutex mutex; ///< v0: the recorder thread records; flips may come from others
     Stream stream;
+    /// GT7-UW: the HUD draws over white, recorded in a list of their own that runs right after
+    /// the main one (which draws them over black): neither list switches between the two
+    /// pictures, so consecutive HUD draws stay in one pass without barriers between them.
+    Stream hud_stream;
+    static bool HudStreamOn();
+    void BeginHudStream();
+    void SpliceHudStream(u64 tick);
     DrawBindings bindings;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
