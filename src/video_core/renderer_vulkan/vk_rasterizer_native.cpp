@@ -6005,6 +6005,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // drawn into the display's black and white HUD pictures instead.
     std::optional<RenderState> hud_black_state;
     std::optional<RenderState> hud_white_state;
+    HudLayer* hud_layer = nullptr;
+    if (HudSplitOn() && targets.colors[0] && targets.depth &&
+        targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
+        hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
+    }
     if (HudSplitOn() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
         IsDisplayAddress(targets.colors[0]->info.guest_address)) {
         HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
@@ -6034,6 +6039,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                                      : std::array<u32, 4>{};
                 layer.clear_pending = false;
                 layer.hud_frame = frame;
+                hud_layer = &layer;
             }
         }
     }
@@ -6047,6 +6053,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
+    // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
+    const auto note_race_hud = [&] {
+        if (!hud_layer || hud_layer->race_frame == frame) {
+            return;
+        }
+        for (const auto* sampled : b.sampled) {
+            const auto it = hud_depth_drawn.find(sampled->info.guest_address);
+            if (it != hud_depth_drawn.end() && it->second == frame) {
+                hud_layer->race_frame = frame;
+                return;
+            }
+        }
+    };
     if (!from_prepared) {
         b.Clear();
         b.push = UserData(regs);
@@ -6335,6 +6354,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
     };
+    note_race_hud();
     {
         PhaseClock part{stats.record_ns[6]};
         record_draw();
@@ -7761,6 +7781,14 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     if (!src || !dst) {
         return;
     }
+    // GT7-UW: a resolve of a picture drawn with depth this frame (a race's minimaps are drawn
+    // with MSAA and resolved before the HUD shows them) passes that on to its result.
+    if (HudSplitOn()) {
+        const auto it = hud_depth_drawn.find(src->info.guest_address);
+        if (it != hud_depth_drawn.end() && it->second == frame) {
+            hud_depth_drawn[dst->info.guest_address] = frame;
+        }
+    }
     Stream& s = Begin();
     // NAT-122: a fill before the resolve is applied before it (left pending, it cleared the
     // resolved picture at its first read: GT Sport's minimaps, resolved into the scratch pool).
@@ -8672,6 +8700,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             hud_view.format = view_format;
             display.hud_black = View(*it->second.black, hud_view, ViewUse::Sampled);
             display.hud_white = View(*it->second.white, hud_view, ViewUse::Sampled);
+            display.hud_race = it->second.race_frame + 1 == frame;
         }
     }
     VerifyMirrors(); // FIX-176 (diagnosis)

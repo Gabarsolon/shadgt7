@@ -1376,7 +1376,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     }
     // GT7-UW: the HUD pieces, as placed with the F7 editor.
     std::vector<HostPasses::PostProcessingPass::HudWidget> hud_widgets;
-    if (display->hud_black && display->hud_white) {
+    if (display->hud_black && display->hud_white && display->hud_race) { // not in menus
         auto& layout = HudLayout();
         std::scoped_lock lock{layout.mutex};
         if (!layout.loaded) {

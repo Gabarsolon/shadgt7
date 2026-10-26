@@ -116,6 +116,8 @@ public:
         /// GT7-UW: the frame's HUD drawn over black and over white (both null without one).
         vk::ImageView hud_black{};
         vk::ImageView hud_white{};
+        /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
+        bool hud_race = false;
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
 
@@ -233,7 +235,11 @@ private:
         u64 composite_frame = ~u64{0}; ///< the frame the scene was drawn in
         u64 hud_frame = ~u64{0};       ///< the frame HUD draws went to the layer in
         bool clear_pending = false;    ///< the next HUD draw clears both pictures first
+        u64 race_frame = ~u64{0};      ///< the frame its HUD showed a race's maps
     };
+    /// GT7-UW: small pictures drawn with a depth buffer, and the frame (a race HUD's track
+    /// and course maps are drawn so every frame; menus' HUDs take none).
+    std::unordered_map<VAddr, u64> hud_depth_drawn; ///< by address
     std::unordered_map<VAddr, HudLayer> hud_layers;
     static bool HudSplitOn();
     Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like);
