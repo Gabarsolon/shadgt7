@@ -2,12 +2,12 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 # shadGT7
 
-The experimental Vulkan renderer used by [ryGT7](https://gitlab.com/67933lance/rygt7) for
+The experimental Vulkan renderer used by [ryGT7](https://gitlab.com/rygt-team/rygt7) for
 Gran Turismo 7 on Windows. Derived from [shadGT](https://github.com/mlgprorektm8/shadGT),
 [shadPS4](https://github.com/shadps4-emu/shadPS4), and their contributors. Upstream Git history
 and license notices are preserved.
 
-Players should use the complete [ryGT7 prerelease](https://gitlab.com/67933lance/rygt7/-/releases)
+Players should use the complete [ryGT7 prerelease](https://gitlab.com/rygt-team/rygt7/-/releases)
 and its launcher. This repository supplies the renderer library, not a standalone GT7 setup.
 You provide your own decrypted CUSA24769 game, firmware modules, and fonts.
 
@@ -28,7 +28,7 @@ cmake --build Build/x64-Clang-Release --target ryty_gpu --parallel 8
 ```
 
 This builds libSceVideoOut.prx. The companion runtime and packaging instructions are in
-[ryGT7 build-support](https://gitlab.com/67933lance/rygt7/-/tree/main/build-support).
+[ryGT7 build-support](https://gitlab.com/rygt-team/rygt7/-/tree/main/build-support).
 The standalone shadGT emulator and historical GT Sport documentation remain inherited source;
 use the ryGT7 launcher to prepare and run GT7.
 
