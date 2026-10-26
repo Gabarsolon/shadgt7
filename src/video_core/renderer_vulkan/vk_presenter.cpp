@@ -157,13 +157,13 @@ std::vector<HudPiece> DefaultHudPieces() {
         return HudPiece{name, {x / 1920.0f, y / 1080.0f, w / 1920.0f, h / 1080.0f}};
     };
     return {
-        piece("Lap", 20, 30, 140, 95),
-        piece("Lap time", 820, 225, 280, 70),
-        piece("Track map", 1560, 15, 210, 295),
-        piece("Position", 1690, 320, 230, 70),
-        piece("Race time", 15, 1000, 215, 70),
-        piece("Dashboard", 245, 935, 1100, 140),
-        piece("Course map", 1575, 805, 340, 270),
+        piece("Lap", 10, 20, 170, 115),
+        piece("Lap time", 790, 215, 340, 90),
+        piece("Track map", 1530, 5, 260, 315),
+        piece("Position", 1670, 310, 250, 200),
+        piece("Race time", 5, 990, 250, 90),
+        piece("Dashboard", 235, 920, 1120, 160),
+        piece("Course map", 1560, 790, 360, 290),
     };
 }
 
@@ -298,8 +298,15 @@ static void DrawHudEditor(ImVec2 origin, ImVec2 size) {
                     piece.src[0] = std::clamp(piece.src[0] + dx / width, 0.0f, 1.0f - piece.src[2]);
                     piece.src[1] = std::clamp(piece.src[1] + dy, 0.0f, 1.0f - piece.src[3]);
                 } else {
+                    // A placed piece keeps its scale: its box on the screen grows with its area.
+                    const float scale_x = piece.dst[2] / std::max(piece.src[2], 0.001f);
+                    const float scale_y = piece.dst[3] / std::max(piece.src[3], 0.001f);
                     piece.src[2] = std::clamp(piece.src[2] + dx / width, 0.01f, 1.0f - piece.src[0]);
                     piece.src[3] = std::clamp(piece.src[3] + dy, 0.01f, 1.0f - piece.src[1]);
+                    if (piece.placed) {
+                        piece.dst[2] = std::min(piece.src[2] * scale_x, 1.0f - piece.dst[0]);
+                        piece.dst[3] = std::min(piece.src[3] * scale_y, 1.0f - piece.dst[1]);
+                    }
                 }
             } else {
                 if (!piece.placed) {
