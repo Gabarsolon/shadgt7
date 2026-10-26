@@ -392,27 +392,25 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         sl::DLSSGOptions options{};
         options.mode = sl::DLSSGMode::eOn;
         // GT-MFG: frames generated between game frames, RYGT_DLSSG_FRAMES=1..3 (2x to 4x;
-        // default 1), no more than the GPU supports (multi-frame generation: RTX 50).
+        // default 1; multi-frame generation needs an RTX 50). DLSS-G reports what the GPU
+        // supports only once it runs, so the request goes in as asked and falls back to one
+        // generated frame when refused.
         u32 frames = 1;
         if (const char* env = std::getenv("RYGT_DLSSG_FRAMES"); env && *env) {
             frames = std::clamp<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 3u);
         }
-        u32 most = 1;
-        if (g_sl.dlssg_get_state) {
-            sl::DLSSGState state{};
-            if (g_sl.dlssg_get_state(viewport, state, nullptr) == sl::Result::eOk &&
-                state.numFramesToGenerateMax > 0) {
-                most = state.numFramesToGenerateMax;
-            }
+        options.numFramesToGenerate = frames;
+        sl::Result set = g_sl.dlssg_set_options(viewport, options);
+        if (set != sl::Result::eOk && frames > 1) {
+            options.numFramesToGenerate = 1;
+            set = g_sl.dlssg_set_options(viewport, options);
         }
-        options.numFramesToGenerate = std::min(frames, most);
-        const sl::Result set = g_sl.dlssg_set_options(viewport, options);
         g_sl.options_set = set == sl::Result::eOk;
         LOG_WARNING(Render_Vulkan,
                     "ryGT DLSS-G: frame generation {} (result {}), {} generated frames a game "
-                    "frame ({} asked, {} supported)",
+                    "frame ({} asked)",
                     g_sl.options_set ? "on" : "could not be turned on", static_cast<int>(set),
-                    options.numFramesToGenerate, frames, most);
+                    options.numFramesToGenerate, frames);
     }
     Marker(sl::PCLMarker::eRenderSubmitEnd);
 
@@ -424,8 +422,10 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                                                    std::memory_order_relaxed);
             if (static_cast<int>(state.status) != g_sl.last_status) {
                 g_sl.last_status = static_cast<int>(state.status);
-                LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: status {:#x} (0 = generating)",
-                            g_sl.last_status);
+                LOG_WARNING(Render_Vulkan,
+                            "ryGT DLSS-G: status {:#x} (0 = generating), up to {} generated "
+                            "frames supported",
+                            g_sl.last_status, state.numFramesToGenerateMax);
             }
         }
     }
