@@ -44,6 +44,10 @@
 #include <limits>
 #include <memory>
 #include <span>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
 #include <sstream>
 #include <system_error>
 #include <vector>
@@ -120,6 +124,223 @@ static bool StretchToWindow() {
 #else
     return false;
 #endif
+}
+
+// GT7-UW: the HUD's pieces, which the F7 editor moves and resizes over the stretched picture.
+// src: where the piece is in the 16:9 HUD (0..1); dst: where it goes on the output (0..1), once
+// placed (until then it stays where the centred HUD has it). Kept in
+// user\custom_configs\hud_layout.ini beside the game.
+namespace {
+struct HudPiece {
+    std::string name;
+    float src[4];
+    bool placed = false;
+    float dst[4]{};
+};
+
+struct HudLayoutState {
+    std::mutex mutex;
+    std::vector<HudPiece> pieces;
+    bool loaded = false;
+    bool editing = false;
+    bool capture_areas = false; ///< the editor moves the pieces' areas in the HUD instead
+};
+
+HudLayoutState& HudLayout() {
+    static HudLayoutState state;
+    return state;
+}
+
+// The pieces of GT7's race HUD (in pixels of its 1920x1080 picture).
+std::vector<HudPiece> DefaultHudPieces() {
+    const auto piece = [](const char* name, float x, float y, float w, float h) {
+        return HudPiece{name, {x / 1920.0f, y / 1080.0f, w / 1920.0f, h / 1080.0f}};
+    };
+    return {
+        piece("Lap", 20, 30, 140, 95),
+        piece("Lap time", 820, 225, 280, 70),
+        piece("Track map", 1560, 15, 210, 295),
+        piece("Position", 1690, 320, 230, 70),
+        piece("Race time", 15, 1000, 215, 70),
+        piece("Dashboard", 245, 935, 1100, 140),
+        piece("Course map", 1575, 805, 340, 270),
+    };
+}
+
+std::filesystem::path HudLayoutPath() {
+    return std::filesystem::path{Common::FS::GetUserPath(Common::FS::PathType::UserDir)} /
+           "custom_configs" / "hud_layout.ini";
+}
+
+void LoadHudLayout(HudLayoutState& state) {
+    state.loaded = true;
+    state.pieces = DefaultHudPieces();
+    std::ifstream file(HudLayoutPath());
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        // name|sx sy sw sh|placed dx dy dw dh
+        const size_t bar1 = line.find('|');
+        const size_t bar2 = bar1 == std::string::npos ? bar1 : line.find('|', bar1 + 1);
+        if (bar2 == std::string::npos) {
+            continue;
+        }
+        const std::string name = line.substr(0, bar1);
+        for (auto& piece : state.pieces) {
+            if (piece.name != name) {
+                continue;
+            }
+            std::istringstream src(line.substr(bar1 + 1, bar2 - bar1 - 1));
+            std::istringstream dst(line.substr(bar2 + 1));
+            float s[4];
+            int placed = 0;
+            float d[4];
+            if (src >> s[0] >> s[1] >> s[2] >> s[3]) {
+                std::copy(std::begin(s), std::end(s), piece.src);
+            }
+            if (dst >> placed >> d[0] >> d[1] >> d[2] >> d[3]) {
+                piece.placed = placed != 0;
+                std::copy(std::begin(d), std::end(d), piece.dst);
+            }
+        }
+    }
+}
+
+void SaveHudLayout(const HudLayoutState& state) {
+    std::error_code error;
+    std::filesystem::create_directories(HudLayoutPath().parent_path(), error);
+    std::ofstream file(HudLayoutPath());
+    file << "# The HUD layout of the F7 editor: name|area in the 16:9 HUD|placed, place on the "
+            "screen (0..1)\n";
+    for (const auto& piece : state.pieces) {
+        file << piece.name << '|' << piece.src[0] << ' ' << piece.src[1] << ' ' << piece.src[2]
+             << ' ' << piece.src[3] << '|' << (piece.placed ? 1 : 0) << ' ' << piece.dst[0] << ' '
+             << piece.dst[1] << ' ' << piece.dst[2] << ' ' << piece.dst[3] << '\n';
+    }
+}
+
+// Where a piece shows on the output: its place, or where the centred HUD has it.
+std::array<float, 4> HudPieceRect(const HudPiece& piece, float x0, float x1) {
+    if (piece.placed) {
+        return {piece.dst[0], piece.dst[1], piece.dst[2], piece.dst[3]};
+    }
+    const float width = x1 - x0;
+    return {x0 + piece.src[0] * width, piece.src[1], piece.src[2] * width, piece.src[3]};
+}
+
+// The horizontal span of the centred 16:9 HUD on an output of this shape.
+std::pair<float, float> HudSpan(float width, float height) {
+    const float hud = width > 0.0f ? std::min(1.0f, height * 16.0f / 9.0f / width) : 1.0f;
+    return {0.5f - hud / 2.0f, 0.5f + hud / 2.0f};
+}
+} // namespace
+
+// GT7-UW: F7 shows the HUD pieces as boxes over the picture: drag one to move it, drag its
+// corner to resize it (keeping its shape). "Edit areas" moves the boxes' areas in the HUD
+// instead (when a piece is cut off or takes in too much).
+static void DrawHudEditor(ImVec2 origin, ImVec2 size) {
+    auto& layout = HudLayout();
+    std::scoped_lock lock{layout.mutex};
+    if (!layout.loaded) {
+        LoadHudLayout(layout);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_F7, false)) {
+        layout.editing = !layout.editing;
+    }
+    if (!layout.editing || size.x <= 0.0f || size.y <= 0.0f) {
+        return;
+    }
+    const auto [x0, x1] = HudSpan(size.x, size.y);
+    auto* draw = ImGui::GetWindowDrawList();
+    const ImGuiIO& io = ImGui::GetIO();
+    // The centred HUD's outline.
+    draw->AddRect(ImVec2{origin.x + x0 * size.x, origin.y},
+                  ImVec2{origin.x + x1 * size.x, origin.y + size.y}, IM_COL32(255, 255, 255, 60));
+    constexpr float handle = 16.0f;
+    for (size_t i = 0; i < layout.pieces.size(); ++i) {
+        auto& piece = layout.pieces[i];
+        // The box: the piece on screen, or (editing areas) its area in the centred HUD.
+        std::array<float, 4> rect;
+        if (layout.capture_areas) {
+            const float width = x1 - x0;
+            rect = {x0 + piece.src[0] * width, piece.src[1], piece.src[2] * width, piece.src[3]};
+        } else {
+            rect = HudPieceRect(piece, x0, x1);
+        }
+        const ImVec2 p0{origin.x + rect[0] * size.x, origin.y + rect[1] * size.y};
+        const ImVec2 p1{p0.x + rect[2] * size.x, p0.y + rect[3] * size.y};
+        const ImU32 colour = layout.capture_areas ? IM_COL32(255, 200, 40, 230)
+                                                  : IM_COL32(60, 200, 255, 230);
+        draw->AddRectFilled(p0, p1, layout.capture_areas ? IM_COL32(255, 200, 40, 30)
+                                                         : IM_COL32(60, 200, 255, 30));
+        draw->AddRect(p0, p1, colour, 0.0f, 0, 2.0f);
+        draw->AddText(ImVec2{p0.x + 4, p0.y + 2}, colour, piece.name.c_str());
+        draw->AddTriangleFilled(ImVec2{p1.x, p1.y - handle}, p1, ImVec2{p1.x - handle, p1.y},
+                                colour);
+        ImGui::PushID(static_cast<int>(i));
+        // Moving.
+        ImGui::SetCursorScreenPos(p0);
+        ImGui::InvisibleButton("move", ImVec2{std::max(p1.x - p0.x, 4.0f),
+                                              std::max(p1.y - p0.y, 4.0f)});
+        const bool moving = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        // Resizing (the corner), keeping the piece's shape when it is placed.
+        ImGui::SetCursorScreenPos(ImVec2{p1.x - handle, p1.y - handle});
+        ImGui::InvisibleButton("size", ImVec2{handle, handle});
+        const bool sizing = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        if (moving || sizing) {
+            const float dx = io.MouseDelta.x / size.x;
+            const float dy = io.MouseDelta.y / size.y;
+            if (layout.capture_areas) {
+                const float width = x1 - x0;
+                if (moving) {
+                    piece.src[0] = std::clamp(piece.src[0] + dx / width, 0.0f, 1.0f - piece.src[2]);
+                    piece.src[1] = std::clamp(piece.src[1] + dy, 0.0f, 1.0f - piece.src[3]);
+                } else {
+                    piece.src[2] = std::clamp(piece.src[2] + dx / width, 0.01f, 1.0f - piece.src[0]);
+                    piece.src[3] = std::clamp(piece.src[3] + dy, 0.01f, 1.0f - piece.src[1]);
+                }
+            } else {
+                if (!piece.placed) {
+                    piece.placed = true;
+                    std::copy(rect.begin(), rect.end(), piece.dst);
+                }
+                if (moving) {
+                    piece.dst[0] = std::clamp(piece.dst[0] + dx, 0.0f, 1.0f - piece.dst[2]);
+                    piece.dst[1] = std::clamp(piece.dst[1] + dy, 0.0f, 1.0f - piece.dst[3]);
+                } else {
+                    const float shape = piece.dst[3] / std::max(piece.dst[2], 0.001f);
+                    piece.dst[2] = std::clamp(piece.dst[2] + dx, 0.02f, 1.0f - piece.dst[0]);
+                    piece.dst[3] = std::min(piece.dst[2] * shape, 1.0f - piece.dst[1]);
+                }
+            }
+        }
+        ImGui::PopID();
+    }
+    // The controls.
+    ImGui::SetNextWindowPos(ImVec2{origin.x + size.x * 0.5f, origin.y + size.y * 0.42f},
+                            ImGuiCond_Appearing, ImVec2{0.5f, 0.5f});
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    if (ImGui::Begin("HUD layout (F7)", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                         ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::TextUnformatted("Drag a box to move it, its corner to resize it.");
+        ImGui::Checkbox("Edit areas (what each box takes from the HUD)", &layout.capture_areas);
+        if (ImGui::Button("Save")) {
+            SaveHudLayout(layout);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset all")) {
+            layout.pieces = DefaultHudPieces();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Close")) {
+            SaveHudLayout(layout);
+            layout.editing = false;
+        }
+    }
+    ImGui::End();
 }
 
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
@@ -657,6 +878,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
                      instance.GetAllocator(), num_images);
 #endif
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    pp_pass.CreateHudBuffer(instance.GetAllocator()); // GT7-UW
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
     ImGui::Friends::Register();
@@ -1152,8 +1374,22 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         pass_cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
                                                         .pMemoryBarriers = &hud_written});
     }
+    // GT7-UW: the HUD pieces, as placed with the F7 editor.
+    std::vector<HostPasses::PostProcessingPass::HudWidget> hud_widgets;
+    if (display->hud_black && display->hud_white) {
+        auto& layout = HudLayout();
+        std::scoped_lock lock{layout.mutex};
+        if (!layout.loaded) {
+            LoadHudLayout(layout);
+        }
+        for (const auto& piece : layout.pieces) {
+            const auto rect = HudPieceRect(piece, hud_settings.hud_x0, hud_settings.hud_x1);
+            hud_widgets.push_back({{piece.src[0], piece.src[1], piece.src[2], piece.src[3]},
+                                   {rect[0], rect[1], rect[2], rect[3]}});
+        }
+    }
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, display->hud_black,
-                   display->hud_white);
+                   display->hud_white, hud_widgets);
     const vk::ImageMemoryBarrier2 back{
         .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -1442,6 +1678,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
                 ImGui::Image(game_texture, size);
+                if (stretch) {
+                    DrawHudEditor(ImGui::GetItemRectMin(), ImGui::GetItemRectSize());
+                }
 
                 if (EmulatorSettings.IsNullGPU()) {
                     Core::Devtools::Layer::DrawNullGpuNotice();

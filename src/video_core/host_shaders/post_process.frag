@@ -10,6 +10,15 @@ layout (binding = 0) uniform sampler2D texSampler;
 // GT7-UW: the HUD drawn over black and over white, laid over the picture at 16:9.
 layout (binding = 1) uniform sampler2D hudBlack;
 layout (binding = 2) uniform sampler2D hudWhite;
+// GT7-UW: HUD pieces placed elsewhere: src (x, y, w, h of the 16:9 HUD), dst (of the output).
+struct HudWidget {
+    vec4 src;
+    vec4 dst;
+};
+layout (std140, binding = 3) uniform HudLayout {
+    uvec4 count;
+    HudWidget widgets[16];
+} layout_;
 
 layout (push_constant) uniform settings {
     float gamma;
@@ -39,16 +48,44 @@ vec3 degamma(vec3 rgb) {
     );
 }
 
+bool inside(vec2 p, vec4 rect) {
+    return p.x >= rect.x && p.y >= rect.y && p.x < rect.x + rect.z && p.y < rect.y + rect.w;
+}
+
 void main() {
     vec4 color_linear = texture(texSampler, uv);
-    if (pp.hud && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1) {
-        // Over black the HUD left its colour times its coverage; over white also 1 - coverage.
-        // Blended as the game blends it, in the display buffer's encoding.
-        const vec2 hud_uv = vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0), uv.y);
-        const vec3 black = texture(hudBlack, hud_uv).rgb;
-        const vec3 white = texture(hudWhite, hud_uv).rgb;
-        const float coverage = clamp(1.0 - dot(white - black, vec3(1.0 / 3.0)), 0.0, 1.0);
-        color_linear.rgb = color_linear.rgb * (1.0 - coverage) + black;
+    if (pp.hud) {
+        // Where on the 16:9 HUD this pixel shows: a placed piece's, else the centred HUD's
+        // (but not what a piece shows elsewhere).
+        bool shown = false;
+        vec2 hud_uv = vec2(0.0);
+        const uint count = min(layout_.count.x, 16u);
+        for (uint i = 0u; i < count; ++i) {
+            const HudWidget w = layout_.widgets[i];
+            if (inside(uv, w.dst)) {
+                hud_uv = w.src.xy + (uv - w.dst.xy) / w.dst.zw * w.src.zw;
+                shown = true;
+                break;
+            }
+        }
+        if (!shown && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1) {
+            hud_uv = vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0), uv.y);
+            shown = true;
+            for (uint i = 0u; i < count; ++i) {
+                if (inside(hud_uv, layout_.widgets[i].src)) {
+                    shown = false;
+                    break;
+                }
+            }
+        }
+        if (shown) {
+            // Over black the HUD left its colour times its coverage; over white also
+            // 1 - coverage. Blended as the game blends it, in the display buffer's encoding.
+            const vec3 black = texture(hudBlack, hud_uv).rgb;
+            const vec3 white = texture(hudWhite, hud_uv).rgb;
+            const float coverage = clamp(1.0 - dot(white - black, vec3(1.0 / 3.0)), 0.0, 1.0);
+            color_linear.rgb = color_linear.rgb * (1.0 - coverage) + black;
+        }
     }
     if (pp.hdr) {
         color = color_linear;

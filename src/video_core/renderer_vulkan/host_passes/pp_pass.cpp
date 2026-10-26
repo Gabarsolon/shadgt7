@@ -12,11 +12,13 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <boost/container/static_vector.hpp>
+#include <cstring>
+#include <vk_mem_alloc.h>
 
 namespace Vulkan::HostPasses {
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
-    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 3> bindings{
+    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 4> bindings{
         {
             .binding = 0,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -32,6 +34,12 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         { // GT7-UW: the HUD over white
             .binding = 2,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        { // GT7-UW: the HUD layout
+            .binding = 3,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
         },
@@ -193,9 +201,32 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     sampler = Check<"create pp sampler">(device.createSamplerUnique(sampler_ci));
 }
 
+void PostProcessingPass::CreateHudBuffer(VmaAllocator allocator) {
+    hud_allocator = allocator;
+    const VkBufferCreateInfo buffer_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = HudSlots * HudSlotSize,
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+    };
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                 VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO,
+    };
+    VkBuffer buffer{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &buffer, &hud_allocation, &info) ==
+        VK_SUCCESS) {
+        hud_buffer = buffer;
+        hud_mapped = static_cast<u8*>(info.pMappedData);
+        std::memset(hud_mapped, 0, HudSlots * HudSlotSize);
+    }
+}
+
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings,
-                                vk::ImageView hud_black, vk::ImageView hud_white) {
+                                vk::ImageView hud_black, vk::ImageView hud_white,
+                                std::span<const HudWidget> hud_widgets) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -247,6 +278,24 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .imageLayout = hud ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
     };
 
+    // GT7-UW: the layout in this frame's slot of the buffer (a count, then the pieces).
+    const u32 slot = hud_slot++ % HudSlots;
+    if (hud_mapped) {
+        u8* data = hud_mapped + slot * HudSlotSize;
+        const u32 count = static_cast<u32>(std::min<size_t>(hud_widgets.size(), MaxHudWidgets));
+        const std::array<u32, 4> header{hud ? count : 0u, 0, 0, 0};
+        std::memcpy(data, header.data(), sizeof(header));
+        if (count != 0) {
+            std::memcpy(data + sizeof(header), hud_widgets.data(), count * sizeof(HudWidget));
+        }
+        vmaFlushAllocation(hud_allocator, hud_allocation, slot * HudSlotSize, HudSlotSize);
+    }
+    const vk::DescriptorBufferInfo hud_layout_info{
+        .buffer = hud_buffer,
+        .offset = slot * HudSlotSize,
+        .range = 16 + MaxHudWidgets * sizeof(HudWidget),
+    };
+
     const std::array set_writes{
         vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
@@ -271,6 +320,14 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &hud_white_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 3,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &hud_layout_info,
         },
     };
 
