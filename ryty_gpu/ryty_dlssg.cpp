@@ -391,11 +391,28 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!g_sl.options_set) {
         sl::DLSSGOptions options{};
         options.mode = sl::DLSSGMode::eOn;
-        options.numFramesToGenerate = 1;
+        // GT-MFG: frames generated between game frames, RYGT_DLSSG_FRAMES=1..3 (2x to 4x;
+        // default 1), no more than the GPU supports (multi-frame generation: RTX 50).
+        u32 frames = 1;
+        if (const char* env = std::getenv("RYGT_DLSSG_FRAMES"); env && *env) {
+            frames = std::clamp<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 3u);
+        }
+        u32 most = 1;
+        if (g_sl.dlssg_get_state) {
+            sl::DLSSGState state{};
+            if (g_sl.dlssg_get_state(viewport, state, nullptr) == sl::Result::eOk &&
+                state.numFramesToGenerateMax > 0) {
+                most = state.numFramesToGenerateMax;
+            }
+        }
+        options.numFramesToGenerate = std::min(frames, most);
         const sl::Result set = g_sl.dlssg_set_options(viewport, options);
         g_sl.options_set = set == sl::Result::eOk;
-        LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: frame generation {} (result {})",
-                    g_sl.options_set ? "on" : "could not be turned on", static_cast<int>(set));
+        LOG_WARNING(Render_Vulkan,
+                    "ryGT DLSS-G: frame generation {} (result {}), {} generated frames a game "
+                    "frame ({} asked, {} supported)",
+                    g_sl.options_set ? "on" : "could not be turned on", static_cast<int>(set),
+                    options.numFramesToGenerate, frames, most);
     }
     Marker(sl::PCLMarker::eRenderSubmitEnd);
 
