@@ -29,8 +29,11 @@ struct Liverpool;
 
 namespace Vulkan {
 
-/// GT7-UW: a display buffer's address, for the native renderer (vk_rasterizer_native.cpp).
+#ifdef RYTY_GPU
+/// GT7-UW: a display buffer's address, for the native renderer (vk_rasterizer_native.cpp, which
+/// only the Ryty renderer library builds).
 void NoteDisplayAddress(VAddr address);
+#endif
 
 struct Frame {
     u32 width;
@@ -94,7 +97,9 @@ public:
     VideoCore::Image& RegisterVideoOutSurface(
         const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
         vo_buffers_addr.emplace_back(cpu_address);
+#ifdef RYTY_GPU
         NoteDisplayAddress(cpu_address); // GT7-UW
+#endif
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
