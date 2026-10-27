@@ -22,8 +22,9 @@ namespace Serialization {
 // left their ids biased, and older entries could read the padding it now uses.
 // 19/20 (FIX-199): cube samples with an implicit level take their gradients from the direction.
 // The 96-byte buffer-offset table moves the quad sample mask and stage offset ranges.
-static constexpr u32 ShaderBinaryVersion = 21u;
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 22u;
+// 23/24 (FIX-215): samplers record whether they sample a cube map.
+static constexpr u32 ShaderBinaryVersion = 23u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 24u;
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
