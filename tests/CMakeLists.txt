@@ -9,14 +9,13 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
-    CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 23)
-    foreach(t gtest gtest_main gmock gmock_main)
-        if (TARGET ${t})
-            target_compile_options(${t} PRIVATE -Wno-error=character-conversion)
-        endif()
-    endforeach()
-endif()
+# Google Test builds itself with warnings as errors; a newer compiler's diagnostics (clang 22's
+# -Wcharacter-conversion in gtest-printers.h) must not stop the test build. The form upstream uses.
+foreach(gtest_target gtest gtest_main gmock gmock_main)
+    if (TARGET ${gtest_target})
+        target_compile_options(${gtest_target} PRIVATE $<IF:$<BOOL:${MSVC}>,/WX-,-Wno-error>)
+    endif()
+endforeach()
 
 add_executable(shadps4_stencil_test test_stencil_reference.cpp)
 target_include_directories(shadps4_stencil_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
