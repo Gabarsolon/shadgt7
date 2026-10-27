@@ -245,7 +245,15 @@ bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
 }
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
-                             RuntimeInfo& runtime_info, const Profile& profile) {
+                             RuntimeInfo& runtime_info, const Profile& device_profile) {
+    auto profile = device_profile;
+    if (runtime_info.hw_stage == HwStage::Fragment &&
+        runtime_info.hw.fs.single_sample_barycentric) {
+        profile.supports_amd_shader_explicit_vertex_parameter = false;
+        // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
+        // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
+        profile.needs_manual_interpolation = true;
+    }
     // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {

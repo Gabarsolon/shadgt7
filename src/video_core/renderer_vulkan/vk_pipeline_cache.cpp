@@ -40,6 +40,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/single_sample_barycentric.h"
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -519,6 +520,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.en_flags = regs.ps_input_ena;
         info.hw.fs.addr_flags = regs.ps_input_addr;
         info.hw.fs.num_inputs = regs.num_interp;
+        static const bool direct_barycentric_requested = [] {
+            const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        info.hw.fs.single_sample_barycentric = UseSingleSampleBarycentric(
+            instance.GetVendorID(), profile.supports_fragment_shader_barycentric,
+            S().graphics_key.num_samples, direct_barycentric_requested);
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
         info.hw.fs.quad_sample_mask =
             regs.reg_array[0xa30e] != ~0u || regs.reg_array[0xa30f] != ~0u;
@@ -688,6 +696,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // D2: read-only guest buffers are read in place through the direct-memory page table.
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
+    if (const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+        value && std::strcmp(value, "1") == 0 && instance.GetVendorID() == 0x1002) {
+        LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample compiler candidate requested; KHR {}",
+                    profile.supports_fragment_shader_barycentric);
+    }
+    const char* barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+    SetSingleSampleBarycentricCacheEnabled(UseSingleSampleBarycentric(
+        instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
+        barycentric_env && std::strcmp(barycentric_env, "1") == 0));
     CreateDriverCache();
     LoadElseScopeFixed();
     // PERF-032: the shader store: a program's stored translations are read when a draw first

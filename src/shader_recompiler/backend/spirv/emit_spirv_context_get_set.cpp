@@ -147,6 +147,11 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                 ctx.F32[1], ctx.OpInterpolateAtCentroid(ctx.F32[3], ctx.bary_coord), comp);
         }
     case IR::Attribute::BaryCoordSmoothSample:
+        if (ctx.runtime_info.hw.fs.single_sample_barycentric) {
+            // The single-sample AMD path must not query InterpolateAtSample on BaryCoordKHR:
+            // the checked UV reference disagreed by .18; direct loads agreed within 1.2e-7.
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
+        }
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
             return ctx.OpLoad(
                 ctx.F32[1],

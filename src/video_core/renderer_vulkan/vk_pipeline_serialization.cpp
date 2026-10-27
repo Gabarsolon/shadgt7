@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -25,6 +26,9 @@ namespace Serialization {
 // 23/24 (FIX-215): samplers record whether they sample a cube map.
 static constexpr u32 ShaderBinaryVersion = 23u;
 static constexpr u32 ShaderBinaryVersionQuadSampleMask = 24u;
+// 25: AMD single-sample KHR barycentrics (RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC=1) change the
+// fragment interface and interpolation; read only while that option is on.
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 25u;
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
@@ -38,6 +42,13 @@ static constexpr u32 ShaderMetaVersion = 16u;
 static constexpr u32 ShaderMetaVersionWithoutResourceUsage = 15u;
 static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
 } // namespace Serialization
+
+namespace Vulkan {
+std::atomic<bool> single_sample_barycentric_cache_enabled{false};
+void SetSingleSampleBarycentricCacheEnabled(bool enabled) {
+    single_sample_barycentric_cache_enabled.store(enabled, std::memory_order_relaxed);
+}
+} // namespace Vulkan
 
 namespace Vulkan {
 
@@ -168,8 +179,12 @@ void RegisterShaderMeta(const Shader::Info& info,
     meta.Write(Serialization::ShaderMetaVersion);
     const bool masked_fragment = spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
                                  spec.runtime_info.hw.fs.quad_sample_mask;
-    meta.Write(masked_fragment ? Serialization::ShaderBinaryVersionQuadSampleMask
-                               : Serialization::ShaderBinaryVersion);
+    const bool single_sample_barycentric =
+        spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+        spec.runtime_info.hw.fs.single_sample_barycentric;
+    meta.Write(single_sample_barycentric ? Serialization::ShaderBinaryVersionSingleSampleBarycentric
+               : masked_fragment         ? Serialization::ShaderBinaryVersionQuadSampleMask
+                                         : Serialization::ShaderBinaryVersion);
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -206,8 +221,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion &&
-        binary_version != Serialization::ShaderBinaryVersionQuadSampleMask) {
+    const bool single_sample_binary =
+        binary_version == Serialization::ShaderBinaryVersionSingleSampleBarycentric;
+    if (single_sample_binary
+            ? !Vulkan::single_sample_barycentric_cache_enabled.load(std::memory_order_relaxed)
+            : binary_version != Serialization::ShaderBinaryVersion &&
+                  binary_version != Serialization::ShaderBinaryVersionQuadSampleMask) {
         return false;
     }
 
@@ -216,6 +235,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
+    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment && !single_sample_binary) {
+        // This byte was padding in every older metadata revision.
+        spec.runtime_info.hw.fs.single_sample_barycentric = false;
+    }
     if (binary_version == Serialization::ShaderBinaryVersion &&
         spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
         spec.runtime_info.hw.fs.quad_sample_mask = false;

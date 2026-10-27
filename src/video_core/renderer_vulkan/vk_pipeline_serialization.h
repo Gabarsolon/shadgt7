@@ -10,6 +10,9 @@
 
 namespace Vulkan {
 
+// Set before cache readers/workers start; candidate blobs are ignored on other profiles.
+void SetSingleSampleBarycentricCacheEnabled(bool enabled);
+
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);

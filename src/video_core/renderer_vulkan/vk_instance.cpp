@@ -318,7 +318,12 @@ bool Instance::CreateDevice() {
     }
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
-    if (!amd_shader_explicit_vertex_parameter) {
+    const char* direct_barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+    const bool direct_barycentric_candidate = properties.vendorID == 0x1002 &&
+        direct_barycentric_env && std::strcmp(direct_barycentric_env, "1") == 0;
+    if (!amd_shader_explicit_vertex_parameter || direct_barycentric_candidate) {
+        // Keep AMD explicit-vertex support for multisampled shaders; the opt-in candidate
+        // additionally enables KHR for separately specialized one-sample fragments.
         fragment_shader_barycentric =
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     }

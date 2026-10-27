@@ -655,8 +655,16 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 }
 } // Anonymous namespace
 
-std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
+std::vector<u32> EmitSPIRV(const Profile& device_profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
+    auto profile = device_profile;
+    if (runtime_info.hw_stage == HwStage::Fragment &&
+        runtime_info.hw.fs.single_sample_barycentric) {
+        profile.supports_amd_shader_explicit_vertex_parameter = false;
+        // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
+        // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
+        profile.needs_manual_interpolation = true;
+    }
     EmitContext ctx{profile, runtime_info, program.info, binding};
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program.info, ctx, main);
