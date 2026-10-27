@@ -65,6 +65,7 @@ TEST(ImageDescriptorGeometry, AcceptsValidArrayAndCubeGeometryAtDeviceLimits) {
     EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
               ImageDescriptorGeometryError::None);
     image.type = u64(AmdGpu::ImageType::Cube);
+    image.height = image.width; // FIX-080: a cube's faces are square
     image.depth = 255;
     image.pow2pad = true;
     ASSERT_EQ(image.NumLayers(), 2048u);
@@ -137,12 +138,35 @@ TEST(ImageDescriptorGeometry, RejectsNonTextureDescriptorTypes) {
     }
 }
 
-TEST(ImageDescriptorGeometry, RejectsGuestSizeAboveFourGiB) {
-    // GT Sport stale-table descriptor that preceded a device loss.
+TEST(ImageDescriptorGeometry, RejectsNonSquareCubes) {
+    // FIX-080: Vulkan requires a cube's faces to be square. The check comes before the extent
+    // and size checks, so a garbage cube is refused for its shape whatever its size.
     auto image = MakeImage(AmdGpu::ImageType::Cube);
+    image.depth = 0;
+    image.pow2pad = true;
+    image.last_level = 0;
+    ASSERT_EQ(image.NumLayers(), 8u);
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::CubeNotSquare);
+    image.height = image.width;
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::None);
+    // The GT Sport stale-table descriptor that preceded a device loss: a 1x15873 cube.
     image.width = 0;
     image.height = 15872;
     image.pitch = 15360;
+    image.data_format = u64(AmdGpu::DataFormat::Format2_10_10_10);
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::CubeNotSquare);
+}
+
+TEST(ImageDescriptorGeometry, RejectsGuestSizeAboveFourGiB) {
+    // The stale-table descriptor above with square faces, so the size check sees it:
+    // 15873 x 15873 texels x 8 faces x 4 bytes is 7.5 GiB.
+    auto image = MakeImage(AmdGpu::ImageType::Cube);
+    image.width = 15872;
+    image.height = 15872;
+    image.pitch = 15872;
     image.depth = 0;
     image.pow2pad = true;
     image.last_level = 0;
