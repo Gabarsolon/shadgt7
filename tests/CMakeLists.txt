@@ -71,7 +71,8 @@ target_include_directories(shadps4_image_resource_test PRIVATE ${CMAKE_SOURCE_DI
 target_link_libraries(shadps4_image_resource_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers)
 gtest_discover_tests(shadps4_image_resource_test)
 
-add_executable(shadps4_shader_program_test test_shader_program.cpp)
+add_executable(shadps4_shader_program_test test_shader_program.cpp stubs/perf_monitor_stub.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/read_capture.cpp)
 target_include_directories(shadps4_shader_program_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_shader_program_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers tsl::robin_map xxHash::xxhash
@@ -95,11 +96,11 @@ target_link_libraries(shadps4_image_mips_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers magic_enum::magic_enum)
 gtest_discover_tests(shadps4_image_mips_test)
 
-add_executable(shadps4_draw_pipe_test test_draw_pipe.cpp
+add_executable(shadps4_draw_pipe_test test_draw_pipe.cpp stubs/perf_monitor_stub.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/draw_pipe.cpp)
 target_include_directories(shadps4_draw_pipe_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_draw_pipe_test PRIVATE cxx_std_23)
-target_link_libraries(shadps4_draw_pipe_test PRIVATE GTest::gtest_main)
+target_link_libraries(shadps4_draw_pipe_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)
 gtest_discover_tests(shadps4_draw_pipe_test)
 
 add_executable(shadps4_uploaded_pages_test test_uploaded_pages.cpp)
@@ -349,6 +350,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/ntapi.cpp
     ${CMAKE_SOURCE_DIR}/src/common/decoder.cpp
     ${CMAKE_SOURCE_DIR}/src/common/signal_context.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/read_capture.cpp
 
     # Stubs that replace dependencies
     stubs/common_stub.cpp
@@ -417,6 +419,7 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     half::half
     xbyak::xbyak
     Zydis::Zydis
+    xxHash::xxhash
 )
 
 
@@ -550,7 +553,7 @@ target_include_directories(shadgt_wave64_inspect PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_compile_features(shadgt_wave64_inspect PRIVATE cxx_std_23)
 target_link_libraries(shadgt_wave64_inspect PRIVATE fmt::fmt nlohmann_json::nlohmann_json
     magic_enum::magic_enum toml11::toml11 Boost::headers Vulkan::Headers sirit SDL3::SDL3
-    tsl::robin_map
+    tsl::robin_map xxHash::xxhash
     spdlog::spdlog half::half xbyak::xbyak Zydis::Zydis)
 if (WIN32)
     target_link_libraries(shadgt_wave64_inspect PRIVATE onecore)
