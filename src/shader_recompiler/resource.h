@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -226,11 +227,21 @@ struct ImageResource {
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
 
+/// FIX-215: whether samplers of cube maps clamp at the faces' edges (RYGT_CUBE_SAMPLER_CLAMP=0 off).
+inline bool CubeSamplerClampEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_CUBE_SAMPLER_CLAMP");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
 struct SamplerResource {
     SharpFetch<AmdGpu::Sampler> sharp_fetch{};
     SharpFetchPostOp post_op{};
     SharpLocation post_op_tsharp_dw3_off{};
     bool is_depth{};
+    bool is_cube{}; ///< FIX-215: sampled with a cube image (read as a 2D array of its faces)
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
@@ -251,6 +262,14 @@ struct SamplerResource {
         } else if (post_op == SharpFetchPostOp::ClearAnisoRatioAndThreshold) {
             sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             sampler.aniso_threshold.Assign(0);
+        }
+        if (is_cube && CubeSamplerClampEnabled()) {
+            // FIX-215: the hardware samples a cube map seamlessly whatever the sampler's address
+            // modes; here its faces are layers of a 2D array, so a wrapping sampler filtered the
+            // texels of a face's far edge into its near one: a bright line where the sky cube's
+            // faces meet (GT7). Each face is clamped at its edges instead.
+            sampler.clamp_x.Assign(AmdGpu::ClampMode::ClampLastTexel);
+            sampler.clamp_y.Assign(AmdGpu::ClampMode::ClampLastTexel);
         }
         return sampler;
     }
