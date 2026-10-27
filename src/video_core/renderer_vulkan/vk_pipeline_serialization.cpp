@@ -26,7 +26,7 @@ namespace Serialization {
 // 23/24 (FIX-215): samplers record whether they sample a cube map.
 static constexpr u32 ShaderBinaryVersion = 23u;
 static constexpr u32 ShaderBinaryVersionQuadSampleMask = 24u;
-// 25: AMD single-sample KHR barycentrics (RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC=1) change the
+// 25: AMD single-sample KHR barycentrics (on for AMD GPUs) change the
 // fragment interface and interpolation; read only while that option is on.
 static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 25u;
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,

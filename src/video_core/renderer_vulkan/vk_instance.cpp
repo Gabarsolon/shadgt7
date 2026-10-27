@@ -14,6 +14,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/single_sample_barycentric.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
@@ -318,9 +319,8 @@ bool Instance::CreateDevice() {
     }
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
-    const char* direct_barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-    const bool direct_barycentric_candidate = properties.vendorID == 0x1002 &&
-        direct_barycentric_env && std::strcmp(direct_barycentric_env, "1") == 0;
+    const bool direct_barycentric_candidate =
+        properties.vendorID == 0x1002 && SingleSampleBarycentricRequested();
     if (!amd_shader_explicit_vertex_parameter || direct_barycentric_candidate) {
         // Keep AMD explicit-vertex support for multisampled shaders; the opt-in candidate
         // additionally enables KHR for separately specialized one-sample fragments.
