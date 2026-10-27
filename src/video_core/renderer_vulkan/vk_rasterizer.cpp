@@ -59,6 +59,25 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+/// Copies guest memory for a diagnostic; false where it is not readable. Ryty's guarded copy
+/// (the game may have released the memory), or the emulator's own mapping check first.
+static bool ReadGuestMemory(void* dest, VAddr address, u64 size) {
+#ifdef RYTY_GPU
+    return Core::RytyMemory::GuardedCopy(dest, reinterpret_cast<const void*>(address), size);
+#else
+    auto* memory = Core::Memory::Instance();
+    for (VAddr at = address; at < address + size;) {
+        const VAddr area_end = memory->MappedAreaEnd(at, address + size);
+        if (area_end <= at) {
+            return false;
+        }
+        at = area_end;
+    }
+    std::memcpy(dest, reinterpret_cast<const void*>(address), size);
+    return true;
+#endif
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
@@ -2641,7 +2660,15 @@ bool AnyRecent(const std::array<std::atomic<u64>, N>& table, u32 bits, VAddr add
 }
 } // namespace
 
+#ifdef RYTY_GPU
 bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+#else
+// FIX-110 asks Ryty's game patch whether a race project runs; the emulator has no game patch,
+// so it never knows of one.
+static bool RytyGtsInRace() {
+    return false;
+}
+#endif
 
 // FIX-124: outside races buffers are not read in place. GT Sport's car screens still showed a
 // blown-out car or a white dashboard panel every few seconds with FIX-122/123 (no cause found
@@ -3017,8 +3044,7 @@ void Rasterizer::FrameDumpFlip() {
             ++peeked;
             for (const VAddr address : peek) {
                 std::array<float, 8> v{};
-                if (Core::RytyMemory::GuardedCopy(v.data(), reinterpret_cast<const void*>(address),
-                                                  sizeof(v))) {
+                if (ReadGuestMemory(v.data(), address, sizeof(v))) {
                     LOG_WARNING(Render_Vulkan, "FIX-158 peek: flip {} {:#x}: {} {} {} {} {} {} {} {}",
                                 peeked, address, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
                 }
@@ -3035,8 +3061,7 @@ void Rasterizer::FrameDumpFlip() {
                 continue;
             }
             std::array<u16, 64 * 16 * 4> grid{};
-            if (Core::RytyMemory::GuardedCopy(grid.data(), reinterpret_cast<const void*>(it->first),
-                                              sizeof(grid))) {
+            if (ReadGuestMemory(grid.data(), it->first, sizeof(grid))) {
                 std::array<double, 3> sum{};
                 u32 bad = 0;
                 for (size_t i = 0; i < grid.size(); i += 4) {
@@ -3089,8 +3114,7 @@ void Rasterizer::FrameDumpFlip() {
         std::string list;
         for (const VAddr address : frame_dump_mem) {
             std::vector<u8> bytes(16_KB);
-            const bool read = Core::RytyMemory::GuardedCopy(
-                bytes.data(), reinterpret_cast<const void*>(address), bytes.size());
+            const bool read = ReadGuestMemory(bytes.data(), address, bytes.size());
             list += fmt::format("{:#x} {}\n", address, read ? "read" : "unreadable");
             if (read) {
                 if (std::FILE* file = std::fopen(
@@ -3155,9 +3179,12 @@ void Rasterizer::FrameDumpFlip() {
     frame_dump_done = true;
 #ifdef RYTY_GPU
     Native::g_watch_window = false;
+    const char* const mode = native ? "native" : "old";
+#else
+    const char* const mode = "old";
 #endif
     const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
-                     fmt::format("dump-{}-{}", native ? "native" : "old",
+                     fmt::format("dump-{}-{}", mode,
                                  now_request    ? fmt::format("now{}", now_dumps)
                                  : dump_at >= 0 ? fmt::format("{:g}", dump_at)
                                                 : std::string{"exp"});
@@ -4668,9 +4695,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 if (log_watched) {
                     std::array<u32, 4> head{};
-                    const bool read = size != 0 && Core::RytyMemory::GuardedCopy(
-                        head.data(), reinterpret_cast<const void*>(u64(vsharp.base_address)),
-                        std::min<u64>(size, sizeof(head)));
+                    const bool read =
+                        size != 0 && ReadGuestMemory(head.data(), u64(vsharp.base_address),
+                                                     std::min<u64>(size, sizeof(head)));
                     LOG_WARNING(Render_Vulkan,
                                 "DIAG-030: shader {:#x} use {} buffer {} {} {:#x}+{:#x} stride {} "
                                 "records {:#x}: {}; memory {} (DIAG-150)",

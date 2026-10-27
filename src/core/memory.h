@@ -221,12 +221,11 @@ public:
         rasterizer = rasterizer_;
     }
 
-#ifdef RYTY_GPU
-    // Ryty's libkernel owns guest memory and reports unmaps to the renderer through this.
+    /// The renderer bound to guest memory: Ryty's libkernel reports unmaps to it through this,
+    /// and the pipeline cache's tessellation diagnostics ask it about GPU-written constants.
     Vulkan::Rasterizer* GetRasterizer() const {
         return rasterizer;
     }
-#endif
 
     AddressSpace& GetAddressSpace() {
         return impl;
