@@ -765,11 +765,25 @@ PipelineCache::~PipelineCache() {
 // PERF-164: on again by default (RYGT_DRIVER_CACHE=0 turns it off). GT7's file is about 180 MB,
 // read in 68 ms and written in 0.5 s off the GPU thread, and it is saved during play (GT7 never
 // reaches the exit-time save): each session adds the pipelines of the cars and tracks it met.
+// PERF-167: the driver cache file's size limit, from the launcher's Graphics page
+// (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; 1 GB by default.
+static u64 DriverCacheMaxBytes() {
+    static const u64 limit = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_MAX_MB");
+        if (!env || !*env) {
+            return u64{1} << 30;
+        }
+        const long long mb = std::strtoll(env, nullptr, 10);
+        return mb < 0 ? ~u64{0} : u64(mb) << 20;
+    }();
+    return limit;
+}
+
 static bool DriverCacheFileEnabled() {
 #ifdef RYTY_GPU
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_DRIVER_CACHE");
-        return !(env && env[0] == '0');
+        return !(env && env[0] == '0') && DriverCacheMaxBytes() != 0;
     }();
     return enabled && EmulatorSettings.IsPipelineCacheEnabled();
 #else
@@ -843,6 +857,7 @@ void PipelineCache::CreateDriverCache() {
     pipeline_cache = std::move(cache);
     pipelines_at_driver_save = num_new_pipelines;
     driver_cache_saved_at = std::chrono::steady_clock::now();
+    driver_cache_bytes.store(data.size(), std::memory_order_relaxed); // PERF-167
     LOG_INFO(Render_Vulkan, "Driver pipeline cache: loaded {} bytes", data.size());
 }
 
@@ -867,11 +882,10 @@ void PipelineCache::SaveDriverCache(bool wait) {
     const auto write = [path = driver_cache_path](std::vector<u8> data) {
         // PERF-164: a cache over 1 GB is not written (GT Sport's reached 3.7 GB and stalled);
         // the file from before stays.
-        constexpr size_t MaxDriverCacheBytes = size_t{1} << 30;
-        if (data.size() > MaxDriverCacheBytes) {
+        if (data.size() > DriverCacheMaxBytes()) {
             LOG_WARNING(Render_Vulkan,
                         "PERF-164: driver pipeline cache not saved: {} MB is over the {} MB limit",
-                        data.size() >> 20, MaxDriverCacheBytes >> 20);
+                        data.size() >> 20, DriverCacheMaxBytes() >> 20);
             return;
         }
         // Write beside the file and rename, so an interrupted write never leaves a broken cache.
@@ -897,6 +911,7 @@ void PipelineCache::SaveDriverCache(bool wait) {
             const auto read_end = std::chrono::steady_clock::now();
             if (result == vk::Result::eSuccess && !data.empty()) {
                 const size_t size = data.size();
+                driver_cache_bytes.store(size, std::memory_order_relaxed); // PERF-167
                 write(std::move(data));
                 LOG_WARNING(Render_Vulkan,
                             "PERF-036: driver pipeline cache saved off the GPU thread: {} MB, "
@@ -932,7 +947,11 @@ void PipelineCache::MaybeSaveDriverCache() {
     // Every 2 minutes missed a race's pipelines: the game was closed before the next save.
     using namespace std::chrono_literals;
     const auto since = std::chrono::steady_clock::now() - driver_cache_saved_at;
-    if (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= 45s) {
+    // PERF-167: a big cache is copied out whole each save, so it is saved less often as it
+    // grows: every 45 s up to 256 MB, then 45 s more per further 256 MB (2 GB: every 6 min).
+    const u64 size_mb = driver_cache_bytes.load(std::memory_order_relaxed) >> 20;
+    const auto interval = 45s * std::max<u64>(1, (size_mb + 255) / 256);
+    if (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= interval) {
         SaveDriverCache(false);
     }
     return;
