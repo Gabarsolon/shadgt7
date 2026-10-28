@@ -319,6 +319,40 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 return depth;
             }
         }
+        if (!render_target && !info.props.is_depth) {
+            // FIX-219: a colour texture that reads the first layers of a layered target of its own
+            // layout (size, mips, format, pitch, tiling): the target itself, viewed through those
+            // layers, as NAT-040 does for depth. GT7 draws every object's reflection probe into a
+            // 64x64 B10G11R11 target of 7 mips and 2048 layers, and the car shaders read it as
+            // 1464 layers: no target had that layout, the texture was uploaded from memory, which
+            // never holds what the GPU drew, and parts of the cars reflected black (blocks on
+            // the car in the race start's close-ups). RYGT_NATIVE_LAYER_VIEWS=0: as before.
+            static const bool layer_views = [] {
+                const char* env = std::getenv("RYGT_NATIVE_LAYER_VIEWS");
+                return !(env && env[0] == '0');
+            }();
+            ImageEntry* layered = nullptr;
+            for (auto it = first; layer_views && it != last; ++it) {
+                const auto& c = it->second->info;
+                if (!it->second->from_cpu && it->second->image &&
+                    !it->second->reused.load(std::memory_order_relaxed) && !c.props.is_depth &&
+                    c.resources.layers > info.resources.layers &&
+                    c.resources.levels == info.resources.levels &&
+                    c.size.width == info.size.width && c.size.height == info.size.height &&
+                    c.size.depth == info.size.depth && c.pitch == info.pitch &&
+                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
+                    c.num_samples == info.num_samples && c.pixel_format == info.pixel_format &&
+                    (!layered || it->second->write_version.load(std::memory_order_relaxed) >
+                                     layered->write_version.load(std::memory_order_relaxed))) {
+                    layered = it->second.get();
+                }
+            }
+            if (layered) {
+                ++stats.hits;
+                layered->last_use.store(frame, std::memory_order_relaxed);
+                return layered;
+            }
+        }
         if (!render_target && WatchedTexture(info.guest_address, info.guest_address + 1) &&
             WatchSample()) {
             // DIAG-221 (diagnosis, with RYGT_NATIVE_WATCH_TEXTURE): a texture lookup that found no
