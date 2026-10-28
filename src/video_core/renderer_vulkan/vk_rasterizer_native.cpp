@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -801,13 +802,77 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
         sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
     }
+    const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
-                     (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(border.Address()) << 1);
+                     (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
+                     (custom ? u64(border.Address()) << 1 : 0);
     std::scoped_lock lock{sampler_mutex};
-    auto& slot = samplers[hash];
-    if (!slot) {
-        slot = std::make_unique<VideoCore::Sampler>(r.instance, sharp, border, is_depth);
+    if (const auto it = sampler_lookup.find(hash); it != sampler_lookup.end()) {
+        return it->second;
     }
+    // FIX-GT7-002: one Vulkan sampler per state the device sees. GT7's S#s differ in bits the
+    // sampler doesn't use (performance hints, unused bits, the border colour table when the
+    // colour isn't custom), and a sampler per raw S# passed the driver's limit (4000 on NVIDIA):
+    // "Failed to create sampler: ErrorOutOfDeviceMemory" ended the game.
+    AmdGpu::Sampler state{};
+    state.clamp_x.Assign(sharp.clamp_x.Value());
+    state.clamp_y.Assign(sharp.clamp_y.Value());
+    state.clamp_z.Assign(sharp.clamp_z.Value());
+    state.xy_mag_filter.Assign(sharp.xy_mag_filter.Value());
+    state.xy_min_filter.Assign(sharp.xy_min_filter.Value());
+    state.mip_filter.Assign(sharp.mip_filter.Value());
+    if (AmdGpu::IsAnisoFilter(sharp.xy_mag_filter) || AmdGpu::IsAnisoFilter(sharp.xy_min_filter)) {
+        state.max_aniso.Assign(sharp.max_aniso.Value());
+    }
+    if (is_depth) {
+        state.depth_compare_func.Assign(sharp.depth_compare_func.Value());
+    }
+    state.border_color_type.Assign(sharp.border_color_type.Value());
+    std::array<float, 4> custom_color{};
+    if (custom) {
+        state.border_color_ptr.Assign(sharp.border_color_ptr.Value());
+        if (border.Address() != 0) {
+            custom_color = border.Address<std::array<float, 4>*>()[sharp.border_color_ptr.Value()];
+        }
+    }
+    const u32 limit = r.instance.GetMaxSamplerAllocationCount();
+    if (samplers.size() >= limit / 4 * 3) {
+        // Close to the limit: levels of detail in quarter steps.
+        const auto quarter = [](float lod) { return std::round(lod * 4.0f) * 64.0f; };
+        state.min_lod.Assign(u64(quarter(sharp.MinLod())));
+        state.max_lod.Assign(u64(quarter(sharp.MaxLod())));
+        state.lod_bias.Assign(u64(s64(quarter(sharp.LodBias()))) & 0x3fff);
+    } else {
+        state.min_lod.Assign(sharp.min_lod.Value());
+        state.max_lod.Assign(sharp.max_lod.Value());
+        state.lod_bias.Assign(sharp.lod_bias.Value());
+    }
+    struct Key {
+        AmdGpu::Sampler state;
+        std::array<float, 4> color;
+        u64 depth;
+    };
+    const Key key{state, custom_color, is_depth ? 1u : 0u};
+    const u64 state_hash = XXH3_64bits(&key, sizeof(key));
+    auto& slot = samplers[state_hash];
+    if (!slot) {
+        if (samplers.size() + 64 > limit && !samplers.empty()) {
+            // At the limit: the last sampler made stands in (logged), rather than a failure.
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_ERROR(Render_Vulkan, "FIX-GT7-002: {} samplers, the device's limit is {}",
+                          samplers.size(), limit);
+            }
+            samplers.erase(state_hash);
+            return last_sampler;
+        }
+        slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
+        last_sampler = slot->Handle();
+    }
+    if (sampler_lookup.size() > (1u << 20)) {
+        sampler_lookup.clear();
+    }
+    sampler_lookup.emplace(hash, slot->Handle());
     return slot->Handle();
 }
 

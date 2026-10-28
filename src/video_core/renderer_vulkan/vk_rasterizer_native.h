@@ -905,7 +905,10 @@ private:
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
 
     std::mutex sampler_mutex;
+    /// FIX-GT7-002: by the state the device sees; sampler_lookup by the raw S#.
     std::unordered_map<u64, std::unique_ptr<VideoCore::Sampler>> samplers;
+    std::unordered_map<u64, vk::Sampler> sampler_lookup;
+    vk::Sampler last_sampler{};
 
     std::mutex views_mutex;
     std::unordered_map<const Native::ImageEntry*, std::vector<ViewRecord>> views;
