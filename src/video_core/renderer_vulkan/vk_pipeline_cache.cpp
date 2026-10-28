@@ -437,6 +437,35 @@ static Shader::PsColorBuffer TranslationColorBuffer(const Shader::PsColorBuffer&
     return out;
 }
 
+bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
+    // FIX-217: whether a pixel shader has a V_INTERP_MOV_F32 selecting P10 or P20 (a vertex's own
+    // attribute value; P0 is the provoking vertex, which flat inputs give anyway). VINTRP is
+    // 0b110010 in bits 31:26, the opcode in 17:16 (2: MOV) and the selector in 7:0. Each
+    // program's answer is kept by its code address. DIAG-222 (RYGT_DIAG_BARY_COUNT=1) logs the
+    // count of such programs.
+    const VAddr address = program.Address<VAddr>();
+    if (const auto it = vertex_value_programs.find(address); it != vertex_value_programs.end()) {
+        return it->second;
+    }
+    const auto params = AmdGpu::GetParams(program);
+    bool found = false;
+    for (const u32 word : params.code) {
+        if ((word >> 26) == 0b110010 && ((word >> 16) & 3) == 2 && (word & 0xff) < 2) {
+            found = true;
+            break;
+        }
+    }
+    vertex_value_programs.emplace(address, found);
+    static u32 programs = 0, matching = 0;
+    ++programs;
+    matching += found;
+    if (std::getenv("RYGT_DIAG_BARY_COUNT") && (found || programs % 100 == 0)) {
+        LOG_WARNING(Render_Vulkan, "DIAG-222: {} of {} pixel shaders read vertex values ({:#x}{})",
+                    matching, programs, params.hash, found ? " does" : "");
+    }
+    return found;
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = S().runtime_infos[u32(l_stage)];
     const auto& regs = Regs();
@@ -521,9 +550,23 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.addr_flags = regs.ps_input_addr;
         info.hw.fs.num_inputs = regs.num_interp;
         static const bool direct_barycentric_requested = SingleSampleBarycentricRequested();
-        info.hw.fs.single_sample_barycentric = UseSingleSampleBarycentric(
+        // FIX-217: only for the fragment shaders 217d4011 is about (a V_INTERP_MOV reading a
+        // vertex's own value, P10 or P20); every other shader keeps the hardware interpolation and
+        // its 27b translation and cache entries. On for all fragment shaders, it made AMD retranslate
+        // and recompile everything with heavier shaders. RYGT_AMD_BARYCENTRIC_ALL=1: all, as before.
+        static const bool all_shaders = [] {
+            const char* env = std::getenv("RYGT_AMD_BARYCENTRIC_ALL");
+            return env && env[0] == '1';
+        }();
+        static const bool diag_count = std::getenv("RYGT_DIAG_BARY_COUNT") != nullptr;
+        const bool candidate = UseSingleSampleBarycentric(
             instance.GetVendorID(), profile.supports_fragment_shader_barycentric,
             S().graphics_key.num_samples, direct_barycentric_requested);
+        info.hw.fs.single_sample_barycentric =
+            candidate && (all_shaders || ReadsVertexValues(regs.ps_program));
+        if (diag_count) {
+            ReadsVertexValues(regs.ps_program); // DIAG-222: counted on any GPU
+        }
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
         info.hw.fs.quad_sample_mask =
             regs.reg_array[0xa30e] != ~0u || regs.reg_array[0xa30f] != ~0u;
