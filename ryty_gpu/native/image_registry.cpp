@@ -319,6 +319,26 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 return depth;
             }
         }
+        if (!render_target && WatchedTexture(info.guest_address, info.guest_address + 1) &&
+            WatchSample()) {
+            // DIAG-221 (diagnosis, with RYGT_NATIVE_WATCH_TEXTURE): a texture lookup that found no
+            // target of its layout: the pictures at its address and how their layouts differ.
+            std::string others;
+            for (auto it = first; it != last; ++it) {
+                const auto& c = it->second->info;
+                others += fmt::format(" | {} {}x{} pitch {} tile {} bits {} fmt {} lv {} ly {}{}{}",
+                                      it->second->from_cpu ? "texture" : "target", c.size.width,
+                                      c.size.height, c.pitch, u32(c.tile_mode), c.num_bits,
+                                      u32(c.pixel_format), c.resources.levels, c.resources.layers,
+                                      it->second->reused.load() ? " reused" : "",
+                                      SameLayout(c, info) ? " same-layout" : "");
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-221: texture {:#x} {}x{} pitch {} tile {} bits {} fmt {}: no target; "
+                        "at the address:{}",
+                        info.guest_address, info.size.width, info.size.height, info.pitch,
+                        u32(info.tile_mode), info.num_bits, u32(info.pixel_format), others);
+        }
         if (exact) {
             ++stats.hits;
             exact->last_use.store(frame, std::memory_order_relaxed);
