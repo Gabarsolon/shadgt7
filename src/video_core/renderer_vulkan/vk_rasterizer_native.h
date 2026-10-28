@@ -183,6 +183,25 @@ private:
         void Clear();
     };
 
+    /// DIAG-GT7-001 (RYGT_DIAG_GPU_TIME=1): what the GPU ran between two timestamps of a list.
+    struct GpuSegment {
+        u32 draws = 0, dispatches = 0, uploads = 0;
+        u64 upload_bytes = 0;
+        u64 max_groups = 0, max_groups_cs = 0; ///< the largest direct dispatch and its program
+        u64 max_prims = 0, max_prims_ps = 0;   ///< the largest draw (indices x instances), its PS
+    };
+    /// DIAG-GT7-001: a list's timestamps (at its start, after each global barrier, at its end).
+    struct GpuTiming {
+        vk::QueryPool pool{};
+        u32 used = 0;
+        u64 tick = 0;
+        u64 frame = 0;
+        double cpu_s = 0.0;     ///< when the recorder began it
+        double cpu_end_s = 0.0; ///< when the recorder ended it
+        std::vector<GpuSegment> segments;
+        u64 uploads_at = 0, upload_bytes_at = 0; ///< registry counters at the segment's start
+    };
+
     /// The command list being recorded and its state.
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
@@ -215,6 +234,7 @@ private:
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
         u32 commands = 0;
+        std::unique_ptr<GpuTiming> gpu_timing; ///< DIAG-GT7-001
     };
 
     struct ViewRecord {
@@ -438,6 +458,27 @@ private:
                                                           bool mirror = false);
 
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
+    /// DIAG-GT7-001: GPU timestamps of the main stream's lists.
+    static bool GpuTimeOn();
+    void GpuTimeBegin(Stream& s);
+    void GpuTimeMark(Stream& s);
+    void GpuTimeEnd(Stream& s, u64 tick);
+    void GpuTimeCollect();
+    GpuSegment* GpuSeg() {
+        auto* t = stream.gpu_timing.get();
+        return t && !t->segments.empty() ? &t->segments.back() : nullptr;
+    }
+    static constexpr u32 GpuTimeQueries = 1024;
+    std::deque<std::unique_ptr<GpuTiming>> gpu_timing_pending;
+    std::vector<vk::QueryPool> gpu_timing_pools;
+    u64 gpu_timing_prev_end = 0;
+    double gpu_timing_prev_cpu_end = 0.0;
+    std::chrono::steady_clock::time_point gpu_timing_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point gpu_timing_report = std::chrono::steady_clock::now();
+    struct GpuTimeStats {
+        u64 lists = 0, slow = 0;
+        double busy_ms = 0.0, max_list_ms = 0.0, max_gap_ms = 0.0;
+    } gpu_time_stats;
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,

@@ -487,6 +487,12 @@ NativeRenderer::~NativeRenderer() {
     for (const auto pool : stream.pools) {
         vk_device.destroyDescriptorPool(pool);
     }
+    for (const auto pool : gpu_timing_pools) { // DIAG-GT7-001
+        vk_device.destroyQueryPool(pool);
+    }
+    for (const auto& timing : gpu_timing_pending) {
+        vk_device.destroyQueryPool(timing->pool);
+    }
     views.clear();
     samplers.clear();
 }
@@ -898,10 +904,165 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.pipeline = vk::Pipeline{};
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
+    GpuTimeBegin(s); // DIAG-GT7-001: the first segment is the wait for earlier GPU work
     // What was recorded before this list (earlier lists, the presenter) is finished first.
     GlobalBarrier();
     MakePendingMirrors(); // NAT-150: behind the barrier the list starts with anyway
     return s;
+}
+
+bool NativeRenderer::GpuTimeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DIAG_GPU_TIME");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+void NativeRenderer::GpuTimeBegin(Stream& s) {
+    if (!GpuTimeOn() || s.wrapped_list) {
+        return;
+    }
+    vk::QueryPool pool{};
+    if (!gpu_timing_pools.empty()) {
+        pool = gpu_timing_pools.back();
+        gpu_timing_pools.pop_back();
+    } else {
+        const auto [result, made] = r.instance.GetDevice().createQueryPool(vk::QueryPoolCreateInfo{
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = GpuTimeQueries,
+        });
+        if (result != vk::Result::eSuccess) {
+            return;
+        }
+        pool = made;
+    }
+    auto timing = std::make_unique<GpuTiming>();
+    timing->pool = pool;
+    timing->frame = frame;
+    timing->cpu_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_timing_start).count();
+    timing->segments.emplace_back();
+    const auto& registry_stats = registry->GetStats();
+    timing->uploads_at = registry_stats.uploads.load(std::memory_order_relaxed);
+    timing->upload_bytes_at = registry_stats.upload_bytes.load(std::memory_order_relaxed);
+    s.cmd.resetQueryPool(pool, 0, GpuTimeQueries);
+    s.cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, timing->used++);
+    s.gpu_timing = std::move(timing);
+}
+
+void NativeRenderer::GpuTimeMark(Stream& s) {
+    GpuTiming* t = s.gpu_timing.get();
+    if (!t || t->used + 1 >= GpuTimeQueries) {
+        return; // (past the pool's size the rest of the list goes in its last segment)
+    }
+    const auto& registry_stats = registry->GetStats();
+    const u64 uploads = registry_stats.uploads.load(std::memory_order_relaxed);
+    const u64 upload_bytes = registry_stats.upload_bytes.load(std::memory_order_relaxed);
+    GpuSegment& seg = t->segments.back();
+    seg.uploads += u32(uploads - t->uploads_at);
+    seg.upload_bytes += upload_bytes - t->upload_bytes_at;
+    t->uploads_at = uploads;
+    t->upload_bytes_at = upload_bytes;
+    s.cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, t->pool, t->used++);
+    t->segments.emplace_back();
+}
+
+void NativeRenderer::GpuTimeEnd(Stream& s, u64 tick) {
+    GpuTiming* t = s.gpu_timing.get();
+    if (!t) {
+        return;
+    }
+    if (t->used + 1 < GpuTimeQueries) {
+        GpuTimeMark(s); // the end, with an empty segment after it
+        t->segments.pop_back();
+    }
+    t->tick = tick;
+    t->cpu_end_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_timing_start).count();
+    gpu_timing_pending.push_back(std::move(s.gpu_timing));
+}
+
+void NativeRenderer::GpuTimeCollect() {
+    if (gpu_timing_pending.empty()) {
+        return;
+    }
+    const double period_ms = double(r.instance.GetImageLimits().timestampPeriod) / 1e6;
+    const vk::Device vk_device = r.instance.GetDevice();
+    static thread_local std::vector<u64> stamps;
+    while (!gpu_timing_pending.empty()) {
+        GpuTiming& t = *gpu_timing_pending.front();
+        stamps.assign(t.used, 0);
+        const vk::Result result = vk_device.getQueryPoolResults(
+            t.pool, 0, t.used, stamps.size() * sizeof(u64), stamps.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result == vk::Result::eNotReady) {
+            break; // the GPU has not run it yet (later lists come after it)
+        }
+        if (result == vk::Result::eSuccess && t.used >= 2) {
+            const double list_ms = double(stamps[t.used - 1] - stamps[0]) * period_ms;
+            const double gap_ms = gpu_timing_prev_end != 0 && stamps[0] > gpu_timing_prev_end
+                                      ? double(stamps[0] - gpu_timing_prev_end) * period_ms
+                                      : 0.0;
+            gpu_timing_prev_end = stamps[t.used - 1];
+            // On the CPU: from the previous list's end to this one's start (a GPU gap about as
+            // long means the GPU waited for the recorder; much longer, it ran other work).
+            const double cpu_gap_ms =
+                gpu_timing_prev_cpu_end != 0.0 ? (t.cpu_s - gpu_timing_prev_cpu_end) * 1000.0 : 0.0;
+            gpu_timing_prev_cpu_end = t.cpu_end_s;
+            auto& st = gpu_time_stats;
+            ++st.lists;
+            st.busy_ms += list_ms;
+            st.max_list_ms = std::max(st.max_list_ms, list_ms);
+            st.max_gap_ms = std::max(st.max_gap_ms, gap_ms);
+            // The slowest segments of a slow list (or after a long gap), with what they held.
+            std::vector<std::pair<double, u32>> segs;
+            for (u32 i = 0; i + 1 < t.used && i < t.segments.size(); ++i) {
+                segs.emplace_back(double(stamps[i + 1] - stamps[i]) * period_ms, i);
+            }
+            std::ranges::sort(segs, std::greater{});
+            const bool slow = list_ms >= 20.0 || gap_ms >= 20.0 ||
+                              (!segs.empty() && segs.front().first >= 10.0);
+            if (slow) {
+                ++st.slow;
+                std::string text;
+                for (size_t k = 0; k < std::min<size_t>(segs.size(), 4); ++k) {
+                    const auto [ms, i] = segs[k];
+                    const GpuSegment& g = t.segments[i];
+                    text += fmt::format(
+                        "; seg {}/{} {:.2f} ms: {} draws (max {} prims, ps {:#x}), {} dispatches "
+                        "(max {} groups, cs {:#x}), {} uploads ({} KB)",
+                        i, t.segments.size(), ms, g.draws, g.max_prims, g.max_prims_ps,
+                        g.dispatches, g.max_groups, g.max_groups_cs, g.uploads,
+                        g.upload_bytes / 1024);
+                }
+                u32 draws = 0, dispatches = 0;
+                for (const GpuSegment& g : t.segments) {
+                    draws += g.draws;
+                    dispatches += g.dispatches;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-GT7-001: frame {} at {:.2f} s: list {:.2f} ms on the GPU "
+                            "({} draws, {} dispatches, {} segments, recorded in {:.2f} ms), "
+                            "started {:.2f} ms after the previous list ended on the GPU ({:.2f} "
+                            "ms on the CPU){}",
+                            t.frame, t.cpu_s, list_ms, draws, dispatches, t.segments.size(),
+                            (t.cpu_end_s - t.cpu_s) * 1000.0, gap_ms, cpu_gap_ms, text);
+            }
+        }
+        gpu_timing_pools.push_back(t.pool);
+        gpu_timing_pending.pop_front();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - gpu_timing_report >= std::chrono::seconds{10}) {
+        auto& st = gpu_time_stats;
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GT7-001 (10 s): {} lists, {:.0f} ms on the GPU in them, longest list "
+                    "{:.2f} ms, longest gap between lists {:.2f} ms, {} slow lists logged",
+                    st.lists, st.busy_ms, st.max_list_ms, st.max_gap_ms, st.slow);
+        st = {};
+        gpu_timing_report = now;
+    }
 }
 
 void NativeRenderer::EndRendering() {
@@ -972,6 +1133,7 @@ void NativeRenderer::GlobalBarrier() {
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
+    GpuTimeMark(s); // DIAG-GT7-001
     s.written.clear();
     s.buffers_written = false;
     s.attach_dirty.clear();
@@ -6593,6 +6755,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     ProbeDraw(targets, regs); // DIAG-170 (diagnosis)
     StripDraw(targets);       // DIAG-173 (diagnosis)
+    if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001
+        ++seg->draws;
+        const u64 prims = u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1);
+        if (prims > seg->max_prims) {
+            const Shader::Info* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            seg->max_prims = prims;
+            seg->max_prims_ps = ps ? ps->pgm_hash : 0;
+        }
+    }
     ++stats.draws;
     if (indirect) {
         indirect_skip.skipped = nullptr;
@@ -7884,6 +8055,14 @@ void NativeRenderer::DispatchDirect() {
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     ProbeDispatch(pipeline->GetStage(Shader::SwStage::Compute), b, false); // DIAG-175
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001
+        ++seg->dispatches;
+        const u64 groups = u64(cs_program.dim_x) * cs_program.dim_y * cs_program.dim_z;
+        if (groups > seg->max_groups) {
+            seg->max_groups = groups;
+            seg->max_groups_cs = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+        }
+    }
     ProbeDispatch(pipeline->GetStage(Shader::SwStage::Compute), b, true); // DIAG-175
     split(4);
     NoteWrites(nullptr, b);
@@ -7950,6 +8129,9 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     cmdbuf.dispatchIndirect(args->first, args->second);
+    if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001 (groups unknown here)
+        ++seg->dispatches;
+    }
     NoteWrites(nullptr, b);
     StripDispatch(b); // DIAG-173 (diagnosis)
     s.buffers_written = true;
@@ -8785,6 +8967,7 @@ void NativeRenderer::Splice() {
         GlobalBarrier(); // NAT-112: written back in this submission
     }
     const bool wrapped = s.wrapped_list != nullptr; // FIX-188: Intel Arc (#65)
+    GpuTimeEnd(s, r.scheduler.CurrentTick()); // DIAG-GT7-001
     if (!wrapped) {
         s.list->End();
     }
@@ -8794,6 +8977,7 @@ void NativeRenderer::Splice() {
         r.scheduler.CommandBuffer().executeCommands(secondary);
     }
     const u64 tick = r.scheduler.CurrentTick();
+    GpuTimeCollect(); // DIAG-GT7-001: lists the GPU finished
     SpliceHudStream(tick); // GT7-UW
     if (!wrapped) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
