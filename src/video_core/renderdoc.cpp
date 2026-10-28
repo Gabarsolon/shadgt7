@@ -125,7 +125,7 @@ void TriggerCapture() {
     // command buffers were submitted, so it held only the presentation.
     static const bool present_frame = std::getenv("RYGT_RDOC_PRESENT_FRAME") != nullptr;
     if (present_frame && rdoc_api) {
-        rdoc_api->TriggerCapture();
+        rdoc_api->TriggerMultiFrameCapture(3); // presents run at 60 Hz, game frames at 30
         return;
     }
     if (capture_state == CaptureState::Idle) {
