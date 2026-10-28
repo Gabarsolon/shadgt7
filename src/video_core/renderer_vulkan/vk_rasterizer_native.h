@@ -891,7 +891,15 @@ private:
         }
     } in_place;
     bool InPlaceSampled() const {
-        return (frame & 7) == 0;
+        // PERF-GT7-001: diagnosis only (RYGT_NATIVE_INPLACE_STATS=1). Sampled frames put every
+        // 64 KB page of every binding in a set and looked each vertex attribute up in full
+        // (no OPT-004 shortcut): in GT7's busy scenes (~3,000 draws) those frames missed the
+        // 30 fps deadline.
+        static const bool on = [] {
+            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            return env && env[0] == '1';
+        }();
+        return on && (frame & 7) == 0;
     }
     /// NAT-150: the counter for a binding of that kind, by what GuestBuffer bound.
     u32 BoundKind(u32 kind) const {

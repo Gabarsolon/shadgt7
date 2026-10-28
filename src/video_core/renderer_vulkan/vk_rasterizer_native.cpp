@@ -1964,8 +1964,15 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
     auto* direct = r.buffer_cache.GetDirectMemory();
     const VAddr end = address + size;
     const u64 alignment = r.instance.StorageMinAlignment();
-    for (auto& [base, region] : regions) {
-        if (region.begin >= end || region.end <= address || region.cpu_pages.empty()) {
+    // PERF-GT7-003: from the region over the write's start, in address order (regions never
+    // overlap); every write walked them all.
+    auto first = regions.upper_bound(address);
+    if (first != regions.begin() && std::prev(first)->second.end > address) {
+        --first;
+    }
+    for (auto it = first; it != regions.end() && it->second.begin < end; ++it) {
+        Region& region = it->second;
+        if (region.end <= address || region.cpu_pages.empty()) {
             continue;
         }
         const VAddr from = std::max(address, region.begin);

@@ -73,6 +73,10 @@ struct RecentView {
 };
 thread_local std::array<RecentView, 8> t_recent_views{};
 thread_local u32 t_recent_next = 0;
+// PERF-GT7-002: ranges a thread found imported whole (over one view or several), by their start:
+// GT7's busy scenes bind thousands of ranges a frame over more views than the eight above hold,
+// and each miss walked the view map page by page under the lock.
+thread_local std::array<RecentView, 256> t_recent_ranges{};
 
 } // namespace
 
@@ -357,6 +361,10 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             return true;
         }
     }
+    RecentView& range = t_recent_ranges[(address >> 12) % t_recent_ranges.size()];
+    if (range.generation == generation && address >= range.begin && end <= range.end) {
+        return true;
+    }
     std::scoped_lock lk{mutex};
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
         auto it = views.upper_bound(page);
@@ -375,6 +383,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             return false;
         }
     }
+    range = {generation, address, end};
     return true;
 }
 
