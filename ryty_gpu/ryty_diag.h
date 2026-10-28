@@ -79,10 +79,14 @@ inline void Mark(Zone zone, u64 arg = 0) {
 /// Called once per presented game frame (the screen clock).
 void FrameShown();
 
+/// DIAG-GT7-002: tags the stack samples taken from now on (the renderer's A/B window << 8 | mode).
+void SetProfileTag(u32 tag);
+
 #ifndef RYTY_DIAG
 inline void Record(Zone, u64, u64, u64) {}
 inline void RecordElapsed(Zone, std::chrono::steady_clock::duration, u64) {}
 inline void FrameShown() {}
+inline void SetProfileTag(u32) {}
 #endif
 
 class Scope {

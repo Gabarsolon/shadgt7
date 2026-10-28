@@ -762,7 +762,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // that selection).
     if (!compute && direct_draw && decode_draw_packet &&
         regs.primitive_type != PrimitiveType::QuadList &&
-        Vulkan::NativeRenderer::PrepareEnabled()) {
+        Vulkan::NativeRenderer::PreparedOn()) { // DIAG-GT7-003: off in A/B windows
         if (auto* native = rasterizer->Native()) {
             prepared_draw = native->HasPrepared(decode_draw_packet);
         }

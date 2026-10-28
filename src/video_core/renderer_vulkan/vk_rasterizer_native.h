@@ -26,6 +26,9 @@
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/regs_color.h"
+#include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_texture.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -126,6 +129,8 @@ public:
 
     /// OPT-010 (RYGT_NATIVE_PREPARE=1): whether game job threads prepare draws.
     static bool PrepareEnabled();
+    /// DIAG-GT7-003: whether the prepared draws are used now (off in A/B windows).
+    static bool PreparedOn();
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
     /// (with its stages): then the command thread doesn't select its pipeline.
     bool HasPrepared(const void* packet);
@@ -201,6 +206,19 @@ private:
         std::vector<GpuSegment> segments;
         u64 uploads_at = 0, upload_bytes_at = 0; ///< registry counters at the segment's start
     };
+    /// OPT-014: what a list bound in one set of its last graphics pipeline layout.
+    struct SetMemo {
+        bool valid = false;
+        u64 generation = 0;
+        std::vector<u64> signature;
+    };
+    /// OPT-015: the small upload memory a stage's set last filled in a list.
+    struct UploadMemo {
+        u64 list = ~u64{0};
+        vk::Buffer buffer{};
+        u64 offset = 0;
+        std::vector<u8> bytes;
+    };
 
     /// The command list being recorded and its state.
     struct Stream {
@@ -235,6 +253,15 @@ private:
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
         u32 commands = 0;
         std::unique_ptr<GpuTiming> gpu_timing; ///< DIAG-GT7-001
+        /// OPT-014: the sets and push constants this list bound for its last graphics pipeline
+        /// layout (a draw binding the same ones binds nothing again).
+        vk::PipelineLayout memo_layout{};
+        bool push_known = false;
+        Shader::PushData last_push{};
+        std::array<SetMemo, 5> set_memos{};
+        /// OPT-015: which list the upload memos belong to (moves on when a list begins or ends).
+        u64 serial = 0;
+        std::array<UploadMemo, 5 * 3> upload_memos{};
     };
 
     struct ViewRecord {
@@ -479,6 +506,48 @@ private:
         u64 lists = 0, slow = 0;
         double busy_ms = 0.0, max_list_ms = 0.0, max_gap_ms = 0.0;
     } gpu_time_stats;
+    /// OPT-013..015 (RYGT_NATIVE_REUSE=0 turns them off): work the previous draws of the list
+    /// already did is not done again.
+    static bool ReuseOn();
+    /// DIAG-GT7-003 (RYGT_NATIVE_AB=1): the changes under test alternate with the reference
+    /// every 10 s report window (A reference, B changes, C as B with prepared draws when the
+    /// prepare workers run), each window's cost logged.
+    static bool AbOn();
+    u32 AbMode() const;
+    /// Prepared draws taken out (the next C window starts without leftovers).
+    void DropPrepared();
+    u64 ab_window = 0;
+    u64 ab_frame = 0;
+    /// OPT-013: the targets the previous draw resolved, by the registers that name them, while
+    /// the registry made or dropped no picture and no memory was unmapped. Clears, rewrites,
+    /// depth twins and last uses are still done at every draw.
+    struct TargetsMemo {
+        bool valid = false;
+        u64 generation = 0;
+        u32 mrt_mask = 0;
+        u32 color_mode = 0;
+        u32 target_mask = 0;
+        u32 num_colors = 0;
+        std::array<AmdGpu::ColorBuffer, 8> color_buffers{};
+        std::array<AmdGpu::CbDbExtent, 8> cb_extents{};
+        bool depth_used = false;
+        u32 depth_flags = 0; ///< depth and stencil enable, depth write enable
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        VAddr htile = 0;
+        AmdGpu::CbDbExtent db_extent{};
+        std::array<VAddr, 8> cmasks{};
+        bool htile_meta = false; ///< the depth image has HTILE (FIX-156)
+        Targets targets{};
+    } targets_memo;
+    bool TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
+    /// OPT-014: the list's binding memos are no longer what is bound.
+    static void ForgetBindings(Stream& s);
+    /// OPT-015: upload memory of the list holding `data` (an earlier draw's with the same bytes).
+    std::pair<vk::Buffer, u64> UploadBytes(u32 slot, const void* data, u32 size, u64 align);
+    /// Everything OPT-014 depends on: pictures made or dropped, memory unmapped, regions or
+    /// mirrors made or dropped.
+    u64 ReuseGeneration() const;
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
@@ -996,6 +1065,10 @@ private:
         u64 timed_draws = 0;     ///< OPT-001
         u64 vertex_near = 0;     ///< OPT-004
         u64 vertex_skipped = 0;  ///< OPT-005
+        /// OPT-013..015: targets from the memo, sets bound again without a new one, sets
+        /// written, pushed sets and push constants not pushed again, uploads reused.
+        u64 targets_reused = 0, sets_reused = 0, sets_written = 0, pushes_skipped = 0,
+            push_constants_skipped = 0, uploads_reused = 0;
         /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:
         /// another pipeline, other user data, memory unmapped, pictures or buffers changed.
         u64 prepared_used = 0, prepared_missing = 0;

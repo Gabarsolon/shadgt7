@@ -28,6 +28,12 @@
 
 namespace RyDiag {
 
+std::atomic<u32> g_profile_tag{0}; // DIAG-GT7-002
+
+void SetProfileTag(u32 tag) {
+    g_profile_tag.store(tag, std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr const char* ZoneName(Zone zone) {
@@ -409,6 +415,7 @@ void SamplerThread() {
             Sample sample{};
             sample.cycles = used;
             sample.tid = t.tid;
+            sample.pad = g_profile_tag.load(std::memory_order_relaxed); // DIAG-GT7-002
             const bool stop = stack_tick && t.stack_base && SuspendThread(t.handle) != DWORD(-1);
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
@@ -924,8 +931,90 @@ void WriteSpike(const State::SpikeRequest& req) {
     std::fclose(f);
 }
 
+// DIAG-GT7-002: where the GPU recorder thread is, from every stack sample since the start, by the
+// mode the renderer set (A/B/C: 1/2/3), as module+offset (system frames with their first caller in
+// the renderer library). Symbolize offline with the build's PDB.
+void WriteRecorderProfile() {
+    auto& s = GetState();
+    static u64 read_upto = 0;
+    static std::map<std::pair<u32, std::string>, u64> counts;
+    static std::map<u32, u64> totals;
+    u32 recorder = 0;
+    {
+        std::scoped_lock lk{s.threads_mutex};
+        for (const auto& [tid, name] : s.thread_names) {
+            if (name == "shadGT:GpuRecorder") {
+                recorder = tid;
+            }
+        }
+    }
+    const u64 head = s.sample_head.load(std::memory_order_acquire);
+    if (head - read_upto > SampleRingSize) {
+        read_upto = head - SampleRingSize;
+    }
+    // Every sample as taken too (window, mode, the frame and the callers found on the stack), for
+    // inclusive costs and per-window cuts offline; the renderer's tag is window << 8 | mode.
+    static FILE* raw = nullptr;
+    if (!raw && recorder != 0) {
+        raw = _wfopen((s.dir / "recorder_samples.csv").c_str(), L"w");
+        if (raw) {
+            std::fputs("window,mode,frames\n", raw);
+        }
+    }
+    for (; read_upto < head; ++read_upto) {
+        const Sample sm = s.samples[read_upto % SampleRingSize];
+        if (recorder == 0 || sm.tid != recorder || sm.rip == 0) {
+            continue;
+        }
+        const u32 mode = sm.pad & 0xff;
+        std::string key = Symbol(sm.rip);
+        std::string frames = key;
+        bool keyed = key.starts_with("libSceVideoOut");
+        for (const u64 caller : sm.callers) {
+            if (!caller) {
+                break;
+            }
+            const std::string sym = Symbol(caller);
+            frames += " " + sym;
+            if (!keyed && sym.starts_with("libSceVideoOut")) {
+                key += " < " + sym;
+                keyed = true;
+            }
+        }
+        if (raw) {
+            std::fprintf(raw, "%u,%u,%s\n", sm.pad >> 8, mode, frames.c_str());
+        }
+        ++counts[{mode, key}];
+        ++totals[mode];
+    }
+    if (raw) {
+        std::fflush(raw);
+    }
+    std::string text = "ryGT recorder profile (DIAG-GT7-002): stack samples of shadGT:GpuRecorder "
+                       "by tag (renderer A/B mode)\n";
+    for (const auto& [tag, total] : totals) {
+        text += fmt::format("\n== tag {}: {} samples\n", tag, total);
+        std::vector<std::pair<u64, std::string>> top;
+        for (const auto& [key, n] : counts) {
+            if (key.first == tag) {
+                top.emplace_back(n, key.second);
+            }
+        }
+        std::sort(top.begin(), top.end(), std::greater{});
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 400); ++i) {
+            text += fmt::format("{:8} {:6.2f}%  {}\n", top[i].first,
+                                100.0 * top[i].first / total, top[i].second);
+        }
+    }
+    if (FILE* f = _wfopen((s.dir / "recorder_profile.txt").c_str(), L"w")) {
+        std::fputs(text.c_str(), f);
+        std::fclose(f);
+    }
+}
+
 void WriteSummary() {
     auto& s = GetState();
+    WriteRecorderProfile(); // DIAG-GT7-002
     std::vector<float> sorted;
     {
         std::scoped_lock lk{s.frames_mutex};

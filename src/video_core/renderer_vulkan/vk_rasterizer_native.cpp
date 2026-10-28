@@ -44,6 +44,7 @@
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
+#include "ryty_gpu/ryty_diag.h"
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/direct_memory.h"
@@ -309,6 +310,91 @@ bool NativeModeRequested() {
     return requested;
 }
 
+namespace {
+// OPT-013..015 on (RYGT_NATIVE_REUSE=0 off; DIAG-GT7-003 switches it while the game runs).
+std::atomic<bool> g_reuse_on{[] {
+    const char* env = std::getenv("RYGT_NATIVE_REUSE");
+    return !(env && env[0] == '0');
+}()};
+// OPT-010..012: the recorder and the command thread use the draws the prepare workers worked
+// out (DIAG-GT7-003 switches it while the game runs; the workers prepare in every window).
+std::atomic<bool> g_prepared_on{true};
+} // namespace
+
+bool NativeRenderer::ReuseOn() {
+    return g_reuse_on.load(std::memory_order_relaxed);
+}
+
+bool NativeRenderer::PreparedOn() {
+    return PrepareEnabled() && g_prepared_on.load(std::memory_order_relaxed);
+}
+
+void NativeRenderer::DropPrepared() {
+    // What was prepared while nothing used it is not used later: a prepared draw the command
+    // thread sees makes it skip its own selection, and one left over from an older submission
+    // of the same packet would then be installed.
+    std::vector<PreparedDraw*> dropped;
+    for (auto& shard : prepared_shards) {
+        std::scoped_lock lock{shard.mutex};
+        for (const auto& [packet, draw] : shard.draws) {
+            dropped.push_back(draw);
+        }
+        shard.draws.clear();
+    }
+    for (PreparedDraw* draw : dropped) {
+        FreePrepared(draw);
+    }
+}
+
+bool NativeRenderer::AbOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_AB");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+u32 NativeRenderer::AbMode() const {
+    // A, B, and C (B with prepared draws) when the prepare workers run (RYGT_NATIVE_PREPARE=1).
+    return u32(ab_window % (PrepareEnabled() ? 3 : 2));
+}
+
+void NativeRenderer::ForgetBindings(Stream& s) {
+    s.memo_layout = vk::PipelineLayout{};
+    s.push_known = false;
+    for (auto& memo : s.set_memos) {
+        memo.valid = false;
+    }
+}
+
+u64 NativeRenderer::ReuseGeneration() const {
+    return registry->Generation() + unmap_generation.load(std::memory_order_relaxed) +
+           buffer_generation;
+}
+
+std::pair<vk::Buffer, u64> NativeRenderer::UploadBytes(u32 slot, const void* data, u32 size,
+                                                      u64 align) {
+    Stream& s = stream;
+    if (ReuseOn() && slot < s.upload_memos.size()) {
+        UploadMemo& memo = s.upload_memos[slot];
+        if (memo.list == s.serial && memo.bytes.size() == size &&
+            std::memcmp(memo.bytes.data(), data, size) == 0) {
+            ++stats.uploads_reused;
+            return {memo.buffer, memo.offset};
+        }
+        const auto [buffer, offset, mapped] = Allocate(size, align);
+        std::memcpy(mapped, data, size);
+        memo.list = s.serial;
+        memo.buffer = buffer;
+        memo.offset = offset;
+        memo.bytes.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
+        return {buffer, offset};
+    }
+    const auto [buffer, offset, mapped] = Allocate(size, align);
+    std::memcpy(mapped, data, size);
+    return {buffer, offset};
+}
+
 void NativeRenderer::DrawBindings::Clear() {
     writes.clear();
     write_sets.clear();
@@ -462,6 +548,11 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                                 .name = "native gds"});
     ASSERT_MSG(gds && gds->Mapped(), "NAT-100: no GDS buffer");
     std::memset(gds->Mapped(), 0, gds->Size());
+    if (AbOn()) {
+        g_reuse_on.store(false, std::memory_order_relaxed); // DIAG-GT7-003: window 0 is A
+        g_prepared_on.store(false, std::memory_order_relaxed);
+        RyDiag::SetProfileTag(1);
+    }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
     if (const u64 address = HwWatchAddress(); address != 0) {
@@ -557,6 +648,8 @@ void NativeRenderer::BeginHudStream() {
     s.pipeline = vk::Pipeline{};
     s.vertex_state_known = false;
     s.commands = 0;
+    ++s.serial;        // OPT-015
+    ForgetBindings(s); // OPT-014
     // It runs after the main list: what that list wrote is finished first.
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -597,6 +690,8 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     s.keep.clear();
     s.list = nullptr;
     s.cmd = vk::CommandBuffer{};
+    ++s.serial;        // OPT-015: the list's upload memory retires with it
+    ForgetBindings(s); // OPT-014
 }
 
 Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like) {
@@ -905,6 +1000,8 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     GpuTimeBegin(s); // DIAG-GT7-001: the first segment is the wait for earlier GPU work
+    ++s.serial;        // OPT-015
+    ForgetBindings(s); // OPT-014
     // What was recorded before this list (earlier lists, the presenter) is finished first.
     GlobalBarrier();
     MakePendingMirrors(); // NAT-150: behind the barrier the list starts with anyway
@@ -1219,6 +1316,7 @@ void NativeRenderer::FlushWritebacks() {
     }
     writebacks.clear();
     s.pipeline = vk::Pipeline{}; // the re-tiling binds its own pipeline
+    ForgetBindings(s);            // OPT-014: and its own bindings
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1253,6 +1351,7 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
             *s.list, std::span<Native::ImageEntry* const>{
                          const_cast<Native::ImageEntry* const*>(bound.data()), bound.size()});
         s.pipeline = vk::Pipeline{}; // the uploads bind their own pipelines
+        ForgetBindings(s);            // OPT-014: and their own bindings
     }
 }
 
@@ -1480,8 +1579,20 @@ void NativeRenderer::SortRegionWrites() {
         std::scoped_lock lock{region_dirty_mutex};
         writes.swap(pending_region_writes);
     }
+    const bool by_address = ReuseOn();
     for (const auto& [begin, end] : writes) {
-        for (auto& [base, region] : regions) {
+        // PERF-GT7-006: from the region over the write's start, in address order (regions never
+        // overlap), as PERF-GT7-003; each write walked all ~700 of GT7's regions (A still does).
+        auto first = regions.begin();
+        if (by_address) {
+            first = regions.upper_bound(begin);
+            if (first != regions.begin() && std::prev(first)->second.end > begin) {
+                --first;
+            }
+        }
+        for (auto it = first; it != regions.end() && (!by_address || it->second.begin < end);
+             ++it) {
+            Region& region = it->second;
             if (region.begin < end && region.end > begin) {
                 for (VAddr page = std::max(begin, region.begin); page < std::min(end, region.end);
                      page += 4096) {
@@ -2219,6 +2330,7 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
                         s.keep.push_back(std::move(guest));
                     });
                 s.pipeline = vk::Pipeline{}; // the compare binds its own pipeline
+                ForgetBindings(s); // OPT-014
                 if (compared) {
                     stats.region_writeback_bytes += run_to - run_from;
                     ++stats.precise_writebacks;
@@ -2522,8 +2634,98 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     return std::pair{dst, u64{0}};
 }
 
+bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
+                                     Targets& out) {
+    TargetsMemo& m = targets_memo;
+    const auto& key = pipeline.GetGraphicsKey();
+    if (!m.valid ||
+        m.generation != registry->Generation() + unmap_generation.load(std::memory_order_relaxed) ||
+        m.mrt_mask != key.mrt_mask || m.color_mode != u32(regs.color_control.mode) ||
+        m.target_mask != regs.color_target_mask.raw) {
+        return false;
+    }
+    for (u32 cb = 0; cb < m.num_colors; ++cb) {
+        if (std::memcmp(&m.color_buffers[cb], &regs.color_buffers[cb], sizeof(AmdGpu::ColorBuffer)) !=
+                0 ||
+            m.cb_extents[cb].raw != r.liverpool->DrawCbExtent(cb).raw) {
+            return false;
+        }
+    }
+    const bool depth_used = (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                            (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    if (depth_used != m.depth_used) {
+        return false;
+    }
+    if (depth_used &&
+        (m.depth_flags != (u32(regs.depth_control.depth_enable) |
+                           (u32(regs.depth_control.stencil_enable) << 1) |
+                           (u32(regs.depth_control.depth_write_enable) << 2)) ||
+         std::memcmp(&m.depth_buffer, &regs.depth_buffer, sizeof(AmdGpu::DepthBuffer)) != 0 ||
+         std::memcmp(&m.depth_view, &regs.depth_view, sizeof(AmdGpu::DepthView)) != 0 ||
+         m.htile != regs.depth_htile_data_base.GetAddress() ||
+         m.db_extent.raw != r.liverpool->DrawDbExtent().raw)) {
+        return false;
+    }
+    // The pictures, views and ranges are the ones the lookups would give; what each draw does
+    // to them (pending rewrites, depth twins, clears of their metadata, their last use) is done
+    // as without the memo.
+    out = m.targets;
+    for (u32 cb = 0; cb < m.num_colors; ++cb) {
+        auto* entry = const_cast<Native::ImageEntry*>(out.colors[cb]);
+        if (!entry) {
+            continue;
+        }
+        entry->last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(*entry); // NAT-120
+        auto& attachment = out.state.color_attachments[cb];
+        const bool is_clear = m.cmasks[cb] != 0 && cleared_meta.erase(m.cmasks[cb]) != 0;
+        attachment.clear_value =
+            is_clear ? LiverpoolToVK::ColorBufferClearValue(regs.color_buffers[cb]).color.uint32
+                     : std::array<u32, 4>{};
+        attachment.is_clear = is_clear;
+    }
+    if (auto* entry = const_cast<Native::ImageEntry*>(out.depth)) {
+        entry->last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(*entry); // NAT-120
+        SyncDepthTwin(*entry); // FIX-212
+        bool meta_clear = false;
+        if (m.htile != 0) {
+            meta_clear = cleared_meta.erase(m.htile) != 0;
+            if (!meta_clear && m.htile_meta && !entry->from_cpu &&
+                entry->write_version.load(std::memory_order_relaxed) == 0) {
+                meta_clear = true; // FIX-156
+                ++stats.meta_clears;
+            }
+        }
+        const auto aspects = DepthStencilClearAspects(regs.depth_buffer, regs.depth_control,
+                                                      regs.depth_render_control, meta_clear);
+        const bool depth_clear = bool(aspects & vk::ImageAspectFlagBits::eDepth);
+        const bool stencil_clear = bool(aspects & vk::ImageAspectFlagBits::eStencil);
+        auto& db = out.state.depth_stencil_attachment;
+        if (db.has_depth) {
+            db.clear_value[0] = depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+            db.depth_clear = depth_clear;
+        }
+        if (db.has_stencil) {
+            db.clear_value[1] = stencil_clear ? regs.stencil_clear : 0u;
+            db.stencil_clear = stencil_clear;
+        }
+    }
+    ++stats.targets_reused;
+    return true;
+}
+
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
+    // OPT-013: not with watched pictures or frame dumps (their logs and notes are per lookup).
+    const bool memo = ReuseOn() && Native::WatchedTextures().empty() && !r.FrameDumpActive();
+    if (memo && TargetsFromMemo(regs, pipeline, out)) {
+        return true;
+    }
+    // Read before the lookups: a picture they make moves it on, and the next draw looks again.
+    const u64 generation =
+        registry->Generation() + unmap_generation.load(std::memory_order_relaxed);
+    bool htile_meta = false;
     const auto& key = pipeline.GetGraphicsKey();
     RenderState& state = out.state;
     state = {};
@@ -2611,6 +2813,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             }
             bool meta_clear = false;
             bool fresh = false;
+            htile_meta = desc.info.meta_info.htile_addr != 0; // OPT-013
             if (htile != 0) {
                 known_meta.insert(htile);
                 meta_clear = cleared_meta.erase(htile) != 0;
@@ -2673,6 +2876,31 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
     state.height = static_cast<u16>(std::min<u32>(height, 0xffff));
     state.num_layers = static_cast<u16>(
         num_layers == std::numeric_limits<u16>::max() ? 1u : std::max(num_layers, 1u));
+    TargetsMemo& m = targets_memo; // OPT-013
+    m.valid = memo;
+    if (memo) {
+        m.generation = generation;
+        m.mrt_mask = key.mrt_mask;
+        m.color_mode = u32(regs.color_control.mode);
+        m.target_mask = regs.color_target_mask.raw;
+        m.num_colors = state.num_color_attachments;
+        for (u32 cb = 0; cb < m.num_colors; ++cb) {
+            m.color_buffers[cb] = regs.color_buffers[cb];
+            m.cb_extents[cb] = r.liverpool->DrawCbExtent(cb);
+            m.cmasks[cb] = regs.color_buffers[cb].CmaskAddress();
+        }
+        m.depth_used = (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                       (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+        m.depth_flags = u32(regs.depth_control.depth_enable) |
+                        (u32(regs.depth_control.stencil_enable) << 1) |
+                        (u32(regs.depth_control.depth_write_enable) << 2);
+        m.depth_buffer = regs.depth_buffer;
+        m.depth_view = regs.depth_view;
+        m.htile = regs.depth_htile_data_base.GetAddress();
+        m.db_extent = r.liverpool->DrawDbExtent();
+        m.htile_meta = htile_meta;
+        m.targets = out;
+    }
     return true;
 }
 
@@ -4269,6 +4497,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     stage.pgm_hash, watched_bind, sources);
     }
     auto* direct = stage.uses_direct ? r.buffer_cache.GetDirectMemory() : nullptr;
+    // OPT-015: the stage set's upload memos (flattened user data, clip planes, D3 table).
+    const u32 upload_slot = Shader::Backend::StageSet(u32(stage.sw_stage)) * 3;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
     // through it.
     static thread_local std::vector<std::array<u32, 4>> direct_entries;
@@ -4286,8 +4516,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             case Shader::BufferType::Flatbuf: {
                 const u32 size = static_cast<u32>(stage.flattened_ud_buf.size() * sizeof(u32));
                 if (size != 0) {
-                    const auto [buffer, offset, data] = Allocate(size, alignment);
-                    std::memcpy(data, stage.flattened_ud_buf.data(), size);
+                    const auto [buffer, offset] = UploadBytes(
+                        upload_slot + 0, stage.flattened_ud_buf.data(), size, alignment); // OPT-015
                     info = {buffer, offset, size};
                 }
                 if (watched) {
@@ -4305,16 +4535,16 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
                         planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
                     }
-                    const auto [buffer, offset, data] = Allocate(sizeof(planes), alignment);
-                    std::memcpy(data, planes.data(), sizeof(planes));
+                    const auto [buffer, offset] = UploadBytes(upload_slot + 1, planes.data(),
+                                                              sizeof(planes), alignment); // OPT-015
                     info = {buffer, offset, sizeof(planes)};
                 }
                 break;
             case Shader::BufferType::DirectTable: {
                 const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
-                const auto [buffer, offset, data] = Allocate(words * sizeof(u32), alignment);
-                auto* table = reinterpret_cast<u32*>(data);
-                std::memset(table, 0, words * sizeof(u32));
+                static thread_local std::vector<u32> table_words;
+                table_words.assign(words, 0);
+                u32* const table = table_words.data();
                 if (auto* memory = r.buffer_cache.GetDirectMemory()) {
                     const u64 l1 = memory->L1Address();
                     const u64 zero = memory->ZeroPageAddress();
@@ -4326,6 +4556,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
                     }
                 }
+                const auto [buffer, offset] = UploadBytes(upload_slot + 2, table,
+                                                          words * sizeof(u32), alignment); // OPT-015
                 info = {buffer, offset, words * sizeof(u32)};
                 break;
             }
@@ -4542,7 +4774,14 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         static const bool slot_log = std::getenv("RYGT_DIAG_IMAGE_SLOTS") != nullptr &&
                                      std::getenv("SHADGT_WATCH_SHADERS") != nullptr;
         const bool log_slot = slot_log && frame % 30 == 0 && IsWatchedShader(stage.pgm_hash);
-        const auto slot_text = [&](const std::string& bound) {
+        // PERF-GT7-006: the slot's text is only made when it is logged (A, the reference, still
+        // makes it for every slot, as before).
+        const bool make_text = log_slot || !ReuseOn();
+        const auto slot_text = [&](const auto& make_bound) {
+            if (!make_text) {
+                return;
+            }
+            const std::string bound = make_bound();
             if (log_slot) {
                 LOG_WARNING(Render_Vulkan, "DIAG-213: frame {} program {:#x} slot {} T# {:#x} {}x{} "
                             "fmt {}/{} type {} levels {}-{} layers {}-{}{} -> {}", frame,
@@ -4559,9 +4798,19 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             }
             ++stats.null_images;
             ++stats.null_reasons[reason];
-            slot_text(fmt::format("NULL (reason {})", reason)); // DIAG-213
+            slot_text([&] { return fmt::format("NULL (reason {})", reason); }); // DIAG-213
             add_write();
         };
+        // PERF-GT7-006: an empty T# (no address or format: ~0.8 a draw in GT7) is bound empty
+        // before the memo is hashed; the memo never holds one.
+        if (ReuseOn() && (tsharp.Address() == 0 ||
+                          tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
+                          !magic_enum::enum_contains(tsharp.GetDataFmt()) ||
+                          !magic_enum::enum_contains(tsharp.GetNumberFmt()))) {
+            ++stats.texture_lookups;
+            bind_null(0);
+            continue;
+        }
         // OPT-002: the picture and views this T# resolved to last time.
         ++stats.texture_lookups;
         TextureMemo* memo = nullptr;
@@ -4600,10 +4849,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     b.images.push_back({VK_NULL_HANDLE, memo->views[i], vk::ImageLayout::eGeneral});
                 }
                 (storage ? b.stored : b.sampled).push_back(entry);
-                slot_text(fmt::format("{} {:#x} {}x{} v{} (memo)", entry->from_cpu ? "texture" : "target",
-                                      entry->info.guest_address, entry->info.size.width,
-                                      entry->info.size.height,
-                                      entry->write_version.load())); // DIAG-213
+                slot_text([&] {
+                    return fmt::format("{} {:#x} {}x{} v{} (memo)",
+                                       entry->from_cpu ? "texture" : "target",
+                                       entry->info.guest_address, entry->info.size.width,
+                                       entry->info.size.height, entry->write_version.load());
+                }); // DIAG-213
                 add_write();
                 ++stats.texture_memo_hits;
                 continue;
@@ -4707,9 +4958,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             memo->generation = registry->Generation() + unmap_generation;
         }
         (storage ? b.stored : b.sampled).push_back(entry);
-        slot_text(fmt::format("{} {:#x} {}x{} v{}", entry->from_cpu ? "texture" : "target",
-                              entry->info.guest_address, entry->info.size.width,
-                              entry->info.size.height, entry->write_version.load())); // DIAG-213
+        slot_text([&] {
+            return fmt::format("{} {:#x} {}x{} v{}", entry->from_cpu ? "texture" : "target",
+                               entry->info.guest_address, entry->info.size.width,
+                               entry->info.size.height, entry->write_version.load());
+        }); // DIAG-213
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
@@ -4736,9 +4989,27 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                                   DrawBindings& b) {
     Stream& s = stream;
     const CmdBuf cmdbuf{s.cmd};
+    const vk::PipelineLayout pipeline_layout = pipeline.GetLayout();
+    // OPT-014: draws in a row with the same pipeline layout keep what the list bound for it
+    // (sets and push constants stay bound across pipeline binds of one layout, and only these
+    // draws bind graphics state in the list).
+    const bool memo =
+        ReuseOn() && bind_point == vk::PipelineBindPoint::eGraphics && !s.wrapped_list;
+    if (memo && pipeline_layout != s.memo_layout) {
+        ForgetBindings(s);
+        s.memo_layout = pipeline_layout;
+    }
     const auto stage_flags =
         pipeline.IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+    if (memo && s.push_known && std::memcmp(&s.last_push, &b.push, sizeof(b.push)) == 0) {
+        ++stats.push_constants_skipped;
+    } else {
+        cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, sizeof(b.push), &b.push);
+        if (memo) {
+            s.last_push = b.push;
+            s.push_known = true;
+        }
+    }
     if (b.writes.empty()) {
         return;
     }
@@ -4750,13 +5021,49 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         by_set[i < b.write_sets.size() ? b.write_sets[i] : 0].push_back(b.writes[i]);
     }
     const vk::Device vk_device = r.instance.GetDevice();
+    const u64 generation = memo ? ReuseGeneration() : 0;
+    static thread_local std::vector<u64> signature;
     for (u32 index = 0; index < by_set.size(); ++index) {
         auto& writes = by_set[index];
         if (writes.empty()) {
             continue;
         }
+        SetMemo* set_memo = memo && index < s.set_memos.size() ? &s.set_memos[index] : nullptr;
+        if (set_memo) {
+            // OPT-014: what the writes bind, descriptor by descriptor.
+            signature.clear();
+            for (const auto& write : writes) {
+                signature.push_back((u64(write.dstBinding) << 32) |
+                                    (u64(write.descriptorType) << 8) | write.descriptorCount);
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    if (write.pBufferInfo) {
+                        const auto& info = write.pBufferInfo[i];
+                        signature.push_back(
+                            reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)));
+                        signature.push_back(info.offset);
+                        signature.push_back(info.range);
+                    } else if (write.pImageInfo) {
+                        const auto& info = write.pImageInfo[i];
+                        signature.push_back(
+                            reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler)));
+                        signature.push_back(
+                            reinterpret_cast<u64>(static_cast<VkImageView>(info.imageView)));
+                    }
+                }
+            }
+            if (set_memo->valid && set_memo->generation == generation &&
+                set_memo->signature == signature) {
+                ++(index == pipeline.PushSet() ? stats.pushes_skipped : stats.sets_reused);
+                continue; // still bound
+            }
+        }
         if (index == pipeline.PushSet()) {
-            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), index, writes);
+            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, index, writes);
+            if (set_memo) {
+                set_memo->valid = true;
+                set_memo->generation = generation;
+                set_memo->signature.swap(signature);
+            }
             continue;
         }
         const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
@@ -4788,7 +5095,13 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             write.dstSet = set;
         }
         vk_device.updateDescriptorSets(writes, {});
-        cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set, {});
+        cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, index, set, {});
+        ++stats.sets_written;
+        if (set_memo) {
+            set_memo->valid = true;
+            set_memo->generation = generation;
+            set_memo->signature.swap(signature);
+        }
     }
 }
 
@@ -6207,7 +6520,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // OPT-010: the draw a game job thread prepared, if any (job threads prepare direct draws).
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
-    if (prepare && !indirect && !r.FrameDumpCollecting()) {
+    if (prepare && PreparedOn() && !indirect && !r.FrameDumpCollecting()) {
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         stats.prepared_missing += prepared ? 0 : 1;
     }
@@ -8671,6 +8984,7 @@ void NativeRenderer::ProbeWatchedPictures() {
                 stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
                 stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 stream.pipeline = vk::Pipeline{};
+                ForgetBindings(stream); // OPT-014
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,
                                   entry.info.size.height, !entry.from_cpu, watched, false});
@@ -9002,6 +9316,8 @@ void NativeRenderer::Splice() {
     s.list = nullptr;
     s.cmd = vk::CommandBuffer{};
     s.rendering = false;
+    ++s.serial;        // OPT-015: the list's upload memory retires with it
+    ForgetBindings(s); // OPT-014
     ++stats.splices;
 }
 
@@ -9620,6 +9936,54 @@ void NativeRenderer::Report() {
                  }
                  return text;
              }());
+    LOG_INFO(Render_Vulkan,
+             "OPT-013..015 (10 s): targets reused {} of {} draws; sets bound again {} of {}, "
+             "pushed sets kept {}, push constants kept {}; uploads reused {}",
+             stats.targets_reused, stats.draws, stats.sets_reused,
+             stats.sets_reused + stats.sets_written, stats.pushes_skipped,
+             stats.push_constants_skipped, stats.uploads_reused);
+    stats.targets_reused = stats.sets_reused = stats.sets_written = stats.pushes_skipped = 0;
+    stats.push_constants_skipped = stats.uploads_reused = 0;
+    if (AbOn()) {
+        // DIAG-GT7-003 (RYGT_NATIVE_AB=1): the recorder's cost in the window that ends (A the
+        // reference, B with the changes under test, C as B with prepared draws), then the next
+        // window in the next mode.
+        const auto per_draw = [&](u64 ns) {
+            return stats.timed_draws ? ns / 1000.0 / stats.timed_draws : 0.0;
+        };
+        std::string phases;
+        for (u32 i = 0; i < stats.phase_ns.size(); ++i) {
+            phases += fmt::format("{}{:.2f}", i == 0 ? "" : "/", per_draw(stats.phase_ns[i]));
+        }
+        std::string parts;
+        for (u32 i = 0; i < stats.record_ns.size(); ++i) {
+            parts += fmt::format("{}{:.2f}", i == 0 ? "" : "/", per_draw(stats.record_ns[i]));
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GT7-003 A/B window {} mode {}: {:.1f} s, {} draws, {:.3f} us a draw, {} "
+                    "dispatches, {:.2f} us a dispatch, {} frames; phases pipeline/targets/buffers/"
+                    "textures/sources/vertices/prepare/record {}; record parts barrier/begin/"
+                    "dynamic/vertex/pipeline/bindings/draw/notes {}",
+                    ab_window, char('A' + AbMode()), seconds, stats.draws,
+                    stats.draws ? stats.draw_ns / 1000.0 / stats.draws : 0.0, stats.dispatches,
+                    stats.dispatches ? stats.dispatch_ns / 1000.0 / stats.dispatches : 0.0,
+                    frame - ab_frame, phases, parts);
+        ab_frame = frame;
+        ++ab_window;
+        const u32 mode = AbMode();
+        g_reuse_on.store(mode != 0, std::memory_order_relaxed);
+        if (mode == 2) {
+            DropPrepared();
+        }
+        g_prepared_on.store(mode == 2, std::memory_order_relaxed);
+        targets_memo.valid = false;
+        ForgetBindings(stream);
+        ForgetBindings(hud_stream);
+        ++stream.serial;
+        ++hud_stream.serial;
+        // DIAG-GT7-002: the mode, and the window for the raw samples.
+        RyDiag::SetProfileTag(u32(ab_window << 8) | (mode + 1));
+    }
     if (in_place.frames != 0) {
         const auto mb = [&](u32 i) { return in_place.total[i] * 64.0 / 1024.0 / in_place.frames; };
         LOG_INFO(Render_Vulkan,
