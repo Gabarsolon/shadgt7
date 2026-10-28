@@ -1648,6 +1648,26 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
                         forced, entry->content_hash, WatchedBytes(info.guest_address));
         }
         entry->upload_kind = kind;
+        // FIX-218: an upload replaces what the texture's targets had copied in (NAT-104), but those
+        // were only copied again once a target was drawn anew (NAT-111). GT7's driver fill
+        // rewrites its scratch pool before each pass, and the textures over its post-processing
+        // pyramid and the car close-ups were uploaded from that (zero) memory and kept it: black
+        // blocks on the car during the race start. They take their targets' pictures again at
+        // their next use. RYGT_NATIVE_SOURCES_AFTER_UPLOAD=0: as before.
+        static const bool sources_after_upload = [] {
+            const char* env = std::getenv("RYGT_NATIVE_SOURCES_AFTER_UPLOAD");
+            return !(env && env[0] == '0');
+        }();
+        if (sources_after_upload) {
+            bool has_sources;
+            {
+                std::scoped_lock lock{entry->sources_mutex};
+                has_sources = !entry->sources.empty();
+            }
+            if (has_sources) {
+                entry->sources_dirty.store(true, std::memory_order_relaxed);
+            }
+        }
         ++entry->total_uploads;
         ++entry->upload_count;
         ++uploaded;
