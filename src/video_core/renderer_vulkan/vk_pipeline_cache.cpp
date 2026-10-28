@@ -809,12 +809,12 @@ PipelineCache::~PipelineCache() {
 // read in 68 ms and written in 0.5 s off the GPU thread, and it is saved during play (GT7 never
 // reaches the exit-time save): each session adds the pipelines of the cars and tracks it met.
 // PERF-167: the driver cache file's size limit, from the launcher's Graphics page
-// (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; 1 GB by default.
+// (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; 5 GB by default.
 static u64 DriverCacheMaxBytes() {
     static const u64 limit = [] {
         const char* env = std::getenv("RYGT_DRIVER_CACHE_MAX_MB");
         if (!env || !*env) {
-            return u64{1} << 30;
+            return u64{5} << 30;
         }
         const long long mb = std::strtoll(env, nullptr, 10);
         return mb < 0 ? ~u64{0} : u64(mb) << 20;
