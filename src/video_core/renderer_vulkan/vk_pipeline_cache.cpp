@@ -762,11 +762,14 @@ PipelineCache::~PipelineCache() {
 // 10 fps and back again and again, and once the menus froze for a minute. The driver keeps its
 // own shader cache, and races ran no slower without the file (2026-10-16). With
 // RYGT_DRIVER_CACHE=1 the file is loaded, and saved only when the game ends.
+// PERF-164: on again by default (RYGT_DRIVER_CACHE=0 turns it off). GT7's file is about 180 MB,
+// read in 68 ms and written in 0.5 s off the GPU thread, and it is saved during play (GT7 never
+// reaches the exit-time save): each session adds the pipelines of the cars and tracks it met.
 static bool DriverCacheFileEnabled() {
 #ifdef RYTY_GPU
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_DRIVER_CACHE");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     return enabled && EmulatorSettings.IsPipelineCacheEnabled();
 #else
@@ -862,6 +865,15 @@ void PipelineCache::SaveDriverCache(bool wait) {
     pipelines_at_driver_save = num_new_pipelines;
     driver_cache_saved_at = std::chrono::steady_clock::now();
     const auto write = [path = driver_cache_path](std::vector<u8> data) {
+        // PERF-164: a cache over 1 GB is not written (GT Sport's reached 3.7 GB and stalled);
+        // the file from before stays.
+        constexpr size_t MaxDriverCacheBytes = size_t{1} << 30;
+        if (data.size() > MaxDriverCacheBytes) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-164: driver pipeline cache not saved: {} MB is over the {} MB limit",
+                        data.size() >> 20, MaxDriverCacheBytes >> 20);
+            return;
+        }
         // Write beside the file and rename, so an interrupted write never leaves a broken cache.
         auto temp = path;
         temp += ".tmp";
@@ -915,7 +927,14 @@ void PipelineCache::SaveDriverCache(bool wait) {
 
 void PipelineCache::MaybeSaveDriverCache() {
 #ifdef RYTY_GPU
-    // FIX-165: never during play (the whole cache is read out and written each time).
+    // PERF-164: during play, off the GPU thread, after a batch of at least 32 new pipelines and
+    // at most every 45 s (FIX-165 had turned saves during play off for GT Sport's 3.7 GB file).
+    // Every 2 minutes missed a race's pipelines: the game was closed before the next save.
+    using namespace std::chrono_literals;
+    const auto since = std::chrono::steady_clock::now() - driver_cache_saved_at;
+    if (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= 45s) {
+        SaveDriverCache(false);
+    }
     return;
 #endif
     // New pipelines are compiled during play; save them in batches without blocking the frame.
