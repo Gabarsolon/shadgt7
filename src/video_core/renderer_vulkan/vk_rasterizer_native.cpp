@@ -1748,16 +1748,52 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     if (!enabled) {
         return false;
     }
+    // DIAG-220 (diagnosis, RYGT_DIAG_ONE_OFF=1): why targets count as one-off: never drawn
+    // into, or how many frames since they were last drawn into.
+    static const bool diag = [] {
+        const char* env = std::getenv("RYGT_DIAG_ONE_OFF");
+        return env && env[0] == '1';
+    }();
+    const auto note = [&](u64 gap) {
+        if (!diag) {
+            return;
+        }
+        static std::array<u32, 6> buckets{}; // never, 5-8, 9-16, 17-64, 65-600, more
+        static u64 report_frame = 0;
+        const size_t i = gap == 0 ? 0 : gap <= 8 ? 1 : gap <= 16 ? 2 : gap <= 64 ? 3 : gap <= 600 ? 4 : 5;
+        ++buckets[i];
+        if (frame >= report_frame + 300) {
+            report_frame = frame;
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-220: one-off targets in 300 frames: never drawn {}, last drawn 5-8 "
+                        "frames ago {}, 9-16 {}, 17-64 {}, 65-600 {}, more {}",
+                        buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]);
+            buckets = {};
+        }
+    };
     const auto drawn_lately = [&](VAddr address) {
         const Native::ImageEntry* entry = registry->FindExisting(
             address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
         if (!entry) {
+            note(0);
             return false; // never drawn into
         }
         const u64 last = entry->written_frame.load(std::memory_order_relaxed);
         const u64 earlier =
             last < frame ? last : entry->written_frame_before.load(std::memory_order_relaxed);
-        return earlier != 0 && frame - earlier <= 4;
+        // PERF-165: a picture drawn into within the last 64 frames is redrawn regularly (GT7
+        // redraws some every 9-64 frames: DIAG-220 counted up to 983 such draws in 300 frames,
+        // and they waited for new pipelines as one-off pictures); a skipped draw shows at its next
+        // redraw. Never-drawn pictures still wait. RYGT_NATIVE_ONE_OFF_FRAMES=4: as before.
+        static const u64 window = [] {
+            const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_FRAMES");
+            return env && *env ? std::strtoull(env, nullptr, 10) : u64{64};
+        }();
+        const bool lately = earlier != 0 && frame - earlier <= window;
+        if (!lately) {
+            note(earlier == 0 ? 0 : frame - earlier);
+        }
+        return lately;
     };
     if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
         for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
