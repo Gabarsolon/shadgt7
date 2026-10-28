@@ -8563,6 +8563,36 @@ void NativeRenderer::EvictImages() {
         }
         return true;
     };
+    // PERF-GT7-005: textures the game loaded stay past their idle time, the most recently used
+    // first, up to a budget (RYGT_NATIVE_KEEP_TEXTURES_MB, 2048; 0 as before). Their pages are
+    // watched, so a CPU write or an unmap still uploads them again at their next use. GT7's
+    // license tests left the track's textures unused for over 4 s while a retry reloaded, and
+    // at ~4 s into the next attempt 50-120 MB of them were made and uploaded again.
+    static const u64 texture_budget = [] {
+        const char* env = std::getenv("RYGT_NATIVE_KEEP_TEXTURES_MB");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : u64{2048}) << 20;
+    }();
+    std::unordered_set<const Native::ImageEntry*> kept_textures;
+    if (texture_budget != 0) {
+        std::vector<Native::ImageEntry*> idle;
+        registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
+            if (entry.from_cpu && entry.image &&
+                entry.last_use.load(std::memory_order_relaxed) < frame - KeepFrames) {
+                idle.push_back(&entry);
+            }
+        });
+        std::ranges::sort(idle, std::greater{}, [](const Native::ImageEntry* entry) {
+            return entry->last_use.load(std::memory_order_relaxed);
+        });
+        u64 bytes = 0;
+        for (const Native::ImageEntry* entry : idle) {
+            bytes += std::max<u64>(entry->info.guest_size, 1);
+            if (bytes > texture_budget) {
+                break;
+            }
+            kept_textures.insert(entry);
+        }
+    }
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
         if (entry.kept.load(std::memory_order_relaxed)) {
             kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
@@ -8593,7 +8623,9 @@ void NativeRenderer::EvictImages() {
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
-    }, keep);
+    }, [&](Native::ImageEntry& entry) {
+        return kept_textures.contains(&entry) || keep(entry); // PERF-GT7-005, FIX-157
+    });
     if (newly_kept != 0) {
         static std::atomic<u32> logged{};
         if (const u32 n = logged++; n < 20 || n % 100 == 0) {
