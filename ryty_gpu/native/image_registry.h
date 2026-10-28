@@ -117,6 +117,9 @@ public:
     /// texture last wrote over it, and the clock it was uploaded again for.
     std::atomic<u64> gpu_rewritten{0};
     u64 rewrite_seen = 0;
+    /// FIX-221: a hash of a few samples of each layer, checked once a frame while it is used.
+    std::vector<u64> layer_samples;
+    u64 layer_check_frame = 0;
     /// FIX-198: the native renderer's frame the picture was last written in, and the last frame
     /// before that one it was written in (0: none).
     std::atomic<u64> written_frame{0};
@@ -259,6 +262,9 @@ public:
     /// FIX-202: a small texture a larger storage write went over since its last upload is
     /// uploaded again (true when it was asked for).
     bool RewrittenSmall(ImageEntry& entry);
+    /// FIX-221: a large layered texture whose layers' memory changed with no CPU write seen is
+    /// uploaded again (true when it was asked for).
+    bool LayersRewritten(ImageEntry& entry, u64 frame);
     static bool SmallRewritesOn();
     static constexpr u64 SmallRewriteSize = 64 * 1024;
 

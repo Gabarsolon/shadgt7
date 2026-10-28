@@ -4358,6 +4358,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     if (entry->from_cpu && registry->RewrittenSmall(*entry)) {
                         ++stats.small_rewrites; // FIX-202
                     }
+                    if (entry->from_cpu) {
+                        registry->LayersRewritten(*entry, frame); // FIX-221
+                    }
                     RefreshSources(*entry); // NAT-104 (FIX-197: targets too)
                 } else if (PartSyncOn()) {
                     RefreshSources(*entry); // FIX-210: a store counts as writing all of it
@@ -4441,6 +4444,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         if (!storage) {
             if (entry->from_cpu && registry->RewrittenSmall(*entry)) {
                 ++stats.small_rewrites; // FIX-202
+            }
+            if (entry->from_cpu) {
+                registry->LayersRewritten(*entry, frame); // FIX-221
             }
             // (part of the textures' time; reported apart; OPT-001: on timed draws only)
             PhaseClock sources_clock{stats.phase_ns[4]};
@@ -8171,6 +8177,33 @@ void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Im
                 memo ? " (memo)" : "", program, entry.from_cpu ? "texture" : "target",
                 entry.info.size.width, entry.info.size.height, entry.info.resources.layers,
                 entry.write_version.load(), sources, frame);
+    if (entry.from_cpu) {
+        // DIAG-223 (diagnosis): whether the texture's memory still holds what was uploaded, and
+        // which of its layers differ (CPU writes the page watch missed show here).
+        const bool unchanged = registry->MemoryUnchanged(const_cast<Native::ImageEntry&>(entry));
+        std::string layers;
+        const u64 layer_size = entry.info.resources.layers > 1
+                                   ? entry.info.guest_size / entry.info.resources.layers
+                                   : 0;
+        if (!unchanged && layer_size >= 4096) {
+            static std::unordered_map<VAddr, std::vector<u64>> seen;
+            auto& hashes = seen[entry.info.guest_address];
+            hashes.resize(entry.info.resources.layers);
+            u32 changed = 0;
+            for (u32 l = 0; l < entry.info.resources.layers; ++l) {
+                const u64 h = Core::HashGuestBytes(entry.info.guest_address + l * layer_size,
+                                                   layer_size);
+                if (hashes[l] != 0 && hashes[l] != h && changed++ < 12) {
+                    layers += fmt::format(" {}", l);
+                }
+                hashes[l] = h;
+            }
+            layers += fmt::format(" ({} layers changed since the last bind)", changed);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-223: texture {:#x} memory {} the upload (uploads {}){}",
+                    entry.info.guest_address, unchanged ? "matches" : "DIFFERS FROM",
+                    u32(entry.total_uploads), layers);
+    }
 }
 
 bool NativeRenderer::SeqTraced(const Native::ImageEntry* entry) const {

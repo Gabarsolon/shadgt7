@@ -691,6 +691,55 @@ bool ImageRegistry::RewrittenSmall(ImageEntry& entry) {
     return true;
 }
 
+bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
+    // FIX-221: GT7 fills its lighting-probe pools (64x64 B10G11R11 with 1536 layers, 128x128 with
+    // 256: 24 and 16 MB) from the CPU, and after the first write faulted the page watch saw none of
+    // the next ones: ~110 layers written at the race start's close-ups stayed as uploaded, zero,
+    // and the cars lit by those probes showed black blocks. Too large to hash at each use (NAT-109
+    // hashes textures up to 4 MB), such a texture is sampled instead: four 64-byte samples of
+    // each layer, once a frame while it is used, and uploaded again when one changed.
+    // RYGT_NATIVE_LAYER_SAMPLES=0: as before.
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_SAMPLES");
+        return !(env && env[0] == '0');
+    }();
+    const u32 layers = entry.info.resources.layers;
+    if (!enabled || layers < 16 || entry.info.guest_size <= (4ull << 20) ||
+        entry.layer_check_frame == frame || !memory_clamp ||
+        memory_clamp(entry.info.guest_address, entry.info.guest_size) != entry.info.guest_size) {
+        return false;
+    }
+    entry.layer_check_frame = frame;
+    const u64 layer_size = entry.info.guest_size / layers;
+    if (layer_size < 256) {
+        return false;
+    }
+    const bool first = entry.layer_samples.size() != layers;
+    entry.layer_samples.resize(layers);
+    u32 changed = 0;
+    for (u32 l = 0; l < layers; ++l) {
+        const VAddr base = entry.info.guest_address + l * layer_size;
+        u64 h = 0;
+        for (u32 part = 0; part < 4; ++part) {
+            const VAddr at = base + (layer_size / 4) * part;
+            h = h * 1099511628211ull ^ Core::HashGuestBytes(at, 64);
+        }
+        changed += !first && entry.layer_samples[l] != h;
+        entry.layer_samples[l] = h;
+    }
+    if (changed == 0) {
+        return false;
+    }
+    MarkStale(entry, Stale::CpuWrite);
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged++; n < 40 || n % 1000 == 0) {
+        LOG_WARNING(Render_Vulkan, "FIX-221: texture {:#x} {}x{} layers {}: {} layers changed "
+                    "unseen; uploaded again ({} so far)", entry.info.guest_address,
+                    entry.info.size.width, entry.info.size.height, layers, changed, n + 1);
+    }
+    return true;
+}
+
 bool TargetPartsOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_NATIVE_TARGET_PARTS");
