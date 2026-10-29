@@ -17,6 +17,16 @@ namespace Shader::Backend::SPIRV {
 using PointerType = EmitContext::PointerType;
 using PointerSize = EmitContext::PointerSize;
 
+// FIX-GT7-005: the tessellation attribute arrays are sized from the hull's constants and not
+// defined when a stride there is 0. Sirit aborts the process on an undefined id (a race start
+// crashed in a translation worker); this fails the translation instead, which drops a worker's
+// job or skips the draw.
+static Id AttrArray(Id array, const char* which) {
+    ASSERT_MSG(array.value != 0, "{} not defined: a stride of 0 in the tessellation constants",
+               which);
+    return array;
+}
+
 static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribute attr) {
     if (IR::IsParam(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::Param0)};
@@ -284,7 +294,8 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
         const u32 attr_index{u32(attr) - u32(IR::Attribute::Param0)};
         if (ctx.hw_stage == HwStage::Local) {
             const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
-            return op_store(ctx.OpAccessChain(component_ptr, ctx.output_attr_array,
+            return op_store(ctx.OpAccessChain(component_ptr,
+                                              AttrArray(ctx.output_attr_array, "out_attrs"),
                                               ctx.ConstU32(attr_index), ctx.ConstU32(element)));
         } else {
             const auto& info{ctx.output_params.at(attr_index)};
@@ -348,22 +359,24 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
 
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
-    return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.input_attr_array,
-                                                    vertex_index, attr_index, comp_index));
+    return ctx.OpLoad(ctx.F32[1],
+                      ctx.OpAccessChain(attr_comp_ptr, AttrArray(ctx.input_attr_array, "in_attrs"),
+                                        vertex_index, attr_index, comp_index));
 }
 
 Id EmitReadTcsGenericOuputAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
                                     Id comp_index) {
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
-    return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.output_attr_array,
-                                                    vertex_index, attr_index, comp_index));
+    return ctx.OpLoad(ctx.F32[1],
+                      ctx.OpAccessChain(attr_comp_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
+                                        vertex_index, attr_index, comp_index));
 }
 
 void EmitSetTcsGenericAttribute(EmitContext& ctx, Id value, Id attr_index, Id comp_index) {
     // Implied vertex index is invocation_id
     const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
     Id pointer =
-        ctx.OpAccessChain(component_ptr, ctx.output_attr_array,
+        ctx.OpAccessChain(component_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
                           ctx.OpLoad(ctx.U32[1], ctx.invocation_id), attr_index, comp_index);
     ctx.OpStore(pointer, value);
 }

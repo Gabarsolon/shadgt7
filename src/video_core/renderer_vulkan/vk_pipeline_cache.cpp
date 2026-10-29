@@ -1438,6 +1438,15 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     }
     while (in_budget() && states->Take(queued_state_regs->reg_array)) {
         if (!evaluate() && RetryReadAhead()) {
+            // FIX-GT7-005: not a tessellated state. Its hull constants are in memory the game
+            // writes again for later draws: read up to 3 s later they were another draw's, or
+            // garbage that passes SaneTessConstants (a local stride of 0 crashed a translation).
+            using Stages = AmdGpu::ShaderStageEnable::VgtStages;
+            const u32 stages = queued_state_regs->stage_enable.raw;
+            if (stages == Stages::LsHs || stages == Stages::LsHsEsGs) {
+                ++blocked_stats.tessellated;
+                continue;
+            }
             keep(std::chrono::steady_clock::now());
             ++blocked_stats.kept;
         }
@@ -1460,11 +1469,12 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
                     "PERF-034 pipeline read-ahead in {:.1f} s: {} draw states from the command "
                     "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
                     "({:.1f} ms); {} pending; PERF-GT7-021: {} states kept for their shaders, {} "
-                    "evaluated again, {} builds started from them, {} dropped, {} kept now",
+                    "evaluated again, {} builds started from them, {} dropped, {} kept now; "
+                    "FIX-GT7-005: {} tessellated not kept",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
                     stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
                     blocked_stats.kept, blocked_stats.retried, blocked_stats.started,
-                    blocked_stats.dropped, blocked_states.size());
+                    blocked_stats.dropped, blocked_states.size(), blocked_stats.tessellated);
         stats = {};
         stats.since = now;
         blocked_stats = {};

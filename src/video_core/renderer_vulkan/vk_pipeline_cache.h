@@ -453,6 +453,7 @@ private:
         u64 retried{};
         u64 started{};
         u64 dropped{};
+        u64 tessellated{}; ///< FIX-GT7-005: not kept
     } blocked_stats;
     std::shared_ptr<PipelineBuild> skipped_build; ///< PERF-GT7-020
     struct {
