@@ -375,24 +375,28 @@ Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
         const Id address = ctx.OpIAdd(
             ctx.U64, ctx.lds_scratch_base,
             ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], dword, ctx.ConstU32(2u))));
+        // The patch's own control points from its inputs (all of them when the draw has no
+        // scratch); only those past them from scratch.
+        const u32 num_cp = std::max(ctx.runtime_info.sw.tcs.num_input_control_points, 1u);
+        const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
+        const Id from_scratch =
+            ctx.OpLogicalAnd(ctx.U1[1], ctx.lds_enabled, ctx.OpLogicalNot(ctx.U1[1], in_range));
+        const auto own_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
+        const Id own_value = ctx.OpLoad(
+            ctx.F32[1], ctx.OpAccessChain(own_ptr, ctx.input_attr_array, vertex_index, attr_index,
+                                          comp_index));
+        const Id own_label = ctx.last_label;
+        const Id scratch_label = ctx.OpLabel();
+        const Id merge_label = ctx.OpLabel();
+        ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(from_scratch, scratch_label, merge_label);
+        ctx.AddLabel(scratch_label);
         const Id scratch_value =
             ctx.OpLoad(ctx.F32[1], ctx.OpConvertUToPtr(ctx.physical_pointer_type_f32, address),
                        spv::MemoryAccessMask::Aligned, 4u);
-        // DIAG-240 (diagnosis, RYGT_DIAG_LDS_ALL=1): every read from scratch.
-        static const bool all_scratch = std::getenv("RYGT_DIAG_LDS_ALL") != nullptr;
-        if (all_scratch) {
-            return scratch_value;
-        }
-        // The patch's own control points from its inputs; only those past them from scratch.
-        const u32 num_cp = std::max(ctx.runtime_info.sw.tcs.num_input_control_points, 1u);
-        const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
-        const Id own_index =
-            ctx.OpUMin(ctx.U32[1], vertex_index, ctx.ConstU32(num_cp - 1));
-        const auto own_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
-        const Id own_value = ctx.OpLoad(
-            ctx.F32[1], ctx.OpAccessChain(own_ptr, ctx.input_attr_array, own_index, attr_index,
-                                          comp_index));
-        return ctx.OpSelect(ctx.F32[1], in_range, own_value, scratch_value);
+        ctx.OpBranch(merge_label);
+        ctx.AddLabel(merge_label);
+        return ctx.OpPhi(ctx.F32[1], scratch_value, scratch_label, own_value, own_label);
     }
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
     return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.input_attr_array,

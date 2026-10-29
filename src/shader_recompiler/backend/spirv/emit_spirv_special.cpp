@@ -30,8 +30,12 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     };
     const Id lo = push_word(0);
     const Id hi = push_word(1);
-    const Id writer = ctx.OpINotEqual(
-        ctx.U1[1], ctx.OpBitwiseAnd(ctx.U32[1], lo, ctx.u32_one_value), ctx.u32_zero_value);
+    // The quad sample mask's words when the draw has no scratch (all ones): off.
+    ctx.lds_enabled = ctx.OpINotEqual(ctx.U1[1], hi, ctx.ConstU32(~0u));
+    const Id writer = ctx.OpLogicalAnd(
+        ctx.U1[1], ctx.lds_enabled,
+        ctx.OpINotEqual(ctx.U1[1], ctx.OpBitwiseAnd(ctx.U32[1], lo, ctx.u32_one_value),
+                        ctx.u32_zero_value));
     const Id lo_aligned = ctx.OpBitwiseAnd(ctx.U32[1], lo, ctx.ConstU32(~3u));
     ctx.lds_scratch_base =
         ctx.OpBitcast(ctx.U64, ctx.OpCompositeConstruct(ctx.U32[2], lo_aligned, hi));

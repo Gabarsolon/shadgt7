@@ -60,12 +60,12 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     // FIX-227: hull shaders of draws with several patches a VGT group read their inputs from the
     // LDS emulation scratch buffer (the renderer runs a writer pass first), so input control
     // points past their own patch's are the next patches', as in GCN's LDS (GT7's car hull
-    // shaders read such). Off by default: it did not change GT7's race-start black patches.
-    // RYGT_TESS_LDS_EMULATION=2: on, slots counted from the patch's own first control point (as
-    // GCN with the patch id folded out); =1: from the start of the patch's VGT group.
+    // shaders read such; with FIX-228 that ends the black patches on the car in the race start's
+    // close-ups). Slots count from the patch's own first control point (as GCN, the patch id
+    // folded out). RYGT_TESS_LDS_EMULATION=0: off; =1: slots from the start of the VGT group.
     static const u32 mode = [] {
         const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
-        return env && *env ? u32(env[0] - '0') : 0u;
+        return env && *env ? u32(env[0] - '0') : 2u;
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) {

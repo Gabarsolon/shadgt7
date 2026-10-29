@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -29,6 +30,16 @@ static constexpr u32 ShaderBinaryVersionQuadSampleMask = 24u;
 // 25: AMD single-sample KHR barycentrics (on for AMD GPUs) change the
 // fragment interface and interpolation; read only while that option is on.
 static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 25u;
+// 29/30/31 (FIX-227/228): hull shaders, whose unnormalized samples at an explicit LOD are normalized
+// by that mip's dimensions. Other stages keep their versions. RYGT_UNNORMALIZED_MIP=0: hull
+// shaders as before too.
+static u32 ShaderBinaryVersionStep(Shader::SwStage stage) {
+    static const u32 step = [] {
+        const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+        return env && env[0] == '0' ? 0u : 6u;
+    }();
+    return stage == Shader::SwStage::TessellationControl ? step : 0u;
+}
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
@@ -182,9 +193,10 @@ void RegisterShaderMeta(const Shader::Info& info,
     const bool single_sample_barycentric =
         spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
         spec.runtime_info.hw.fs.single_sample_barycentric;
-    meta.Write(single_sample_barycentric ? Serialization::ShaderBinaryVersionSingleSampleBarycentric
-               : masked_fragment         ? Serialization::ShaderBinaryVersionQuadSampleMask
-                                         : Serialization::ShaderBinaryVersion);
+    meta.Write((single_sample_barycentric ? Serialization::ShaderBinaryVersionSingleSampleBarycentric
+                : masked_fragment         ? Serialization::ShaderBinaryVersionQuadSampleMask
+                                          : Serialization::ShaderBinaryVersion) +
+               Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -221,6 +233,13 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
+    // FIX-228: hull shader translations made with the other normalization are not read (the
+    // stage is checked once the specialization is read).
+    const u32 stored_version = binary_version;
+    if (binary_version >= Serialization::ShaderBinaryVersion + 6 &&
+        binary_version <= Serialization::ShaderBinaryVersionSingleSampleBarycentric + 6) {
+        binary_version -= 6;
+    }
     const bool single_sample_binary =
         binary_version == Serialization::ShaderBinaryVersionSingleSampleBarycentric;
     if (single_sample_binary
@@ -235,6 +254,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
+    if (stored_version - binary_version !=
+        Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage)) {
+        return false; // FIX-228
+    }
     if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment && !single_sample_binary) {
         // This byte was padding in every older metadata revision.
         spec.runtime_info.hw.fs.single_sample_barycentric = false;

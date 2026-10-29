@@ -6587,7 +6587,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     pipeline->LdsEmulation(), u32(regs.ls_hs_config.hs_input_control_points),
                     u32(regs.ls_hs_config.num_patches));
     }
-    if (const u32 lds_mode = pipeline->LdsEmulation(); lds_mode != 0 && !indirect) {
+    bool lds_pushed = false;
+    if (const u32 lds_mode = pipeline->LdsEmulation();
+        lds_mode != 0 && !indirect && b.push.quad_sample_mask[0] == ~0u &&
+        b.push.quad_sample_mask[1] == ~0u) {
         const u32 num_cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
         const u64 patches = u64(regs.num_indices / num_cp) * regs.num_instances.NumInstances();
         Shader::TessellationDataConstantBuffer tess_constants{};
@@ -6597,12 +6600,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         const u32 vertex_bytes = std::max<u32>((tess_constants.ls_stride + 15) / 16 * 16, 64u);
         const u64 address =
             vertex_bytes != 0 ? LdsScratch(std::max<u64>(patches, 1) * num_cp * vertex_bytes) : 0;
-        auto push = b.push;
         const auto push_scratch = [&](u64 value) {
-            push.lds_scratch = {u32(value), u32(value >> 32)};
+            const std::array<u32, 2> words{u32(value), u32(value >> 32)};
             stream.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
-                                     u32(offsetof(Shader::PushData, lds_scratch)), 8u,
-                                     push.lds_scratch.data());
+                                     u32(offsetof(Shader::PushData, quad_sample_mask)), 8u,
+                                     words.data());
         };
         if (address != 0) {
             push_scratch(address | 1);
@@ -6631,9 +6633,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             BeginRendering(resumed);
             stream.render = current; // its clears are done; the same pass to later draws
             push_scratch(address);
+            lds_pushed = true;
             lds_snap_address = address; // DIAG-241
             lds_snap_bytes = std::min<u64>(patches * num_cp * vertex_bytes, 1ull << 20);
-            if (++stats.lds_emulated_draws <= 5 || regs.num_instances.NumInstances() > 1) {
+            if (++stats.lds_emulated_draws <= 5) {
                 LOG_WARNING(Render_Vulkan, "FIX-227: draw of {} patches ({} instances) with hull "
                             "shader LDS emulation (mode {}, {} bytes a vertex) at {:#x}",
                             patches, regs.num_instances.NumInstances(), lds_mode, vertex_bytes,
@@ -6669,6 +6672,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                                   u32(regs.ls_hs_config.hs_input_control_points),
                                                   lds_snap_bytes)});
             }
+        }
+        if (lds_pushed) {
+            // FIX-227: the quad sample mask's words back for the draws after.
+            stream.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
+                                     u32(offsetof(Shader::PushData, quad_sample_mask)), 8u,
+                                     b.push.quad_sample_mask.data());
         }
         lds_snap_address = 0;
         if (hud_white_state && HudStreamOn() && !stream.wrapped_list) {
