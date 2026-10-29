@@ -2773,6 +2773,14 @@ void Rasterizer::FlushDeferredFences() {
     }
 }
 
+void Rasterizer::OnRecorderIdle() {
+#ifdef RYTY_GPU
+    if (native) {
+        native->BeginAhead(); // PERF-GT7-008
+    }
+#endif
+}
+
 bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
                                   bool compute_queue, std::span<const u8> value,
                                   bool flush) {

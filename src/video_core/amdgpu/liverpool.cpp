@@ -391,6 +391,11 @@ void Liverpool::StartDrawPipe() {
         recorder_tid = gettid();
 #endif
     });
+    // PERF-GT7-008: the native renderer's next list is begun while the recorder waits for work
+    // (in mode B only; RYGT_NATIVE_REUSE=0 or A/B mode A: as before).
+    if (rasterizer) {
+        draw_pipe->SetIdleHook([this] { rasterizer->OnRecorderIdle(); });
+    }
     pipe_report_start = std::chrono::steady_clock::now();
     pipelined.store(true, std::memory_order_release);
     // PERF-063: SHADGT_EARLY_FENCES=1 signals graphics fences at decode when the work before
@@ -452,6 +457,7 @@ void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 sr
         }
         draw_pipe->Push(
             [this, seq, work = std::move(work)]() mutable {
+                RecorderParts::Scope part{RecorderParts::Part::Dmas}; // DIAG-GT7-005
                 work();
                 if (seq != 0) {
                     labels_done.store(seq, std::memory_order_release);
@@ -480,6 +486,7 @@ void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 sr
     // Covered by the window's capture, but a barrier for the buffer stage (it changes buffers).
     DrawPipe::SetPushTag("captured dma"); // DIAG-069
     draw_pipe->Push([this, work = std::move(work), capture = window_capture]() mutable {
+        RecorderParts::Scope part{RecorderParts::Part::Dmas}; // DIAG-GT7-005
         rasterizer->SetReadCapture(capture.get());
         work();
         rasterizer->SetReadCapture(nullptr);
@@ -870,6 +877,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
                      decode_epoch, capture = std::move(capture), staged]() mutable {
+        RecorderParts::Scope part{RecorderParts::Part::DrawJobs}; // DIAG-GT7-005
         auto& sel = staged ? staged->selected : selected;
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
@@ -1004,6 +1012,7 @@ void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
     }
     DrawPipe::SetPushTag("label write"); // DIAG-069
     draw_pipe->Push([this, address, job, label_seq, work = std::move(work)] {
+        RecorderParts::Scope part{RecorderParts::Part::Labels}; // DIAG-GT7-005
         work();
         if (label_seq != 0) {
             labels_done.store(label_seq, std::memory_order_release);

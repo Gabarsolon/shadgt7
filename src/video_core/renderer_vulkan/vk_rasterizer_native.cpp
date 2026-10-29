@@ -46,6 +46,7 @@
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "ryty_gpu/ryty_diag.h"
 #include "shader_recompiler/info.h"
+#include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
@@ -390,12 +391,16 @@ std::string NativeRenderer::DispatchPartsText() const {
         "{:.2f}; bindings in begin/buffers/textures/copies before/fill/rest "
         "{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} (region refreshes {:.2f}); notes in "
         "write-backs/GPU writes {:.2f}/{:.2f}; copies before {} ({:.1f} MB), buffers made {}, "
-        "reused {}",
+        "reused {}; image slots {} ({} from the memo, {:.1f} views each)",
         per(part[0]), per(part[1]), per(part[2]), per(part[3]), per(part[4]), per(part[5]),
         per(bind[0]), per(bind[1]), per(bind[2]), per(bind[3]), per(bind[4]),
         per(bindings > pieces ? bindings - pieces : 0), per(stats.dispatch_refresh_ns),
         per(stats.dispatch_note_ns[0]), per(stats.dispatch_note_ns[1]), stats.writeback_befores,
-        stats.snapshot_bytes / 1048576.0, stats.snapshots_made, stats.snapshots_reused);
+        stats.snapshot_bytes / 1048576.0, stats.snapshots_made, stats.snapshots_reused,
+        stats.compute_texture_lookups, stats.compute_texture_hits,
+        stats.compute_texture_lookups
+            ? double(stats.compute_texture_bindings) / double(stats.compute_texture_lookups)
+            : 0.0);
 }
 
 u32 NativeRenderer::AbMode() const {
@@ -1053,6 +1058,23 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     return s;
 }
 
+void NativeRenderer::BeginAhead() {
+    // PERF-GT7-008 (B): a list begun (command list, barrier, pending mirrors) cost a dispatch
+    // 2.3 us on average in IB-3, the first work after each of the ~5,000 splices a second; it
+    // is begun while the recorder waits for work instead. Not on Intel (FIX-188: the native
+    // work goes in the scheduler's own command buffer there).
+    if (!ReuseOn() || r.instance.IsIntel()) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    if (stream.list) {
+        return;
+    }
+    AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Ahead}; // DIAG-GT7-005
+    Begin();
+    ++stats.lists_ahead;
+}
+
 bool NativeRenderer::GpuTimeOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_DIAG_GPU_TIME");
@@ -1312,6 +1334,7 @@ void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
     }
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::WriteBacks};
     struct Timed {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         u64& total;
@@ -1376,6 +1399,7 @@ void NativeRenderer::FlushWritebacks() {
 }
 
 void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bound) {
+    AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Uploads}; // DIAG-GT7-005
     const bool init = device->PendingImageInit();
     // PERF-109: the stale textures the work uses, with the uploads queued.
     const bool bound_stale = std::ranges::any_of(bound, [](const Native::ImageEntry* entry) {
@@ -4864,6 +4888,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
+        const bool compute_stage = stage.sw_stage == Shader::SwStage::Compute; // PERF-GT7-009
+        if (compute_stage) {
+            ++stats.compute_texture_lookups;
+            stats.compute_texture_bindings += num_bindings;
+        }
         const auto add_write = [&] {
             b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
             b.writes.push_back(vk::WriteDescriptorSet{
@@ -4930,7 +4959,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
                                (num_bindings << 16);
-        if (num_bindings <= 4 && stage.pgm_hash != 0xaa3822a3 && !r.FrameDumpCollecting()) {
+        const u32 memo_views = ReuseOn() ? TextureMemoViews : 4u; // PERF-GT7-009
+        if (num_bindings <= memo_views && stage.pgm_hash != 0xaa3822a3 &&
+            !r.FrameDumpCollecting()) {
             memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
                                                        memo_flags) &
                                   (texture_memos.size() - 1)];
@@ -4965,6 +4996,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 }); // DIAG-213
                 add_write();
                 ++stats.texture_memo_hits;
+                stats.compute_texture_hits += compute_stage ? 1 : 0;
                 continue;
             }
         }
@@ -6536,6 +6568,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     std::scoped_lock lock{mutex};
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Draws}; // DIAG-GT7-005
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -7732,7 +7765,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     // copies of sources (the recorder does them).
     DrawBindings& b = p.bindings;
     const u64 now_frame = shared_frame.load(std::memory_order_relaxed);
-    static thread_local std::array<TextureMemo, 4096> memos{};
+    static thread_local std::array<JobTextureMemo, 4096> memos{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const u32 num_bindings = image_desc.NumBindings(stage);
@@ -7770,7 +7803,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             return false; // the recorder (FIX-081's grass shader, long arrays)
         }
         const u64 memo_generation = p.image_generation + p.unmap_gen;
-        TextureMemo& memo = memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
+        JobTextureMemo& memo = memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
                                                        memo_flags) &
                                   (memos.size() - 1)];
         const VAddr address = tsharp.Address();
@@ -8425,6 +8458,7 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
 
 void NativeRenderer::DispatchDirect() {
     std::scoped_lock lock{mutex};
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -8532,6 +8566,7 @@ void NativeRenderer::DispatchDirect() {
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     std::scoped_lock lock{mutex};
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
     t_timed = false; // OPT-001
     r.scheduler.PopPendingOperations();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
@@ -9394,6 +9429,7 @@ u32 NativeRenderer::ReadGds(u32 gds_offset) {
 
 void NativeRenderer::Splice() {
     std::scoped_lock lock{mutex};
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
     Stream& s = stream;
     if (!s.list) {
         return;
@@ -9934,6 +9970,25 @@ void NativeRenderer::Report() {
     }
     const double seconds = std::chrono::duration<double>(now - last_report).count();
     last_report = now;
+    // DIAG-GT7-005: the recorder's time in the window by part, in ms a second.
+    const std::string recorder_parts = [&] {
+        if (!AmdGpu::RecorderParts::On()) {
+            return std::string{};
+        }
+        const auto ns = AmdGpu::RecorderParts::Take();
+        u64 busy = 0;
+        std::string text;
+        for (u32 i = 0; i < ns.size(); ++i) {
+            busy += ns[i];
+            text += fmt::format("{}{:.1f}", i == 0 ? "" : "/", ns[i] / 1e6 / seconds);
+        }
+        return fmt::format("jobs/draw jobs/draws/dispatches/labels/DMAs/splices/submits/uploads/"
+                           "write-backs/GPU waits/lists ahead {}, busy {:.1f}",
+                           text, busy / 1e6 / seconds);
+    }();
+    if (!recorder_parts.empty()) {
+        LOG_INFO(Render_Vulkan, "DIAG-GT7-005 (10 s): recorder ms a second in {}", recorder_parts);
+    }
     const auto& registry_stats = registry->GetStats();
     const u64 uploads = registry_stats.uploads.load();
     const u64 upload_bytes = registry_stats.upload_bytes.load();
@@ -10086,11 +10141,14 @@ void NativeRenderer::Report() {
                     "DIAG-GT7-003 A/B window {} mode {}: {:.1f} s, {} draws, {:.3f} us a draw, {} "
                     "dispatches, {:.2f} us a dispatch, {} frames; phases pipeline/targets/buffers/"
                     "textures/sources/vertices/prepare/record {}; record parts barrier/begin/"
-                    "dynamic/vertex/pipeline/bindings/draw/notes {}; dispatches: {}",
+                    "dynamic/vertex/pipeline/bindings/draw/notes {}; dispatches: {}; recorder ms a "
+                    "second in {}; lists begun ahead {}",
                     ab_window, char('A' + AbMode()), seconds, stats.draws,
                     stats.draws ? stats.draw_ns / 1000.0 / stats.draws : 0.0, stats.dispatches,
                     stats.dispatches ? stats.dispatch_ns / 1000.0 / stats.dispatches : 0.0,
-                    frame - ab_frame, phases, parts, DispatchPartsText());
+                    frame - ab_frame, phases, parts, DispatchPartsText(), recorder_parts,
+                    stats.lists_ahead);
+        stats.lists_ahead = 0;
         ab_frame = frame;
         ++ab_window;
         const u32 mode = AbMode();
@@ -10145,6 +10203,8 @@ void NativeRenderer::Report() {
     stats.dispatch_note_ns = {};
     stats.dispatch_refresh_ns = 0;
     stats.snapshot_bytes = stats.snapshots_made = stats.snapshots_reused = 0;
+    stats.compute_texture_lookups = stats.compute_texture_hits = 0;
+    stats.compute_texture_bindings = 0;
     if (stats.writeback_befores != 0 || stats.precise_writebacks != 0) {
         LOG_INFO(Render_Vulkan, "FIX-203: {} written ranges copied before the work, {} page runs "
                  "written back by compare", std::exchange(stats.writeback_befores, 0),

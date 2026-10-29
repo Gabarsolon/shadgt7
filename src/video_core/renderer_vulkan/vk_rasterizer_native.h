@@ -131,6 +131,8 @@ public:
     static bool PrepareEnabled();
     /// DIAG-GT7-003: whether the prepared draws are used now (off in A/B windows).
     static bool PreparedOn();
+    /// PERF-GT7-008 (B): on the recorder when it runs out of work, the next list is begun.
+    void BeginAhead();
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
     /// (with its stages): then the command thread doesn't select its pipeline.
     bool HasPrepared(const void* packet);
@@ -469,13 +471,19 @@ private:
     /// OPT-002: what a T# resolved to the last time (picture and views), by the T# and how the
     /// shader reads it, valid while the registry made or dropped no picture and no memory was
     /// unmapped since.
-    struct TextureMemo {
+    /// PERF-GT7-009: B remembers T#s bound with up to 16 views (one per mip for a storage image
+    /// indexed by mip, as GT7's compute passes bind them); A up to 4, as before.
+    static constexpr u32 TextureMemoViews = 16;
+    template <u32 Views>
+    struct TextureMemoOf {
         std::array<u64, 4> sharp{};
         u32 flags = 0;
         u64 generation = ~u64{0};
         Native::ImageEntry* entry = nullptr;
-        std::array<vk::ImageView, 4> views{};
+        std::array<vk::ImageView, Views> views{};
     };
+    using TextureMemo = TextureMemoOf<TextureMemoViews>;
+    using JobTextureMemo = TextureMemoOf<4>; ///< OPT-010's, per job thread (thread-local)
     std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
     std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
@@ -1111,6 +1119,9 @@ private:
         u64 dispatch_refresh_ns = 0;
         /// PERF-GT7-007: FIX-203 copies by bytes, and their buffers made and reused.
         u64 snapshot_bytes = 0, snapshots_made = 0, snapshots_reused = 0;
+        u64 lists_ahead = 0; ///< PERF-GT7-008: lists begun while the recorder waited
+        /// PERF-GT7-009: compute stages' image slots looked up, from the memo, and bindings.
+        u64 compute_texture_lookups = 0, compute_texture_hits = 0, compute_texture_bindings = 0;
         u64 small_rewrites = 0; ///< FIX-202: small textures uploaded again after big writes
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,

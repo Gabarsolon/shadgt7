@@ -16,6 +16,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "common/nvtx.h"
+#include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "ryty_gpu/ryty_diag.h"
 
@@ -406,6 +407,7 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
         return;
     }
     Common::Nvtx::Scope nvtx{"wait for GPU"}; // DIAG-056
+    AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::GpuWaits}; // DIAG-GT7-005
     const auto start = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
     RecordGpuWait(loc, std::chrono::steady_clock::now() - start);
@@ -500,6 +502,7 @@ void Scheduler::CloseSession() {
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     Common::PhaseTimer submit_timer{Common::Phase::Submit};
     RYDIAG_SCOPE(Submit);
+    AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Submits}; // DIAG-GT7-005
     // PERF-084: the queue lock is taken only around queue calls (the submit callback's sparse
     // binds take it themselves), so the command thread can submit while the recorder works.
     const u64 signal_value = work_semaphore.NextTick();

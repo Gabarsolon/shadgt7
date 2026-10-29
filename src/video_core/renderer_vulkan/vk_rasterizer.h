@@ -286,6 +286,8 @@ public:
                           bool flush = true);
     /// D5: submits fences deferred without a submit of their own (recorder out of work).
     void FlushDeferredFences();
+    /// PERF-GT7-008: the recorder ran out of work (the native renderer begins its next list).
+    void OnRecorderIdle();
     /// D6: the imported guest memory holding a range read in place, when direct mode can.
     std::optional<std::pair<const VideoCore::Buffer*, u64>> DirectReadBuffer(VAddr address,
                                                                              u64 size);
