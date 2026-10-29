@@ -9863,6 +9863,9 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
                     "memory {}", address, size, exact, Native::WatchedBytes(address));
     }
     NoteHistory(begin, end - begin, 7, exact != 0 ? address + exact : 0); // DIAG-187 (diagnosis)
+    if (RyDiag::Enabled()) {
+        NoteFaultPages(begin, end); // DIAG-GT7-010
+    }
     // FIX-173: a region page holds what the GPU wrote there, which guest memory never got; a
     // CPU write to the page copies in only the bytes the CPU changed (RefreshRegion compares
     // with this copy of the page from before the write), not the whole page from guest memory.
@@ -9942,6 +9945,86 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     }
     has_pending_region_writes.store(true, std::memory_order_release);
     split(4);
+}
+
+void NativeRenderer::NoteFaultPages(VAddr begin, VAddr end) {
+    const u64 now = shared_frame.load(std::memory_order_relaxed);
+    std::scoped_lock lock{fault_pages_mutex};
+    for (VAddr page = begin; page < end; page += 4096) {
+        if (fault_pages.size() >= 65536 && !fault_pages.contains(page)) {
+            return;
+        }
+        FaultPage& p = fault_pages[page];
+        const u64 gap = now - p.last_frame;
+        if (p.faults == 0 || gap >= 32) {
+            p.frames = 1;
+        } else if (gap != 0) {
+            p.frames = (p.frames << gap) | 1u;
+        }
+        p.last_frame = now;
+        ++p.faults;
+    }
+}
+
+std::string NativeRenderer::FaultPagesText() {
+    std::unordered_map<VAddr, FaultPage> pages;
+    {
+        std::scoped_lock lock{fault_pages_mutex};
+        pages.swap(fault_pages);
+    }
+    if (pages.empty()) {
+        return {};
+    }
+    const u64 now = shared_frame.load(std::memory_order_relaxed);
+    u64 faults = 0;
+    u32 hot = 0;
+    std::array<u32, 4> by_class{}; // region, texture up to 4 MB (hashed), larger texture, neither
+    std::map<VAddr, std::pair<u32, std::string>> chunks; // 64 KB: hot pages, what one holds
+    for (const auto& [page, p] : pages) {
+        faults += p.faults;
+        // Hot: written in 6 or more of the 8 frames up to its last write, and lately.
+        if (now - p.last_frame > 8 || std::popcount(p.frames & 0xffu) < 6) {
+            continue;
+        }
+        ++hot;
+        bool region = false;
+        {
+            std::shared_lock map_lock{buffer_map_mutex};
+            region = RegionOver(page, 4096) != nullptr;
+        }
+        u64 biggest = 0;
+        std::string what;
+        registry->ForEachOverlapping(page, page + 4096, [&](Native::ImageEntry& entry) {
+            if (entry.from_cpu && entry.info.guest_size > biggest) {
+                biggest = entry.info.guest_size;
+                what = fmt::format("texture {:#x} {}x{} {} ({} KB)", entry.info.guest_address,
+                                   entry.info.size.width, entry.info.size.height,
+                                   vk::to_string(entry.info.pixel_format),
+                                   entry.info.guest_size >> 10);
+            }
+        });
+        const size_t cls = region ? 0 : biggest == 0 ? 3 : biggest <= 4_MB ? 1 : 2;
+        ++by_class[cls];
+        auto& chunk = chunks[page & ~VAddr{0xFFFF}];
+        ++chunk.first;
+        if (chunk.second.empty()) {
+            chunk.second = region ? std::string{"region"} : biggest ? what : std::string{"neither"};
+        }
+    }
+    std::vector<std::pair<u32, VAddr>> busiest;
+    for (const auto& [chunk, info] : chunks) {
+        busiest.emplace_back(info.first, chunk);
+    }
+    std::ranges::sort(busiest, std::greater{});
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(busiest.size(), 6); ++i) {
+        top += fmt::format("; {:#x} {} hot pages: {}", busiest[i].second, busiest[i].first,
+                           chunks[busiest[i].second].second);
+    }
+    return fmt::format("{} CPU write faults on {} pages; {} pages written in 6+ of 8 frames: {} in "
+                       "regions, {} in textures up to 4 MB, {} in larger textures, {} neither{}",
+                       faults, pages.size(), hot, by_class[0], by_class[1], by_class[2],
+                       by_class[3], top);
 }
 
 u32 NativeRenderer::ReadGds(u32 gds_offset) {
@@ -10758,6 +10841,11 @@ void NativeRenderer::Report() {
     if (stats.one_off_waits != 0) {
         LOG_INFO(Render_Vulkan, "FIX-198: {} draws into pictures not drawn lately waited for their "
                  "new pipeline", std::exchange(stats.one_off_waits, 0));
+    }
+    if (RyDiag::Enabled()) {
+        if (std::string text = FaultPagesText(); !text.empty()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-010 (10 s): {}", text);
+        }
     }
     if (stats.one_off_exempt != 0) {
         LOG_INFO(Render_Vulkan, "PERF-GT7-023: {} draws into one-off pictures of kinds always "

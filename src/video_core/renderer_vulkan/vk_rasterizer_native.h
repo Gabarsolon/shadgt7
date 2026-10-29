@@ -453,6 +453,18 @@ private:
     void SaveOneOffKinds(bool wait); ///< when changed; wait: on this thread
     std::unordered_map<OneOffKind, OneOffKindStats, OneOffKindHash> one_off_kinds;
     std::unordered_map<OneOffPlace, OneOffKindStats, OneOffPlaceHash> one_off_places;
+    /// DIAG-GT7-010 (with RYGT_DIAG): the pages CPU write faults hit, by frame, to find the ones
+    /// the game writes every frame (watched again and faulted again each frame: 4-7 ms a frame of
+    /// faults on the game's threads in a heavy scene) and what they hold.
+    struct FaultPage {
+        u64 last_frame = 0;
+        u32 frames = 0; ///< bit n: written n frames before last_frame
+        u32 faults = 0;
+    };
+    std::mutex fault_pages_mutex;
+    std::unordered_map<VAddr, FaultPage> fault_pages;
+    void NoteFaultPages(VAddr begin, VAddr end);
+    std::string FaultPagesText(); ///< the window's pages, then cleared
     bool one_off_kinds_changed = false;
     /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
     /// yet run by the GPU (guest range, GPU tick), and CPU writes that met one.
