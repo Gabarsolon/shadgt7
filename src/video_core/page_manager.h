@@ -7,6 +7,7 @@
 #include <memory>
 #include "common/alignment.h"
 #include "common/types.h"
+#include "core/address_space.h"
 #include "video_core/buffer_cache/region_definitions.h"
 
 namespace Vulkan {
@@ -14,6 +15,16 @@ class Rasterizer;
 }
 
 namespace VideoCore {
+
+/// FIX-233: the protection a page gets on the host. x86 has no write-only pages: a page whose
+/// reads are watched (GPU-written data, precise readbacks) and whose writes are not becomes
+/// no-access; its CPU write faults too and is handled as a read first (PageManager).
+constexpr Core::MemoryPermission HostPermission(bool read_watched, bool write_watched) {
+    if (read_watched) {
+        return Core::MemoryPermission::None;
+    }
+    return write_watched ? Core::MemoryPermission::Read : Core::MemoryPermission::ReadWrite;
+}
 
 struct UffdImpl;
 struct SignalImpl;

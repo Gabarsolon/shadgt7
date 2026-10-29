@@ -315,6 +315,20 @@ bool NativeModeRequested() {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         const std::wstring name{exe};
         const std::wstring file = name.substr(name.find_last_of(L"\\/") + 1);
+        if (Common::RytyGameConfigText().empty()) {
+            // FIX-231: the launcher's settings were not found where the renderer looks.
+            const std::wstring path = Common::RytyGameConfigPathW();
+            std::string narrow(path.size() * 3 + 1, ' ');
+            narrow.resize(std::max(0, WideCharToMultiByte(CP_UTF8, 0, path.c_str(),
+                                                          static_cast<int>(path.size()),
+                                                          narrow.data(),
+                                                          static_cast<int>(narrow.size()),
+                                                          nullptr, nullptr)));
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-231: the launcher's settings file was not found at {} (start GT7 "
+                        "with RyGT7.exe from its own folder); the game's defaults apply",
+                        narrow);
+        }
         if (_wcsicmp(file.c_str(), L"GT7.exe") == 0) {
             LOG_WARNING(Render_Vulkan, "FIX-231: native renderer on (GT7 always uses it; the "
                                        "settings say {})",

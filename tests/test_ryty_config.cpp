@@ -13,6 +13,17 @@
 #include <gtest/gtest.h>
 
 #include "common/ryty_config.h"
+#include "video_core/page_manager.h"
+
+// FIX-233: a page's host protection is never write-only (x86 cannot protect so).
+TEST(PagePermission, NeverWriteOnly) {
+    using Core::MemoryPermission;
+    EXPECT_EQ(VideoCore::HostPermission(false, false), MemoryPermission::ReadWrite);
+    EXPECT_EQ(VideoCore::HostPermission(false, true), MemoryPermission::Read);
+    EXPECT_EQ(VideoCore::HostPermission(true, true), MemoryPermission::None);
+    // GPU-written data whose CPU write watch was dropped: no access, not write-only.
+    EXPECT_EQ(VideoCore::HostPermission(true, false), MemoryPermission::None);
+}
 
 #ifdef _WIN32
 TEST(RytyConfig, ExeDirEndsWithSeparatorAndExists) {

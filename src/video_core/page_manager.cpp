@@ -85,7 +85,9 @@ struct PageManager::Impl {
             if (num_guards != 0) {
                 return Core::MemoryPermission::None;
             }
-            return ReadPerm() | WritePerm();
+            // FIX-233: never write-only (x86 cannot protect so; it asserted on a tester's AMD
+            // PC when GPU-written pages lost their CPU write watch).
+            return HostPermission(num_read_watchers != 0, num_write_watchers != 0);
         }
 
         template <bool is_read>
@@ -580,8 +582,21 @@ public:
 #endif // __linux__
 
 struct SignalImpl : public PageManager::Impl {
+    /// FIX-233: whether the page's reads / writes are watched (racy reads; a hint for faults).
+    /// Pages are 4 KiB (PageManager's PM_PAGE_BITS).
+    inline static SignalImpl* instance = nullptr;
+    static bool ReadWatched(VAddr page) {
+        const PageState* state = instance ? instance->cached_pages.find(page >> 12) : nullptr;
+        return state && state->num_read_watchers != 0;
+    }
+    static bool WriteWatched(VAddr page) {
+        const PageState* state = instance ? instance->cached_pages.find(page >> 12) : nullptr;
+        return state && state->num_write_watchers != 0;
+    }
+
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
+        instance = this; // FIX-233
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -1012,6 +1027,22 @@ struct SignalImpl : public PageManager::Impl {
         // The faulting instruction, with bit 63 set for a write.
         RYDIAG_SCOPE(WriteFault, reinterpret_cast<u64>(Common::GetRip(context)) |
                                      (u64(Common::IsWriteError(context)) << 63));
+        if (Common::IsWriteError(context) && ReadWatched(fault_page)) {
+            // FIX-233: the page holds GPU-written data the CPU has not read back; it is
+            // no-access (not write-only), so a CPU write lands here. The data is brought back
+            // as for a read first, so the write changes the GPU's data, not stale memory; then
+            // the write is handled as usual if the page's writes are watched too, else the
+            // write runs again on the now open page.
+            static std::atomic<u32> logged{};
+            if (const u32 n = ++logged; n <= 8 || n % 1000 == 0) {
+                LOG_WARNING(Render, "FIX-233: CPU write to a read-watched page at {:#x} ({} so far)",
+                            addr, n);
+            }
+            const bool read = rasterizer->ReadMemory(addr, size, assume_locks);
+            if (!WriteWatched(fault_page)) {
+                return read;
+            }
+        }
         if (Common::IsWriteError(context)) {
             const auto start = timed ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
