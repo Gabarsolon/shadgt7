@@ -869,6 +869,63 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     return info;
 }
 
+// PERF-GT7-037: GT7 uses the same few compute pipelines in every race, some of which take the
+// driver ~1 s to build (0x2f3cb32d18925709, 0xe1682ae083e54205), on the command thread while
+// the game waits for them: two frames of ~1 s in every race the driver's cache lacks them (after
+// a driver update, or a cleared cache). Each compute pipeline is kept once as a recipe, and
+// built again in the background at each start (quick for those the driver has).
+// RYGT_WARM_COMPUTE=0: neither.
+static bool WarmComputeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_WARM_COMPUTE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+std::filesystem::path PipelineCache::WarmComputeDir() {
+    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           fmt::format("{}.warm_compute", serial);
+}
+
+void PipelineCache::WarmComputePipelines(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:WarmCompute");
+    Common::PreferCompileCores();
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(WarmComputeDir(), ec)) {
+        if (entry.path().extension() == ".bin" && files.size() < 64) {
+            files.push_back(entry.path());
+        }
+    }
+    if (files.empty()) {
+        return;
+    }
+    u32 warmed = 0;
+    double total_ms = 0;
+    double longest_ms = 0;
+    for (const auto& file : files) {
+        if (stop.stop_requested()) {
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (ComputePipeline::WarmFromRecipe(instance, *pipeline_cache, file)) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+            ++warmed;
+            total_ms += ms;
+            longest_ms = std::max(longest_ms, ms);
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "PERF-GT7-037: {} of {} compute pipelines built ahead in the background ({:.0f} ms, "
+             "the longest {:.0f} ms)",
+             warmed, files.size(), total_ms, longest_ms);
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -945,6 +1002,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         SingleSampleBarycentricRequested()));
     CreateDriverCache();
+    if (WarmComputeOn()) { // PERF-GT7-037
+        warm_compute_thread =
+            std::jthread([this](std::stop_token stop) { WarmComputePipelines(stop); });
+    }
     LoadElseScopeFixed();
     // PERF-032: the shader store: a program's stored translations are read when a draw first
     // uses it, and new translations are stored. -DisablePerf 47 leaves the store closed.
@@ -1002,6 +1063,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
+    if (warm_compute_thread.joinable()) { // PERF-GT7-037: before the caches go
+        warm_compute_thread.request_stop();
+        warm_compute_thread.join();
+    }
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
     }
@@ -2274,6 +2339,40 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             ms >= 50.0) {
             LOG_INFO(Render_Vulkan, "PERF-GT7-032: compute pipeline {:#x} built in {:.0f} ms{}",
                      pipeline_hash, ms, foreground_on ? ", the other compiles set aside" : "");
+        }
+        // PERF-GT7-037: kept, to be built ahead at the next start: each compute pipeline once
+        // (the driver may already have one that took long the first time). Its SPIR-V is the
+        // stored translation of the program's permutation that made the module.
+        if (const Shader::Info* info = S().infos[0]; WarmComputeOn() && info) {
+            const auto dir = WarmComputeDir();
+            const auto file = dir / fmt::format("{:#018x}.bin", pipeline_hash);
+            std::error_code ec;
+            if (!std::filesystem::exists(file, ec)) {
+                std::optional<size_t> perm;
+                if (const auto prog = program_cache.find(info->pgm_hash);
+                    prog != program_cache.end()) {
+                    const auto& modules = prog->second->modules;
+                    for (size_t i = 0; i < modules.size(); ++i) {
+                        if (modules[i].module == S().modules[0]) {
+                            perm = i;
+                            break;
+                        }
+                    }
+                }
+                std::vector<u32> spirv;
+                if (perm) {
+                    Storage::DataBase::Instance().Load(
+                        Storage::BlobType::ShaderBinary,
+                        fmt::format("{:#018x}_{}", info->pgm_hash, *perm), spirv);
+                }
+                std::filesystem::create_directories(dir, ec);
+                if (IsCompleteSpirv(spirv) && it->second->SaveRecipe(file, spirv)) {
+                    LOG_INFO(Render_Vulkan,
+                             "PERF-GT7-037: compute pipeline {:#x} kept, to be built ahead at "
+                             "the next start",
+                             pipeline_hash);
+                }
+            }
         }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
