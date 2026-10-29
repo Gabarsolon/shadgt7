@@ -464,6 +464,13 @@ private:
     std::mutex fault_pages_mutex;
     std::unordered_map<VAddr, FaultPage> fault_pages;
     void NoteFaultPages(VAddr begin, VAddr end);
+    /// PERF-GT7-030: after a write fault in a region page (its copy kept, FIX-173), the other
+    /// still watched pages of its 64 KB chunk and region are opened too, when the chunk faulted
+    /// within the last 8 frames: GT7 writes such chunks whole, a page at a time, every ~4 frames.
+    void FaultAhead(VAddr begin, VAddr end);
+    std::unordered_map<VAddr, u64> fault_chunks; ///< 64 KB chunk: frame of its last fault
+    std::atomic<u64> fault_ahead_faults{};
+    std::atomic<u64> fault_ahead_pages{};
     std::string FaultPagesText(); ///< the window's pages, then cleared
     bool one_off_kinds_changed = false;
     /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not

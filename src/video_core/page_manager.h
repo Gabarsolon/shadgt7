@@ -64,6 +64,10 @@ public:
     /// the page is neither write- nor read-protected). Any thread; a racy but word-sized read.
     bool IsUnwatched(VAddr page) const;
 
+    /// PERF-GT7-030: whether the native renderer watches the page. Any thread; a racy but
+    /// word-sized read.
+    bool IsNativeWatched(VAddr page) const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

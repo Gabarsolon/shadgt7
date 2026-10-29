@@ -9881,12 +9881,14 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // the GPU faulted - device lost - in most races.) Taken under the region lock, each fault
     // waited ~2.5 us for the recorder.
     split(0);
+    bool region_fault = false; // PERF-GT7-030
     if (end - begin <= 64_KB) {
         bool in_region = false;
         {
             std::shared_lock map_lock{buffer_map_mutex};
             in_region = RegionOver(begin, end - begin) != nullptr;
         }
+        region_fault = in_region;
         if (in_region) {
             boost::container::small_vector<
                 std::pair<VAddr, std::unique_ptr<std::array<u8, 4096>>>, 2>
@@ -9944,7 +9946,103 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
         pending_region_writes.emplace_back(begin, end);
     }
     has_pending_region_writes.store(true, std::memory_order_release);
+    if (region_fault) {
+        FaultAhead(begin, end); // PERF-GT7-030
+    }
     split(4);
+}
+
+void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
+    // PERF-GT7-030: in GT7's pause menu, ~2,700 write faults a frame (25-28 ms of the game's
+    // threads, the game at ~15 fps) on region pages: whole 64 KB chunks written again every few
+    // frames, each of their pages faulting, copied (FIX-173), opened, then watched again at the
+    // region's next use. The chunk's other pages are opened with the first one, as if written:
+    // each copied first while still protected and kept under the lock before it opens, as the
+    // faulting page is (PERF-107), so a kept copy never holds a CPU write the region lacks; a
+    // page left unwritten copies nothing in at the refresh. RYGT_NATIVE_FAULT_AHEAD=0: as before.
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FAULT_AHEAD");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled) {
+        return;
+    }
+    const VAddr chunk = begin & ~VAddr{0xFFFF};
+    if (end > chunk + 64_KB) {
+        return;
+    }
+    const u64 now = shared_frame.load(std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        if (fault_chunks.size() >= 65536) {
+            fault_chunks.clear();
+        }
+        auto [it, first] = fault_chunks.try_emplace(chunk, now);
+        const bool lately = !first && now - it->second <= 8;
+        it->second = now;
+        if (!lately) {
+            return;
+        }
+    }
+    // The chunk's other pages of the same region that are still watched.
+    boost::container::small_vector<VAddr, 16> pages;
+    {
+        std::shared_lock map_lock{buffer_map_mutex};
+        const Region* region = RegionOver(begin, 4096);
+        if (!region) {
+            return;
+        }
+        const VAddr from = std::max(chunk, region->begin);
+        const VAddr to = std::min<VAddr>(chunk + 64_KB, region->end);
+        for (VAddr page = from; page + 4096 <= to; page += 4096) {
+            if ((page < begin || page >= end) && r.page_manager.IsNativeWatched(page)) {
+                pages.push_back(page);
+            }
+        }
+    }
+    if (pages.empty()) {
+        return;
+    }
+    boost::container::small_vector<std::pair<VAddr, std::unique_ptr<std::array<u8, 4096>>>, 16>
+        copies;
+    for (const VAddr page : pages) {
+        auto copy = std::make_unique<std::array<u8, 4096>>();
+        if (Core::RytyMemory::GuardedCopy(copy->data(), reinterpret_cast<const void*>(page),
+                                          4096)) {
+            copies.emplace_back(page, std::move(copy));
+        }
+    }
+    if (copies.empty()) {
+        return;
+    }
+    {
+        std::scoped_lock pending_lock{region_dirty_mutex};
+        for (auto& [page, copy] : copies) {
+            auto& slot = page_snapshots[page];
+            if (!slot) {
+                slot = std::move(copy); // the first copy since the page was copied in counts
+            }
+        }
+    }
+    // Opened, then noted as written, in runs (one protect each), as OnCpuWrite does.
+    for (size_t i = 0; i < copies.size();) {
+        size_t j = i + 1;
+        while (j < copies.size() && copies[j].first == copies[j - 1].first + 4096) {
+            ++j;
+        }
+        const VAddr run_begin = copies[i].first;
+        const VAddr run_end = copies[j - 1].first + 4096;
+        UnwatchPages(run_begin, run_end);
+        registry->CpuWrite(run_begin, run_end - run_begin, 0);
+        {
+            std::scoped_lock pending_lock{region_dirty_mutex};
+            pending_region_writes.emplace_back(run_begin, run_end);
+        }
+        i = j;
+    }
+    has_pending_region_writes.store(true, std::memory_order_release);
+    fault_ahead_faults.fetch_add(1, std::memory_order_relaxed);
+    fault_ahead_pages.fetch_add(copies.size(), std::memory_order_relaxed);
 }
 
 void NativeRenderer::NoteFaultPages(VAddr begin, VAddr end) {
@@ -10841,6 +10939,10 @@ void NativeRenderer::Report() {
     if (stats.one_off_waits != 0) {
         LOG_INFO(Render_Vulkan, "FIX-198: {} draws into pictures not drawn lately waited for their "
                  "new pipeline", std::exchange(stats.one_off_waits, 0));
+    }
+    if (const u64 opened = fault_ahead_pages.exchange(0); opened != 0) {
+        LOG_INFO(Render_Vulkan, "PERF-GT7-030: {} write faults in region chunks written lately "
+                 "opened {} more pages with them", fault_ahead_faults.exchange(0), opened);
     }
     if (RyDiag::Enabled()) {
         if (std::string text = FaultPagesText(); !text.empty()) {
