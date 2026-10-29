@@ -6646,6 +6646,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     {
         PhaseClock part{stats.record_ns[6]};
+        // DIAG-243: the draws recorded last, for the report of a lost device.
+        static const bool note_draws = [] {
+            const char* env = std::getenv("RYGT_DEVICE_FAULT");
+            return env && env[0] == '1';
+        }();
+        if (note_draws) {
+            const auto& key = pipeline->GetGraphicsKey();
+            NoteDrawForFault(XXH3_64bits(&key, sizeof(key)),
+                             (pipeline->LdsEmulation() & 0xff) |
+                                 (u32(regs.stage_enable.hs_en != 0) << 8));
+        }
         record_draw();
         // DIAG-241 (diagnosis): in a dumped frame, the LDS scratch of the first such draw.
         if (lds_snap_address != 0 && r.FrameDumpCollecting() &&

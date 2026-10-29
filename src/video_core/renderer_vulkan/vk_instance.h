@@ -19,12 +19,19 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan {
 
+/// DIAG-243 (RYGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
+void NoteDrawForFault(u64 pipeline_hash, u32 info);
+
 class Instance {
 public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
+
+    /// DIAG-243: once, after a lost device: VK_EXT_device_fault's report (with
+    /// RYGT_DEVICE_FAULT=1) and the last draws the renderer recorded.
+    void ReportDeviceLost() const;
 
     /// Returns a formatted string for the driver version
     std::string GetDriverVersionName();
@@ -596,6 +603,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool device_fault{}; // DIAG-243
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
