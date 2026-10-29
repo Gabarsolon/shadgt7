@@ -471,6 +471,7 @@ private:
     std::unordered_map<VAddr, u64> fault_chunks; ///< 64 KB chunk: frame of its last fault
     std::atomic<u64> fault_ahead_faults{};
     std::atomic<u64> fault_ahead_pages{};
+    u64 draws_at_frame = 0; ///< DIAG-GT7-011: stats.draws at the last frame's end
     std::string FaultPagesText(); ///< the window's pages, then cleared
     bool one_off_kinds_changed = false;
     /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not

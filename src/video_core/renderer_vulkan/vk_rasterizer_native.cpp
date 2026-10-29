@@ -10197,6 +10197,13 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     ++frame;
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
+    if (RyDiag::Enabled() && !AbOn()) {
+        // DIAG-GT7-011: the recorder's stack samples of heavy frames (over 3,300 draws, as GT7's
+        // pause menu) go to their own tag in recorder_profile.txt (2; the others 0).
+        const u64 drawn = stats.draws >= draws_at_frame ? stats.draws - draws_at_frame : stats.draws;
+        draws_at_frame = stats.draws;
+        RyDiag::SetProfileTag(drawn > 3300 ? 2 : 0);
+    }
     CheckOneOffs(); // DIAG-GT7-008
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
