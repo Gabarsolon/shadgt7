@@ -3062,7 +3062,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
                         catch_up_bumped.exchange(0), c.step_backs, c.stepped_seconds);
         }
     }
-    // PERF-GT7-033, PERF-GT7-034: the background compiles follow the game's frame rate in races.
+    // PERF-GT7-033, PERF-GT7-034: the background compiles follow the game's frame rate.
     // Each second the game takes more than 34 ms a frame on average (one frame of 66 ms in a
     // second already makes 34.4), they take one step back: a catch-up goes back to the usual
     // compiles (4 at a time on the compile cores, normal priority), then one fewer at a time,
@@ -3071,7 +3071,8 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     // of 1,600), the command thread still decoded 9-11 ms a submit instead of 6-7 in GT7's
     // heavy scenes (the pit straight, ~3,000 draws): every 5-10 frames one took 66 ms. A draw
     // waiting for its pipeline still widens the compiles; the draws on screen still build first
-    // (FIX-GT7-009). RYGT_CATCH_UP_PACE=0: never.
+    // (FIX-GT7-009). In menus too (they run at 60 fps or wait for their pipelines).
+    // RYGT_CATCH_UP_PACE=0: never.
     if (!paced) {
         return;
     }
@@ -3095,17 +3096,14 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     c.pace_frames = totals.frames;
     c.pace_us = totals.us;
     const u32 usual = PipelineBuildWorkers::UsualWidth();
-#ifdef RYTY_GPU
-    if (!RytyGtsInRace()) {
-        // Menus run at their own rates: the usual compiles there.
-        if (c.pace_limit != usual) {
-            c.pace_limit = usual;
-            build_workers->SetPace(64);
-        }
+    // FIX-GT7-012: not gated on FIX-110's race flag, which GT7 never sets (its project scripts
+    // aren't seen): PERF-GT7-034 never acted. A second over 80 ms a frame (loading, a draw
+    // waiting for its pipeline, a stall) is neither late nor on time: compiles are not what
+    // holds the game then, and a draw waiting widens them anyway.
+    if (frame_ms >= 80.0) {
         c.fast = 0;
         return;
     }
-#endif
     const auto note = [&](const char* what) {
         if (++c.pace_changes <= 40) {
             LOG_WARNING(Render_Vulkan, "PERF-GT7-034: the game at {:.1f} ms a frame: {}",
