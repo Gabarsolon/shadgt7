@@ -73,7 +73,9 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma || info.uses_direct) {
+    const bool lds_emulation = info.sw_stage == SwStage::TessellationControl &&
+                               runtime_info.sw.tcs.lds_emulation != 0; // FIX-227
+    if (info.uses_dma || info.uses_direct || lds_emulation) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -176,7 +178,7 @@ void EmitContext::DefineArithmeticTypes() {
     if (info.uses_dma || info.uses_direct) {
         physical_pointer_type_u32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
     }
-    if (info.uses_direct) {
+    if (info.uses_direct || (info.sw_stage == SwStage::TessellationControl && runtime_info.sw.tcs.lds_emulation != 0)) { // FIX-227
         physical_pointer_type_f32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, F32[1]);
         physical_pointer_type_u64 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
         if (profile.support_int8) {

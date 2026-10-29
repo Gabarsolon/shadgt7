@@ -319,6 +319,60 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 return depth;
             }
         }
+        if (!render_target && !info.props.is_depth) {
+            // FIX-219: a colour texture that reads the first layers of a layered target of its own
+            // layout (size, mips, format, pitch, tiling): the target itself, viewed through those
+            // layers, as NAT-040 does for depth. GT7 draws every object's reflection probe into a
+            // 64x64 B10G11R11 target of 7 mips and 2048 layers, and the car shaders read it as
+            // 1464 layers: no target had that layout, the texture was uploaded from memory, which
+            // never holds what the GPU drew, and parts of the cars reflected black (blocks on
+            // the car in the race start's close-ups). RYGT_NATIVE_LAYER_VIEWS=0: as before.
+            static const bool layer_views = [] {
+                const char* env = std::getenv("RYGT_NATIVE_LAYER_VIEWS");
+                return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
+            }();
+            ImageEntry* layered = nullptr;
+            for (auto it = first; layer_views && it != last; ++it) {
+                const auto& c = it->second->info;
+                if (!it->second->from_cpu && it->second->image &&
+                    !it->second->reused.load(std::memory_order_relaxed) && !c.props.is_depth &&
+                    c.resources.layers > info.resources.layers &&
+                    c.resources.levels == info.resources.levels &&
+                    c.size.width == info.size.width && c.size.height == info.size.height &&
+                    c.size.depth == info.size.depth && c.pitch == info.pitch &&
+                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
+                    c.num_samples == info.num_samples && c.pixel_format == info.pixel_format &&
+                    (!layered || it->second->write_version.load(std::memory_order_relaxed) >
+                                     layered->write_version.load(std::memory_order_relaxed))) {
+                    layered = it->second.get();
+                }
+            }
+            if (layered) {
+                ++stats.hits;
+                layered->last_use.store(frame, std::memory_order_relaxed);
+                return layered;
+            }
+        }
+        if (!render_target && WatchedTexture(info.guest_address, info.guest_address + 1) &&
+            WatchSample()) {
+            // DIAG-221 (diagnosis, with RYGT_NATIVE_WATCH_TEXTURE): a texture lookup that found no
+            // target of its layout: the pictures at its address and how their layouts differ.
+            std::string others;
+            for (auto it = first; it != last; ++it) {
+                const auto& c = it->second->info;
+                others += fmt::format(" | {} {}x{} pitch {} tile {} bits {} fmt {} lv {} ly {}{}{}",
+                                      it->second->from_cpu ? "texture" : "target", c.size.width,
+                                      c.size.height, c.pitch, u32(c.tile_mode), c.num_bits,
+                                      u32(c.pixel_format), c.resources.levels, c.resources.layers,
+                                      it->second->reused.load() ? " reused" : "",
+                                      SameLayout(c, info) ? " same-layout" : "");
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-221: texture {:#x} {}x{} pitch {} tile {} bits {} fmt {}: no target; "
+                        "at the address:{}",
+                        info.guest_address, info.size.width, info.size.height, info.pitch,
+                        u32(info.tile_mode), info.num_bits, u32(info.pixel_format), others);
+        }
         if (exact) {
             ++stats.hits;
             exact->last_use.store(frame, std::memory_order_relaxed);
@@ -634,6 +688,55 @@ bool ImageRegistry::RewrittenSmall(ImageEntry& entry) {
         return false;
     }
     MarkStale(entry, Stale::GpuWrite);
+    return true;
+}
+
+bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
+    // FIX-221: GT7 fills its lighting-probe pools (64x64 B10G11R11 with 1536 layers, 128x128 with
+    // 256: 24 and 16 MB) from the CPU, and after the first write faulted the page watch saw none of
+    // the next ones: ~110 layers written at the race start's close-ups stayed as uploaded, zero,
+    // and the cars lit by those probes showed black blocks. Too large to hash at each use (NAT-109
+    // hashes textures up to 4 MB), such a texture is sampled instead: four 64-byte samples of
+    // each layer, once a frame while it is used, and uploaded again when one changed.
+    // RYGT_NATIVE_LAYER_SAMPLES=0: as before.
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_SAMPLES");
+        return !(env && env[0] == '0');
+    }();
+    const u32 layers = entry.info.resources.layers;
+    if (!enabled || layers < 16 || entry.info.guest_size <= (4ull << 20) ||
+        entry.layer_check_frame == frame || !memory_clamp ||
+        memory_clamp(entry.info.guest_address, entry.info.guest_size) != entry.info.guest_size) {
+        return false;
+    }
+    entry.layer_check_frame = frame;
+    const u64 layer_size = entry.info.guest_size / layers;
+    if (layer_size < 256) {
+        return false;
+    }
+    const bool first = entry.layer_samples.size() != layers;
+    entry.layer_samples.resize(layers);
+    u32 changed = 0;
+    for (u32 l = 0; l < layers; ++l) {
+        const VAddr base = entry.info.guest_address + l * layer_size;
+        u64 h = 0;
+        for (u32 part = 0; part < 4; ++part) {
+            const VAddr at = base + (layer_size / 4) * part;
+            h = h * 1099511628211ull ^ Core::HashGuestBytes(at, 64);
+        }
+        changed += !first && entry.layer_samples[l] != h;
+        entry.layer_samples[l] = h;
+    }
+    if (changed == 0) {
+        return false;
+    }
+    MarkStale(entry, Stale::CpuWrite);
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged++; n < 40 || n % 1000 == 0) {
+        LOG_WARNING(Render_Vulkan, "FIX-221: texture {:#x} {}x{} layers {}: {} layers changed "
+                    "unseen; uploaded again ({} so far)", entry.info.guest_address,
+                    entry.info.size.width, entry.info.size.height, layers, changed, n + 1);
+    }
     return true;
 }
 
@@ -1648,6 +1751,26 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
                         forced, entry->content_hash, WatchedBytes(info.guest_address));
         }
         entry->upload_kind = kind;
+        // FIX-218: an upload replaces what the texture's targets had copied in (NAT-104), but those
+        // were only copied again once a target was drawn anew (NAT-111). GT7's driver fill
+        // rewrites its scratch pool before each pass, and the textures over its post-processing
+        // pyramid and the car close-ups were uploaded from that (zero) memory and kept it: black
+        // blocks on the car during the race start. They take their targets' pictures again at
+        // their next use. RYGT_NATIVE_SOURCES_AFTER_UPLOAD=0: as before.
+        static const bool sources_after_upload = [] {
+            const char* env = std::getenv("RYGT_NATIVE_SOURCES_AFTER_UPLOAD");
+            return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
+        }();
+        if (sources_after_upload) {
+            bool has_sources;
+            {
+                std::scoped_lock lock{entry->sources_mutex};
+                has_sources = !entry->sources.empty();
+            }
+            if (has_sources) {
+                entry->sources_dirty.store(true, std::memory_order_relaxed);
+            }
+        }
         ++entry->total_uploads;
         ++entry->upload_count;
         ++uploaded;

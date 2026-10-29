@@ -3,6 +3,7 @@
 
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
+#include "common/logging/log.h"
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -247,6 +248,15 @@ bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& device_profile) {
     auto profile = device_profile;
+    if (runtime_info.sw_stage == SwStage::TessellationControl) { // FIX-227 (diagnosis)
+        static int logged = 0;
+        if (logged++ < 10) {
+            LOG_WARNING(Render_Recompiler, "FIX-227: translating hull shader, LDS emulation {} "
+                        "patches {} input cp {}",
+                        u32(runtime_info.sw.tcs.lds_emulation), u32(runtime_info.sw.tcs.num_patches),
+                        runtime_info.sw.tcs.num_input_control_points);
+        }
+    }
     if (runtime_info.hw_stage == HwStage::Fragment &&
         runtime_info.hw.fs.single_sample_barycentric) {
         profile.supports_amd_shader_explicit_vertex_parameter = false;

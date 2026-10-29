@@ -102,6 +102,14 @@ public:
         return key;
     }
 
+    /// FIX-227: the hull shader's LDS emulation mode (0: off) and LS output bytes per vertex.
+    u32 LdsEmulation() const {
+        return lds_emulation;
+    }
+    u32 LdsVertexBytes() const {
+        return lds_vertex_bytes;
+    }
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
@@ -149,6 +157,8 @@ private:
     std::unique_ptr<LibraryLink> library_link;
 
     GraphicsPipelineKey key;
+    u32 lds_emulation{};
+    u32 lds_vertex_bytes{};
     Shader::Gcn::FetchShaderData fetch_shader{};
 };
 

@@ -108,6 +108,12 @@ struct SwTessControlRuntimeInfo {
     u32 num_threads;
     AmdGpu::TessellationType tess_type;
     bool offchip_lds_enable;
+    /// FIX-227: the hull shader reads the LS outputs of the other patches of its VGT group (GCN
+    /// LDS): they come from a scratch buffer a writer pass of the same draw fills (0: off, 1: a
+    /// slot is from the start of the group, 2: from the patch's own vertices). In what was
+    /// padding, so the layout stays as stored translations have it.
+    u8 lds_emulation;
+    u8 num_patches;
     u32 ls_stride;
     u32 hs_output_base;
 

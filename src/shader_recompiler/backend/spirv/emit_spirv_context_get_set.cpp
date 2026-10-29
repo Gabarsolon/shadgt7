@@ -333,8 +333,15 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
             ctx.OpAccessChain(ctx.output_f32, ctx.cull_distances, ctx.ConstU32(element)));
     case IR::Attribute::PointSize:
         return op_store(ctx.output_point_size);
-    case IR::Attribute::RenderTargetIndex:
+    case IR::Attribute::RenderTargetIndex: {
+        // DIAG-231 (diagnosis, RYGT_DIAG_TES_LAYER0=1): domain shaders draw into layer 0.
+        static const bool tes_layer0 = std::getenv("RYGT_DIAG_TES_LAYER0") != nullptr;
+        if (tes_layer0 && ctx.sw_stage == SwStage::TessellationEval) {
+            value = ctx.ConstF32(0.0f);
+            return op_store(ctx.output_layer);
+        }
         return op_store(ctx.output_layer);
+    }
     case IR::Attribute::ViewportIndex:
         return op_store(ctx.output_viewport_index);
     case IR::Attribute::Depth:
@@ -358,6 +365,50 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
 }
 
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
+    // DIAG-238 (diagnosis, RYGT_DIAG_TCS_CLAMP_VERTEX=1): hull shader input reads stay inside the
+    // patch (an index past gl_PatchVerticesIn reads undefined values in Vulkan).
+    static const bool clamp_vertex = std::getenv("RYGT_DIAG_TCS_CLAMP_VERTEX") != nullptr;
+    if (clamp_vertex && ctx.sw_stage == SwStage::TessellationControl &&
+        Sirit::ValidId(ctx.patch_vertices)) {
+        const Id last = ctx.OpISub(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.patch_vertices),
+                                   ctx.u32_one_value);
+        vertex_index = ctx.OpUMin(ctx.U32[1], vertex_index, last);
+    }
+    if (ctx.sw_stage == SwStage::TessellationControl && Sirit::ValidId(ctx.lds_vertex_base)) {
+        // FIX-227: from the scratch buffer the writer pass filled.
+        const u32 num_attrs = (ctx.runtime_info.sw.tcs.ls_stride + 15) / 16;
+        const Id vertex = ctx.OpIAdd(ctx.U32[1], ctx.lds_vertex_base, vertex_index);
+        const Id dword = ctx.OpIAdd(
+            ctx.U32[1], ctx.OpIMul(ctx.U32[1], vertex, ctx.ConstU32(num_attrs * 4)),
+            ctx.OpIAdd(ctx.U32[1],
+                       ctx.OpShiftLeftLogical(ctx.U32[1], attr_index, ctx.ConstU32(2u)),
+                       comp_index));
+        const Id address = ctx.OpIAdd(
+            ctx.U64, ctx.lds_scratch_base,
+            ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], dword, ctx.ConstU32(2u))));
+        // The patch's own control points from its inputs (all of them when the draw has no
+        // scratch); only those past them from scratch.
+        const u32 num_cp = std::max(ctx.runtime_info.sw.tcs.num_input_control_points, 1u);
+        const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
+        const Id from_scratch =
+            ctx.OpLogicalAnd(ctx.U1[1], ctx.lds_enabled, ctx.OpLogicalNot(ctx.U1[1], in_range));
+        const auto own_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
+        const Id own_value = ctx.OpLoad(
+            ctx.F32[1], ctx.OpAccessChain(own_ptr, ctx.input_attr_array, vertex_index, attr_index,
+                                          comp_index));
+        const Id own_label = ctx.last_label;
+        const Id scratch_label = ctx.OpLabel();
+        const Id merge_label = ctx.OpLabel();
+        ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(from_scratch, scratch_label, merge_label);
+        ctx.AddLabel(scratch_label);
+        const Id scratch_value =
+            ctx.OpLoad(ctx.F32[1], ctx.OpConvertUToPtr(ctx.physical_pointer_type_f32, address),
+                       spv::MemoryAccessMask::Aligned, 4u);
+        ctx.OpBranch(merge_label);
+        ctx.AddLabel(merge_label);
+        return ctx.OpPhi(ctx.F32[1], scratch_value, scratch_label, own_value, own_label);
+    }
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
     return ctx.OpLoad(ctx.F32[1],
                       ctx.OpAccessChain(attr_comp_ptr, AttrArray(ctx.input_attr_array, "in_attrs"),
@@ -414,6 +465,12 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
             UNREACHABLE_MSG("Patch {}", u32(patch));
         }
     }()};
+    // DIAG-229 (diagnosis, RYGT_DIAG_TESS_MIN1=1): tessellation levels below 1 or NaN become 1,
+    // so no patch is culled by its factors.
+    static const bool min1 = std::getenv("RYGT_DIAG_TESS_MIN1") != nullptr;
+    if (min1 && !IR::IsGeneric(patch)) {
+        value = ctx.OpNMax(ctx.F32[1], value, ctx.ConstF32(1.0f));
+    }
     ctx.OpStore(pointer, value);
 }
 

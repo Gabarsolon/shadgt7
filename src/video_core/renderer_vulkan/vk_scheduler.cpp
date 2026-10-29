@@ -580,6 +580,9 @@ void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
         std::scoped_lock lk{submit_mutex};
         ImGui::Core::TextureManager::Submit();
         auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceLost(); // DIAG-243
+        }
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     }
 

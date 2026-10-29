@@ -54,6 +54,7 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "ryty_gpu/ryty_upscale.h"
 #include "ryty_gpu/ryty_diag.h"
 
 namespace Vulkan {
@@ -1184,10 +1185,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
 #ifdef RYTY_GPU
-    // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
+    // ryGT: DLSS (when it is on and can scale to the target size) replaces FSR. The target is the
+    // window, or the picture times the launcher's Upscaling quality (ryty_upscale.h).
+    const vk::Extent2D upscale_target =
+        RytyUpscale::Target(image_size, {frame->width, frame->height});
     if (const auto dlss_view =
             dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
-                             image_size, {frame->width, frame->height});
+                             image_size, upscale_target);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
@@ -1199,7 +1203,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
         if (const auto fsr3_view =
                 fsr3_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
-                                 image_size, {frame->width, frame->height}, sharpness,
+                                 image_size, upscale_target, sharpness,
                                  attribute.attrib.pixel_format ==
                                      Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
             fsr3_view != image_view) {
@@ -1340,9 +1344,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     vk::ImageView image_view = display->view;
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
+    const vk::Extent2D upscale_target =
+        RytyUpscale::Target(image_size, {frame->width, frame->height});
     if (const auto dlss_view = dlss_pass.Render(pass_cmdbuf, display->image, image_view,
-                                                view_format, image_size,
-                                                {frame->width, frame->height});
+                                                view_format, image_size, upscale_target);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
@@ -1352,7 +1357,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
         if (const auto fsr3_view =
                 fsr3_pass.Render(pass_cmdbuf, display->image, image_view, view_format, image_size,
-                                 {frame->width, frame->height}, sharpness,
+                                 upscale_target, sharpness,
                                  attribute.attrib.pixel_format ==
                                      Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
             fsr3_view != image_view) {

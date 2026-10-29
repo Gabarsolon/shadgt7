@@ -293,6 +293,10 @@ struct PushData {
     static constexpr u32 BufOffsetIndex = 4;
     /// After the six buffer-offset vectors.
     static constexpr u32 QuadSampleMaskIndex = 10;
+    /// FIX-227: the hull shader LDS scratch address (bit 0: the writer pass), in the quad sample
+    /// mask's place (only draws whose mask is all ones use it), so the push block keeps its size
+    /// and every cached pipeline stays valid.
+    static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
 
     float xoffset;
     float yoffset;

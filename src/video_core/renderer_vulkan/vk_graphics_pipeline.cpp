@@ -189,8 +189,12 @@ private:
 // summary (the driver figure) needs hundreds of new ones at once. With every build worker on one,
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
 // At most two of them are created at the same time; -DisablePerf 79 lets them all run.
-// PERF-GT7-029: three while compiles use every core (a catch-up, or a draw waiting): GT7's
-// tessellated road and terrain blinked for two minutes on a new track while theirs built.
+// (PERF-GT7-029's three while compiles use every core gave way to PERF-172's limit.)
+// PERF-172: GT7's tessellated pipelines are compiled without optimization (FIX-057, PERF-081),
+// and two at a time held its cars back for most of a race start; up to RYGT_TESS_BUILDS
+// (default 4) run at once while the process commits under half the RAM and 4 GB stay free, two
+// otherwise. RYGT_TESS_BUILDS=2 is the old limit. (Six, with twelve builds at a time, cost fps
+// during a race start's backlog: the CPU is the limit.)
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -200,11 +204,9 @@ public:
         }
         const auto start = std::chrono::steady_clock::now();
         {
-            auto& gate = Gate();
+            auto& gate = State();
             std::unique_lock lk{gate.mutex};
-            while (gate.running >= (Common::CompileCoresWide() ? 3 : 2)) {
-                gate.cv.wait_for(lk, std::chrono::milliseconds{50}); // the limit can change
-            }
+            gate.cv.wait(lk, [&] { return gate.running < Limit(); });
             ++gate.running;
         }
         held = true;
@@ -221,24 +223,57 @@ public:
     }
     ~HeavyBuildGate() {
         if (held) {
-            auto& gate = Gate();
+            auto& gate = State();
             {
                 std::scoped_lock lk{gate.mutex};
                 --gate.running;
             }
-            gate.cv.notify_one();
+            gate.cv.notify_all();
         }
     }
 
 private:
-    struct State {
+    struct Gate {
         std::mutex mutex;
         std::condition_variable cv;
-        int running = 0;
+        u32 running = 0;
     };
-    static State& Gate() {
-        static State state;
-        return state;
+    static Gate& State() {
+        static Gate gate;
+        return gate;
+    }
+    static u32 Limit() {
+        static const u32 asked = [] {
+            if (const char* env = std::getenv("RYGT_TESS_BUILDS"); env && *env) {
+                return std::clamp(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 16u);
+            }
+            return 4u;
+        }();
+        if (asked <= 2) {
+            return asked;
+        }
+#ifdef _WIN32
+        MEMORYSTATUSEX status{.dwLength = sizeof(MEMORYSTATUSEX)};
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        if (GlobalMemoryStatusEx(&status) &&
+            K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                    sizeof(counters))) {
+            const bool tight = counters.PrivateUsage > status.ullTotalPhys / 2 ||
+                               status.ullAvailPhys < (4ull << 30);
+            if (tight) {
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-172: memory is tight ({} MB committed, {} MB free); "
+                                "tessellated pipelines build two at a time",
+                                counters.PrivateUsage >> 20, status.ullAvailPhys >> 20);
+                }
+                return 2;
+            }
+        }
+#endif
+        return asked;
     }
     bool held = false;
 };
@@ -388,6 +423,11 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const vk::Device device = instance.GetDevice();
+    if (infos[u32(Shader::SwStage::TessellationControl)]) { // FIX-227
+        const auto& tcs = runtime_infos[u32(Shader::SwStage::TessellationControl)].sw.tcs;
+        lds_emulation = tcs.lds_emulation;
+        lds_vertex_bytes = ((tcs.ls_stride + 15) / 16) * 16;
+    }
     std::ranges::copy(infos, stages.begin());
     std::ranges::copy(infos, canonical_stages.begin());
     BuildDescSetLayout();

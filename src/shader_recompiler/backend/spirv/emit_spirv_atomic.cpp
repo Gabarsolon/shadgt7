@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -295,12 +296,62 @@ Id EmitBufferAtomicUMin64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
     return BufferAtomicU64(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicUMin);
 }
 
+// FIX-226: a float atomic min/max without VK_EXT_shader_atomic_float2 (NVIDIA has none) is one
+// integer atomic chosen by the value's sign: a value of +0 or more orders with the stored float's
+// bits as signed integers, a negative one as unsigned integers reversed. The emulation ran both
+// atomics, one after the other, so a smaller value than the stored one went in anyway (an atomic
+// max kept whichever write came last). GT7 builds its occlusion depth pyramid with float atomic
+// maxes: it came out wrong and streaky, and its car hull shaders culled patches in view in the
+// race start's close-ups (black patches on the car). RYGT_FLOAT_ATOMIC_EXACT=0: as before.
+static bool FloatAtomicExact() {
+    static const bool exact = [] {
+        const char* env = std::getenv("RYGT_FLOAT_ATOMIC_EXACT");
+        return !(env && env[0] == '0');
+    }();
+    return exact;
+}
+
+Id EmitBufferAtomicUMin32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
+Id EmitBufferAtomicUMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
+Id EmitBufferAtomicSMin32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
+Id EmitBufferAtomicSMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
+
+static Id FloatMinMaxByIntegerAtomics(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
+                                      Id value, bool is_max) {
+    const Id u32_value = ctx.OpBitcast(ctx.U32[1], value);
+    const Id negative = ctx.OpINotEqual(
+        ctx.U1[1],
+        ctx.OpBitFieldUExtract(ctx.U32[1], u32_value, ctx.ConstU32(31u), ctx.ConstU32(1u)),
+        ctx.u32_zero_value);
+    const Id negative_label = ctx.OpLabel();
+    const Id positive_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(negative, negative_label, positive_label);
+    ctx.AddLabel(negative_label);
+    const Id negative_old =
+        is_max ? EmitBufferAtomicUMin32(ctx, inst, handle, address, u32_value)
+               : EmitBufferAtomicUMax32(ctx, inst, handle, address, u32_value);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(positive_label);
+    const Id positive_old =
+        is_max ? EmitBufferAtomicSMax32(ctx, inst, handle, address, u32_value)
+               : EmitBufferAtomicSMin32(ctx, inst, handle, address, u32_value);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+    const Id old = ctx.OpPhi(ctx.U32[1], negative_old, negative_label, positive_old, positive_label);
+    return ctx.OpBitcast(ctx.F32[1], old);
+}
+
 Id EmitBufferAtomicFMin32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     if (ctx.profile.supports_buffer_fp32_atomic_min_max) {
         return BufferAtomicU32<true>(ctx, inst, handle, address, value,
                                      &Sirit::Module::OpAtomicFMin);
     }
 
+    if (FloatAtomicExact()) {
+        return FloatMinMaxByIntegerAtomics(ctx, inst, handle, address, value, false); // FIX-226
+    }
     const auto u32_value = ctx.OpBitcast(ctx.U32[1], value);
     // OpSelect requires a bool condition; produce one by comparing the sign bit to 0.
     const auto sign_bit_set = ctx.OpINotEqual(
@@ -339,6 +390,9 @@ Id EmitBufferAtomicFMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
                                      &Sirit::Module::OpAtomicFMax);
     }
 
+    if (FloatAtomicExact()) {
+        return FloatMinMaxByIntegerAtomics(ctx, inst, handle, address, value, true); // FIX-226
+    }
     const auto u32_value = ctx.OpBitcast(ctx.U32[1], value);
     // OpSelect requires a bool condition; produce one by comparing the sign bit to 0.
     const auto sign_bit_set = ctx.OpINotEqual(

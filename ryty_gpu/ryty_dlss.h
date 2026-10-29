@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// ryGT: NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (see rygt_dlss_api.h). The
-// plugin links NVIDIA's DLSS SDK, which cannot be part of this GPL library, so it is loaded at run
-// time, only when the GT Sport config has "dlss_enabled" and the plugin is next to GTSport.exe.
+// ryGT: NVIDIA DLSS upscaling, loaded at run time only when the config has "dlss_enabled":
+// through Streamline's sl.dlss.dll (NVIDIA's signed files, which the launcher downloads from
+// NVIDIA's GitHub; see ryty_dlssg.h), or else through the optional self-built plugin
+// dlss\ryGT_dlss.dll (see rygt_dlss_api.h). NVIDIA's DLSS SDK cannot be part of this GPL library.
 
 #pragma once
 
@@ -55,6 +56,7 @@ private:
     void CreateImages(Img& img) const;
 
     vk::Device device{};
+    VmaAllocator allocator{};
     vk::Extent2D cur_size{};
     u32 cur_image{};
     std::vector<Img> available_imgs;

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <array>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -372,6 +374,18 @@ bool Instance::CreateDevice() {
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+    // DIAG-243: RYGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
+    // faulting address and the driver's description.
+    if (const char* env = std::getenv("RYGT_DEVICE_FAULT"); env && env[0] == '1') {
+        const auto fault_chain =
+            physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                         vk::PhysicalDeviceFaultFeaturesEXT>();
+        if (fault_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault) {
+            device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-243: VK_EXT_device_fault {}",
+                    device_fault ? "enabled" : "not available");
+    }
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
@@ -628,6 +642,13 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
+    // DIAG-243: the fault feature joins the chain when its extension is on.
+    vk::PhysicalDeviceFaultFeaturesEXT fault_features{.deviceFault = true};
+    if (device_fault) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        fault_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &fault_features;
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
@@ -883,6 +904,82 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+namespace {
+// DIAG-243: a ring of the last draws recorded (pipeline key hash, info word).
+struct FaultDraw {
+    std::atomic<u64> hash{};
+    std::atomic<u32> info{};
+    std::atomic<u64> serial{};
+};
+constexpr u32 FaultRingSize = 64;
+std::array<FaultDraw, FaultRingSize> g_fault_draws;
+std::atomic<u64> g_fault_serial{};
+} // namespace
+
+void NoteDrawForFault(u64 pipeline_hash, u32 info) {
+    const u64 serial = g_fault_serial.fetch_add(1, std::memory_order_relaxed);
+    auto& entry = g_fault_draws[serial % FaultRingSize];
+    entry.hash.store(pipeline_hash, std::memory_order_relaxed);
+    entry.info.store(info, std::memory_order_relaxed);
+    entry.serial.store(serial + 1, std::memory_order_release);
+}
+
+void Instance::ReportDeviceLost() const {
+    static std::atomic<bool> reported{};
+    if (reported.exchange(true)) {
+        return;
+    }
+    LOG_CRITICAL(Render_Vulkan, "DIAG-243: the GPU device was lost");
+    if (device_fault && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT) {
+        const VkDevice dev = static_cast<VkDevice>(*device);
+        VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(dev, &counts, nullptr);
+        std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+        VkDeviceFaultInfoEXT info{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        info.pAddressInfos = addresses.data();
+        info.pVendorInfos = vendors.data();
+        counts.vendorBinarySize = 0; // no vendor binary dump
+        const VkResult result =
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(dev, &counts, &info);
+        LOG_CRITICAL(Render_Vulkan, "DIAG-243: device fault ({}): {}; {} addresses, {} vendor infos",
+                     static_cast<int>(result), info.description, counts.addressInfoCount,
+                     counts.vendorInfoCount);
+        // VkDeviceFaultAddressTypeEXT.
+        static constexpr const char* types[] = {"none", "read invalid", "write invalid",
+                                                "execute invalid",
+                                                "instruction pointer (a running wave)",
+                                                "instruction pointer invalid",
+                                                "instruction pointer fault"};
+        for (u32 i = 0; i < counts.addressInfoCount; ++i) {
+            const auto& a = addresses[i];
+            const u32 type = static_cast<u32>(a.addressType);
+            LOG_CRITICAL(Render_Vulkan, "DIAG-243:   address {:#x} (+-{:#x}): {}",
+                         a.reportedAddress, a.addressPrecision,
+                         type < std::size(types) ? types[type] : "?");
+        }
+        for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
+            const auto& v = vendors[i];
+            LOG_CRITICAL(Render_Vulkan, "DIAG-243:   vendor: {} (code {:#x}, data {:#x})",
+                         v.description, v.vendorFaultCode, v.vendorFaultData);
+        }
+    }
+    // The draws recorded last, newest first (the GPU was somewhere among them or before).
+    const u64 newest = g_fault_serial.load(std::memory_order_acquire);
+    for (u32 back = 0; back < FaultRingSize && back < newest; ++back) {
+        const u64 serial = newest - 1 - back;
+        const auto& entry = g_fault_draws[serial % FaultRingSize];
+        if (entry.serial.load(std::memory_order_acquire) != serial + 1) {
+            continue;
+        }
+        const u32 info = entry.info.load(std::memory_order_relaxed);
+        LOG_CRITICAL(Render_Vulkan,
+                     "DIAG-243:   draw -{}: pipeline {:#018x}, tessellated {}, LDS emulation {}",
+                     back, entry.hash.load(std::memory_order_relaxed), (info >> 8) & 1,
+                     info & 0xff);
+    }
 }
 
 } // namespace Vulkan

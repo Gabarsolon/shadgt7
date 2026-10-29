@@ -10,6 +10,7 @@
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "ryty_gpu/ryty_fsr3.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -211,8 +212,11 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
     if (failed || !EmulatorSettings.IsFsr3Enabled()) {
         return input;
     }
-    // Like FSR 1: only when the window is larger than the game picture.
-    if (input_size.width >= output_size.width && input_size.height >= output_size.height) {
+    // Like FSR 1: only when the target is larger than the game picture, or the same size for
+    // native anti-aliasing (the launcher's Native quality).
+    const bool same = input_size == output_size;
+    if (output_size.width < input_size.width || output_size.height < input_size.height ||
+        (same && !RytyUpscale::NativeAA())) {
         return input;
     }
     // GT Sport's 10-bit picture (A2R10G10B10) has no FidelityFX format. FSR reads it as
