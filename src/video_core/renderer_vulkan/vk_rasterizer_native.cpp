@@ -2288,9 +2288,15 @@ namespace {
 // colour and 256x128 depth pictures of GT7's races had 34 and 137 in five runs, none sampled
 // first).
 constexpr u32 OneOffSafeCount = 8;
+// At one address, 4 (the per-frame targets there come back at the same address run after run).
+constexpr u32 OneOffPlaceSafeCount = 4;
 
 bool OneOffKindExempt(u32 safe, u32 harmful) {
     return harmful == 0 && safe >= OneOffSafeCount;
+}
+
+bool OneOffPlaceExempt(u32 safe, u32 harmful) {
+    return harmful == 0 && safe >= OneOffPlaceSafeCount;
 }
 
 std::filesystem::path OneOffKindsPath() {
@@ -2308,6 +2314,10 @@ size_t NativeRenderer::OneOffKindHash::operator()(const OneOffKind& kind) const 
     return MemoHash(words.data(), words.size(), 0x198);
 }
 
+size_t NativeRenderer::OneOffPlaceHash::operator()(const OneOffPlace& place) const noexcept {
+    return OneOffKindHash{}(place.kind) ^ (u64(place.address) * 0x9E3779B97F4A7C15ULL);
+}
+
 NativeRenderer::OneOffKind NativeRenderer::KindOf(const OneOffHit& hit) {
     return {.depth = hit.depth,
             .pitch = hit.pitch,
@@ -2323,8 +2333,13 @@ bool NativeRenderer::OneOffExempt(const OneOffHit& hit) const {
     if (!OneOffLearnOn()) {
         return false;
     }
-    const auto it = one_off_kinds.find(KindOf(hit));
-    return it != one_off_kinds.end() && OneOffKindExempt(it->second.safe, it->second.harmful);
+    const OneOffKind kind = KindOf(hit);
+    if (const auto it = one_off_kinds.find(kind);
+        it != one_off_kinds.end() && OneOffKindExempt(it->second.safe, it->second.harmful)) {
+        return true;
+    }
+    const auto it = one_off_places.find({hit.address, kind});
+    return it != one_off_places.end() && OneOffPlaceExempt(it->second.safe, it->second.harmful);
 }
 
 void NativeRenderer::LoadOneOffKinds() {
@@ -2334,25 +2349,43 @@ void NativeRenderer::LoadOneOffKinds() {
     std::ifstream file{OneOffKindsPath()};
     std::string line;
     u32 exempt = 0;
+    u32 places_exempt = 0;
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#') {
             continue;
         }
         std::istringstream in{line};
         std::string what;
+        VAddr address = 0;
+        if (!(in >> what)) {
+            continue;
+        }
+        if (what == "at") { // a place: "at <address> <kind ...>"
+            std::string where;
+            if (!(in >> where >> what)) {
+                continue;
+            }
+            address = std::strtoull(where.c_str(), nullptr, 16);
+        }
         OneOffKind kind{};
         OneOffKindStats seen{};
-        if (!(in >> what >> kind.pitch >> kind.height >> kind.slices >> kind.samples >>
-              kind.format >> kind.number_format >> kind.tile >> seen.safe >> seen.harmful)) {
+        if (!(in >> kind.pitch >> kind.height >> kind.slices >> kind.samples >> kind.format >>
+              kind.number_format >> kind.tile >> seen.safe >> seen.harmful)) {
             continue;
         }
         kind.depth = what == "depth";
-        one_off_kinds[kind] = seen;
-        exempt += OneOffKindExempt(seen.safe, seen.harmful) ? 1 : 0;
+        if (address != 0) {
+            one_off_places[{address, kind}] = seen;
+            places_exempt += OneOffPlaceExempt(seen.safe, seen.harmful) ? 1 : 0;
+        } else {
+            one_off_kinds[kind] = seen;
+            exempt += OneOffKindExempt(seen.safe, seen.harmful) ? 1 : 0;
+        }
     }
     LOG_INFO(Render_Vulkan,
-             "PERF-GT7-023: {} kinds of one-off pictures known, {} of them no longer waited for",
-             one_off_kinds.size(), exempt);
+             "PERF-GT7-023: {} kinds of one-off pictures known, {} of them no longer waited for; "
+             "{} places, {} of them no longer waited for",
+             one_off_kinds.size(), exempt, one_off_places.size(), places_exempt);
 }
 
 void NativeRenderer::SaveOneOffKinds(bool wait) {
@@ -2361,11 +2394,18 @@ void NativeRenderer::SaveOneOffKinds(bool wait) {
     }
     one_off_kinds_changed = false;
     std::string text = "# PERF-GT7-023: FIX-198 picture kinds (kind pitch height slices samples "
-                       "format number_format tile safe harmful)\n";
+                       "format number_format tile safe harmful),\n# and places (at address kind "
+                       "... safe harmful)\n";
+    const auto kind_text = [](const OneOffKind& kind, const OneOffKindStats& seen) {
+        return fmt::format("{} {} {} {} {} {} {} {} {} {}\n", kind.depth ? "depth" : "color",
+                           kind.pitch, kind.height, kind.slices, kind.samples, kind.format,
+                           kind.number_format, kind.tile, seen.safe, seen.harmful);
+    };
     for (const auto& [kind, seen] : one_off_kinds) {
-        text += fmt::format("{} {} {} {} {} {} {} {} {} {}\n", kind.depth ? "depth" : "color",
-                            kind.pitch, kind.height, kind.slices, kind.samples, kind.format,
-                            kind.number_format, kind.tile, seen.safe, seen.harmful);
+        text += kind_text(kind, seen);
+    }
+    for (const auto& [place, seen] : one_off_places) {
+        text += fmt::format("at {:#x} ", place.address) + kind_text(place.kind, seen);
     }
     auto write = [path = OneOffKindsPath(), text = std::move(text)] {
         static std::mutex write_mutex;
@@ -2446,15 +2486,20 @@ void NativeRenderer::CheckOneOffs() {
         if (OneOffLearnOn()) {
             // PERF-GT7-023: what its kind learns. A picture whose draws were all skipped proves
             // nothing when redrawn (nothing waited), only when sampled first.
+            const bool was_exempt = OneOffExempt(hit);
             auto& seen = one_off_kinds[KindOf(hit)];
+            auto& here = one_off_places[{address, KindOf(hit)}];
             if (outcome <= 4 && !watch.skipped) {
                 ++seen.safe;
+                ++here.safe;
                 one_off_kinds_changed = true;
             } else if (outcome == 5) {
-                if (seen.harmful++ == 0 && seen.safe >= OneOffSafeCount) {
+                ++seen.harmful;
+                ++here.harmful;
+                if (was_exempt) {
                     LOG_WARNING(Render_Vulkan,
                                 "PERF-GT7-023: picture {:#x} ({} {}x{} format {}/{}) sampled "
-                                "before its redraw{}: its kind waits again",
+                                "before its redraw{}: it waits again",
                                 address, hit.depth ? "depth" : "color", hit.pitch, hit.height,
                                 hit.format, hit.number_format,
                                 watch.skipped ? " after a skipped draw" : "");

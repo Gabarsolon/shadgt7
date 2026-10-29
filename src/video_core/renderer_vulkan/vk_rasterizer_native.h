@@ -432,6 +432,17 @@ private:
         u32 safe = 0;    ///< pictures redrawn after a wait, not sampled before
         u32 harmful = 0; ///< pictures sampled in a later frame before any redraw
     };
+    /// A kind of picture at one address (GT7 keeps its per-frame targets at fixed addresses): such
+    /// a place no longer waits after 4 redraws, none sampled first, even when its kind was sampled
+    /// first elsewhere (the 256x256 depth pool at 0x100a0e8000 against the probes of that size).
+    struct OneOffPlace {
+        VAddr address = 0;
+        OneOffKind kind{};
+        bool operator==(const OneOffPlace&) const = default;
+    };
+    struct OneOffPlaceHash {
+        size_t operator()(const OneOffPlace& place) const noexcept;
+    };
     static OneOffKind KindOf(const OneOffHit& hit);
     static bool OneOffLearnOn();
     static bool OneOffTrackOn(); ///< PERF-GT7-023 or DIAG-GT7-008
@@ -439,6 +450,7 @@ private:
     void LoadOneOffKinds();
     void SaveOneOffKinds(bool wait); ///< when changed; wait: on this thread
     std::unordered_map<OneOffKind, OneOffKindStats, OneOffKindHash> one_off_kinds;
+    std::unordered_map<OneOffPlace, OneOffKindStats, OneOffPlaceHash> one_off_places;
     bool one_off_kinds_changed = false;
     /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
     /// yet run by the GPU (guest range, GPU tick), and CPU writes that met one.
