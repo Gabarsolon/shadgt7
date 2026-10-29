@@ -189,6 +189,11 @@ private:
 // summary (the driver figure) needs hundreds of new ones at once. With every build worker on one,
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
 // At most two of them are created at the same time; -DisablePerf 79 lets them all run.
+// PERF-172: GT7's tessellated pipelines are compiled without optimization (FIX-057, PERF-081),
+// and two at a time held its cars back for most of a race start; up to RYGT_TESS_BUILDS
+// (default 4) run at once while the process commits under half the RAM and 4 GB stay free, two
+// otherwise. RYGT_TESS_BUILDS=2 is the old limit. (Six, with twelve builds at a time, cost fps
+// during a race start's backlog: the CPU is the limit.)
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -197,7 +202,12 @@ public:
             return;
         }
         const auto start = std::chrono::steady_clock::now();
-        Semaphore().acquire();
+        {
+            auto& gate = State();
+            std::unique_lock lk{gate.mutex};
+            gate.cv.wait(lk, [&] { return gate.running < Limit(); });
+            ++gate.running;
+        }
         held = true;
         const auto waited = std::chrono::steady_clock::now() - start;
         if (waited >= std::chrono::seconds{1}) {
@@ -212,14 +222,57 @@ public:
     }
     ~HeavyBuildGate() {
         if (held) {
-            Semaphore().release();
+            auto& gate = State();
+            {
+                std::scoped_lock lk{gate.mutex};
+                --gate.running;
+            }
+            gate.cv.notify_all();
         }
     }
 
 private:
-    static std::counting_semaphore<64>& Semaphore() {
-        static std::counting_semaphore<64> semaphore{2};
-        return semaphore;
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        u32 running = 0;
+    };
+    static Gate& State() {
+        static Gate gate;
+        return gate;
+    }
+    static u32 Limit() {
+        static const u32 asked = [] {
+            if (const char* env = std::getenv("RYGT_TESS_BUILDS"); env && *env) {
+                return std::clamp(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 16u);
+            }
+            return 4u;
+        }();
+        if (asked <= 2) {
+            return asked;
+        }
+#ifdef _WIN32
+        MEMORYSTATUSEX status{.dwLength = sizeof(MEMORYSTATUSEX)};
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        if (GlobalMemoryStatusEx(&status) &&
+            K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                    sizeof(counters))) {
+            const bool tight = counters.PrivateUsage > status.ullTotalPhys / 2 ||
+                               status.ullAvailPhys < (4ull << 30);
+            if (tight) {
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-172: memory is tight ({} MB committed, {} MB free); "
+                                "tessellated pipelines build two at a time",
+                                counters.PrivateUsage >> 20, status.ullAvailPhys >> 20);
+                }
+                return 2;
+            }
+        }
+#endif
+        return asked;
     }
     bool held = false;
 };

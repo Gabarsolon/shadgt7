@@ -14,11 +14,12 @@
 namespace Vulkan {
 
 /// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, then
-/// normal ones (read-ahead) in order, on at most `max_running` workers at once.
+/// soon ones (PERF-171: tessellated pipelines, the cars), then normal ones (read-ahead) in order,
+/// on at most `max_running` workers at once.
 class BuildQueue {
 public:
     using Job = std::function<void()>;
-    enum class Kind { Urgent, Normal };
+    enum class Kind { Urgent, Soon, Normal };
 
     explicit BuildQueue(u32 max_running_) : max_running{max_running_} {}
 
@@ -27,6 +28,11 @@ public:
             std::scoped_lock lk{mutex};
             if (kind == Kind::Urgent) {
                 jobs.push_front(std::move(job));
+                ++num_urgent;
+            } else if (kind == Kind::Soon) {
+                // After the urgent jobs and the soon ones queued before it.
+                jobs.insert(jobs.begin() + num_urgent + num_soon, std::move(job));
+                ++num_soon;
             } else {
                 jobs.push_back(std::move(job));
             }
@@ -42,9 +48,15 @@ public:
         }
         job = std::move(jobs.front());
         jobs.pop_front();
+        if (num_urgent > 0) {
+            --num_urgent;
+        } else if (num_soon > 0) {
+            --num_soon;
+        }
         ++running;
         return true;
     }
+
 
     void Finished() {
         {
@@ -76,6 +88,8 @@ private:
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<Job> jobs;
+    size_t num_urgent{};
+    size_t num_soon{};
     u32 running{};
 };
 

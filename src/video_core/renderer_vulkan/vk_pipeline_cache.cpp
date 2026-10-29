@@ -254,8 +254,8 @@ public:
         queue.NotifyAll();
     }
 
-    void Push(std::function<void()>&& job, bool urgent) {
-        queue.Push(std::move(job), urgent ? BuildQueue::Kind::Urgent : BuildQueue::Kind::Normal);
+    void Push(std::function<void()>&& job, BuildQueue::Kind kind) {
+        queue.Push(std::move(job), kind);
     }
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
@@ -1116,7 +1116,16 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool
             FinishBuild(*build);
         }
     };
-    build_workers->Push(std::move(job), urgent);
+    // PERF-171: tessellated pipelines (GT7's cars) are built before the other read-ahead
+    // ones, so the cars appear first. RYGT_TESS_FIRST=0 keeps them in order.
+    static const bool tess_first = [] {
+        const char* env = std::getenv("RYGT_TESS_FIRST");
+        return !(env && env[0] == '0');
+    }();
+    const bool tessellated = build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr;
+    build_workers->Push(std::move(job), urgent                       ? BuildQueue::Kind::Urgent
+                                        : tess_first && tessellated ? BuildQueue::Kind::Soon
+                                                                    : BuildQueue::Kind::Normal);
 }
 
 std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent) {
