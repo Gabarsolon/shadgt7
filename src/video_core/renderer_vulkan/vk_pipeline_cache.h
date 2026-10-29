@@ -367,6 +367,10 @@ private:
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::atomic<bool> driver_cache_writing{}; // PERF-036
     std::jthread driver_cache_writer;
+    /// FIX-217: pixel shaders (by code address) with a V_INTERP_MOV of a vertex's own value.
+    bool ReadsVertexValues(const AmdGpu::ShaderProgram& program);
+    std::unordered_map<VAddr, bool> vertex_value_programs;
+    std::atomic<u64> driver_cache_bytes{}; // PERF-167: size of the last save
 
     std::unordered_set<u64> logged_swizzled_blends;
 
