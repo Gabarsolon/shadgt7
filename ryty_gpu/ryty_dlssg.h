@@ -33,6 +33,25 @@ bool Active();
 void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
              vk::Extent2D size);
 
+/// ryGT: DLSS upscaling (GPU.dlss_enabled) through Streamline's sl.dlss.dll, when it is in the dlss
+/// folder (RYGT_DLSS_STREAMLINE=0 keeps the self-built ryGT_dlss.dll plugin instead). It runs on
+/// its own viewport with zero motion vectors and a flat depth image, starting DLSS's history over
+/// every frame like the plugin.
+bool UpscaleRequested();
+
+/// After the device exists: whether Streamline's DLSS upscaling is available.
+bool InitUpscale();
+
+/// Whether DLSS has a quality mode that scales input to output.
+bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output);
+
+/// Records DLSS into cmdbuf: input (shader-read-only layout) into output (general layout,
+/// storage usage). False when nothing usable was written.
+bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
+             vk::Image input_image, vk::ImageView input, vk::Format input_format,
+             vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
+             vk::Format output_format, vk::Extent2D output_size);
+
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();
 void PresentEnd();
