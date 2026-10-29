@@ -10260,10 +10260,13 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
     // region's next use. The chunk's other pages are opened with the first one, as if written:
     // each copied first while still protected and kept under the lock before it opens, as the
     // faulting page is (PERF-107), so a kept copy never holds a CPU write the region lacks; a
-    // page left unwritten copies nothing in at the refresh. RYGT_NATIVE_FAULT_AHEAD=0: as before.
+    // page left unwritten copies nothing in at the refresh.
+    // FIX-GT7-017: off unless RYGT_NATIVE_FAULT_AHEAD=1. With it, GT7 races showed long black
+    // triangles on some frames (at times the whole sky black for a frame), gone with it off:
+    // a region refresh can take pages opened ahead while the game is still writing them.
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_NATIVE_FAULT_AHEAD");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1';
     }();
     if (!enabled) {
         return;
