@@ -303,7 +303,7 @@ Id EmitBufferAtomicUMin64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 // max kept whichever write came last). GT7 builds its occlusion depth pyramid with float atomic
 // maxes: it came out wrong and streaky, and its car hull shaders culled patches in view in the
 // race start's close-ups (black patches on the car). RYGT_FLOAT_ATOMIC_EXACT=0: as before.
-static bool FloatAtomicExact() {
+bool FloatAtomicExact() {
     static const bool exact = [] {
         const char* env = std::getenv("RYGT_FLOAT_ATOMIC_EXACT");
         return !(env && env[0] == '0');

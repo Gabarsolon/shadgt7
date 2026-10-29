@@ -3176,6 +3176,24 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
         }
         return {};
     }
+    // FIX-GT7-011: FIX-226 changed how float atomic min/max are made without
+    // VK_EXT_shader_atomic_float2, and the stored translations kept their version: one made the
+    // other way than RYGT_FLOAT_ATOMIC_EXACT asks is translated again (GT7's occlusion depth
+    // pyramid came out wrong from the old way).
+    if (const auto emulation = FindFloatAtomicEmulation(spv);
+        emulation != FloatAtomicEmulation::None &&
+        emulation != (Shader::Backend::SPIRV::FloatAtomicExact()
+                          ? FloatAtomicEmulation::OneAtomic
+                          : FloatAtomicEmulation::BothAtomics)) {
+        static u32 reports = 0;
+        if (reports++ < 20) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-011: stored shader {:#x} permutation {} makes its float atomic "
+                        "min/max the other way; translating it again",
+                        pgm_hash, perm_idx);
+        }
+        return {};
+    }
     if (++loaded % 500 == 0) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-032: {} shader S().modules loaded from the store instead of translated",
