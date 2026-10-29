@@ -129,8 +129,10 @@ public:
 
     /// OPT-010 (RYGT_NATIVE_PREPARE=1): whether game job threads prepare draws.
     static bool PrepareEnabled();
-    /// DIAG-GT7-003: whether the prepared draws are used now (off in A/B windows).
+    /// Whether the prepared draws are used (the recorder takes them, the command thread trusts them).
     static bool PreparedOn();
+    /// PERF-GT7-010: whether the recorder and the command processor run above normal priority.
+    static bool BoostOn();
     /// PERF-GT7-008 (B): on the recorder when it runs out of work, the next list is begun.
     void BeginAhead();
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
@@ -521,14 +523,15 @@ private:
     /// already did is not done again.
     static bool ReuseOn();
     /// DIAG-GT7-003 (RYGT_NATIVE_AB=1): the changes under test alternate with the reference
-    /// every 10 s report window (A reference, B changes, C as B with prepared draws when the
-    /// prepare workers run), each window's cost logged.
+    /// every 10 s report window (A reference, B changes, C as B with the GPU threads above
+    /// normal priority), each window's cost logged.
     static bool AbOn();
     u32 AbMode() const;
     /// DIAG-GT7-004: the window's dispatch costs by part and piece.
     std::string DispatchPartsText() const;
-    /// Prepared draws taken out (the next C window starts without leftovers).
-    void DropPrepared();
+    /// PERF-GT7-010: the calling thread (the recorder) at the priority BoostOn asks for.
+    void ApplyRecorderPriority();
+    bool recorder_boosted = false;
     u64 ab_window = 0;
     u64 ab_frame = 0;
     /// OPT-013: the targets the previous draw resolved, by the registers that name them, while

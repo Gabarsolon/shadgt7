@@ -1315,6 +1315,7 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
+    [[maybe_unused]] bool boosted = false;
 
     while (!stoken.stop_requested()) {
         if (draw_pipe) {
@@ -1328,6 +1329,15 @@ void Liverpool::Process(std::stop_token stoken) {
         if (stoken.stop_requested()) {
             break;
         }
+#ifdef RYTY_GPU
+        // PERF-GT7-010: above normal priority while the native renderer asks for it, as the
+        // recorder (the shader compiler's threads and the game's spinning jobs took cores).
+        if (const bool boost = Vulkan::NativeRenderer::BoostOn(); boost != boosted) {
+            boosted = boost;
+            Common::SetCurrentThreadPriority(boost ? Common::ThreadPriority::High
+                                                   : Common::ThreadPriority::Normal);
+        }
+#endif
         if (!draw_pipe && rasterizer && DrawPipeRequested()) {
             StartDrawPipe();
         }

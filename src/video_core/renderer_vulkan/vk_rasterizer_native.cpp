@@ -33,6 +33,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
+#include "common/thread.h"
 #include "common/ryty_config.h"
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
 #undef near
@@ -336,9 +337,12 @@ std::atomic<bool> g_reuse_on{[] {
     const char* env = std::getenv("RYGT_NATIVE_REUSE");
     return !(env && env[0] == '0');
 }()};
-// OPT-010..012: the recorder and the command thread use the draws the prepare workers worked
-// out (DIAG-GT7-003 switches it while the game runs; the workers prepare in every window).
-std::atomic<bool> g_prepared_on{true};
+// PERF-GT7-010 (RYGT_NATIVE_GPU_PRIORITY=1; DIAG-GT7-003 switches it while the game runs): the
+// recorder and the command processor run above normal priority.
+std::atomic<bool> g_boost_on{[] {
+    const char* env = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
+    return env && env[0] == '1';
+}()};
 } // namespace
 
 bool NativeRenderer::ReuseOn() {
@@ -346,23 +350,22 @@ bool NativeRenderer::ReuseOn() {
 }
 
 bool NativeRenderer::PreparedOn() {
-    return PrepareEnabled() && g_prepared_on.load(std::memory_order_relaxed);
+    return PrepareEnabled();
 }
 
-void NativeRenderer::DropPrepared() {
-    // What was prepared while nothing used it is not used later: a prepared draw the command
-    // thread sees makes it skip its own selection, and one left over from an older submission
-    // of the same packet would then be installed.
-    std::vector<PreparedDraw*> dropped;
-    for (auto& shard : prepared_shards) {
-        std::scoped_lock lock{shard.mutex};
-        for (const auto& [packet, draw] : shard.draws) {
-            dropped.push_back(draw);
-        }
-        shard.draws.clear();
-    }
-    for (PreparedDraw* draw : dropped) {
-        FreePrepared(draw);
+bool NativeRenderer::BoostOn() {
+    return g_boost_on.load(std::memory_order_relaxed);
+}
+
+void NativeRenderer::ApplyRecorderPriority() {
+    // PERF-GT7-010: in GT7's missions the shader compiler's threads (the driver's, at normal
+    // priority, each a whole core) and the game's job threads spinning on GPU labels ran while
+    // the recorder, at ~30 ms of work for a 33 ms frame, ran 80% of a missed frame's interval.
+    const bool boost = BoostOn();
+    if (boost != recorder_boosted) {
+        recorder_boosted = boost;
+        Common::SetCurrentThreadPriority(boost ? Common::ThreadPriority::High
+                                               : Common::ThreadPriority::Normal);
     }
 }
 
@@ -404,8 +407,8 @@ std::string NativeRenderer::DispatchPartsText() const {
 }
 
 u32 NativeRenderer::AbMode() const {
-    // A, B, and C (B with prepared draws) when the prepare workers run (RYGT_NATIVE_PREPARE=1).
-    return u32(ab_window % (PrepareEnabled() ? 3 : 2));
+    // A, B, and C (B with the GPU threads above normal priority, PERF-GT7-010).
+    return u32(ab_window % 3);
 }
 
 void NativeRenderer::ForgetBindings(Stream& s) {
@@ -599,7 +602,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     std::memset(gds->Mapped(), 0, gds->Size());
     if (AbOn()) {
         g_reuse_on.store(false, std::memory_order_relaxed); // DIAG-GT7-003: window 0 is A
-        g_prepared_on.store(false, std::memory_order_relaxed);
+        g_boost_on.store(false, std::memory_order_relaxed);
         RyDiag::SetProfileTag(1);
     }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
@@ -9964,6 +9967,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
 }
 
 void NativeRenderer::Report() {
+    ApplyRecorderPriority(); // PERF-GT7-010 (on the recorder: Report runs at its draws' end)
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report < std::chrono::seconds{10}) {
         return;
@@ -10153,10 +10157,7 @@ void NativeRenderer::Report() {
         ++ab_window;
         const u32 mode = AbMode();
         g_reuse_on.store(mode != 0, std::memory_order_relaxed);
-        if (mode == 2) {
-            DropPrepared();
-        }
-        g_prepared_on.store(mode == 2, std::memory_order_relaxed);
+        g_boost_on.store(mode == 2, std::memory_order_relaxed); // PERF-GT7-010
         targets_memo.valid = false;
         ForgetBindings(stream);
         ForgetBindings(hud_stream);
