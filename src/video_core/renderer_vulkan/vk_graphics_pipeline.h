@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <functional>
 #include <future>
 #include <memory>
 #include <boost/container/static_vector.hpp>
@@ -21,10 +20,6 @@ class TextureCache;
 } // namespace VideoCore
 
 namespace Vulkan {
-
-/// PERF-GT7-035: a pipeline build nothing waits for (an optimized one replacing a fast one), on
-/// the pipeline link workers, on the compile cores below normal priority.
-void QueueBackgroundPipelineBuild(std::function<void()>&& job);
 
 static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::SwStage::NumLogicalStages);
 static constexpr u32 MaxVertexBufferCount = 32;

@@ -2256,28 +2256,19 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                 }
             }
         };
-        // PERF-GT7-035: built without optimization first (the commands wait for it), the
-        // optimized one in the background. GT7's new compute pipelines took the driver up to
-        // 1.4 s each here, frozen frames of a race on a new track. RYGT_COMPUTE_FAST_FIRST=0:
-        // optimized at once, as before.
-        static const bool fast_first = [] {
-            const char* env = std::getenv("RYGT_COMPUTE_FAST_FIRST");
-            return !(env && env[0] == '0');
-        }();
         const auto build_start = std::chrono::steady_clock::now();
         {
             const Foreground foreground{build_workers.get(), foreground_on};
             it.value() = std::make_unique<ComputePipeline>(
                 instance, scheduler, desc_heap, profile, *pipeline_cache, compute_key,
-                *S().infos[0], S().modules[0], sdata, fast_first);
+                *S().infos[0], S().modules[0], sdata);
         }
         if (const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - build_start)
                                   .count();
             ms >= 50.0) {
-            LOG_INFO(Render_Vulkan, "PERF-GT7-032: compute pipeline {:#x} built in {:.0f} ms{}{}",
-                     pipeline_hash, ms, fast_first ? " unoptimized" : "",
-                     foreground_on ? ", the other compiles set aside" : "");
+            LOG_INFO(Render_Vulkan, "PERF-GT7-032: compute pipeline {:#x} built in {:.0f} ms{}",
+                     pipeline_hash, ms, foreground_on ? ", the other compiles set aside" : "");
         }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
