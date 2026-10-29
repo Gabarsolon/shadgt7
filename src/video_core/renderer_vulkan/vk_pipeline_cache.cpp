@@ -14,6 +14,7 @@
 #include <ranges>
 #include <sstream>
 #include <chrono>
+#include <future>
 #include <thread>
 #include <string>
 #include <unordered_map>
@@ -155,6 +156,79 @@ private:
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<std::shared_ptr<TranslateJob>> queue;
+    std::vector<std::jthread> threads;
+};
+
+// PERF-GT7-019: reads a program's stored permutations, then the SPIR-V files they list, so the
+// lookup that loads one (LoadStoredModule) finds it read once already.
+class PipelineCache::StoreReaders {
+public:
+    explicit StoreReaders(u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            threads.emplace_back([this, i](std::stop_token stop) { Run(stop, i); });
+        }
+    }
+    ~StoreReaders() {
+        for (auto& thread : threads) {
+            thread.request_stop();
+        }
+        cv.notify_all();
+    }
+
+    std::future<StoredListing> List(u64 pgm_hash) {
+        Job job{.pgm_hash = pgm_hash};
+        auto listing = job.promise.get_future();
+        {
+            std::scoped_lock lk{mutex};
+            queue.push_back(std::move(job));
+        }
+        cv.notify_one();
+        return listing;
+    }
+
+    std::atomic<u64> files_read_ahead{};
+
+private:
+    // A program has ~1.4 stored permutations in GT7; more are rare and read when matched.
+    static constexpr size_t MaxReadAhead = 8;
+
+    struct Job {
+        u64 pgm_hash{};
+        std::promise<StoredListing> promise;
+    };
+
+    void Run(std::stop_token stop, u32 index) {
+        Common::SetCurrentThreadName(fmt::format("shadGT:ShaderStore{}", index).c_str());
+        std::vector<u32> words;
+        while (!stop.stop_requested()) {
+            Job job;
+            {
+                std::unique_lock lk{mutex};
+                cv.wait(lk, stop, [this] { return !queue.empty(); });
+                if (queue.empty()) {
+                    continue;
+                }
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            StoredListing listing = ReadStoredListing(job.pgm_hash);
+            std::vector<std::string> spv_names;
+            for (const auto& entry : listing.entries) {
+                if (entry.has_spv && spv_names.size() < MaxReadAhead) {
+                    spv_names.push_back(fmt::format("{:#018x}_{}", job.pgm_hash, entry.perm_idx));
+                }
+            }
+            job.promise.set_value(std::move(listing));
+            for (const auto& name : spv_names) {
+                Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, words);
+                files_read_ahead.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<Job> queue;
     std::vector<std::jthread> threads;
 };
 
@@ -735,6 +809,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             LOG_WARNING(Render_Vulkan,
                         "PERF-032: shader translations are loaded from the store on first use");
+            // PERF-GT7-019 (RYGT_STORE_READERS=0: read on the GPU threads as before).
+            const char* readers_env = std::getenv("RYGT_STORE_READERS");
+            if (!(readers_env && readers_env[0] == '0')) {
+                store_readers = std::make_unique<StoreReaders>(8);
+                store_stats.since = std::chrono::steady_clock::now();
+            }
         }
     }
     if (CompileMode() == 1 && AsyncPipelines()) {
@@ -2321,6 +2401,41 @@ void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
     ApplyStoredListing(ReadStoredListing(pgm_hash), program);
 }
 
+bool PipelineCache::StoredListingReady(u64 pgm_hash, bool may_skip) {
+    auto [pending, queued] = pending_listings.try_emplace(pgm_hash);
+    if (queued) {
+        pending->second = store_readers->List(pgm_hash);
+        ++store_stats.listed;
+    }
+    bool ready = pending->second.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
+    if (!ready && may_skip) {
+        ++store_stats.skipped;
+    } else if (!ready) {
+        const auto start = std::chrono::steady_clock::now();
+        pending->second.wait();
+        ++store_stats.waited;
+        store_stats.wait_ms += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        ready = true;
+    }
+    if (const auto now = std::chrono::steady_clock::now();
+        now - store_stats.since >= std::chrono::seconds{10}) {
+        if (store_stats.listed != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-GT7-019: shader store in {:.1f} s: {} programs listed on the store "
+                        "readers, {} lookups went on without their listing, {} waited for it "
+                        "({:.1f} ms); {} SPIR-V files read ahead so far",
+                        std::chrono::duration<double>(now - store_stats.since).count(),
+                        store_stats.listed, store_stats.skipped, store_stats.waited,
+                        store_stats.wait_ms, store_readers->files_read_ahead.load());
+        }
+        store_stats = {};
+        store_stats.since = now;
+    }
+    return ready;
+}
+
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
     // Keep going: rendering must not wait for a cosmetic pipeline.
     if (CompileMode() == 2) return false;
@@ -3214,11 +3329,31 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (t_lookup_only) {
         return GetProgramForJob(hw_stage, params, runtime_info, binding); // NAT-031
     }
+    // PERF-GT7-019: a new program's stored permutations are read on a store reader. A read-ahead
+    // state, or a draw that may be skipped while its shaders are made (SHD-005, or FIX-078's
+    // first pass, which queues all of a draw's stages), goes on without them for now.
+    if (store_readers && !program_cache.contains(params.hash)) {
+        const bool read_ahead = regs_override != nullptr;
+        const bool skip = SkipTranslationWait(sw_stage, params);
+        if (!StoredListingReady(params.hash, read_ahead || defer_misses || skip)) {
+            if (!read_ahead) {
+                deferred_miss = true;
+                translation_skipped |= skip;
+            }
+            return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+        }
+    }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>();
         if (use_stored_shaders) {
-            ListStoredPermutations(params.hash, *it_pgm.value());
+            if (const auto pending = pending_listings.find(params.hash);
+                pending != pending_listings.end()) {
+                ApplyStoredListing(pending->second.get(), *it_pgm.value()); // PERF-GT7-019
+                pending_listings.erase(pending);
+            } else {
+                ListStoredPermutations(params.hash, *it_pgm.value());
+            }
         }
     }
     // FIX-018: stored permutations of a program with an else after an empty if were translated

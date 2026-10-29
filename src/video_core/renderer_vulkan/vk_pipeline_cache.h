@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -479,6 +480,24 @@ private:
         std::chrono::steady_clock::time_point since{};
     } translate_stats;
     std::unique_ptr<TranslateWorkers> translate_workers;
+
+    /// PERF-GT7-019: the shader store's reads (a new program's stored permutations, then their
+    /// SPIR-V files) on threads of their own. The first open of a stored file took ~5 ms (it is
+    /// scanned on open; 0.1 ms after), and a new track's first race read ~2,000 of them one at
+    /// a time on the GPU threads: a 6 s stop. Eight readers open them at once.
+    class StoreReaders;
+    /// PERF-GT7-019 (lookup lock held): whether the program's stored permutations were read (by a
+    /// store reader). When `may_skip`, false while they are read; otherwise waits for them.
+    bool StoredListingReady(u64 pgm_hash, bool may_skip);
+    std::unordered_map<u64, std::future<StoredListing>> pending_listings;
+    struct {
+        u64 listed{};
+        u64 skipped{};
+        u64 waited{};
+        double wait_ms{};
+        std::chrono::steady_clock::time_point since{};
+    } store_stats;
+    std::unique_ptr<StoreReaders> store_readers;
 
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
