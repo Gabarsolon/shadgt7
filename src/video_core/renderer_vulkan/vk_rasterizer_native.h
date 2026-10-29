@@ -251,6 +251,8 @@ private:
         u64 chunk_used = 0;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
+        /// PERF-GT7-007: FIX-203 copies this list reads, back to the pool when it ran.
+        std::vector<std::unique_ptr<Native::Rhi::Buffer>> pooled;
         u32 commands = 0;
         std::unique_ptr<GpuTiming> gpu_timing; ///< DIAG-GT7-001
         /// OPT-014: the sets and push constants this list bound for its last graphics pipeline
@@ -347,6 +349,7 @@ private:
         VAddr begin = 0; ///< the pages copied
         VAddr end = 0;
         std::unique_ptr<Native::Rhi::Buffer> copy;
+        bool pooled = false; ///< PERF-GT7-007: goes back to the pool
     };
     std::vector<WrittenBefore> written_befores;
     std::unique_ptr<Native::Rhi::PipelineLayout> writeback_layout;
@@ -514,6 +517,8 @@ private:
     /// prepare workers run), each window's cost logged.
     static bool AbOn();
     u32 AbMode() const;
+    /// DIAG-GT7-004: the window's dispatch costs by part and piece.
+    std::string DispatchPartsText() const;
     /// Prepared draws taken out (the next C window starts without leftovers).
     void DropPrepared();
     u64 ab_window = 0;
@@ -1019,6 +1024,14 @@ private:
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
     std::deque<Chunk> retiring_chunks;
+    /// PERF-GT7-007 (B): the device buffers of FIX-203's copies before the work (~2,000 a
+    /// second in GT7, each made and destroyed), kept by size class and used again once the GPU
+    /// ran the list that read them.
+    std::vector<Chunk> free_snapshots;
+    std::deque<Chunk> retiring_snapshots;
+    u64 snapshot_pool_bytes = 0;
+    std::unique_ptr<Native::Rhi::Buffer> TakeSnapshotBuffer(u64 size);
+    void RetireSnapshots(Stream& s, u64 tick);
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
 
@@ -1089,6 +1102,15 @@ private:
         /// barrier with write-backs, recording, notes), and the write-backs' share.
         std::array<u64, 6> dispatch_part_ns{};
         u64 writeback_ns = 0;
+        /// DIAG-GT7-004: a direct dispatch's bindings part by piece (list begin, buffers,
+        /// textures, FIX-203 copies before the work, fill shader read; the rest is the
+        /// difference), its notes' region write-backs and GPU-write notes, and the region
+        /// refreshes inside its bindings.
+        std::array<u64, 5> dispatch_bind_ns{};
+        std::array<u64, 2> dispatch_note_ns{};
+        u64 dispatch_refresh_ns = 0;
+        /// PERF-GT7-007: FIX-203 copies by bytes, and their buffers made and reused.
+        u64 snapshot_bytes = 0, snapshots_made = 0, snapshots_reused = 0;
         u64 small_rewrites = 0; ///< FIX-202: small textures uploaded again after big writes
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,

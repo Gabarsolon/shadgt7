@@ -292,6 +292,25 @@ struct PhaseClock {
     }
 };
 
+// DIAG-GT7-004: a piece of a dispatch's recorder time, on every dispatch (nothing when `total`
+// is null: the same code for a draw).
+struct PartClock {
+    u64* total;
+    std::chrono::steady_clock::time_point start{};
+    explicit PartClock(u64* total_) : total{total_} {
+        if (total) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~PartClock() {
+        if (total) {
+            *total += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+        }
+    }
+};
+
 constexpr u64 ChunkSize = 8_MB;
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
 
@@ -352,6 +371,31 @@ bool NativeRenderer::AbOn() {
         return env && env[0] == '1';
     }();
     return on;
+}
+
+std::string NativeRenderer::DispatchPartsText() const {
+    // DIAG-GT7-004: us a dispatch by DIAG-188 part, its bindings and notes by piece, and the
+    // FIX-203 copies before the work.
+    const double count = double(std::max<u64>(stats.dispatches, 1));
+    const auto per = [&](u64 ns) { return ns / 1000.0 / count; };
+    u64 pieces = 0;
+    for (const u64 ns : stats.dispatch_bind_ns) {
+        pieces += ns;
+    }
+    const u64 bindings = stats.dispatch_part_ns[1];
+    const auto& part = stats.dispatch_part_ns;
+    const auto& bind = stats.dispatch_bind_ns;
+    return fmt::format(
+        "us in pipeline/bindings/images/barrier/record/notes {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/"
+        "{:.2f}; bindings in begin/buffers/textures/copies before/fill/rest "
+        "{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} (region refreshes {:.2f}); notes in "
+        "write-backs/GPU writes {:.2f}/{:.2f}; copies before {} ({:.1f} MB), buffers made {}, "
+        "reused {}",
+        per(part[0]), per(part[1]), per(part[2]), per(part[3]), per(part[4]), per(part[5]),
+        per(bind[0]), per(bind[1]), per(bind[2]), per(bind[3]), per(bind[4]),
+        per(bindings > pieces ? bindings - pieces : 0), per(stats.dispatch_refresh_ns),
+        per(stats.dispatch_note_ns[0]), per(stats.dispatch_note_ns[1]), stats.writeback_befores,
+        stats.snapshot_bytes / 1048576.0, stats.snapshots_made, stats.snapshots_reused);
 }
 
 u32 NativeRenderer::AbMode() const {
@@ -687,6 +731,7 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     s.chunks.clear();
     s.chunk_used = 0;
     s.pools.clear();
+    RetireSnapshots(s, tick); // PERF-GT7-007
     s.keep.clear();
     s.list = nullptr;
     s.cmd = vk::CommandBuffer{};
@@ -2183,14 +2228,19 @@ void NativeRenderer::SnapshotBeforeWrite(VAddr address, u64 size) {
     if (!recent) {
         return;
     }
-    auto copy = device->CreateBuffer({.size = end - begin,
-                                      .usage = Native::Rhi::BufferUsageStorage |
-                                               Native::Rhi::BufferUsageTransferDst,
-                                      .memory = Native::Rhi::MemoryKind::DeviceLocal,
-                                      .name = "native write-back before"});
+    // PERF-GT7-007 (B): from the pool of copies the GPU is done with (A makes one each time).
+    const bool pooled = ReuseOn();
+    auto copy = pooled ? TakeSnapshotBuffer(end - begin)
+                       : device->CreateBuffer({.size = end - begin,
+                                               .usage = Native::Rhi::BufferUsageStorage |
+                                                        Native::Rhi::BufferUsageTransferDst,
+                                               .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                               .name = "native write-back before"});
     if (!copy) {
         return;
     }
+    stats.snapshots_made += pooled ? 0 : 1;
+    stats.snapshot_bytes += end - begin;
     Stream& s = Begin();
     GlobalBarrier(); // the region as the work before (and the copy-ins) left it
     s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
@@ -2211,14 +2261,67 @@ void NativeRenderer::SnapshotBeforeWrite(VAddr address, u64 size) {
                                .size = size,
                                .begin = begin,
                                .end = end,
-                               .copy = std::move(copy)});
+                               .copy = std::move(copy),
+                               .pooled = pooled});
 }
 
 void NativeRenderer::DropWrittenBefores() {
     for (auto& before : written_befores) {
-        stream.keep.push_back(std::move(before.copy)); // freed once the GPU used it
+        // freed once the GPU used it (PERF-GT7-007: back to the pool then)
+        (before.pooled ? stream.pooled : stream.keep).push_back(std::move(before.copy));
     }
     written_befores.clear();
+}
+
+std::unique_ptr<Native::Rhi::Buffer> NativeRenderer::TakeSnapshotBuffer(u64 size) {
+    // PERF-GT7-007: by size class (powers of two from 64 KB; FIX-194 copies at most 4 MB).
+    const u64 class_size = std::max<u64>(std::bit_ceil(size), 64_KB);
+    auto* semaphore = r.scheduler.GetWorkSemaphore();
+    if (!retiring_snapshots.empty() &&
+        retiring_snapshots.front().retire_tick > semaphore->KnownGpuTick()) {
+        semaphore->Refresh();
+    }
+    const u64 known = semaphore->KnownGpuTick();
+    while (!retiring_snapshots.empty() && retiring_snapshots.front().retire_tick <= known) {
+        free_snapshots.push_back(std::move(retiring_snapshots.front()));
+        retiring_snapshots.pop_front();
+    }
+    for (size_t i = 0; i < free_snapshots.size(); ++i) {
+        if (free_snapshots[i].buffer->Size() == class_size) {
+            auto buffer = std::move(free_snapshots[i].buffer);
+            if (i + 1 != free_snapshots.size()) {
+                free_snapshots[i] = std::move(free_snapshots.back());
+            }
+            free_snapshots.pop_back();
+            ++stats.snapshots_reused;
+            return buffer;
+        }
+    }
+    auto buffer = device->CreateBuffer({.size = class_size,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                        .name = "native write-back before"});
+    if (buffer) {
+        snapshot_pool_bytes += class_size;
+        ++stats.snapshots_made;
+    }
+    return buffer;
+}
+
+void NativeRenderer::RetireSnapshots(Stream& s, u64 tick) {
+    // PERF-GT7-007: the copies the list read go back to the pool once the GPU ran it; past
+    // 256 MB in the pool (copies in flight and free), they are freed as before.
+    constexpr u64 PoolLimit = 256_MB;
+    for (auto& buffer : s.pooled) {
+        if (snapshot_pool_bytes > PoolLimit) {
+            snapshot_pool_bytes -= buffer->Size();
+            s.keep.push_back(std::move(buffer));
+            continue;
+        }
+        retiring_snapshots.push_back({std::move(buffer), tick});
+    }
+    s.pooled.clear();
 }
 
 void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before) {
@@ -2928,6 +3031,7 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
                                              Shader::Backend::StageStart(u32(stage->sw_stage)));
         auto buffer_binding = plans[i].buffers;
         PhaseClock clock{stats.phase_ns[2]};
+        PartClock part{compute ? &stats.dispatch_bind_ns[1] : nullptr}; // DIAG-GT7-004
         BindBuffers(*stage, regs, compute, buffer_binding, b);
         binding = plans[i].next;
     }
@@ -2935,13 +3039,17 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
         if (const auto* stage = stages[i]) {
             auto texture_binding = plans[i].textures;
             PhaseClock clock{stats.phase_ns[3]};
+            PartClock part{compute ? &stats.dispatch_bind_ns[2] : nullptr}; // DIAG-GT7-004
             BindTextures(*stage, regs, texture_binding, b);
         }
     }
     // FIX-203: the region pages the storage buffers may write, as the work will find them
     // (after the copy-ins its bindings recorded).
-    for (const auto& [address, size] : b.gpu_writes) {
-        SnapshotBeforeWrite(address, size);
+    {
+        PartClock part{compute ? &stats.dispatch_bind_ns[3] : nullptr}; // DIAG-GT7-004
+        for (const auto& [address, size] : b.gpu_writes) {
+            SnapshotBeforeWrite(address, size);
+        }
     }
     // DIAG-169 (diagnosis, RYGT_WATCH_DRAW_TEXTURE=<w>x<h>[,<w>x<h>...]): for draws sampling a
     // picture of that size, what guest memory holds now under each buffer they read.
@@ -6401,16 +6509,22 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
     }
     s.buffers_written |= b.writes_buffers;
-    for (const auto& [address, size] : b.gpu_writes) {
-        const auto before = std::ranges::find_if(written_befores, [&](const WrittenBefore& w) {
-            return w.address == address && w.size == size;
-        });
-        NoteRegionWrite(address, size,
-                        before != written_befores.end() ? &*before : nullptr); // FIX-194, FIX-203
+    {
+        // DIAG-GT7-004: for dispatches (no targets), direct and indirect.
+        PartClock part{targets ? nullptr : &stats.dispatch_note_ns[0]};
+        for (const auto& [address, size] : b.gpu_writes) {
+            const auto before = std::ranges::find_if(written_befores, [&](const WrittenBefore& w) {
+                return w.address == address && w.size == size;
+            });
+            NoteRegionWrite(address, size, before != written_befores.end()
+                                               ? &*before
+                                               : nullptr); // FIX-194, FIX-203
+        }
     }
     DropWrittenBefores();
     // NAT-119: images the shader overwrote in memory are uploaded again (after this work, in
     // GPU order: the next PrepareImages records the uploads behind a barrier).
+    PartClock part{targets ? nullptr : &stats.dispatch_note_ns[1]}; // DIAG-GT7-004
     for (const auto& [address, size] : b.gpu_writes) {
         if (b.fill_pattern && address == b.fill_address) {
             GpuWrote(address, std::min(size, b.fill_size), &*b.fill_pattern, true); // NAT-120
@@ -8344,7 +8458,11 @@ void NativeRenderer::DispatchDirect() {
         r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute), cs_program,
                             false); // NAT-118
     }
-    Stream& s = Begin();
+    const u64 refresh_before = stats.region_refresh_ns; // DIAG-GT7-004
+    Stream& s = [&]() -> Stream& {
+        PartClock part{&stats.dispatch_bind_ns[0]};
+        return Begin();
+    }();
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
@@ -8353,7 +8471,11 @@ void NativeRenderer::DispatchDirect() {
         ++stats.skipped;
         return;
     }
-    ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
+    {
+        PartClock part{&stats.dispatch_bind_ns[4]};
+        ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
+    }
+    stats.dispatch_refresh_ns += stats.region_refresh_ns - refresh_before;
     split(1);
     PrepareImages(b); // PERF-109
     split(2);
@@ -9310,6 +9432,7 @@ void NativeRenderer::Splice() {
     s.chunks.clear();
     s.chunk_used = 0;
     s.pools.clear();
+    RetireSnapshots(s, tick); // PERF-GT7-007
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();
@@ -9963,11 +10086,11 @@ void NativeRenderer::Report() {
                     "DIAG-GT7-003 A/B window {} mode {}: {:.1f} s, {} draws, {:.3f} us a draw, {} "
                     "dispatches, {:.2f} us a dispatch, {} frames; phases pipeline/targets/buffers/"
                     "textures/sources/vertices/prepare/record {}; record parts barrier/begin/"
-                    "dynamic/vertex/pipeline/bindings/draw/notes {}",
+                    "dynamic/vertex/pipeline/bindings/draw/notes {}; dispatches: {}",
                     ab_window, char('A' + AbMode()), seconds, stats.draws,
                     stats.draws ? stats.draw_ns / 1000.0 / stats.draws : 0.0, stats.dispatches,
                     stats.dispatches ? stats.dispatch_ns / 1000.0 / stats.dispatches : 0.0,
-                    frame - ab_frame, phases, parts);
+                    frame - ab_frame, phases, parts, DispatchPartsText());
         ab_frame = frame;
         ++ab_window;
         const u32 mode = AbMode();
@@ -10013,9 +10136,15 @@ void NativeRenderer::Report() {
                  per(stats.dispatch_part_ns[2]), per(stats.dispatch_part_ns[3]),
                  per(stats.dispatch_part_ns[4]), per(stats.dispatch_part_ns[5]),
                  stats.writeback_ns / 1e6);
+        LOG_INFO(Render_Vulkan, "DIAG-GT7-004 (10 s): {} dispatches: {}", stats.dispatches,
+                 DispatchPartsText());
     }
     stats.dispatch_part_ns = {};
     stats.writeback_ns = 0;
+    stats.dispatch_bind_ns = {};
+    stats.dispatch_note_ns = {};
+    stats.dispatch_refresh_ns = 0;
+    stats.snapshot_bytes = stats.snapshots_made = stats.snapshots_reused = 0;
     if (stats.writeback_befores != 0 || stats.precise_writebacks != 0) {
         LOG_INFO(Render_Vulkan, "FIX-203: {} written ranges copied before the work, {} page runs "
                  "written back by compare", std::exchange(stats.writeback_befores, 0),
