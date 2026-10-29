@@ -144,6 +144,22 @@ public:
         force_wait = on;
     }
 
+    struct PipelineBuild;
+    /// PERF-GT7-020: while set (the lookup lock held), GetGraphicsPipeline waits for a draw's
+    /// shaders (translations, the store's listing) as with SetForceWait, but not for its
+    /// pipeline: the draw is skipped, and TakeSkippedBuild gives the build to wait for.
+    void SetWaitForShaders(bool on) {
+        wait_for_shaders = on;
+    }
+    /// PERF-GT7-020 (lookup lock held): the build the last GetGraphicsPipeline skipped its draw
+    /// for, when it skipped it for a pipeline still building.
+    std::shared_ptr<PipelineBuild> TakeSkippedBuild() {
+        return std::move(skipped_build);
+    }
+    /// PERF-GT7-020 (without the lookup lock): builds the pipeline here unless a worker started
+    /// it, and returns once it is built.
+    void FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build);
+
     /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
     /// registers installed with Liverpool::SetThreadDrawState), or nullptr. Nothing is
     /// translated, loaded, built or waited for, and the selection made by the threads above is
@@ -179,7 +195,6 @@ private:
     /// registers at an upcoming draw (PERF-019).
     const AmdGpu::Regs& Regs() const;
     bool HasSupportedColorTargets() const;
-    struct PipelineBuild;
     class PipelineBuildWorkers;
     /// PERF-019: builds the pipeline for the current key on a worker thread.
     std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
@@ -417,6 +432,14 @@ private:
     bool translation_skipped{};
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
     bool force_wait = false; ///< FIX-198
+    bool wait_for_shaders = false;                ///< PERF-GT7-020
+    std::shared_ptr<PipelineBuild> skipped_build; ///< PERF-GT7-020
+    struct {
+        std::atomic<u64> waits{};
+        std::atomic<u64> built_here{};
+        std::atomic<u64> wait_us{};
+        std::atomic<s64> since_ms{};
+    } unlocked_stats; ///< PERF-GT7-020
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of

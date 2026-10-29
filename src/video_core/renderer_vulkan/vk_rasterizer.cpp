@@ -1191,8 +1191,40 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
     const DrawIndirectParams& params) {
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
-    const GraphicsPipeline* pipeline;
-    {
+    const GraphicsPipeline* pipeline = nullptr;
+    // PERF-GT7-020: the draw's shaders are waited for under the lookup lock as before, its
+    // pipeline without it (built here when no worker took it yet), so the command thread goes
+    // on selecting the next draws' pipelines and their builds start meanwhile. With the lock
+    // held, a new track's first race built its one-off targets' pipelines one after the other
+    // (171 draws, ~390 ms each with a cold driver cache): a 68 s stop. RYGT_ONE_OFF_UNLOCKED=0
+    // waits as before.
+    static const bool unlocked = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_UNLOCKED");
+        return !(env && env[0] == '0');
+    }();
+    bool found = false;
+    for (u32 round = 0; unlocked && round < 4; ++round) {
+        decltype(pipeline_cache.TakeSkippedBuild()) build;
+        {
+            std::scoped_lock lk{pipeline_cache.LookupMutex()};
+            pipeline_cache.SetWaitForShaders(true);
+            pipeline = pipeline_cache.GetGraphicsPipeline(params);
+            pipeline_cache.SetWaitForShaders(false);
+            if (pipeline) {
+                if (SelectsPipelinesAhead()) {
+                    CopySelectedStages(stages);
+                }
+                found = true;
+            } else {
+                build = pipeline_cache.TakeSkippedBuild();
+            }
+        }
+        if (found || !build) {
+            break;
+        }
+        pipeline_cache.FinishBuildUnlocked(build);
+    }
+    if (!found) {
         std::scoped_lock lk{pipeline_cache.LookupMutex()};
         pipeline_cache.SetForceWait(true);
         pipeline = pipeline_cache.GetGraphicsPipeline(params);
@@ -1201,6 +1233,8 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
             return pipeline;
         }
         CopySelectedStages(stages);
+    } else if (!SelectsPipelinesAhead()) {
+        return pipeline;
     }
     InstallDrawStages(pipeline, stages, false);
     return pipeline;

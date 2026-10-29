@@ -1084,6 +1084,37 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
     build.done.wait();
 }
 
+void PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build) {
+    const auto start = std::chrono::steady_clock::now();
+    const bool here = !build->started.load();
+    FinishBuild(*build);
+    const auto now = std::chrono::steady_clock::now();
+    const u64 us =
+        u64(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
+    ++Common::GetWorkCounters().pipeline_waits;
+    Common::GetWorkCounters().pipeline_wait_us += us;
+    RyDiag::RecordElapsed(RyDiag::Zone::PipelineWait, now - start,
+                          std::hash<GraphicsPipelineKey>{}(build->key));
+    auto& stats = unlocked_stats;
+    stats.waits.fetch_add(1, std::memory_order_relaxed);
+    stats.built_here.fetch_add(here ? 1 : 0, std::memory_order_relaxed);
+    stats.wait_us.fetch_add(us, std::memory_order_relaxed);
+    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           now.time_since_epoch())
+                           .count();
+    s64 since = stats.since_ms.load(std::memory_order_relaxed);
+    if (since == 0) {
+        stats.since_ms.store(now_ms, std::memory_order_relaxed);
+    } else if (now_ms - since >= 10'000 &&
+               stats.since_ms.compare_exchange_strong(since, now_ms)) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-GT7-020: in {:.1f} s, {} draws into one-off targets waited for their "
+                    "pipeline without the lookup lock ({:.1f} ms; {} built by the waiting thread)",
+                    (now_ms - since) / 1000.0, stats.waits.exchange(0), stats.wait_us.exchange(0) / 1000.0,
+                    stats.built_here.exchange(0));
+    }
+}
+
 void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool urgent) {
     if (!build_workers) {
         build_workers = std::make_unique<PipelineBuildWorkers>();
@@ -1366,6 +1397,7 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    skipped_build.reset(); // PERF-GT7-020
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
     BuildQueuedStates(params, false);
     ReportAsyncPipelines(std::chrono::steady_clock::now());
@@ -1546,6 +1578,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             !MenusWait()) {
             ++async_stats.skipped_draws;
             NoteSkippedDraw(); // PERF-103
+            skipped_build = pending->second; // PERF-GT7-020
             return nullptr;
         }
     }
@@ -1675,6 +1708,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 graphics_pipelines.erase(it);
                 ++async_stats.skipped_draws;
                 NoteSkippedDraw(); // PERF-103
+                skipped_build = stored; // PERF-GT7-020
                 return nullptr;
             }
             if (CancelBuild(*stored)) {
@@ -1733,6 +1767,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             ++async_stats.deferred;
             ++async_stats.skipped_draws;
             NoteSkippedDraw(); // PERF-103
+            skipped_build = build; // PERF-GT7-020
             return nullptr;
         }
         if (build) {
@@ -2933,8 +2968,8 @@ bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderPa
     // dozen new shaders came at once). Not compute, and not a shader that writes memory (later
     // work reads what it writes). -DisablePerf 171 waits as before.
     static const bool enabled = Common::PerfFeatureEnabled(171);
-    if (!enabled || force_wait || regs_override != nullptr || sw_stage == SwStage::Compute ||
-        !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
+    if (!enabled || force_wait || wait_for_shaders || regs_override != nullptr ||
+        sw_stage == SwStage::Compute || !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
         return false;
     }
     auto [it, inserted] = code_writes_memory.try_emplace(params.hash, false);
