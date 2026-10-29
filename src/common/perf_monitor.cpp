@@ -244,6 +244,17 @@ static WorkSnapshot Difference(const WorkSnapshot& now, const WorkSnapshot& then
     return d;
 }
 
+namespace {
+std::atomic<u64> game_frames{}; // PERF-GT7-033
+std::atomic<u64> game_frame_us{};
+} // namespace
+
+GameFrameTotals GetGameFrameTotals() {
+    // The time first: a frame counted without its time would look faster, not slower.
+    const u64 us = game_frame_us.load(std::memory_order_acquire);
+    return {game_frames.load(std::memory_order_acquire), us};
+}
+
 void NoteGameFrame() {
     static const double threshold_ms = [] {
         const char* env = std::getenv("SHADGT_STALL_MS");
@@ -261,6 +272,8 @@ void NoteGameFrame() {
     const auto ticks = Snapshot(GetPhaseTicks());
     const double ms = std::chrono::duration<double, std::milli>(now - last_time).count();
     ++frame;
+    game_frames.fetch_add(1, std::memory_order_release);
+    game_frame_us.fetch_add(u64(ms * 1000.0), std::memory_order_release);
     // DIAG-046: frame-time distribution every 10 s, and frames well above the recent median
     // (micro hitches) with where the GPU threads' time went.
     {

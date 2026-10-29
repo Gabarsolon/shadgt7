@@ -468,6 +468,7 @@ struct PipelineCache::PipelineBuild {
     std::atomic<bool> started{};
     std::atomic<bool> bumped{}; ///< PERF-GT7-029: queued again at the front
     std::atomic<u32> skips{};   ///< DIAG-GT7-012: draws skipped while it builds
+    std::atomic<s64> last_skip_ms{}; ///< FIX-GT7-009: steady clock
     // The cached infos the copies were made from; the pipeline points at them once built.
     std::array<const Shader::Info*, MaxShaderStages> canonical{};
 };
@@ -2791,16 +2792,62 @@ bool PipelineCache::AsyncPipelines() {
     return enabled;
 }
 
+static s64 SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 void PipelineCache::NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again) {
     catch_up_skips.fetch_add(1, std::memory_order_relaxed);
     build->skips.fetch_add(1, std::memory_order_relaxed); // DIAG-GT7-012
+    build->last_skip_ms.store(SteadyMs(), std::memory_order_relaxed);
     // A draw skipped again comes back frame after frame: it is on screen. Its build, if no worker
-    // has started it, goes to the front of the queue (the job already queued finds it started
-    // and does nothing).
+    // has started it, goes ahead of the queue (the job already queued finds it started and does
+    // nothing).
+    // FIX-GT7-009: not to the front itself, last first. On a new track ~1,500 of them were moved
+    // so, each in front of the ones before: the draws skipped most (one 111,000 times) waited
+    // minutes behind newer ones and were never started, and the catch-up lasted 163 s. Each such
+    // draw queues a screen job, which builds the one skipped most lately at the time it runs.
     if (again && build_workers && !build->started.load(std::memory_order_relaxed) &&
         !build->bumped.exchange(true)) {
-        QueueBuild(build, BuildQueue::Kind::Urgent);
+        {
+            std::scoped_lock lk{on_screen_mutex};
+            on_screen.push_back(build);
+        }
+        build_workers->Push([this] { BuildOnScreen(); }, BuildQueue::Kind::Screen);
         catch_up_bumped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void PipelineCache::BuildOnScreen() {
+    std::shared_ptr<PipelineBuild> best;
+    {
+        std::scoped_lock lk{on_screen_mutex};
+        std::erase_if(on_screen, [](const std::shared_ptr<PipelineBuild>& build) {
+            return build->started.load(std::memory_order_relaxed);
+        });
+        // Skipped in the last second first (still on screen), then the most skipped.
+        const s64 now = SteadyMs();
+        const auto score = [&](const PipelineBuild& build) {
+            const bool lately = now - build.last_skip_ms.load(std::memory_order_relaxed) <= 1000;
+            return (u64(lately) << 32) | build.skips.load(std::memory_order_relaxed);
+        };
+        auto chosen = on_screen.end();
+        u64 chosen_score = 0;
+        for (auto it = on_screen.begin(); it != on_screen.end(); ++it) {
+            if (const u64 s = score(**it); chosen == on_screen.end() || s > chosen_score) {
+                chosen = it;
+                chosen_score = s;
+            }
+        }
+        if (chosen != on_screen.end()) {
+            best = std::move(*chosen);
+            on_screen.erase(chosen);
+        }
+    }
+    if (best && !best->started.load()) {
+        FinishBuild(*best);
     }
 }
 
@@ -2826,12 +2873,24 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     const double rate = double(skips) / seconds;
     // In: 3,000 skipped draws a second (100 a frame at 30 fps; a new track's start skipped up to
     // 25,000 a second for two minutes). Out: under 1,000 a second for a second.
+    static const bool paced = [] {
+        const char* env = std::getenv("RYGT_CATCH_UP_PACE");
+        return !(env && env[0] == '0');
+    }();
     if (!c.on) {
         if (rate >= 3000.0) {
             c.on = true;
             c.since = now;
             c.calm = 0;
             c.skipped = skips;
+            c.stepped_back = false;
+            c.pace_start = now;
+            const auto totals = Common::GetGameFrameTotals();
+            c.pace_frames = totals.frames;
+            c.pace_us = totals.us;
+            c.fast = 0;
+            c.step_backs = 0;
+            c.stepped_seconds = 0;
             catch_up_bumped.store(0, std::memory_order_relaxed);
             build_workers->SetCatchUp(true);
             LOG_WARNING(Render_Vulkan,
@@ -2846,12 +2905,59 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     c.calm = rate < 1000.0 ? c.calm + 1 : 0;
     if (c.calm >= 4) {
         c.on = false;
-        build_workers->SetCatchUp(false);
+        if (c.stepped_back) {
+            c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
+        } else {
+            build_workers->SetCatchUp(false);
+        }
         LOG_WARNING(Render_Vulkan,
                     "PERF-GT7-029: catch-up over after {:.1f} s ({} draws skipped meanwhile, {} "
-                    "builds of draws on screen moved to the front); compiles back on their cores",
+                    "builds of draws on screen moved ahead; PERF-GT7-033: stepped back {} times, "
+                    "{:.1f} s in all); compiles back on their cores",
                     std::chrono::duration<double>(now - c.since).count(), c.skipped,
-                    catch_up_bumped.exchange(0));
+                    catch_up_bumped.exchange(0), c.step_backs, c.stepped_seconds);
+        return;
+    }
+    // PERF-GT7-033: the catch-up steps back to the usual compiles (4 at a time on the compile
+    // cores, normal priority) while the game runs slower than 30 fps, and comes back once it is
+    // at 30 fps again. On a new track its 8 compiles on every core slowed the command thread's
+    // decoding by 3-6 ms a submit in heavy scenes: the game ran at ~40 ms a frame for minutes.
+    // The draws on screen still build first (FIX-GT7-009). RYGT_CATCH_UP_PACE=0: never.
+    if (!paced || now - c.pace_start < std::chrono::seconds{1}) {
+        return;
+    }
+    const auto totals = Common::GetGameFrameTotals();
+    const u64 frames = totals.frames - c.pace_frames;
+    const double frame_ms =
+        frames != 0 ? double(totals.us - c.pace_us) / 1000.0 / double(frames)
+                    : std::chrono::duration<double, std::milli>(now - c.pace_start).count();
+    c.pace_start = now;
+    c.pace_frames = totals.frames;
+    c.pace_us = totals.us;
+    if (!c.stepped_back) {
+        if (frame_ms > 36.0) {
+            c.stepped_back = true;
+            c.stepped_since = now;
+            c.fast = 0;
+            build_workers->SetCatchUp(false);
+            if (++c.step_backs <= 10) {
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-GT7-033: the game at {:.1f} ms a frame during the catch-up: "
+                            "compiles back to 4 at a time on their cores until it is at 30 fps",
+                            frame_ms);
+            }
+        }
+        return;
+    }
+    c.fast = frame_ms < 34.5 ? c.fast + 1 : 0;
+    if (c.fast >= 2) {
+        c.stepped_back = false;
+        c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
+        build_workers->SetCatchUp(true);
+        if (c.step_backs <= 10) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-GT7-033: the game at 30 fps again: the catch-up's compiles resume");
+        }
     }
 }
 
@@ -2902,10 +3008,15 @@ void PipelineCache::ReportAsyncPipelines(std::chrono::steady_clock::time_point n
                     build.started.load(std::memory_order_relaxed) ? "building" : "not started",
                     build.skips.load(std::memory_order_relaxed));
             };
+            size_t screen = 0;
+            {
+                std::scoped_lock lk{on_screen_mutex};
+                screen = on_screen.size();
+            }
             LOG_WARNING(Render_Vulkan,
                         "DIAG-GT7-012: {} pipelines still building for skipped draws ({} started, "
-                        "{} jobs queued); the oldest {}; the most skipped {}",
-                        count, started, build_workers ? build_workers->Pending() : 0,
+                        "{} jobs queued, {} on screen waiting); the oldest {}; the most skipped {}",
+                        count, started, build_workers ? build_workers->Pending() : 0, screen,
                         describe(*oldest), describe(*most));
         }
     }

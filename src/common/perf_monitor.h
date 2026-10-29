@@ -91,6 +91,13 @@ std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
 /// SHADGT_STALL_MS (default 100) is logged with what the emulator did during it.
 void NoteGameFrame();
 
+/// PERF-GT7-033: the game frames presented so far, and their total time in microseconds.
+struct GameFrameTotals {
+    u64 frames;
+    u64 us;
+};
+GameFrameTotals GetGameFrameTotals();
+
 // PERF-026: the draw-step timers run about 14 times per draw, so the counter read and the
 // tick array are inline instead of function calls.
 inline std::array<std::atomic<u64>, size_t(Phase::Count)> g_phase_ticks{};

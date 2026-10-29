@@ -228,6 +228,9 @@ private:
     /// PERF-GT7-029: a draw skipped for a pipeline still building (counted for the catch-up; one
     /// skipped again moves its build to the front once, `again`).
     void NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again);
+    /// FIX-GT7-009: a worker's screen job: builds the not yet started build of a draw on screen
+    /// skipped most lately.
+    void BuildOnScreen();
     /// PERF-GT7-029: while many draws are skipped for their builds, compiles use every core, 8 at
     /// a time; back on the compile cores once few are. RYGT_COMPILE_CATCH_UP=0 turns it off.
     void UpdateCatchUp(std::chrono::steady_clock::time_point now);
@@ -473,7 +476,18 @@ private:
         std::chrono::steady_clock::time_point since{};
         u32 calm = 0;
         u64 skipped = 0;
+        // PERF-GT7-033: stepped back while the game runs slower than 30 fps.
+        bool stepped_back = false;
+        std::chrono::steady_clock::time_point pace_start{};
+        std::chrono::steady_clock::time_point stepped_since{};
+        u64 pace_frames = 0;
+        u64 pace_us = 0;
+        u32 fast = 0;
+        u32 step_backs = 0;
+        double stepped_seconds = 0;
     } catch_up;
+    std::mutex on_screen_mutex; ///< FIX-GT7-009
+    std::vector<std::shared_ptr<PipelineBuild>> on_screen;
     struct {
         std::atomic<u64> waits{};
         std::atomic<u64> built_here{};
