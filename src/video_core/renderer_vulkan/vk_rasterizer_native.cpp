@@ -2220,7 +2220,12 @@ void NativeRenderer::RefreshRegion(Region& region) {
         }
         const bool compare =
             !always_whole && (!region_writeback || recent || opened_ahead[k]);
-        region.cpu_pages[page] = frame;
+        // FIX-GT7-018: a page opened ahead counts as written lately only once the CPU changed it
+        // (below). Counted at each refresh, every page of a chunk with one write stayed "written
+        // lately" for good: opened ahead again and again, and its GPU writes written back.
+        if (!opened_ahead[k]) {
+            region.cpu_pages[page] = frame;
+        }
         std::array<u8, 4096> now;
         if (!compare || !before ||
             !Core::RytyMemory::GuardedCopy(now.data(), reinterpret_cast<const void*>(page),
@@ -2231,6 +2236,7 @@ void NativeRenderer::RefreshRegion(Region& region) {
             }
             whole_end = page + page_bytes;
             ++stats.region_whole_pages;
+            region.cpu_pages[page] = frame; // FIX-GT7-018: copied in whole, as written
             continue;
         }
         // The runs of 16-byte pieces the CPU changed (gaps under 64 bytes joined).
@@ -2257,6 +2263,9 @@ void NativeRenderer::RefreshRegion(Region& region) {
         if (in_run) {
             copy_in(page + run_begin, run_end - run_begin);
             changed += run_end - run_begin;
+        }
+        if (changed != 0) {
+            region.cpu_pages[page] = frame; // FIX-GT7-018
         }
         ++stats.region_partial_pages;
         stats.region_partial_bytes += changed;
@@ -10262,8 +10271,8 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
     // faulting page is (PERF-107), so a kept copy never holds a CPU write the region lacks; a
     // page left unwritten copies nothing in at the refresh.
     // FIX-GT7-017: off unless RYGT_NATIVE_FAULT_AHEAD=1. With it, GT7 races showed long black
-    // triangles on some frames (at times the whole sky black for a frame), gone with it off:
-    // a region refresh can take pages opened ahead while the game is still writing them.
+    // triangles on some frames (at times the whole sky black for a frame), gone with it off.
+    // FIX-GT7-018 below is the likely cause; on again once races show none with it.
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_NATIVE_FAULT_AHEAD");
         return env && env[0] == '1';
@@ -10315,6 +10324,25 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
                                               now - it->second > RegionRecentFrames;
                                    }),
                     pages.end());
+    }
+    // FIX-GT7-018: not a page under a picture the registry tracks. Opened, the page was handed
+    // to registry->CpuWrite as written by the CPU: a picture the GPU drew there and kept past
+    // its idle time (FIX-157: GT7's sky and reflection pictures) was then taken as reused, no
+    // lookup found it any more, and its draws read a new one made from guest memory, which never
+    // got what the GPU drew: long black triangles, the whole sky black for a frame. A real CPU
+    // write into the page still goes through OnCpuWrite.
+    if (!pages.empty()) {
+        const size_t before = pages.size();
+        pages.erase(std::remove_if(pages.begin(), pages.end(),
+                                   [&](VAddr page) {
+                                       bool picture = false;
+                                       registry->ForEachOverlapping(
+                                           page, page + 4096,
+                                           [&](auto&) { picture = true; });
+                                       return picture;
+                                   }),
+                    pages.end());
+        fault_ahead_pictures.fetch_add(before - pages.size(), std::memory_order_relaxed);
     }
     if (pages.empty()) {
         return;
@@ -11434,7 +11462,8 @@ void NativeRenderer::Report() {
     }
     if (const u64 opened = fault_ahead_pages.exchange(0); opened != 0) {
         LOG_INFO(Render_Vulkan, "PERF-GT7-030: {} write faults in region chunks written lately "
-                 "opened {} more pages with them", fault_ahead_faults.exchange(0), opened);
+                 "opened {} more pages with them; FIX-GT7-018: {} left shut under a picture",
+                 fault_ahead_faults.exchange(0), opened, fault_ahead_pictures.exchange(0));
     }
     if (RyDiag::Enabled()) {
         if (std::string text = FaultPagesText(); !text.empty()) {

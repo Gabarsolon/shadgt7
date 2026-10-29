@@ -476,6 +476,7 @@ private:
     std::unordered_set<VAddr> ahead_pages;
     std::atomic<u64> fault_ahead_faults{};
     std::atomic<u64> fault_ahead_pages{};
+    std::atomic<u64> fault_ahead_pictures{}; ///< FIX-GT7-018: pages left shut for a picture
     u64 draws_at_frame = 0; ///< DIAG-GT7-011: stats.draws at the last frame's end
     std::string FaultPagesText(); ///< the window's pages, then cleared
     bool one_off_kinds_changed = false;
