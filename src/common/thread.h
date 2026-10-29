@@ -56,7 +56,23 @@ void ConfineDriverCompileThreads();
 /// PERF-GT7-024: while a draw waits for its pipeline (the game is stopped anyway), compile work
 /// may use every core; calls nest (on, then off once per on).
 void SetCompileCoresWide(bool wide);
+/// PERF-GT7-024, PERF-GT7-032: compile work uses every core now.
 bool CompileCoresWide();
+
+/// PERF-GT7-032: during a catch-up (PERF-GT7-029: many draws skipped while their pipelines
+/// build), compile work uses every core below normal priority, taking the time the game's and the
+/// renderer's threads leave. Not while a draw waits for its pipeline. Calls nest.
+void SetCompileCatchUp(bool on);
+/// PERF-GT7-032: compile work runs below normal priority now.
+bool CompileThreadsLow();
+
+/// PERF-GT7-032: around a build the calling thread does while the GPU's commands wait for it (a
+/// new compute pipeline on the command thread). Meanwhile the other compile work stays on the
+/// compile cores below normal priority (unless a draw waits for its pipeline), and the calling
+/// thread runs above normal priority on the other cores. Calls nest; End once per Begin, on the
+/// same thread.
+void BeginForegroundCompile();
+void EndForegroundCompile();
 
 void SetThreadName(void* thread, const char* name);
 

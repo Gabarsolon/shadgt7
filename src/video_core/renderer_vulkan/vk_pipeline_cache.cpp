@@ -315,6 +315,9 @@ public:
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
     }
+    size_t Pending() {
+        return queue.Pending(); // DIAG-GT7-012
+    }
     /// PERF-GT7-021: while a draw into a one-off target waits (the game stopped anyway), up to
     /// all but four hardware threads build at once instead of CompileConcurrency (4). Calls nest
     /// (two threads can wait at once).
@@ -326,27 +329,48 @@ public:
         }
         Common::SetCompileCoresWide(on); // PERF-GT7-024: off the compile cores meanwhile
     }
-    /// PERF-GT7-029: during a catch-up, 8 at a time on every core.
+    /// PERF-GT7-029: during a catch-up, 8 at a time on every core; PERF-GT7-032: below normal
+    /// priority (RYGT_CATCH_UP_LOW=0: normal, as before).
     void SetCatchUp(bool on) {
         {
             std::scoped_lock lk{extra_mutex};
             catch_up = on;
             ApplyExtra();
         }
-        Common::SetCompileCoresWide(on);
+        if (CatchUpLow()) {
+            Common::SetCompileCatchUp(on);
+        } else {
+            Common::SetCompileCoresWide(on);
+        }
+    }
+    static bool CatchUpLow() {
+        static const bool low = [] {
+            const char* env = std::getenv("RYGT_CATCH_UP_LOW");
+            return !(env && env[0] == '0');
+        }();
+        return low;
+    }
+    /// PERF-GT7-032: while a thread builds a pipeline the GPU waits for, no more builds than
+    /// usual start (unless a draw waits for its own).
+    void SetForeground(bool on) {
+        std::scoped_lock lk{extra_mutex};
+        foreground += on ? 1 : -1;
+        ApplyExtra();
     }
 
 private:
     void ApplyExtra() {
         const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
                                       CompileConcurrency(), 12u);
-        const u32 width = waiting > 0 ? widest
-                          : catch_up  ? std::clamp(8u, CompileConcurrency(), widest)
-                                      : CompileConcurrency();
+        const u32 width = waiting > 0      ? widest
+                          : foreground > 0 ? CompileConcurrency()
+                          : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
+                                           : CompileConcurrency();
         queue.SetExtraRunning(width - CompileConcurrency());
     }
     std::mutex extra_mutex;
     int waiting = 0;
+    int foreground = 0;
     bool catch_up = false;
 
     static u32 AllCores() {
@@ -404,8 +428,11 @@ private:
                     Common::PreferCompileCores();
                 }
             }
-            if (backlog != low_priority) {
-                low_priority = backlog;
+            // PERF-GT7-032: below normal during a catch-up too, and while a thread builds a
+            // pipeline the GPU waits for (from the next job: one takes up to a second).
+            const bool want_low = backlog || Common::CompileThreadsLow();
+            if (want_low != low_priority) {
+                low_priority = want_low;
                 Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
                                                               : Common::ThreadPriority::Normal);
             }
@@ -440,6 +467,7 @@ struct PipelineCache::PipelineBuild {
     // draw needs it before a worker got to it.
     std::atomic<bool> started{};
     std::atomic<bool> bumped{}; ///< PERF-GT7-029: queued again at the front
+    std::atomic<u32> skips{};   ///< DIAG-GT7-012: draws skipped while it builds
     // The cached infos the copies were made from; the pipeline points at them once built.
     std::array<const Shader::Info*, MaxShaderStages> canonical{};
 };
@@ -2048,9 +2076,49 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         ComputePipeline::SerializationSupport sdata{};
         ++Common::GetWorkCounters().pipelines_compiled;
         RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *S().infos[0],
-                                                       S().modules[0], sdata);
+        // PERF-GT7-032: the GPU's commands wait for this build. Meanwhile the other compiles stay
+        // on the compile cores below normal priority and start no more than usual, and this
+        // thread runs above normal priority on the other cores. In a GT7 race on a new track two
+        // compute pipelines took 1.3-1.6 s each here, beside a catch-up's 8 compiles on every
+        // core and the driver's compiler threads. RYGT_FOREGROUND_COMPILE=0: as before.
+        static const bool foreground_on = [] {
+            const char* env = std::getenv("RYGT_FOREGROUND_COMPILE");
+            return !(env && env[0] == '0');
+        }();
+        struct Foreground {
+            PipelineBuildWorkers* workers;
+            bool on;
+            Foreground(PipelineBuildWorkers* workers_, bool on_) : workers{workers_}, on{on_} {
+                if (on) {
+                    Common::BeginForegroundCompile();
+                    if (workers) {
+                        workers->SetForeground(true);
+                    }
+                }
+            }
+            ~Foreground() {
+                if (on) {
+                    if (workers) {
+                        workers->SetForeground(false);
+                    }
+                    Common::EndForegroundCompile();
+                }
+            }
+        };
+        const auto build_start = std::chrono::steady_clock::now();
+        {
+            const Foreground foreground{build_workers.get(), foreground_on};
+            it.value() = std::make_unique<ComputePipeline>(
+                instance, scheduler, desc_heap, profile, *pipeline_cache, compute_key,
+                *S().infos[0], S().modules[0], sdata);
+        }
+        if (const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - build_start)
+                                  .count();
+            ms >= 50.0) {
+            LOG_INFO(Render_Vulkan, "PERF-GT7-032: compute pipeline {:#x} built in {:.0f} ms{}",
+                     pipeline_hash, ms, foreground_on ? ", the other compiles set aside" : "");
+        }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
 
@@ -2725,6 +2793,7 @@ bool PipelineCache::AsyncPipelines() {
 
 void PipelineCache::NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again) {
     catch_up_skips.fetch_add(1, std::memory_order_relaxed);
+    build->skips.fetch_add(1, std::memory_order_relaxed); // DIAG-GT7-012
     // A draw skipped again comes back frame after frame: it is on screen. Its build, if no worker
     // has started it, goes to the front of the queue (the job already queued finds it started
     // and does nothing).
@@ -2767,8 +2836,9 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             build_workers->SetCatchUp(true);
             LOG_WARNING(Render_Vulkan,
                         "PERF-GT7-029: {:.0f} draws a second skipped while their pipelines build: "
-                        "compiles on every core, 8 at a time",
-                        rate);
+                        "compiles on every core, 8 at a time{}",
+                        rate,
+                        PipelineBuildWorkers::CatchUpLow() ? ", below normal priority" : "");
         }
         return;
     }
@@ -2799,6 +2869,45 @@ void PipelineCache::ReportAsyncPipelines(std::chrono::steady_clock::time_point n
                     std::chrono::duration<double>(now - async_stats.since).count(),
                     async_stats.deferred, async_stats.installed, async_stats.skipped_draws,
                     async_stats.skipped_translating);
+    }
+    if (async_stats.skipped_draws != 0) {
+        // DIAG-GT7-012: the builds draws are skipped for. In a GT7 race on a new track ~4,000
+        // draws a second were skipped for three minutes (the catch-up never ended) while a few
+        // builds finished in 2 s, often none.
+        u32 count = 0;
+        u32 started = 0;
+        const PipelineBuild* oldest = nullptr;
+        const PipelineBuild* most = nullptr;
+        for (const auto& [key, build] : pending_builds) {
+            if (!build->async ||
+                build->done.wait_for(std::chrono::microseconds{0}) == std::future_status::ready) {
+                continue;
+            }
+            ++count;
+            started += build->started.load(std::memory_order_relaxed) ? 1 : 0;
+            if (!oldest || build->queued < oldest->queued) {
+                oldest = build.get();
+            }
+            if (!most || build->skips.load(std::memory_order_relaxed) >
+                             most->skips.load(std::memory_order_relaxed)) {
+                most = build.get();
+            }
+        }
+        if (count != 0) {
+            const auto describe = [&](const PipelineBuild& build) {
+                return fmt::format(
+                    "{:#x}, queued {:.1f} s ago, {}, {} draws skipped",
+                    std::hash<GraphicsPipelineKey>{}(build.key),
+                    std::chrono::duration<double>(now - build.queued).count(),
+                    build.started.load(std::memory_order_relaxed) ? "building" : "not started",
+                    build.skips.load(std::memory_order_relaxed));
+            };
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-012: {} pipelines still building for skipped draws ({} started, "
+                        "{} jobs queued); the oldest {}; the most skipped {}",
+                        count, started, build_workers ? build_workers->Pending() : 0,
+                        describe(*oldest), describe(*most));
+        }
     }
     async_stats = {};
     async_stats.since = now;

@@ -100,6 +100,7 @@ struct CoreClasses {
     std::vector<s8> fast_by_index; // by group * 64 + logical processor index: 1 fast, 0 slow
     bool hybrid = false;
     std::vector<ULONG> compile_ids; // PERF-GT7-024: one kind of core: the compile cores
+    std::vector<ULONG> game_ids;    // PERF-GT7-032: and the other cores
 };
 
 bool CompileCoresOn() {
@@ -169,6 +170,10 @@ const CoreClasses& GetCoreClasses() {
                 const size_t count = std::max<size_t>(2, (cores.size() + 2) / 3);
                 auto it = cores.begin();
                 std::advance(it, cores.size() - count);
+                for (auto other = cores.begin(); other != it; ++other) {
+                    result.game_ids.insert(result.game_ids.end(), other->second.begin(),
+                                           other->second.end());
+                }
                 for (; it != cores.end(); ++it) {
                     result.compile_ids.insert(result.compile_ids.end(), it->second.begin(),
                                               it->second.end());
@@ -247,12 +252,21 @@ struct DriverCompileThreads {
         u64 cpu_100ns = 0;
         u32 outside = 0;       ///< samples outside the compiler
         bool confined = false; ///< the compiler's: on the compile cores
+        int priority = THREAD_PRIORITY_NORMAL; ///< PERF-GT7-032: its own, when confined
     };
     std::mutex mutex;
     std::unordered_map<DWORD, Thread> threads; ///< unnamed threads still looked at, and confined
     std::unordered_map<DWORD, bool> left;      ///< threads not looked at again
-    std::atomic<int> wide{0};
-    bool applied_wide = false; ///< FIX-GT7-008: what the confined threads have (under mutex)
+    // Under the mutex: draws waiting for their pipeline (PERF-GT7-024), catch-ups running and
+    // builds a thread waits for on itself (PERF-GT7-032), and what the confined threads have
+    // (FIX-GT7-008).
+    int waits = 0;
+    int catch_up = 0;
+    int foreground = 0;
+    bool applied_wide = false;
+    bool applied_low = false;
+    std::atomic<bool> wide_now{false};
+    std::atomic<bool> low_now{false};
     u32 calls = 0;
     u32 reports = 0;
 };
@@ -268,6 +282,41 @@ void ApplyCompileCores(HANDLE thread, bool wide) {
         SetThreadSelectedCpuSets(thread, nullptr, 0);
     } else {
         SetThreadSelectedCpuSets(thread, ids.data(), static_cast<ULONG>(ids.size()));
+    }
+}
+
+void ApplyCompilePriority(const DriverCompileThreads::Thread& thread, bool low) {
+    SetThreadPriority(thread.handle,
+                      low ? std::min(thread.priority, int(THREAD_PRIORITY_BELOW_NORMAL))
+                          : thread.priority);
+}
+
+// PERF-GT7-032: the confined threads follow the counts (under the mutex). A draw waiting for its
+// pipeline: every core, normal priority (the game is stopped, the compiles are what it waits
+// for). A build a thread waits for on itself: the compile cores, below normal (it goes first). A
+// catch-up: every core, below normal (the time the game's and the renderer's threads leave).
+void ApplyCompileState(DriverCompileThreads& d) {
+    const bool wide = d.waits > 0 || (d.catch_up > 0 && d.foreground == 0);
+    const bool low = d.waits == 0 && (d.foreground > 0 || d.catch_up > 0);
+    d.wide_now.store(wide, std::memory_order_relaxed);
+    d.low_now.store(low, std::memory_order_relaxed);
+    const bool cores = wide != d.applied_wide;
+    const bool priority = low != d.applied_low;
+    d.applied_wide = wide;
+    d.applied_low = low;
+    if (!cores && !priority) {
+        return;
+    }
+    for (const auto& [tid, thread] : d.threads) {
+        if (!thread.confined) {
+            continue;
+        }
+        if (cores) {
+            ApplyCompileCores(thread.handle, wide);
+        }
+        if (priority) {
+            ApplyCompilePriority(thread, low);
+        }
     }
 }
 
@@ -381,7 +430,15 @@ void ConfineDriverCompileThreads() {
         }
         if (ip >= compiler_begin && ip < compiler_end) {
             thread.confined = true;
+            // PERF-GT7-032: its own priority, given back after a catch-up.
+            if (const int own = GetThreadPriority(thread.handle);
+                own != THREAD_PRIORITY_ERROR_RETURN) {
+                thread.priority = own;
+            }
             ApplyCompileCores(thread.handle, d.applied_wide);
+            if (d.applied_low) {
+                ApplyCompilePriority(thread, true);
+            }
             ++found;
         } else if (++thread.outside >= 12) {
             // Busy, but never in the compiler when looked at.
@@ -419,21 +476,84 @@ void SetCompileCoresWide(bool wide) {
     // count read before the lock, two transitions at once could leave the threads on the cores
     // the earlier one asked for (all cores with the count at 0, or the other way round).
     std::scoped_lock lk{d.mutex};
-    d.wide.fetch_add(wide ? 1 : -1);
-    const bool want = d.wide.load() > 0;
-    if (want == d.applied_wide) {
-        return;
-    }
-    d.applied_wide = want;
-    for (const auto& [tid, thread] : d.threads) {
-        if (thread.confined) {
-            ApplyCompileCores(thread.handle, want);
-        }
-    }
+    d.waits += wide ? 1 : -1;
+    ApplyCompileState(d);
 }
 
 bool CompileCoresWide() {
-    return DriverThreads().wide.load(std::memory_order_relaxed) > 0;
+    return DriverThreads().wide_now.load(std::memory_order_relaxed);
+}
+
+void SetCompileCatchUp(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.catch_up += on ? 1 : -1;
+    ApplyCompileState(d);
+}
+
+bool CompileThreadsLow() {
+    return DriverThreads().low_now.load(std::memory_order_relaxed);
+}
+
+namespace {
+// PERF-GT7-032: the calling thread's own cores and priority during a foreground compile.
+struct ForegroundSelf {
+    int depth = 0;
+    int priority = THREAD_PRIORITY_ERROR_RETURN;
+    bool moved = false;
+    std::vector<ULONG> sets;
+};
+thread_local ForegroundSelf foreground_self;
+} // namespace
+
+void BeginForegroundCompile() {
+    auto& self = foreground_self;
+    if (self.depth++ == 0) {
+        const HANDLE current = GetCurrentThread();
+        self.priority = GetThreadPriority(current);
+        if (self.priority != THREAD_PRIORITY_ERROR_RETURN &&
+            self.priority < THREAD_PRIORITY_ABOVE_NORMAL) {
+            SetThreadPriority(current, THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+        // Off the compile cores, where the other compiles stay meanwhile (its own sets kept).
+        const auto& classes = GetCoreClasses();
+        self.moved = false;
+        if (!classes.hybrid && CompileCoresOn() && !classes.game_ids.empty()) {
+            ULONG count = 0;
+            GetThreadSelectedCpuSets(current, nullptr, 0, &count);
+            self.sets.resize(count);
+            if (count == 0 ||
+                GetThreadSelectedCpuSets(current, self.sets.data(), count, &count)) {
+                self.sets.resize(count);
+                self.moved = SetThreadSelectedCpuSets(current, classes.game_ids.data(),
+                                                      ULONG(classes.game_ids.size())) != FALSE;
+            }
+        }
+    }
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    ++d.foreground;
+    ApplyCompileState(d);
+}
+
+void EndForegroundCompile() {
+    {
+        auto& d = DriverThreads();
+        std::scoped_lock lk{d.mutex};
+        --d.foreground;
+        ApplyCompileState(d);
+    }
+    auto& self = foreground_self;
+    if (--self.depth == 0) {
+        const HANDLE current = GetCurrentThread();
+        if (self.moved) {
+            SetThreadSelectedCpuSets(current, self.sets.empty() ? nullptr : self.sets.data(),
+                                     ULONG(self.sets.size()));
+        }
+        if (self.priority != THREAD_PRIORITY_ERROR_RETURN) {
+            SetThreadPriority(current, self.priority);
+        }
+    }
 }
 
 int CurrentCoreIsFast() {
@@ -514,6 +634,16 @@ void SetCompileCoresWide(bool) {}
 bool CompileCoresWide() {
     return false;
 }
+
+void SetCompileCatchUp(bool) {}
+
+bool CompileThreadsLow() {
+    return false;
+}
+
+void BeginForegroundCompile() {}
+
+void EndForegroundCompile() {}
 
 int CurrentCoreIsFast() {
     return -1;
