@@ -6577,9 +6577,100 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     };
     note_race_hud();
+    // FIX-227: hull shaders that read other patches' LS outputs (GCN LDS) get them from a
+    // scratch buffer: the draw first runs as a writer pass (each patch stores its inputs, nothing
+    // is drawn), then, after a barrier, as itself.
+    static u32 lds_seen = 0;
+    if (pipeline->GetStages()[u32(Shader::SwStage::TessellationControl)] && lds_seen < 5) {
+        ++lds_seen;
+        LOG_WARNING(Render_Vulkan, "FIX-227: tessellated draw, LDS emulation {} (cp {} patches {})",
+                    pipeline->LdsEmulation(), u32(regs.ls_hs_config.hs_input_control_points),
+                    u32(regs.ls_hs_config.num_patches));
+    }
+    if (const u32 lds_mode = pipeline->LdsEmulation(); lds_mode != 0 && !indirect) {
+        const u32 num_cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
+        const u64 patches = u64(regs.num_indices / num_cp) * regs.num_instances.NumInstances();
+        Shader::TessellationDataConstantBuffer tess_constants{};
+        pipeline->GetStage(Shader::SwStage::TessellationControl)
+            .ReadTessConstantBuffer(tess_constants);
+        // At least 64 bytes a vertex: the hull shader's stride is the one it was translated with.
+        const u32 vertex_bytes = std::max<u32>((tess_constants.ls_stride + 15) / 16 * 16, 64u);
+        const u64 address =
+            vertex_bytes != 0 ? LdsScratch(std::max<u64>(patches, 1) * num_cp * vertex_bytes) : 0;
+        auto push = b.push;
+        const auto push_scratch = [&](u64 value) {
+            push.lds_scratch = {u32(value), u32(value >> 32)};
+            stream.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
+                                     u32(offsetof(Shader::PushData, lds_scratch)), 8u,
+                                     push.lds_scratch.data());
+        };
+        if (address != 0) {
+            push_scratch(address | 1);
+            record_draw();
+            const RenderState resumed = [&] {
+                RenderState state = stream.render;
+                for (u32 i = 0; i < state.num_color_attachments; ++i) {
+                    state.color_attachments[i].is_clear = false;
+                }
+                state.depth_stencil_attachment.depth_clear = false;
+                state.depth_stencil_attachment.stencil_clear = false;
+                return state;
+            }();
+            const RenderState current = stream.render;
+            EndRendering();
+            const vk::MemoryBarrier2 written{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTessellationControlShader,
+                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTessellationControlShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+            };
+            // A full barrier: one from and to the tessellation control stage alone left the
+            // reader pass reading stale scratch on NVIDIA.
+            (void)written;
+            GlobalBarrier();
+            BeginRendering(resumed);
+            stream.render = current; // its clears are done; the same pass to later draws
+            push_scratch(address);
+            lds_snap_address = address; // DIAG-241
+            lds_snap_bytes = std::min<u64>(patches * num_cp * vertex_bytes, 1ull << 20);
+            if (++stats.lds_emulated_draws <= 5 || regs.num_instances.NumInstances() > 1) {
+                LOG_WARNING(Render_Vulkan, "FIX-227: draw of {} patches ({} instances) with hull "
+                            "shader LDS emulation (mode {}, {} bytes a vertex) at {:#x}",
+                            patches, regs.num_instances.NumInstances(), lds_mode, vertex_bytes,
+                            address);
+            }
+        }
+    }
     {
         PhaseClock part{stats.record_ns[6]};
         record_draw();
+        // DIAG-241 (diagnosis): in a dumped frame, the LDS scratch of the first such draw.
+        if (lds_snap_address != 0 && r.FrameDumpCollecting() &&
+            std::ranges::none_of(pass_snaps, [](const PassSnap& snap) {
+                return snap.name.starts_with("snap_lds_");
+            })) {
+            auto buffer = device->CreateBuffer({.size = lds_snap_bytes,
+                                                .usage = Native::Rhi::BufferUsageStorage |
+                                                         Native::Rhi::BufferUsageTransferDst,
+                                                .memory = Native::Rhi::MemoryKind::Readback,
+                                                .name = "lds scratch snapshot"});
+            if (buffer && buffer->Mapped()) {
+                EndRendering();
+                GlobalBarrier();
+                stream.cmd.copyBuffer(
+                    vk::Buffer{Handle<VkBuffer_T>(lds_scratch->NativeHandle())},
+                    vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                    vk::BufferCopy{.srcOffset = lds_snap_address - lds_scratch->GpuAddress(),
+                                   .dstOffset = 0,
+                                   .size = lds_snap_bytes});
+                GlobalBarrier();
+                pass_snaps.push_back({std::move(buffer),
+                                      fmt::format("snap_lds_cp{}_{}.bin",
+                                                  u32(regs.ls_hs_config.hs_input_control_points),
+                                                  lds_snap_bytes)});
+            }
+        }
+        lds_snap_address = 0;
         if (hud_white_state && HudStreamOn() && !stream.wrapped_list) {
             // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
             std::swap(stream, hud_stream);
@@ -9288,6 +9379,31 @@ void NativeRenderer::SnapProgramMips(std::span<const Shader::Info* const> stages
         }
         GlobalBarrier();
     }
+}
+
+u64 NativeRenderer::LdsScratch(u64 bytes) {
+    // FIX-227: a ring; a part is written and read by one draw right away, and is written again
+    // only after the ring went round (frames later, long done on the GPU).
+    constexpr u64 RingSize = 128ull << 20;
+    if (bytes > RingSize) {
+        return 0;
+    }
+    if (!lds_scratch) {
+        lds_scratch = device->CreateBuffer(
+            {.size = RingSize,
+             .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageDeviceAddress,
+             .memory = Native::Rhi::MemoryKind::DeviceLocal,
+             .name = "hull shader LDS scratch"});
+        if (!lds_scratch) {
+            return 0;
+        }
+    }
+    if (Common::AlignUp(lds_scratch_used, 256) + bytes > RingSize) {
+        lds_scratch_used = 0;
+    }
+    const u64 offset = Common::AlignUp(lds_scratch_used, 256);
+    lds_scratch_used = offset + bytes;
+    return lds_scratch->GpuAddress() + offset;
 }
 
 void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {

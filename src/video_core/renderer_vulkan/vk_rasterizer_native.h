@@ -521,6 +521,12 @@ private:
     std::array<const Native::ImageEntry*, 3> last_snap_key{};
     u32 pass_snap_index = 0;
     void SnapPass(const Targets& targets);
+    /// FIX-227: device address of `bytes` of the hull shader LDS emulation scratch ring.
+    u64 LdsScratch(u64 bytes);
+    std::unique_ptr<Native::Rhi::Buffer> lds_scratch;
+    u64 lds_scratch_used = 0;
+    u64 lds_snap_address = 0; ///< DIAG-241
+    u64 lds_snap_bytes = 0;
     void NoteStaleFlats(const Shader::Info& stage);
     void CheckStaleFlats();
     void SnapProgramMips(std::span<const Shader::Info* const> stages, const DrawBindings& b);
@@ -977,6 +983,7 @@ private:
         std::array<u64, 6> dispatch_part_ns{};
         u64 writeback_ns = 0;
         u64 small_rewrites = 0; ///< FIX-202: small textures uploaded again after big writes
+        u64 lds_emulated_draws = 0; // FIX-227
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,

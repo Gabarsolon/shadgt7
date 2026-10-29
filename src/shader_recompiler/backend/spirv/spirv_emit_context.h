@@ -261,6 +261,8 @@ public:
     Id stencil_ref{};
     Id sample_mask{};
     Id quad_sample_mask{};
+    Id lds_scratch_base{}; ///< FIX-227: u64 scratch address of the hull shader's LDS inputs
+    Id lds_vertex_base{};  ///< FIX-227: the scratch vertex a read of input slot 0 reads
     Id sample_mask_in{};
     Id helper_invocation{};
     Id sample_index{};

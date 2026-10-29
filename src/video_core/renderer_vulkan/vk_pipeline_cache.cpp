@@ -11,6 +11,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <set>
 #include <ranges>
 #include <sstream>
 #include <chrono>
@@ -54,6 +55,25 @@ extern thread_local std::span<const u32> g_diag_compiling_code;
 extern thread_local u64 g_diag_compiling_hash;
 } // namespace Shader::Optimization
 namespace Vulkan {
+
+u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
+    // FIX-227: hull shaders of draws with several patches a VGT group read their inputs from the
+    // LDS emulation scratch buffer (the renderer runs a writer pass first), so input control
+    // points past their own patch's are the next patches', as in GCN's LDS (GT7's car hull
+    // shaders read such). Off by default: it did not change GT7's race-start black patches.
+    // RYGT_TESS_LDS_EMULATION=2: on, slots counted from the patch's own first control point (as
+    // GCN with the patch id folded out); =1: from the start of the patch's VGT group.
+    static const u32 mode = [] {
+        const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
+        return env && *env ? u32(env[0] - '0') : 0u;
+    }();
+    if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
+        regs.ls_hs_config.num_patches <= 1) {
+        return 0;
+    }
+    return mode;
+}
+
 
 namespace {
 std::atomic<u32> g_shader_translations_running{};
@@ -613,10 +633,17 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.num_threads = regs.ls_hs_config.hs_output_control_points;
         info.sw.tcs.tess_type = regs.tess_config.type;
         info.sw.tcs.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
+        info.sw.tcs.lds_emulation = u8(TessLdsEmulation(regs)); // FIX-227
+        info.sw.tcs.num_patches = u8(info.sw.tcs.lds_emulation ? regs.ls_hs_config.num_patches : 0);
         // DIAG-239 (diagnosis, RYGT_DIAG_TCS_CONFIG=1): the LS/HS configuration, 60 lines at most.
         if (static const bool diag = std::getenv("RYGT_DIAG_TCS_CONFIG") != nullptr; diag) {
-            static std::atomic<u32> lines{};
-            if (lines++ < 60) {
+            static std::mutex seen_mutex;
+            static std::set<u32> seen;
+            const u32 combo = u32(regs.ls_hs_config.num_patches) |
+                              (u32(regs.ls_hs_config.hs_input_control_points) << 8) |
+                              (u32(regs.ls_hs_config.hs_output_control_points) << 16);
+            std::scoped_lock lock{seen_mutex};
+            if (seen.insert(combo).second) {
                 LOG_WARNING(Render_Vulkan, "DIAG-239: hs patches {} input cp {} output threads {} "
                             "offchip {} tess type {}",
                             u32(regs.ls_hs_config.num_patches),

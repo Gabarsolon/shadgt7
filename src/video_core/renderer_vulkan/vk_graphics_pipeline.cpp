@@ -369,6 +369,11 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const vk::Device device = instance.GetDevice();
+    if (infos[u32(Shader::SwStage::TessellationControl)]) { // FIX-227
+        const auto& tcs = runtime_infos[u32(Shader::SwStage::TessellationControl)].sw.tcs;
+        lds_emulation = tcs.lds_emulation;
+        lds_vertex_bytes = ((tcs.ls_stride + 15) / 16) * 16;
+    }
     std::ranges::copy(infos, stages.begin());
     std::ranges::copy(infos, canonical_stages.begin());
     BuildDescSetLayout();
