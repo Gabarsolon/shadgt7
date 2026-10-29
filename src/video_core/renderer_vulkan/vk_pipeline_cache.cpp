@@ -1451,6 +1451,24 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             return nullptr;
         }
     }
+    // PERF-GT7-017: a draw whose pipeline a worker is still building (compile mode 2) is skipped
+    // at once. It came back through the new-pipeline path below every time: the guest clocks'
+    // compile pause (FIX-044), the "Compiling" log line and DIAG-050/051's key bookkeeping, for
+    // up to ~20,000 such draws a second in GT7 (a million log lines in one race), which slowed
+    // the command processor, held the game's clocks and halved the frame rate for a minute.
+    if (CompileMode() == 2 && !force_wait &&
+        graphics_pipelines.find(S().graphics_key) == graphics_pipelines.end()) {
+        if (const auto pending = pending_builds.find(S().graphics_key);
+            pending != pending_builds.end() && pending->second->async &&
+            pending->second->done.wait_for(std::chrono::microseconds{0}) !=
+                std::future_status::ready &&
+            !LegacyWaits() && !WritesMemory(S().infos) && !NeverSkipped(S().infos) &&
+            !MenusWait()) {
+            ++async_stats.skipped_draws;
+            NoteSkippedDraw(); // PERF-103
+            return nullptr;
+        }
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(S().graphics_key);
     if (is_new) {
         Common::GuestClock::CompilePause hold; // FIX-044
