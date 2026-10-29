@@ -1370,7 +1370,35 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     u32 started = 0;
     // Before a draw, 2 ms at most, and while waiting for a build, 64 states between checks on
     // it; the rest comes next time.
-    const auto budget = start + std::chrono::milliseconds{2};
+    auto budget = start + std::chrono::milliseconds{2};
+    // PERF-GT7-026: before draws, also at most 3 ms in any 16 ms. The 2 ms were per draw: in the
+    // first seconds of a race on a new track, the frames with many new states spent 300-390 ms
+    // here starting up to 523 builds (~0.75 ms each), and the game waited for that frame. Not
+    // while a draw waits for its pipeline (the game is stopped then anyway).
+    using ReadAheadClock = std::chrono::steady_clock;
+    static thread_local ReadAheadClock::time_point window{};
+    static thread_local ReadAheadClock::duration window_used{};
+    const bool windowed = !restore && !Common::CompileCoresWide();
+    if (windowed) {
+        if (start - window > std::chrono::milliseconds{16}) {
+            window = start;
+            window_used = {};
+        }
+        const auto left = ReadAheadClock::duration{std::chrono::milliseconds{3}} - window_used;
+        if (left <= ReadAheadClock::duration::zero()) {
+            return;
+        }
+        budget = std::min(budget, start + left);
+    }
+    struct ChargeWindow {
+        bool on;
+        ReadAheadClock::time_point start;
+        ~ChargeWindow() {
+            if (on) {
+                window_used += ReadAheadClock::now() - start;
+            }
+        }
+    } charge_window{windowed, start};
     const auto in_budget = [&] {
         return restore ? evaluated < 64 : std::chrono::steady_clock::now() < budget;
     };
@@ -3539,8 +3567,13 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                     hw_stage, params.hash, params.code.size(), (dir / (name + ".txt")).string());
     }
     // FIX-018/FIX-020: stored translations made before a translator fix that changes them.
+    // PERF-GT7-027: only a program with stored translations is looked at (each look decodes the
+    // whole program up to four times, on the command thread, for hundreds of new programs at a
+    // new track's start); a new one is translated by the fixed translator anyway.
+    const bool has_stored = !it_pgm.value()->modules.empty() ||
+                            stored_perm_end.find(params.hash) != stored_perm_end.end();
     u32 needed_fixes = 0;
-    if (first_use) {
+    if (first_use && has_stored) {
         needed_fixes |= Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
         if (Shader::HasLegacyMad(params.code)) {
             needed_fixes |= 16u; // FIX-101
