@@ -364,6 +364,19 @@ private:
     std::vector<std::jthread> threads;
 };
 
+void QueueBackgroundPipelineBuild(std::function<void()>&& job) {
+    PipelineLinkWorkers::Instance().Push([job = std::move(job)] {
+        // PERF-GT7-035: on the compile cores, below normal priority (nothing waits for it).
+        static thread_local bool placed = false;
+        if (!placed) {
+            placed = true;
+            Common::PreferCompileCores();
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        }
+        job();
+    });
+}
+
 // PERF-018: shader stage libraries (pre-rasterization and fragment shader) of runtime
 // pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
 // pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse

@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
 #include <boost/container/small_vector.hpp>
 
+#include "common/logging/log.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -14,7 +18,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata)
+                                 SerializationSupport& sdata, bool fast_first)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::SwStage::Compute)];
@@ -107,17 +111,79 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = fast_first ? vk::PipelineCreateFlagBits::eDisableOptimization
+                            : vk::PipelineCreateFlags{},
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
+    const auto create_start = std::chrono::steady_clock::now();
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+    if (!fast_first) {
+        return;
+    }
+    // PERF-GT7-035: the optimized pipeline, a second later, in the background. The fast one
+    // stays alive (command buffers may still use it) until this pipeline goes.
+    const double fast_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - create_start)
+                               .count();
+    optimize_cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto done = std::make_shared<std::promise<void>>();
+    optimize_done = done->get_future();
+    const vk::PipelineLayout layout_handle = *pipeline_layout;
+    QueueBackgroundPipelineBuild([this, device, layout_handle, module, cache = pipeline_cache,
+                                  cancelled = optimize_cancelled, done, use_subgroup_control,
+                                  required_subgroup, debug_str, fast_ms] {
+        for (int i = 0; i < 10 && !cancelled->load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+        if (!cancelled->load()) {
+            const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_ci = {
+                .requiredSubgroupSize = required_subgroup,
+            };
+            const vk::ComputePipelineCreateInfo optimized_ci = {
+                .stage =
+                    {
+                        .pNext = use_subgroup_control ? &subgroup_ci : nullptr,
+                        .stage = vk::ShaderStageFlagBits::eCompute,
+                        .module = module,
+                        .pName = "main",
+                    },
+                .layout = layout_handle,
+            };
+            const auto start = std::chrono::steady_clock::now();
+            auto [result, optimized] = device.createComputePipeline(cache, optimized_ci);
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+            if (result == vk::Result::eSuccess) {
+                optimized_pipeline.store(optimized, std::memory_order_release);
+            }
+            if (fast_ms >= 50.0 || ms >= 50.0) {
+                LOG_INFO(Render_Vulkan,
+                         "PERF-GT7-035: compute pipeline {}: unoptimized in {:.0f} ms, optimized "
+                         "in {:.0f} ms in the background{}",
+                         debug_str, fast_ms, ms,
+                         result == vk::Result::eSuccess ? "" : " (failed; the fast one stays)");
+            }
+        }
+        done->set_value();
+    });
 }
 
-ComputePipeline::~ComputePipeline() = default;
+ComputePipeline::~ComputePipeline() {
+    if (optimize_cancelled) {
+        optimize_cancelled->store(true);
+        // Bounded: a job still queued when the link workers stop at exit never runs.
+        optimize_done.wait_for(std::chrono::seconds{10});
+    }
+    if (const VkPipeline optimized = optimized_pipeline.exchange(VK_NULL_HANDLE)) {
+        instance.GetDevice().destroyPipeline(optimized);
+    }
+}
 
 } // namespace Vulkan
