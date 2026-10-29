@@ -22,12 +22,6 @@ void SetCurrentThreadRealtime(std::chrono::nanoseconds period_ns);
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 
-/// GT7-DISPLAY: asks the system to keep the display (and the machine) on while the calling thread
-/// runs, as games do: Windows otherwise turns the screen off (or dims it) after its idle time,
-/// which a gamepad or a wheel does not reset, and presentation stalled for ~250 ms then.
-/// No effect on other systems.
-void KeepDisplayAwake();
-
 void SetCurrentThreadName(const char* name);
 
 /// PERF-088: on a CPU with fast and slow cores (Intel 12th gen and later), keeps the calling

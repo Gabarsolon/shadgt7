@@ -505,8 +505,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::SetCurrentThreadName("shadGT:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
-    // GT7-DISPLAY: the screen stays on while the game presents (the request ends with this thread).
-    Common::KeepDisplayAwake();
 
     Common::AccurateTimer timer{vblank_period};
 
