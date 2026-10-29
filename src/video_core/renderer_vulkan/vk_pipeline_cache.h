@@ -498,6 +498,7 @@ private:
         u64 dropped{};
         u64 tessellated{}; ///< FIX-GT7-005: not kept
         u64 expired{};     ///< FIX-GT7-015: dropped unretried, no draw waiting
+        u64 failed{};      ///< FIX-GT7-016: their key failed a check (stale code)
     } blocked_stats;
     std::shared_ptr<PipelineBuild> skipped_build; ///< PERF-GT7-020
     std::atomic<u64> catch_up_skips{}; ///< PERF-GT7-029: since the last look

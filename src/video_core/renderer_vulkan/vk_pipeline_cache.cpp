@@ -1566,7 +1566,13 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
         ++evaluated;
         regs_override = &regs;
         S().draw_indirect_params = {};
-        const bool valid = RefreshGraphicsKey();
+        bool valid = false;
+        try {
+            Common::RecoverableScope recoverable; // FIX-GT7-016: as BuildQueuedStates
+            valid = RefreshGraphicsKey();
+        } catch (const Common::RecoverableFailure&) {
+            valid = false;
+        }
         regs_override = nullptr;
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             return false;
@@ -1675,7 +1681,19 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         read_ahead_blocked = false;
         regs_override = queued_state_regs.get();
         S().draw_indirect_params = {};
-        const bool valid = RefreshGraphicsKey();
+        // FIX-GT7-016: a state read ahead (or kept, PERF-GT7-021) may point at shader code the
+        // game has freed and reused since: after a GT7 race, a kept state's vertex shader read
+        // as 0xffffffff, and the fetch-shader lookup's decode assertion ended the process on
+        // the command thread. A failed check drops the state instead.
+        bool valid = false;
+        try {
+            Common::RecoverableScope recoverable;
+            valid = RefreshGraphicsKey();
+        } catch (const Common::RecoverableFailure&) {
+            regs_override = nullptr;
+            ++blocked_stats.failed;
+            return true;
+        }
         regs_override = nullptr;
         if (!valid) {
             return !read_ahead_blocked;
@@ -1788,12 +1806,12 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
                     "({:.1f} ms); {} pending; PERF-GT7-021: {} states kept for their shaders, {} "
                     "evaluated again, {} builds started from them, {} dropped, {} kept now; "
                     "FIX-GT7-005: {} tessellated not kept; FIX-GT7-015: {} expired unretried, "
-                    "{} stale builds cancelled",
+                    "{} stale builds cancelled; FIX-GT7-016: {} failed and dropped",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
                     stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
                     blocked_stats.kept, blocked_stats.retried, blocked_stats.started,
                     blocked_stats.dropped, blocked_states.size(), blocked_stats.tessellated,
-                    blocked_stats.expired, std::exchange(stale_dropped, 0));
+                    blocked_stats.expired, std::exchange(stale_dropped, 0), blocked_stats.failed);
         stats = {};
         stats.since = now;
         blocked_stats = {};
