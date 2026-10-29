@@ -1269,6 +1269,12 @@ void NativeRenderer::GpuTimeCollect() {
     static thread_local std::vector<u64> stamps;
     while (!gpu_timing_pending.empty()) {
         GpuTiming& t = *gpu_timing_pending.front();
+        // FIX-GT7-014: only once the list's submission is done. A pool used before can still
+        // report that use's results until the GPU runs this list's reset: eSuccess alone took
+        // them for this list's, and the pool went back to the free ones while the GPU had it.
+        if (!r.scheduler.IsFree(t.tick)) {
+            break; // later lists come after it
+        }
         stamps.assign(t.used, 0);
         const vk::Result result = vk_device.getQueryPoolResults(
             t.pool, 0, t.used, stamps.size() * sizeof(u64), stamps.data(), sizeof(u64),
