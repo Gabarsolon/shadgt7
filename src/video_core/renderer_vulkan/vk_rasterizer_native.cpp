@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -343,7 +344,28 @@ std::atomic<bool> g_boost_on{[] {
     const char* env = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
     return !(env && env[0] == '0');
 }()};
+// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1; DIAG-GT7-003 switches it while the game runs).
+std::atomic<bool> g_next_on{[] {
+    const char* env = std::getenv("RYGT_NATIVE_NEXT");
+    return env && env[0] == '1';
+}()};
+
+// PERF-GT7-013: the memo tables' slot for a key of a few words (XXH3's cost showed at the
+// ~12 lookups of every draw; a full key compare follows, so only the spread matters).
+u64 MemoHash(const u64* words, size_t count, u64 seed) {
+    u64 h = seed ^ 0x9E3779B97F4A7C15ULL;
+    for (size_t i = 0; i < count; ++i) {
+        h = (h ^ words[i]) * 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 32;
+    }
+    h *= 0xC4CEB9FE1A85EC53ULL;
+    return h ^ (h >> 29);
+}
 } // namespace
+
+bool NativeRenderer::NextOn() {
+    return g_next_on.load(std::memory_order_relaxed);
+}
 
 bool NativeRenderer::ReuseOn() {
     return g_reuse_on.load(std::memory_order_relaxed);
@@ -407,7 +429,8 @@ std::string NativeRenderer::DispatchPartsText() const {
 }
 
 u32 NativeRenderer::AbMode() const {
-    // A, B, and C (B with the GPU threads above normal priority, PERF-GT7-010).
+    // A reference, B the defaults (OPT-013..015, PERF-GT7-006..011), C as B with the changes
+    // under test (PERF-GT7-013..016).
     return u32(ab_window % 3);
 }
 
@@ -603,6 +626,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     if (AbOn()) {
         g_reuse_on.store(false, std::memory_order_relaxed); // DIAG-GT7-003: window 0 is A
         g_boost_on.store(false, std::memory_order_relaxed);
+        g_next_on.store(false, std::memory_order_relaxed);
         RyDiag::SetProfileTag(1);
     }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
@@ -956,6 +980,35 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
         sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
     }
+    // PERF-GT7-015 (C): the samplers this thread looked up last, by raw S#, without the lock and
+    // the hash map (a draw binds ~4; samplers live as long as the renderer).
+    struct CachedSampler {
+        std::array<u64, 2> sharp;
+        u64 extra;
+        vk::Sampler sampler;
+    };
+    static thread_local std::array<CachedSampler, 256> cached{};
+    static_assert(sizeof(AmdGpu::Sampler) == sizeof(std::array<u64, 2>));
+    CachedSampler* cache = nullptr;
+    std::array<u64, 2> raw;
+    std::memcpy(raw.data(), &sharp, sizeof(raw));
+    const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
+    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
+    if (NextOn()) {
+        cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
+        if (cache->sampler && cache->sharp == raw && cache->extra == extra) {
+            return cache->sampler;
+        }
+    }
+    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth);
+    if (cache) {
+        *cache = {raw, extra, sampler};
+    }
+    return sampler;
+}
+
+vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
+                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
@@ -2537,8 +2590,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
     const std::array<u64, 3> memo_key{address, size, flags};
-    BufferMemo& memo =
-        buffer_memos[XXH3_64bits(memo_key.data(), sizeof(memo_key)) & (buffer_memos.size() - 1)];
+    // PERF-GT7-013 (C): a lighter hash than XXH3 (the slot is checked against the whole key).
+    const u64 slot = NextOn() ? MemoHash(memo_key.data(), memo_key.size(), 0)
+                              : XXH3_64bits(memo_key.data(), sizeof(memo_key));
+    BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
     if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
         memo.flags == flags) {
         if (memo.region || memo.mirror) {
@@ -4830,8 +4885,36 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     (void)compute;
 }
 
+size_t NativeRenderer::TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 memo_flags) const {
+    // PERF-GT7-013 (C): a lighter hash than XXH3 (the slot is checked against the whole key).
+    const u64 hash = NextOn() ? MemoHash(raw_sharp.data(), raw_sharp.size(), memo_flags)
+                              : XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp), memo_flags);
+    return hash & (texture_memos.size() - 1);
+}
+
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+    if (NextOn() && stage.images.size() > 1 && !r.FrameDumpCollecting()) {
+        // PERF-GT7-014 (C): the stage's texture memo slots are fetched into the cache first;
+        // each slot's first touch was the costliest line of BindTextures (a 1.4 MB table).
+        for (const auto& image_desc : stage.images) {
+            const auto tsharp = image_desc.GetSharp(stage);
+            if (tsharp.Address() == 0) {
+                continue;
+            }
+            std::array<u64, 4> raw_sharp{};
+            std::memcpy(raw_sharp.data(), &tsharp, sizeof(raw_sharp));
+            const u32 memo_flags = u32(image_desc.is_written) | (u32(image_desc.is_array) << 1) |
+                                   (u32(image_desc.is_depth) << 2) |
+                                   (u32(image_desc.mip_fallback_mode) << 3) |
+                                   ((image_desc.constant_mip_index & 0xff) << 6) |
+                                   (image_desc.NumBindings(stage) << 16);
+            const char* line =
+                reinterpret_cast<const char*>(&texture_memos[TextureMemoSlot(raw_sharp, memo_flags)]);
+            _mm_prefetch(line, _MM_HINT_T0);
+            _mm_prefetch(line + 64, _MM_HINT_T0);
+        }
+    }
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         {
@@ -4962,12 +5045,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
                                (num_bindings << 16);
-        const u32 memo_views = ReuseOn() ? TextureMemoViews : 4u; // PERF-GT7-009
-        if (num_bindings <= memo_views && stage.pgm_hash != 0xaa3822a3 &&
+        if (num_bindings <= TextureMemoViews && stage.pgm_hash != 0xaa3822a3 &&
             !r.FrameDumpCollecting()) {
-            memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
-                                                       memo_flags) &
-                                  (texture_memos.size() - 1)];
+            memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
@@ -10196,7 +10276,8 @@ void NativeRenderer::Report() {
         ++ab_window;
         const u32 mode = AbMode();
         g_reuse_on.store(mode != 0, std::memory_order_relaxed);
-        g_boost_on.store(mode == 2, std::memory_order_relaxed); // PERF-GT7-010
+        g_boost_on.store(mode != 0, std::memory_order_relaxed); // PERF-GT7-010 (B and C)
+        g_next_on.store(mode == 2, std::memory_order_relaxed);  // PERF-GT7-013..016
         targets_memo.valid = false;
         ForgetBindings(stream);
         ForgetBindings(hud_stream);

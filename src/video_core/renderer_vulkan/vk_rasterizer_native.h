@@ -133,6 +133,8 @@ public:
     static bool PreparedOn();
     /// PERF-GT7-010: whether the recorder and the command processor run above normal priority.
     static bool BoostOn();
+    /// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.
+    static bool NextOn();
     /// PERF-GT7-008 (B): on the recorder when it runs out of work, the next list is begun.
     void BeginAhead();
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
@@ -300,6 +302,9 @@ private:
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
                            bool is_depth);
+    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool).
+    vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
+                            bool is_depth);
 
     Stream& Begin();
     void EndRendering();
@@ -473,9 +478,10 @@ private:
     /// OPT-002: what a T# resolved to the last time (picture and views), by the T# and how the
     /// shader reads it, valid while the registry made or dropped no picture and no memory was
     /// unmapped since.
-    /// PERF-GT7-009: B remembers T#s bound with up to 16 views (one per mip for a storage image
-    /// indexed by mip, as GT7's compute passes bind them); A up to 4, as before.
-    static constexpr u32 TextureMemoViews = 16;
+    /// PERF-GT7-012: up to 4 views again. PERF-GT7-009's 16 (for storage images indexed by mip)
+    /// found GT7's compute slots at 1.3 views and doubled the table (3 MB), whose first touch
+    /// at each texture slot was then the recorder's costliest line of BindTextures.
+    static constexpr u32 TextureMemoViews = 4;
     template <u32 Views>
     struct TextureMemoOf {
         std::array<u64, 4> sharp{};
@@ -487,6 +493,7 @@ private:
     using TextureMemo = TextureMemoOf<TextureMemoViews>;
     using JobTextureMemo = TextureMemoOf<4>; ///< OPT-010's, per job thread (thread-local)
     std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
+    size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 memo_flags) const;
     std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
     /// buffer of the list (none when part of it is not imported).
@@ -523,8 +530,8 @@ private:
     /// already did is not done again.
     static bool ReuseOn();
     /// DIAG-GT7-003 (RYGT_NATIVE_AB=1): the changes under test alternate with the reference
-    /// every 10 s report window (A reference, B changes, C as B with the GPU threads above
-    /// normal priority), each window's cost logged.
+    /// every 10 s report window (A reference, B the defaults, C as B with the changes under
+    /// test), each window's cost logged.
     static bool AbOn();
     u32 AbMode() const;
     /// DIAG-GT7-004: the window's dispatch costs by part and piece.

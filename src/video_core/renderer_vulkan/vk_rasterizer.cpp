@@ -1052,7 +1052,16 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // PERF-065: moved, not copied; the selection is recycled after the draw and keeps
             // the shadow's old buffer (its capacity).
             std::swap(info.flattened_ud_buf, selected.flattened);
-            info.flattened_ud_src.assign(info.flattened_ud_buf.size(), 0);
+            // PERF-GT7-016 (C): in native mode only diagnostics read where the dwords came from
+            // (zeros here anyway), so the zero fill at every draw is left out while the size holds.
+            bool keep_sources = false;
+#ifdef RYTY_GPU
+            keep_sources = native && NativeRenderer::NextOn() &&
+                           info.flattened_ud_src.size() == info.flattened_ud_buf.size();
+#endif
+            if (!keep_sources) {
+                info.flattened_ud_src.assign(info.flattened_ud_buf.size(), 0);
+            }
         } else {
             // The sharps are read again from the memory as the recorder sees it now.
             info.RefreshFlatBuf();
