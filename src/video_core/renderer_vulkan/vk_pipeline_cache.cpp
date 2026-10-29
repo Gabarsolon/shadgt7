@@ -835,8 +835,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         static std::jthread slow_motion{SlowMotionThread}; // PERF-103
     }
     // FIX-078: a quarter of the hardware threads (at least 2) translate read-ahead shaders.
+    // PERF-GT7-028: half (8 of 16): at a new track's start, 421 shaders took 4.4 s of translation
+    // in 3.6 s on 4 workers, and draws waited 0.5-0.85 s a frame for theirs.
     if (Common::PerfFeatureEnabled(102)) {
-        const u32 count = std::max(2u, std::thread::hardware_concurrency() / 4);
+        const u32 count = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
         translate_workers =
             std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count);
         translate_stats.since = std::chrono::steady_clock::now();
