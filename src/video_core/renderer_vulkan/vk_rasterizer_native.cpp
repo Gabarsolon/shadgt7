@@ -307,6 +307,21 @@ bool NativeModeRequested() {
             return on;
         }
         const auto value = Common::RytyGameConfigValue("native_renderer");
+#ifdef _WIN32
+        // FIX-231: GT7 does not run on the old renderer (a tester's launches without the setting
+        // hung or stopped at "protect region as write-only"), so GT7.exe always gets the native
+        // renderer unless RYGT_NATIVE=0 says otherwise.
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        const std::wstring name{exe};
+        const std::wstring file = name.substr(name.find_last_of(L"\\/") + 1);
+        if (_wcsicmp(file.c_str(), L"GT7.exe") == 0) {
+            LOG_WARNING(Render_Vulkan, "FIX-231: native renderer on (GT7 always uses it; the "
+                                       "settings say {})",
+                        value ? *value : std::string{"nothing"});
+            return true;
+        }
+#endif
         const bool on = value && *value == "true";
         LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} ({})", on ? "on" : "off",
                     value ? "native_renderer in user\\custom_configs\\CUSA03220.json"
@@ -656,11 +671,11 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     if (info.props.is_block && instance.IsBlockTexelViewSupported()) {
         flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
     }
-    const vk::ImageUsageFlags usage = UsageOf(instance, info);
-    const vk::FormatFeatureFlags2 features = FeaturesOf(usage);
-    const vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
+    vk::ImageUsageFlags usage = UsageOf(instance, info);
+    vk::FormatFeatureFlags2 features = FeaturesOf(usage);
+    vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
     const vk::ImageType type = TypeOf(info.type);
-    const auto properties =
+    auto properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
             .format = format,
             .type = type,
@@ -668,6 +683,44 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
             .usage = usage,
             .flags = flags,
         });
+    // FIX-232: an AMD driver refused BC6H images with storage use (about two million lookups
+    // of a tester's session found no image: textures missing). Such an image is made without
+    // the storage use (and the block-texel-view flag that goes with it): it is still sampled
+    // and copied as the game does with it. RYGT_BLOCK_NO_STORAGE_FALLBACK=1 keeps the old way.
+    static const bool fallback = [] {
+        const char* env = std::getenv("RYGT_BLOCK_NO_STORAGE_FALLBACK");
+        return !(env && env[0] == '1');
+    }();
+    if (properties.result != vk::Result::eSuccess && fallback &&
+        (usage & vk::ImageUsageFlagBits::eStorage)) {
+        const vk::ImageUsageFlags reduced = usage & ~vk::ImageUsageFlagBits::eStorage;
+        const vk::ImageCreateFlags reduced_flags =
+            flags & ~vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+        const vk::Format reduced_format =
+            instance.GetSupportedFormat(info.pixel_format, FeaturesOf(reduced));
+        auto retry = instance.GetPhysicalDevice().getImageFormatProperties2(
+            vk::PhysicalDeviceImageFormatInfo2{
+                .format = reduced_format,
+                .type = type,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = reduced,
+                .flags = reduced_flags,
+            });
+        if (retry.result == vk::Result::eSuccess) {
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-232: format {} ({}x{}) made without storage use (the driver "
+                            "refuses it with storage)",
+                            vk::to_string(format), info.size.width, info.size.height);
+            }
+            usage = reduced;
+            flags = reduced_flags;
+            format = reduced_format;
+            features = FeaturesOf(reduced);
+            properties = retry;
+        }
+    }
     if (properties.result != vk::Result::eSuccess) {
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
