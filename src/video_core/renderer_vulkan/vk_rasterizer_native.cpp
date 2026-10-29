@@ -9228,6 +9228,23 @@ void NativeRenderer::EvictImages() {
         const char* env = std::getenv("RYGT_NATIVE_KEEP_TEXTURES_MB");
         return (env && *env ? std::strtoull(env, nullptr, 10) : u64{2048}) << 20;
     }();
+    // PERF-GT7-011: only textures the game loaded and left alone: uploaded at most twice, never
+    // rewritten by GPU work nor made of targets, and at most 4 at one address. Keeping every idle
+    // texture kept those GT7 makes in its scratch pool (0x100a0b0000, a new layout every few
+    // frames, rewritten by compute passes): 2,600 pictures at that one address after 19 minutes,
+    // walked by every lookup, CPU write and GPU write there (ImageRegistry::Find took 5% of the
+    // recorder; 2.5 million textures made stale by CPU writes every 10 s).
+    const auto loaded_texture = [](Native::ImageEntry& entry) {
+        if (entry.total_uploads.load(std::memory_order_relaxed) > 2 ||
+            entry.last_stale == u8(Native::ImageRegistry::Stale::GpuWrite) ||
+            entry.force_upload.load(std::memory_order_relaxed) ||
+            entry.gpu_rewritten.load(std::memory_order_relaxed) != 0 ||
+            entry.foreign_clock.load(std::memory_order_relaxed) != 0) {
+            return false;
+        }
+        std::scoped_lock lock{entry.sources_mutex};
+        return entry.sources.empty();
+    };
     std::unordered_set<const Native::ImageEntry*> kept_textures;
     if (texture_budget != 0) {
         std::vector<Native::ImageEntry*> idle;
@@ -9240,12 +9257,17 @@ void NativeRenderer::EvictImages() {
         std::ranges::sort(idle, std::greater{}, [](const Native::ImageEntry* entry) {
             return entry->last_use.load(std::memory_order_relaxed);
         });
+        std::unordered_map<VAddr, u32> kept_at;
         u64 bytes = 0;
-        for (const Native::ImageEntry* entry : idle) {
+        for (Native::ImageEntry* entry : idle) {
+            if (!loaded_texture(*entry) || kept_at[entry->info.guest_address] >= 4) {
+                continue;
+            }
             bytes += std::max<u64>(entry->info.guest_size, 1);
             if (bytes > texture_budget) {
                 break;
             }
+            ++kept_at[entry->info.guest_address];
             kept_textures.insert(entry);
         }
     }
@@ -10019,6 +10041,23 @@ void NativeRenderer::Report() {
     std::string crowded;
     for (const auto& [address, count] : registry->Crowded(4)) {
         crowded += fmt::format(" {:#x} x{};", address, count);
+        if (crowded.size() < 40) {
+            // PERF-GT7-011: what the busiest address holds (textures, of them idle and made of
+            // targets).
+            u32 textures = 0, idle = 0, made_of_targets = 0;
+            registry->ForEachOverlapping(address, address + 1, [&](Native::ImageEntry& entry) {
+                if (entry.info.guest_address != address || !entry.from_cpu) {
+                    return;
+                }
+                ++textures;
+                idle += entry.last_use.load(std::memory_order_relaxed) + 120 < frame ? 1 : 0;
+                std::scoped_lock lock{entry.sources_mutex};
+                made_of_targets += entry.sources.empty() ? 0 : 1;
+            });
+            crowded.pop_back();
+            crowded += fmt::format(" ({} textures, {} idle, {} made of targets);", textures, idle,
+                                   made_of_targets);
+        }
     }
     LOG_INFO(Render_Vulkan,
              "NAT-108 images (10 s): {} uploads ({:.1f} MB), {} skipped as unchanged (NAT-109), "

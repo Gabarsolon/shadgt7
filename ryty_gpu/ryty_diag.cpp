@@ -731,9 +731,10 @@ void WriteSpike(const State::SpikeRequest& req) {
         flip_gap >= req.median + 0.5 * excess ? "the game itself was late"
                                               : "the game was on time: the delay is after the flip");
     // DIAG-GT7-006: past 400 spikes only their first lines are written, except for stalls of a
-    // second and more (a 6 s freeze late in a mission kept nothing), and each entry reaches the
-    // file at once (the short ones stayed in the buffer and were lost when the game closed).
-    if (number > 400 && req.ms < 1000.0) {
+    // second and more (a 6 s freeze late in a mission kept nothing) and every 10th spike (the
+    // race after 20 minutes of other ones had no detailed spike), and each entry reaches the file
+    // at once (the short ones stayed in the buffer and were lost when the game closed).
+    if (number > 400 && req.ms < 1000.0 && number % 10 != 0) {
         std::fputs(text.c_str(), s.spikes_txt);
         std::fflush(s.spikes_txt);
         return;
