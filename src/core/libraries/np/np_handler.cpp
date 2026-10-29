@@ -25,6 +25,9 @@
 #include "np_handler.h"
 #include "shadnet.pb.h"
 #include "shadnet/server_probe.h"
+#ifdef RYTY_NP_LIBRARY
+#include "ryty_gpu/ryty_np_p2p.h"
+#endif
 
 namespace Libraries::Np {
 
@@ -288,6 +291,9 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
     }
 
     NpMatching2::SetMmShadNetClient(client, host, port);
+#ifdef RYTY_NP_LIBRARY
+    Ryty::InstallSignaling();
+#endif
 
     // Build OrbisNpId
     {

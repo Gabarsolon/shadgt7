@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -712,6 +714,12 @@ s32 sendRequest(s64 request_id, s32 part_index, void* data, u64 data_size,
             if (result >= 0) {
                 if (resp_info_option) {
                     resp_info_option->http_status = http_status;
+                    // Games size their read buffer from this (the Content-Length).
+                    char length[32]{};
+                    if (request->ParseHttpResponseHeaders("Content-Length", length,
+                                                          sizeof(length) - 1, nullptr) >= 0) {
+                        resp_info_option->response_data_size = std::strtoull(length, nullptr, 10);
+                    }
                 }
                 if (http_status >= 400) {
                     result = http_status | 0x82f00000;

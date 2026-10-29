@@ -10,6 +10,9 @@
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/np/np_web_api2/np_web_api2.h"
 #include "core/libraries/np/np_web_api2/np_web_api2_internal.h"
+#ifdef RYTY_NP_LIBRARY
+#include "core/libraries/network/http.h"
+#endif
 #include "core/libraries/system/userservice.h"
 
 namespace Libraries::Np::NpWebApi2 {
@@ -159,12 +162,26 @@ s32 PS4_SYSV_ABI sceNpWebApi2GetMemoryPoolStats(s32 lib_ctx_id,
     return getMemoryPoolStats(lib_ctx_id, stats);
 }
 
+namespace {
+// In Ryty the game's libSceHttp2 is not this library's: its HTTP context IDs mean nothing to the
+// HTTP library the web API sends through, so the web API makes a context of its own.
+s32 HttpContextFor(s32 lib_http_ctx_id, u64 pool_size) {
+#ifdef RYTY_NP_LIBRARY
+    const s32 own = Libraries::Http::sceHttpInit(0, 0, pool_size != 0 ? pool_size : 0x10000);
+    if (own > 0) {
+        return own;
+    }
+#endif
+    return lib_http_ctx_id;
+}
+} // namespace
+
 s32 PS4_SYSV_ABI sceNpWebApi2Initialize(s32 lib_http_ctx_id, u64 pool_size) {
     LOG_DEBUG(Lib_NpWebApi2, "called, lib_http_ctx_id = {:#x}, pool_size = {:#x}", lib_http_ctx_id,
               pool_size);
 
     // Uses a sceLncUtilGetAppStatus check to enable debug mode. For now, default to normal.
-    s32 ctx_id = createLibraryContext(lib_http_ctx_id, 1, pool_size, nullptr);
+    s32 ctx_id = createLibraryContext(HttpContextFor(lib_http_ctx_id, pool_size), 1, pool_size, nullptr);
     if (ctx_id > 0) {
         LOG_INFO(Lib_NpWebApi2, "created lib_ctx_id = {:#x}", ctx_id);
     }
@@ -175,7 +192,7 @@ s32 PS4_SYSV_ABI sceNpWebApi2InitializeForPresence(s32 lib_http_ctx_id, u64 pool
     LOG_DEBUG(Lib_NpWebApi2, "called, lib_http_ctx_id = {:#x}, pool_size = {:#x}", lib_http_ctx_id,
               pool_size);
 
-    s32 ctx_id = createLibraryContext(lib_http_ctx_id, 3, pool_size, nullptr);
+    s32 ctx_id = createLibraryContext(HttpContextFor(lib_http_ctx_id, pool_size), 3, pool_size, nullptr);
     if (ctx_id > 0) {
         LOG_INFO(Lib_NpWebApi2, "created lib_ctx_id = {:#x}", ctx_id);
     }

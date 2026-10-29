@@ -18,6 +18,13 @@
 #include "core/libraries/np/np_signaling/np_signaling_helpers.h"
 #include "core/libraries/np/np_signaling/np_signaling_state.h"
 #include "core/libraries/np/np_signaling/np_signaling_stubs.h"
+#ifdef RYTY_NP_LIBRARY
+#include "ryty_gpu/ryty_np_p2p.h"
+
+namespace Libraries::Np::NpManager {
+s32 PS4_SYSV_ABI sceNpGetAccountIdA(Libraries::UserService::OrbisUserServiceUserId user_id, u64* account_id);
+}
+#endif
 
 namespace Libraries::Np::NpSignaling {
 
@@ -202,8 +209,15 @@ s32 PS4_SYSV_ABI sceNpSignalingCreateContextA(s32 userId, void* callback, void* 
     if (npid_rc < 0) {
         return npid_rc;
     }
+#ifdef RYTY_NP_LIBRARY
+    // Other players find this one through RyGTServer, by online ID or PSN account ID.
+    u64 account_id = 0;
+    NpManager::sceNpGetAccountIdA(userId, &account_id);
+    Ryty::RegisterPlayer(OnlineIdToString(owner_npid.handle), account_id);
+#else
     // Account id isn't needed without matchmaking wired up; leave it 0 for now.
     const OrbisNpAccountId account_id = 0;
+#endif
 
     const bool transport_ready = Stubs::EnsureTransport();
 
@@ -394,6 +408,21 @@ s32 PS4_SYSV_ABI sceNpSignalingActivateConnection(OrbisNpSignalingContextId ctxI
 s32 PS4_SYSV_ABI sceNpSignalingActivateConnectionA(
     OrbisNpSignalingContextId ctxId, const OrbisNpSignalingAccountPlatformPair* peerAddr,
     OrbisNpSignalingConnectionId* outConnId) {
+#ifdef RYTY_NP_LIBRARY
+    // GT Sport's lobby connects to players by PSN account ID. RyGTServer knows which online ID
+    // each account belongs to; from there it is the same handshake as by online ID.
+    if (peerAddr && peerAddr->accountId != 0 && outConnId) {
+        std::string online_id;
+        if (!Ryty::OnlineIdForAccount(peerAddr->accountId, &online_id)) {
+            LOG_WARNING(Lib_NpSignaling, "account {} is not registered with RyGTServer", peerAddr->accountId);
+            return ORBIS_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
+        }
+        OrbisNpId peer_npid{};
+        SetNpId(peer_npid, online_id);
+        LOG_INFO(Lib_NpSignaling, "ctxId={} account {} is '{}'", ctxId, peerAddr->accountId, online_id);
+        return sceNpSignalingActivateConnection(ctxId, &peer_npid, outConnId);
+    }
+#endif
     SignalingMutexGuard lock;
     if (!g_initialized) {
         return ORBIS_NP_SIGNALING_ERROR_NOT_INITIALIZED;
@@ -537,6 +566,36 @@ s32 PS4_SYSV_ABI sceNpSignalingGetConnectionInfo(OrbisNpSignalingContextId ctxId
 s32 PS4_SYSV_ABI sceNpSignalingGetConnectionInfoA(OrbisNpSignalingContextId ctxId,
                                                   OrbisNpSignalingConnectionId connId, s32 infoCode,
                                                   void* outInfo) {
+#ifdef RYTY_NP_LIBRARY
+    // The peer's PSN account (shadPS4 answers with this player's own): looked up from the peer's
+    // online ID outside the signaling lock.
+    if (infoCode == ORBIS_NP_SIGNALING_CONN_INFO_PEER_ADDRESS_A && outInfo) {
+        std::string online_id;
+        {
+            SignalingMutexGuard lock;
+            if (!g_initialized) {
+                return ORBIS_NP_SIGNALING_ERROR_NOT_INITIALIZED;
+            }
+            if (!IsContextValidLocked(ctxId)) {
+                return ORBIS_NP_SIGNALING_ERROR_CTX_NOT_FOUND;
+            }
+            const auto it = g_connections.find(connId);
+            if (it == g_connections.end() || it->second.ctx_id != ctxId) {
+                return ORBIS_NP_SIGNALING_ERROR_CONN_NOT_FOUND;
+            }
+            online_id = OnlineIdToString(it->second.online_id);
+        }
+        u64 account = 0;
+        if (online_id.empty() || !Ryty::AccountForOnlineId(online_id, &account)) {
+            return ORBIS_NP_SIGNALING_ERROR_CONN_IN_PROGRESS;
+        }
+        auto* pair = static_cast<OrbisNpSignalingAccountPlatformPair*>(outInfo);
+        pair->accountId = account;
+        pair->platformType = 1;  // PS4
+        pair->_pad_0c = 0;
+        return ORBIS_OK;
+    }
+#endif
     SignalingMutexGuard lock;
     if (!g_initialized) {
         return ORBIS_NP_SIGNALING_ERROR_NOT_INITIALIZED;
@@ -621,6 +680,31 @@ sceNpSignalingGetConnectionFromPeerAddress(OrbisNpSignalingContextId ctxId, u32 
 s32 PS4_SYSV_ABI sceNpSignalingGetConnectionFromPeerAddressA(
     OrbisNpSignalingContextId ctxId, const OrbisNpSignalingAccountPlatformPair* peerAddr,
     OrbisNpSignalingConnectionId* outConnId) {
+#ifdef RYTY_NP_LIBRARY
+    // The connection to the player with this PSN account: RyGTServer says which online ID it is
+    // (remembered from sceNpSignalingActivateConnectionA, so normally no request is made).
+    if (peerAddr && outConnId && peerAddr->accountId != 0) {
+        std::string online_id;
+        if (!Ryty::OnlineIdForAccount(peerAddr->accountId, &online_id)) {
+            return ORBIS_NP_SIGNALING_ERROR_CONN_NOT_FOUND;
+        }
+        SignalingMutexGuard lock;
+        if (!g_initialized) {
+            return ORBIS_NP_SIGNALING_ERROR_NOT_INITIALIZED;
+        }
+        if (!IsContextValidLocked(ctxId)) {
+            return ORBIS_NP_SIGNALING_ERROR_CTX_NOT_FOUND;
+        }
+        for (const auto& [conn_id, ci] : g_connections) {
+            if (ci.ctx_id == ctxId && ci.state != ConnState::Inactive && !ci.dead_fired &&
+                OnlineIdEqualsString(ci.online_id, online_id)) {
+                *outConnId = conn_id;
+                return ORBIS_OK;
+            }
+        }
+        return ORBIS_NP_SIGNALING_ERROR_CONN_NOT_FOUND;
+    }
+#endif
     SignalingMutexGuard lock;
     if (!g_initialized) {
         return ORBIS_NP_SIGNALING_ERROR_NOT_INITIALIZED;

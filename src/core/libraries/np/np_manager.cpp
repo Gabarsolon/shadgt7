@@ -312,6 +312,36 @@ s32 PS4_SYSV_ABI sceNpGetAccountLanguageA(s32 req_id,
     return CompleteRequest(*req, ORBIS_OK);
 }
 
+// The language as a BCP 47 tag ("en-US"): the profile's language and country. GT7 reads it once
+// signed in and crashes on a request left without a result.
+s32 PS4_SYSV_ABI sceNpGetAccountLanguage2(s32 req_id,
+                                          Libraries::UserService::OrbisUserServiceUserId user_id,
+                                          OrbisNpLanguageCode* language) {
+    if (language == nullptr ||
+        user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    std::scoped_lock lk{g_request_mutex};
+    s32 err;
+    NpRequest* req = GetRequest(req_id, &err);
+    if (!req)
+        return err;
+    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+        return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
+    }
+    FillLanguageCodeFromProfile(user_id, language);
+    OrbisNpCountryCode country{};
+    FillCountryCodeFromProfile(user_id, &country);
+    if (country.country_code[0] != '\0') {
+        language->code[2] = '-';
+        language->code[3] = static_cast<char>(std::toupper(static_cast<unsigned char>(country.country_code[0])));
+        language->code[4] = static_cast<char>(std::toupper(static_cast<unsigned char>(country.country_code[1])));
+        language->code[5] = '\0';
+    }
+    LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}, language = {}", req_id, user_id, language->code);
+    return CompleteRequest(*req, ORBIS_OK);
+}
+
 s32 PS4_SYSV_ABI sceNpGetParentalControlInfo(s32 req_id, OrbisNpOnlineId* online_id, s8* age,
                                              OrbisNpParentalControlInfo* info) {
     if (online_id == nullptr || age == nullptr || info == nullptr) {
@@ -1231,6 +1261,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("r6MyYJkryz8", "libSceNpManager", 1, "libSceNpManager", sceNpCheckPlus);
     LIB_FUNCTION("KZ1Mj9yEGYc", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountLanguage);
     LIB_FUNCTION("TPMbgIxvog0", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountLanguageA);
+    LIB_FUNCTION("3Tcz5bNCfZQ", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountLanguage2);
     LIB_FUNCTION("ilwLM4zOmu4", "libSceNpManager", 1, "libSceNpManager",
                  sceNpGetParentalControlInfo);
     LIB_FUNCTION("m9L3O6yst-U", "libSceNpManager", 1, "libSceNpManager",

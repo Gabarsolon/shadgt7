@@ -1,13 +1,16 @@
 // Stand-ins for the emulator services shadGT's NP libraries call directly. In the Ryty build the
 // game's threads, mutexes and memory belong to Ryty's libkernel, so the kernel calls forward to it
-// by NID. The NP bundle runs offline, so the network, HTTP and overlay calls report failure or do
-// nothing.
+// by NID. HTTP forwards to Ryty's libSceHttp and the P2P transport is in ryty_np_p2p.cpp; overlay
+// calls do nothing.
 
+#include <mutex>
+#include <unordered_map>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "common/logging/log.h"
@@ -229,8 +232,9 @@ int PS4_SYSV_ABI sceNetInetPton(int af, const char* src, void* dst) {
     return inet_pton(af == 28 ? AF_INET6 : af, src, dst);
 }
 // NpSignaling opens a P2P datagram socket at startup only to probe it, and treats a failure as
-// fatal (its cleanup then deadlocks). Ryty's libSceNet has no P2P sockets, so those get a
-// placeholder descriptor; other sockets are Ryty's.
+// fatal (its cleanup then deadlocks). That probe gets a placeholder descriptor, so it never claims
+// a virtual port in Ryty's libSceNet (ryty_np_p2p.cpp opens the real signaling socket); other
+// sockets are Ryty's.
 constexpr OrbisNetId FirstP2PPlaceholder = 0x10000;
 std::atomic<OrbisNetId> g_next_p2p_placeholder{FirstP2PPlaceholder};
 
@@ -254,36 +258,7 @@ int PS4_SYSV_ABI sceNetIoctl() {
     return ORBIS_OK;
 }
 
-u16 GetP2PConfiguredPort() {
-    return 0;
-}
-u32 GetP2PAdvertisedAddr() {
-    return 0;
-}
-bool EnsureP2PTransport() {
-    return false;
-}
-bool P2PTransportIsReady() {
-    return false;
-}
-int P2PSignalingSendTo(const void*, u32, u32, u16) {
-    return -1;
-}
-int P2PSignalingRecvFrom(void*, u32, u32*, u16*) {
-    return -1;
-}
-int P2PControlSendTo(const void*, u32, u32, u16) {
-    return -1;
-}
-int P2PControlRecvFrom(void*, u32, u32*, u16*) {
-    return -1;
-}
-int P2PMatching2SendTo(const void*, u32, u32, u16) {
-    return -1;
-}
-int P2PMatching2RecvFrom(void*, u32, u32*, u16*) {
-    return -1;
-}
+// The P2P transport for NpSignaling is in ryty_np_p2p.cpp.
 
 } // namespace Libraries::Net
 
@@ -298,81 +273,167 @@ int PS4_SYSV_ABI sceNetCtlGetNatInfo(OrbisNetCtlNatInfo* nat_info) {
 }
 } // namespace Libraries::NetCtl
 
+// The NP web API's HTTP goes through Ryty's libSceHttp, the library the game's own HTTP uses: the
+// game hands NpWebApi an HTTP context it made there. Without it the shadNet web API is unreachable.
+#define RYTY_HTTP(nid, ...)                                                                        \
+    static const auto fn = RytyExport<int(PS4_SYSV_ABI*)(__VA_ARGS__)>("libSceHttp.prx", nid);     \
+    if (fn == nullptr) {                                                                           \
+        return ErrorOffline;                                                                       \
+    }                                                                                              \
+    return fn
+
 namespace Libraries::Http {
-int PS4_SYSV_ABI sceHttpCreateTemplate(int, const char*, int, int) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpCreateTemplate(int ctx, const char* agent, int version, int proxy) {
+    RYTY_HTTP("0gYjPTR-6cY", int, const char*, int, int)(ctx, agent, version, proxy);
 }
-int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int, const char*, bool) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmpl, const char* url, bool keep_alive) {
+    RYTY_HTTP("qgxDBjorUxs", int, const char*, int)(tmpl, url, keep_alive ? 1 : 0);
 }
-int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int, s32, const char*, u64) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int conn, s32 method, const char* url, u64 length) {
+    RYTY_HTTP("Aeu5wVKkF9w", int, s32, const char*, u64)(conn, method, url, length);
 }
-int PS4_SYSV_ABI sceHttpAddRequestHeader(int, const char*, const char*, s32) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpAddRequestHeader(int id, const char* name, const char* value, s32 mode) {
+    RYTY_HTTP("EY28T2bkN7k", int, const char*, const char*, u32)(id, name, value,
+                                                                 static_cast<u32>(mode));
 }
-int PS4_SYSV_ABI sceHttpSendRequest(int, const void*, u64) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpSendRequest(int req, const void* data, u64 size) {
+    RYTY_HTTP("1e2BNwI-XzE", int, const void*, u64)(req, data, size);
 }
-int PS4_SYSV_ABI sceHttpReadData(s32, void*, u64) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpReadData(s32 req, void* data, u64 size) {
+    RYTY_HTTP("P5pdoykPYTk", s32, void*, u64)(req, data, size);
 }
-int PS4_SYSV_ABI sceHttpGetAllResponseHeaders(int, char**, u64*) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpGetAllResponseHeaders(int req, char** header, u64* size) {
+    RYTY_HTTP("aCYPMSUIaP8", int, char**, u64*)(req, header, size);
 }
-int PS4_SYSV_ABI sceHttpGetStatusCode(int, int*) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpGetStatusCode(int req, int* status) {
+    RYTY_HTTP("0a2TBNfE3BU", int, int*)(req, status);
 }
-int PS4_SYSV_ABI sceHttpParseResponseHeader(const char*, u64, const char*, const char**, u64*) {
-    return ErrorOffline;
+int PS4_SYSV_ABI sceHttpParseResponseHeader(const char* header, u64 length, const char* field,
+                                            const char** value, u64* value_length) {
+    RYTY_HTTP("hPTXo3bICzI", const char*, u64, const char*, const char**, u64*)(
+        header, length, field, value, value_length);
 }
-int PS4_SYSV_ABI sceHttpDeleteConnection(int) {
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpDeleteConnection(int conn) {
+    RYTY_HTTP("P6A3ytpsiYc", int)(conn);
 }
-int PS4_SYSV_ABI sceHttpDeleteTemplate(int) {
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpDeleteTemplate(int tmpl) {
+    RYTY_HTTP("4I8vEpuEhZ8", int)(tmpl);
 }
-int PS4_SYSV_ABI sceHttpDeleteRequest(int) {
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpDeleteRequest(int req) {
+    RYTY_HTTP("qe7oZ+v4PWA", int)(req);
+}
+int PS4_SYSV_ABI sceHttpInit(int memid, int ssl_ctx, u64 pool_size) {
+    RYTY_HTTP("A9cVMUtEp4Y", int, int, u64)(memid, ssl_ctx, pool_size);
+}
+int PS4_SYSV_ABI sceHttpCreateRequestWithURL2(int conn, const char* method, const char* url, u64 length) {
+    RYTY_HTTP("Cnp77podkCU", int, const char*, const char*, u64)(conn, method, url, length);
+}
+int PS4_SYSV_ABI sceHttpSetRequestContentLength(int req, u64 length) {
+    RYTY_HTTP("PTiFIUxCpJc", int, u64)(req, length);
 }
 } // namespace Libraries::Http
 
+#undef RYTY_HTTP
+
+// The web API's HTTP/2 goes out through the game's libSceHttp (RyGT's, which sends it to
+// RyGTServer) as HTTP/1.1: a template is a libSceHttp template, and a request gets a connection
+// of its own.
 namespace Libraries::Http2 {
-s32 PS4_SYSV_ABI sceHttp2CreateTemplate(s32, const char*, s32, s32) {
-    return ErrorOffline;
+namespace {
+std::mutex g_connections_mutex;
+std::unordered_map<s32, s32> g_connections; // request -> its connection
+} // namespace
+
+s32 PS4_SYSV_ABI sceHttp2CreateTemplate(s32 ctx, const char* agent, s32, s32 proxy) {
+    const s32 result = Libraries::Http::sceHttpCreateTemplate(ctx, agent, 2 /* HTTP/1.1 */, proxy);
+    LOG_INFO(Lib_NpWebApi2, "HTTP template for context {}: {:#x}", ctx, result);
+    return result;
 }
-s32 PS4_SYSV_ABI sceHttp2CreateRequestWithURL(s32, const char*, const char*, u64) {
-    return ErrorOffline;
+// PSN calls shadNet does not answer go to RyGTServer (online_server in RyGT.ini) as
+// /rygt/psn/<path>.
+std::string RouteUrl(const char* url) {
+    static const std::string server = [] {
+        std::string value;
+        if (std::FILE* ini = std::fopen("RyGT.ini", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof(line), ini)) {
+                if (std::strncmp(line, "online_server=", 14) == 0) {
+                    value = line + 14;
+                    value.erase(value.find_last_not_of(" \r\n") + 1);
+                }
+            }
+            std::fclose(ini);
+        }
+        return value;
+    }();
+    const std::string full = url;
+    const auto scheme = full.find("://");
+    const auto slash = scheme == std::string::npos ? std::string::npos : full.find('/', scheme + 3);
+    if (server.empty() || slash == std::string::npos) {
+        return full;
+    }
+    const std::string path = full.substr(slash);
+    if (path.rfind("/v3/users/me/communication/restriction/status", 0) == 0 ||
+        path.rfind("/v2/profanity/filter/", 0) == 0 || path.rfind("/v1/gameSessions", 0) == 0 ||
+        path.rfind("/v1/playerSessions", 0) == 0 || path.rfind("/v1/matches", 0) == 0) {
+        return "http://" + server + "/rygt/psn" + path;
+    }
+    return full;
 }
-s32 PS4_SYSV_ABI sceHttp2AddRequestHeader(s32, const char*, const char*, u32) {
-    return ErrorOffline;
+
+s32 PS4_SYSV_ABI sceHttp2CreateRequestWithURL(s32 tmpl, const char* method, const char* original_url, u64 length) {
+    const std::string routed = RouteUrl(original_url);
+    const char* url = routed.c_str();
+    const s32 conn = Libraries::Http::sceHttpCreateConnectionWithURL(tmpl, url, true);
+    if (conn < 0) {
+        LOG_ERROR(Lib_NpWebApi2, "connection to {} (template {}) failed: {:#x}", url, tmpl, conn);
+        return conn;
+    }
+    const s32 req = Libraries::Http::sceHttpCreateRequestWithURL2(conn, method, url, length);
+    if (req < 0) {
+        LOG_ERROR(Lib_NpWebApi2, "{} request to {} failed: {:#x}", method, url, req);
+        Libraries::Http::sceHttpDeleteConnection(conn);
+        return req;
+    }
+    std::lock_guard lock(g_connections_mutex);
+    g_connections[req] = conn;
+    return req;
 }
-s32 PS4_SYSV_ABI sceHttp2SetRequestContentLength(s32, u64) {
-    return ErrorOffline;
+s32 PS4_SYSV_ABI sceHttp2AddRequestHeader(s32 req, const char* name, const char* value, u32 mode) {
+    return Libraries::Http::sceHttpAddRequestHeader(req, name, value, static_cast<s32>(mode));
+}
+s32 PS4_SYSV_ABI sceHttp2SetRequestContentLength(s32 req, u64 length) {
+    return Libraries::Http::sceHttpSetRequestContentLength(req, length);
 }
 s32 PS4_SYSV_ABI sceHttp2SetPreSendCallback(s32, OrbisHttp2PreSendCallback, void*) {
-    return ErrorOffline;
+    return ORBIS_OK; // shadGT's web API callback does nothing yet
 }
-s32 PS4_SYSV_ABI sceHttp2SendRequest(s32, const void*, u64) {
-    return ErrorOffline;
+s32 PS4_SYSV_ABI sceHttp2SendRequest(s32 req, const void* data, u64 size) {
+    return Libraries::Http::sceHttpSendRequest(req, data, size);
 }
-s32 PS4_SYSV_ABI sceHttp2ReadData(s32, void*, u64) {
-    return ErrorOffline;
+s32 PS4_SYSV_ABI sceHttp2ReadData(s32 req, void* data, u64 size) {
+    return Libraries::Http::sceHttpReadData(req, data, size);
 }
-s32 PS4_SYSV_ABI sceHttp2GetAllResponseHeaders(s32, char**, u64*) {
-    return ErrorOffline;
+s32 PS4_SYSV_ABI sceHttp2GetAllResponseHeaders(s32 req, char** header, u64* size) {
+    return Libraries::Http::sceHttpGetAllResponseHeaders(req, header, size);
 }
-s32 PS4_SYSV_ABI sceHttp2GetStatusCode(s32, s32*) {
-    return ErrorOffline;
+s32 PS4_SYSV_ABI sceHttp2GetStatusCode(s32 req, s32* status) {
+    return Libraries::Http::sceHttpGetStatusCode(req, status);
 }
 s32 PS4_SYSV_ABI sceHttp2AbortRequest(s32) {
     return ORBIS_OK;
 }
-s32 PS4_SYSV_ABI sceHttp2DeleteRequest(s32) {
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceHttp2DeleteRequest(s32 req) {
+    const s32 result = Libraries::Http::sceHttpDeleteRequest(req);
+    std::lock_guard lock(g_connections_mutex);
+    if (const auto it = g_connections.find(req); it != g_connections.end()) {
+        Libraries::Http::sceHttpDeleteConnection(it->second);
+        g_connections.erase(it);
+    }
+    return result;
 }
-s32 PS4_SYSV_ABI sceHttp2DeleteTemplate(s32) {
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceHttp2DeleteTemplate(s32 tmpl) {
+    return Libraries::Http::sceHttpDeleteTemplate(tmpl);
 }
 } // namespace Libraries::Http2
 

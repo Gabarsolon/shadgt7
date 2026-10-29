@@ -222,11 +222,11 @@ foreach(source ${RYTY_NP_SOURCES})
 endforeach()
 ryty_add_library(ryty_np libSceNpAuth
     EXPORT_SOURCES ${RYTY_NP_EXPORT_SOURCES}
-    SOURCES ${RYTY_NP_SOURCES} ${SHADNET} ryty_gpu/ryty_np_entry.cpp ryty_gpu/ryty_np_shims.cpp
+    SOURCES ${RYTY_NP_SOURCES} ${SHADNET} ryty_gpu/ryty_np_entry.cpp ryty_gpu/ryty_np_shims.cpp ryty_gpu/ryty_np_p2p.cpp ryty_gpu/ryty_game_log.cpp
             ryty_gpu/ryty_hle_stubs.cpp src/core/libraries/network/net_upnp.cpp
             src/core/libraries/network/net_util.cpp
 )
-target_compile_definitions(ryty_np PRIVATE RYTY_GUEST_PTHREADS)
+target_compile_definitions(ryty_np PRIVATE RYTY_GUEST_PTHREADS RYTY_NP_LIBRARY)
 target_link_libraries(ryty_np PRIVATE libprotobuf Cpp_Httplib minimp3 miniupnpc::miniupnpc ws2_32 iphlpapi)
 target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
 
