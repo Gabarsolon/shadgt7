@@ -252,6 +252,7 @@ struct DriverCompileThreads {
     std::unordered_map<DWORD, Thread> threads; ///< unnamed threads still looked at, and confined
     std::unordered_map<DWORD, bool> left;      ///< threads not looked at again
     std::atomic<int> wide{0};
+    bool applied_wide = false; ///< FIX-GT7-008: what the confined threads have (under mutex)
     u32 calls = 0;
     u32 reports = 0;
 };
@@ -380,7 +381,7 @@ void ConfineDriverCompileThreads() {
         }
         if (ip >= compiler_begin && ip < compiler_end) {
             thread.confined = true;
-            ApplyCompileCores(thread.handle, d.wide.load() > 0);
+            ApplyCompileCores(thread.handle, d.applied_wide);
             ++found;
         } else if (++thread.outside >= 12) {
             // Busy, but never in the compiler when looked at.
@@ -414,15 +415,19 @@ void ConfineDriverCompileThreads() {
 
 void SetCompileCoresWide(bool wide) {
     auto& d = DriverThreads();
-    const int before = d.wide.fetch_add(wide ? 1 : -1);
-    const int after = before + (wide ? 1 : -1);
-    if ((before > 0) == (after > 0)) {
+    // FIX-GT7-008: the count changes and the threads follow it under one lock. Applied from the
+    // count read before the lock, two transitions at once could leave the threads on the cores
+    // the earlier one asked for (all cores with the count at 0, or the other way round).
+    std::scoped_lock lk{d.mutex};
+    d.wide.fetch_add(wide ? 1 : -1);
+    const bool want = d.wide.load() > 0;
+    if (want == d.applied_wide) {
         return;
     }
-    std::scoped_lock lk{d.mutex};
+    d.applied_wide = want;
     for (const auto& [tid, thread] : d.threads) {
         if (thread.confined) {
-            ApplyCompileCores(thread.handle, after > 0);
+            ApplyCompileCores(thread.handle, want);
         }
     }
 }
