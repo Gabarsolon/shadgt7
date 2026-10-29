@@ -157,7 +157,9 @@ public:
         return std::move(skipped_build);
     }
     /// PERF-GT7-020 (without the lookup lock): builds the pipeline here unless a worker started
-    /// it, and returns once it is built.
+    /// it, and returns once it is built. PERF-GT7-021: meanwhile more workers build at once, and
+    /// the read-ahead states blocked by their shaders are evaluated again (the lock taken when
+    /// free).
     void FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build);
 
     /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
@@ -433,6 +435,25 @@ private:
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
     bool force_wait = false; ///< FIX-198
     bool wait_for_shaders = false;                ///< PERF-GT7-020
+    /// PERF-GT7-021: read-ahead states whose key waited for shaders (a translation queued or not
+    /// taken yet, the store's listing), evaluated again until they have one (3 s at most). They
+    /// were dropped: the first frame of a new track decoded every draw while its shaders were
+    /// made, and the recorder then built each one-off target's pipeline itself, one at a time.
+    static bool RetryReadAhead();
+    struct BlockedState {
+        std::vector<u32> ranges; ///< ReadAheadStates::Ranges, in order
+        std::chrono::steady_clock::time_point first;
+        std::chrono::steady_clock::time_point next;
+    };
+    std::deque<BlockedState> blocked_states;
+    std::vector<std::vector<u32>> blocked_free;
+    bool read_ahead_blocked = false; ///< set by GetProgram for the state being evaluated
+    struct {
+        u64 kept{};
+        u64 retried{};
+        u64 started{};
+        u64 dropped{};
+    } blocked_stats;
     std::shared_ptr<PipelineBuild> skipped_build; ///< PERF-GT7-020
     struct {
         std::atomic<u64> waits{};

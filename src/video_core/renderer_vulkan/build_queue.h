@@ -37,7 +37,8 @@ public:
     /// Waits for the next job. False once stopped. A job must be followed by Finished.
     bool Pop(Job& job, std::stop_token stop) {
         std::unique_lock lk{mutex};
-        if (!cv.wait(lk, stop, [&] { return !jobs.empty() && running < max_running; })) {
+        if (!cv.wait(lk, stop,
+                     [&] { return !jobs.empty() && running < max_running + extra_running; })) {
             return false;
         }
         job = std::move(jobs.front());
@@ -71,12 +72,22 @@ public:
         cv.notify_all();
     }
 
+    /// PERF-GT7-021: this many more jobs may run at once (0: back to the limit).
+    void SetExtraRunning(u32 extra) {
+        {
+            std::scoped_lock lk{mutex};
+            extra_running = extra;
+        }
+        cv.notify_all();
+    }
+
 private:
     const u32 max_running;
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<Job> jobs;
     u32 running{};
+    u32 extra_running{}; ///< PERF-GT7-021
 };
 
 } // namespace Vulkan

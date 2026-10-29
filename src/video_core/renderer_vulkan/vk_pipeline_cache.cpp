@@ -38,6 +38,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/read_ahead_states.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -313,6 +314,13 @@ public:
     }
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
+    }
+    /// PERF-GT7-021: while a draw into a one-off target waits (the game stopped anyway), up to
+    /// all but four hardware threads build at once instead of CompileConcurrency (4).
+    void Widen(bool on) {
+        const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
+                                      CompileConcurrency(), 12u);
+        queue.SetExtraRunning(on ? widest - CompileConcurrency() : 0);
     }
 
 private:
@@ -1086,8 +1094,30 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
 
 void PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build) {
     const auto start = std::chrono::steady_clock::now();
+    // PERF-GT7-021: while this draw waits, more workers build at once (one takes this build,
+    // urgent, at once), and the read-ahead states blocked by their shaders are evaluated again
+    // so the next draws' pipelines start too. Built here only when no worker took it.
+    const bool widen = RetryReadAhead() && build_workers != nullptr;
+    if (widen) {
+        build_workers->Widen(true);
+        const auto grace = start + std::chrono::milliseconds{2};
+        while (!build->started.load() && std::chrono::steady_clock::now() < grace) {
+            std::this_thread::yield();
+        }
+    }
     const bool here = !build->started.load();
+    if (widen && !here) {
+        while (build->done.wait_for(std::chrono::milliseconds{5}) != std::future_status::ready) {
+            if (lookup_mutex.try_lock()) {
+                BuildQueuedStates(S().draw_indirect_params, false);
+                lookup_mutex.unlock();
+            }
+        }
+    }
     FinishBuild(*build);
+    if (widen) {
+        build_workers->Widen(false);
+    }
     const auto now = std::chrono::steady_clock::now();
     const u64 us =
         u64(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
@@ -1306,9 +1336,17 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
     }
 }
 
+bool PipelineCache::RetryReadAhead() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_READ_AHEAD_RETRY");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool restore) {
     auto* states = liverpool->PipeReadAheadStates();
-    if (!states || states->Empty()) {
+    if (!states || (states->Empty() && blocked_states.empty())) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
@@ -1324,21 +1362,85 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     // Before a draw, 2 ms at most, and while waiting for a build, 64 states between checks on
     // it; the rest comes next time.
     const auto budget = start + std::chrono::milliseconds{2};
-    while ((restore ? evaluated < 64 : std::chrono::steady_clock::now() < budget) &&
-           states->Take(queued_state_regs->reg_array)) {
+    const auto in_budget = [&] {
+        return restore ? evaluated < 64 : std::chrono::steady_clock::now() < budget;
+    };
+    using Ranges = AmdGpu::ReadAheadStates;
+    // The state in queued_state_regs: its build started when new; false when its key waits for
+    // shaders (PERF-GT7-021).
+    const auto evaluate = [&]() -> bool {
         ++evaluated;
+        read_ahead_blocked = false;
         regs_override = queued_state_regs.get();
         S().draw_indirect_params = {};
         const bool valid = RefreshGraphicsKey();
         regs_override = nullptr;
-        if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
-            continue;
+        if (!valid) {
+            return !read_ahead_blocked;
         }
-        if (pending_builds.contains(S().graphics_key)) {
-            continue;
+        if (!HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key) ||
+            pending_builds.contains(S().graphics_key)) {
+            return true;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
         ++started;
+        return true;
+    };
+    const auto keep = [&](std::chrono::steady_clock::time_point first) {
+        BlockedState blocked{.first = first, .next = std::chrono::steady_clock::now() +
+                                                    std::chrono::milliseconds{5}};
+        if (!blocked_free.empty()) {
+            blocked.ranges = std::move(blocked_free.back());
+            blocked_free.pop_back();
+        }
+        blocked.ranges.resize(Ranges::StateDwords);
+        u32 at = 0;
+        for (const auto& range : Ranges::Ranges) {
+            std::memcpy(blocked.ranges.data() + at, &queued_state_regs->reg_array[range.first],
+                        range.count * sizeof(u32));
+            at += range.count;
+        }
+        blocked_states.push_back(std::move(blocked));
+        if (blocked_states.size() > 512) {
+            blocked_free.push_back(std::move(blocked_states.front().ranges));
+            blocked_states.pop_front();
+            ++blocked_stats.dropped;
+        }
+    };
+    // PERF-GT7-021: the states kept earlier, once their wait is over.
+    if (RetryReadAhead()) {
+        const auto now = std::chrono::steady_clock::now();
+        for (size_t left = blocked_states.size(); left != 0 && in_budget(); --left) {
+            BlockedState blocked = std::move(blocked_states.front());
+            blocked_states.pop_front();
+            if (blocked.next > now) {
+                blocked_states.push_back(std::move(blocked));
+                continue;
+            }
+            u32 at = 0;
+            for (const auto& range : Ranges::Ranges) {
+                std::memcpy(&queued_state_regs->reg_array[range.first],
+                            blocked.ranges.data() + at, range.count * sizeof(u32));
+                at += range.count;
+            }
+            ++blocked_stats.retried;
+            const u32 started_before = started;
+            const bool done = evaluate();
+            blocked_stats.started += started - started_before;
+            if (!done && now - blocked.first < std::chrono::seconds{3}) {
+                blocked.next = now + std::chrono::milliseconds{5};
+                blocked_states.push_back(std::move(blocked));
+                continue;
+            }
+            blocked_stats.dropped += done ? 0 : 1;
+            blocked_free.push_back(std::move(blocked.ranges));
+        }
+    }
+    while (in_budget() && states->Take(queued_state_regs->reg_array)) {
+        if (!evaluate() && RetryReadAhead()) {
+            keep(std::chrono::steady_clock::now());
+            ++blocked_stats.kept;
+        }
     }
     S().draw_indirect_params = params;
     if (restore && evaluated > 0) {
@@ -1357,11 +1459,15 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         LOG_WARNING(Render_Vulkan,
                     "PERF-034 pipeline read-ahead in {:.1f} s: {} draw states from the command "
                     "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
-                    "({:.1f} ms); {} pending",
+                    "({:.1f} ms); {} pending; PERF-GT7-021: {} states kept for their shaders, {} "
+                    "evaluated again, {} builds started from them, {} dropped, {} kept now",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
-                    stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size());
+                    stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
+                    blocked_stats.kept, blocked_stats.retried, blocked_stats.started,
+                    blocked_stats.dropped, blocked_states.size());
         stats = {};
         stats.since = now;
+        blocked_stats = {};
     }
 }
 
@@ -3374,6 +3480,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             if (!read_ahead) {
                 deferred_miss = true;
                 translation_skipped |= skip;
+            } else {
+                read_ahead_blocked = true; // PERF-GT7-021
             }
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
@@ -3603,10 +3711,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (AsyncTranslation()) {
         // FIX-078: a translation the workers made for these inputs.
         const bool read_ahead = regs_override != nullptr;
+        // PERF-GT7-021: a read-ahead state takes a ready translation as a draw would, so its
+        // pipeline builds before the draw comes.
+        const bool insert = !read_ahead || RetryReadAhead();
         if (TakeReadyTranslation(hw_stage, sw_stage, params.hash, *program, params, runtime_info,
-                                 binding,
-                                 !read_ahead)) {
-            if (read_ahead) {
+                                 binding, insert)) {
+            if (!insert) {
                 return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
             }
             return GetProgram(hw_stage, sw_stage, params, binding);
@@ -3627,13 +3737,15 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             // on. No key without it: the state is skipped for now. SHD-005: a stage's bindings
             // no longer follow from the stages before it, so a race queues every missing stage
             // of the draw at once and skips it.
-            if (!S().stage_deferred || skip_wait) {
+            if (!S().stage_deferred || skip_wait || (read_ahead && RetryReadAhead())) {
                 S().stage_deferred = true;
                 QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
             }
             if (!read_ahead) {
                 deferred_miss = true;
                 translation_skipped |= skip_wait;
+            } else {
+                read_ahead_blocked = true; // PERF-GT7-021
             }
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
