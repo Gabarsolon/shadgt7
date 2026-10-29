@@ -1322,9 +1322,11 @@ void PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& bu
                stats.since_ms.compare_exchange_strong(since, now_ms)) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-GT7-020: in {:.1f} s, {} draws into one-off targets waited for their "
-                    "pipeline without the lookup lock ({:.1f} ms; {} built by the waiting thread)",
+                    "pipeline without the lookup lock ({:.1f} ms; {} built by the waiting thread); "
+                    "PERF-GT7-036: {} for their shaders ({:.1f} ms)",
                     (now_ms - since) / 1000.0, stats.waits.exchange(0), stats.wait_us.exchange(0) / 1000.0,
-                    stats.built_here.exchange(0));
+                    stats.built_here.exchange(0), stats.shader_waits.exchange(0),
+                    stats.shader_wait_us.exchange(0) / 1000.0);
     }
 }
 
@@ -1789,6 +1791,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         if (!key_valid && translation_skipped) {
             break; // SHD-005
         }
+        if (!key_valid && shaders_unlocked && !skipped_translations.empty()) {
+            break; // PERF-GT7-036: the draw waits for them without the lock
+        }
     }
     defer_misses = false;
     if (!key_valid && translation_skipped) {
@@ -1799,7 +1804,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         NoteSkippedDraw();
         return nullptr;
     }
-    if (!key_valid && deferred_miss) {
+    if (!key_valid && deferred_miss && !(shaders_unlocked && !skipped_translations.empty())) {
         deferred_miss = false;
         key_valid = RefreshGraphicsKey();
     }
@@ -3794,12 +3799,51 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
     return false;
 }
 
+void PipelineCache::NoteUnlockedShaderWait(u64 hash) {
+    const auto it = translate_jobs.find(hash);
+    if (it == translate_jobs.end()) {
+        return;
+    }
+    for (const auto& job : it.value()) {
+        if (!job->done.load() &&
+            std::ranges::find(skipped_translations, job) == skipped_translations.end()) {
+            skipped_translations.push_back(job);
+        }
+    }
+}
+
+std::function<void()> PipelineCache::TakeShaderWait() {
+    if (skipped_translations.empty()) {
+        return {};
+    }
+    return [this, jobs = std::move(skipped_translations)] {
+        // As HarvestTranslations: the game never sees a PS4 wait for a shader.
+        Common::GuestClock::CompilePause hold;
+        const auto start = std::chrono::steady_clock::now();
+        for (const auto& job : jobs) {
+            RYDIAG_SCOPE(ShaderCompile, job->hash);
+            std::unique_lock lk{job->mutex};
+            job->cv.wait(lk, [&] { return job->done.load(); });
+        }
+        unlocked_stats.shader_waits.fetch_add(1, std::memory_order_relaxed);
+        unlocked_stats.shader_wait_us.fetch_add(
+            u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count()),
+            std::memory_order_relaxed);
+    };
+}
+
 void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
     const auto it = translate_jobs.find(hash);
     if (it == translate_jobs.end()) {
         return;
     }
     auto& jobs = it.value();
+    if (wait && shaders_unlocked) {
+        NoteUnlockedShaderWait(hash); // PERF-GT7-036: waited for without the lookup lock
+        wait = false;
+    }
     if (wait) {
         const auto wait_start = std::chrono::steady_clock::now();
         bool waited = false;
@@ -4302,15 +4346,22 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             fallback_miss = true;
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
-        if (read_ahead || defer_misses || skip_wait) {
+        // PERF-GT7-036: a one-off draw's shader is translated on a worker, never here under
+        // the lookup lock; the draw waits for it without the lock.
+        const bool unlocked = shaders_unlocked && !read_ahead && AsyncTranslation();
+        if (read_ahead || defer_misses || skip_wait || unlocked) {
             // A shader an upcoming draw needs (or this draw, which looks again once the next
             // draws' shaders are queued too); translated on a worker while this thread reads
             // on. No key without it: the state is skipped for now. SHD-005: a stage's bindings
             // no longer follow from the stages before it, so a race queues every missing stage
             // of the draw at once and skips it.
-            if (!S().stage_deferred || skip_wait || (read_ahead && RetryReadAhead())) {
+            if (!S().stage_deferred || skip_wait || unlocked ||
+                (read_ahead && RetryReadAhead())) {
                 S().stage_deferred = true;
                 QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
+            }
+            if (unlocked) {
+                NoteUnlockedShaderWait(params.hash);
             }
             if (!read_ahead) {
                 deferred_miss = true;

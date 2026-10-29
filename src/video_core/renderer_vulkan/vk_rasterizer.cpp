@@ -1218,13 +1218,25 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
         const char* env = std::getenv("RYGT_ONE_OFF_UNLOCKED");
         return !(env && env[0] == '0');
     }();
+    // PERF-GT7-036: its shaders too: waited for under the lock, the command thread could not
+    // select the next draws (nor queue their shaders and builds) meanwhile, so a new track's
+    // first corner waited for each draw's translations one after the other (45 draws, ~11 ms
+    // each: frames of 400-900 ms). A draw takes a round per stage it lacks, and one for its
+    // pipeline. RYGT_ONE_OFF_SHADERS_UNLOCKED=0: under the lock, as before.
+    static const bool shaders_unlocked = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_SHADERS_UNLOCKED");
+        return !(env && env[0] == '0');
+    }();
     bool found = false;
-    for (u32 round = 0; unlocked && round < 4; ++round) {
+    for (u32 round = 0; unlocked && round < 8; ++round) {
         decltype(pipeline_cache.TakeSkippedBuild()) build;
+        std::function<void()> shader_wait;
         {
             std::scoped_lock lk{pipeline_cache.LookupMutex()};
             pipeline_cache.SetWaitForShaders(true);
+            pipeline_cache.SetShadersUnlocked(shaders_unlocked);
             pipeline = pipeline_cache.GetGraphicsPipeline(params);
+            pipeline_cache.SetShadersUnlocked(false);
             pipeline_cache.SetWaitForShaders(false);
             if (pipeline) {
                 if (SelectsPipelinesAhead()) {
@@ -1234,8 +1246,16 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
             } else {
                 build = pipeline_cache.TakeSkippedBuild();
             }
+            shader_wait = pipeline_cache.TakeShaderWait();
         }
-        if (found || !build) {
+        if (found) {
+            break;
+        }
+        if (shader_wait) {
+            shader_wait();
+            continue;
+        }
+        if (!build) {
             break;
         }
         pipeline_cache.FinishBuildUnlocked(build);

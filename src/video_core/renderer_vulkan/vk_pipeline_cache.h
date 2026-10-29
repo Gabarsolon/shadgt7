@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -161,6 +162,13 @@ public:
     std::shared_ptr<PipelineBuild> TakeSkippedBuild() {
         return std::move(skipped_build);
     }
+    /// PERF-GT7-036: with SetWaitForShaders, GetGraphicsPipeline does not wait for the draw's
+    /// translations on the workers either: it returns no pipeline, and TakeShaderWait (lookup
+    /// lock held) gives what waits for them, to call without the lock. Empty when none.
+    void SetShadersUnlocked(bool on) {
+        shaders_unlocked = on;
+    }
+    std::function<void()> TakeShaderWait();
     /// PERF-GT7-020 (without the lookup lock): builds the pipeline here unless a worker started
     /// it, and returns once it is built. PERF-GT7-021: meanwhile more workers build at once, and
     /// the read-ahead states blocked by their shaders are evaluated again (the lock taken when
@@ -454,6 +462,11 @@ private:
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
     bool force_wait = false; ///< FIX-198
     bool wait_for_shaders = false;                ///< PERF-GT7-020
+    bool shaders_unlocked = false; ///< PERF-GT7-036
+    /// PERF-GT7-036: translations a draw would have waited for under the lookup lock.
+    struct TranslateJob;
+    std::vector<std::shared_ptr<TranslateJob>> skipped_translations;
+    void NoteUnlockedShaderWait(u64 hash);
     /// PERF-GT7-021: read-ahead states whose key waited for shaders (a translation queued or not
     /// taken yet, the store's listing), evaluated again until they have one (3 s at most). They
     /// were dropped: the first frame of a new track decoded every draw while its shaders were
@@ -503,6 +516,8 @@ private:
         std::atomic<u64> built_here{};
         std::atomic<u64> wait_us{};
         std::atomic<s64> since_ms{};
+        std::atomic<u64> shader_waits{};   ///< PERF-GT7-036
+        std::atomic<u64> shader_wait_us{}; ///< PERF-GT7-036
     } unlocked_stats; ///< PERF-GT7-020
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
