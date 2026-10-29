@@ -610,6 +610,7 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
             continue;
         }
         const u64 tick = work_semaphore.CurrentTick();
+        Common::ConfineDriverCompileThreads(); // PERF-GT7-024
         LOG_WARNING(Render_Vulkan, "Perf monitor {:.1f} s: GPU busy {:.0f}%, {} submits; CPU {}",
                     std::chrono::duration<double>(now - window_start).count(),
                     samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick,

@@ -4,7 +4,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cwctype>
 #include <ctime>
+#include <map>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <string>
 #include <thread>
@@ -23,6 +28,7 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include <tlhelp32.h>
 #include "common/string_util.h"
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -93,7 +99,16 @@ struct CoreClasses {
     std::vector<ULONG> slow_ids;
     std::vector<s8> fast_by_index; // by group * 64 + logical processor index: 1 fast, 0 slow
     bool hybrid = false;
+    std::vector<ULONG> compile_ids; // PERF-GT7-024: one kind of core: the compile cores
 };
+
+bool CompileCoresOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_COMPILE_CORES");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
 const CoreClasses& GetCoreClasses() {
     static const CoreClasses classes = [] {
         CoreClasses result;
@@ -135,6 +150,34 @@ const CoreClasses& GetCoreClasses() {
         }
         LOG_INFO(Common, "PERF-088: {} CPU, {} fast logical processors",
                  result.hybrid ? "hybrid" : "uniform", result.fast_ids.size());
+        if (!result.hybrid) {
+            // PERF-GT7-024: in a GT7 race after a new track's start, ~1,100 new pipelines took four
+            // cores for ~90 s, the driver's compiler threads anywhere: the game and the renderer
+            // ran ~40% slower and frames doubled. Compiles get the last third of the cores (both
+            // hardware threads of each), the others stay the game's and the renderer's.
+            std::map<u32, std::vector<ULONG>> cores;
+            for (ULONG offset = 0; offset < length;) {
+                const auto& entry =
+                    *reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+                if (entry.Type == CpuSetInformation) {
+                    cores[u32(entry.CpuSet.Group) << 8 | entry.CpuSet.CoreIndex].push_back(
+                        entry.CpuSet.Id);
+                }
+                offset += entry.Size;
+            }
+            if (cores.size() >= 4) {
+                const size_t count = std::max<size_t>(2, (cores.size() + 2) / 3);
+                auto it = cores.begin();
+                std::advance(it, cores.size() - count);
+                for (; it != cores.end(); ++it) {
+                    result.compile_ids.insert(result.compile_ids.end(), it->second.begin(),
+                                              it->second.end());
+                }
+                LOG_INFO(Common, "PERF-GT7-024: compiles on {} of {} cores ({} logical processors){}",
+                         count, cores.size(), result.compile_ids.size(),
+                         CompileCoresOn() ? "" : ", off (RYGT_COMPILE_CORES=0)");
+            }
+        }
         return result;
     }();
     return classes;
@@ -167,7 +210,17 @@ void PreferEfficiencyCores() {
         return !(env && env[0] == '0');
     }();
     const auto& classes = GetCoreClasses();
-    if (!enabled || !classes.hybrid || classes.slow_ids.empty()) {
+    if (!enabled) {
+        return;
+    }
+    if (!classes.hybrid) {
+        if (CompileCoresOn() && !classes.compile_ids.empty()) { // PERF-GT7-024
+            SetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
+                                     static_cast<ULONG>(classes.compile_ids.size()));
+        }
+        return;
+    }
+    if (classes.slow_ids.empty()) {
         return;
     }
     SetThreadSelectedCpuSets(GetCurrentThread(), classes.slow_ids.data(),
@@ -176,6 +229,153 @@ void PreferEfficiencyCores() {
 
 void AllowAllCores() {
     SetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+}
+
+bool HybridCpu() {
+    return GetCoreClasses().hybrid;
+}
+
+namespace {
+// PERF-GT7-024: the driver's compiler threads kept on the compile cores.
+struct DriverCompileThreads {
+    std::mutex mutex;
+    std::unordered_map<DWORD, HANDLE> confined;
+    std::unordered_map<DWORD, std::wstring> checked; // thread: the module it started in
+    std::atomic<int> wide{0};
+    u32 calls = 0;
+    u32 reports = 0;
+};
+
+DriverCompileThreads& DriverThreads() {
+    static DriverCompileThreads threads;
+    return threads;
+}
+
+void ApplyCompileCores(HANDLE thread, bool wide) {
+    const auto& ids = GetCoreClasses().compile_ids;
+    if (wide) {
+        SetThreadSelectedCpuSets(thread, nullptr, 0);
+    } else {
+        SetThreadSelectedCpuSets(thread, ids.data(), static_cast<ULONG>(ids.size()));
+    }
+}
+
+// The module a thread started in (its Win32 start address), lower case.
+std::wstring StartModule(HANDLE thread) {
+    using QueryFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<QueryFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    constexpr ULONG ThreadQuerySetWin32StartAddress = 9;
+    PVOID start = nullptr;
+    if (!query || query(thread, ThreadQuerySetWin32StartAddress, &start, sizeof(start), nullptr) < 0 ||
+        !start) {
+        return L"?";
+    }
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCWSTR>(start), &module)) {
+        return L"(no module)";
+    }
+    wchar_t path[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    std::wstring name{path, length};
+    if (const auto slash = name.find_last_of(L"\\/"); slash != std::wstring::npos) {
+        name.erase(0, slash + 1);
+    }
+    std::ranges::transform(name, name.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+    return name;
+}
+} // namespace
+
+void ConfineDriverCompileThreads() {
+    const auto& classes = GetCoreClasses();
+    if (classes.hybrid || classes.compile_ids.empty() || !CompileCoresOn()) {
+        return;
+    }
+    std::vector<DWORD> tids;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    const DWORD pid = GetCurrentProcessId();
+    THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
+    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID == pid) {
+            tids.push_back(entry.th32ThreadID);
+        }
+    }
+    CloseHandle(snapshot);
+    std::ranges::sort(tids);
+
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    ++d.calls;
+    const auto alive = [&](DWORD tid) { return std::ranges::binary_search(tids, tid); };
+    std::erase_if(d.confined, [&](const auto& item) {
+        if (alive(item.first)) {
+            return false;
+        }
+        CloseHandle(item.second);
+        return true;
+    });
+    std::erase_if(d.checked, [&](const auto& item) { return !alive(item.first); });
+    u32 found = 0;
+    for (const DWORD tid : tids) {
+        if (d.checked.contains(tid)) {
+            continue;
+        }
+        const HANDLE thread =
+            OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_LIMITED_INFORMATION, FALSE, tid);
+        if (!thread) {
+            d.checked.emplace(tid, L"(not opened)");
+            continue;
+        }
+        std::wstring module = StartModule(thread);
+        if (module.starts_with(L"nvgpucomp")) {
+            ApplyCompileCores(thread, d.wide.load() > 0);
+            d.confined.emplace(tid, thread);
+            ++found;
+        } else {
+            CloseHandle(thread);
+        }
+        d.checked.emplace(tid, std::move(module));
+    }
+    if (found != 0 && d.reports < 20) {
+        ++d.reports;
+        LOG_INFO(Common, "PERF-GT7-024: {} driver compiler threads moved to the compile cores ({} "
+                 "now)", found, d.confined.size());
+    }
+    if (d.calls == 30) {
+        // After a minute, the threads by the module they started in: the compiler's should be there.
+        std::map<std::wstring, u32> modules;
+        for (const auto& [tid, module] : d.checked) {
+            ++modules[module];
+        }
+        std::string text;
+        for (const auto& [module, count] : modules) {
+            text += fmt::format(" {} {}", UTF16ToUTF8(module), count);
+        }
+        LOG_INFO(Common, "PERF-GT7-024: threads by start module:{}; {} on the compile cores", text,
+                 d.confined.size());
+    }
+}
+
+void SetCompileCoresWide(bool wide) {
+    auto& d = DriverThreads();
+    const int before = d.wide.fetch_add(wide ? 1 : -1);
+    const int after = before + (wide ? 1 : -1);
+    if ((before > 0) == (after > 0)) {
+        return;
+    }
+    std::scoped_lock lk{d.mutex};
+    for (const auto& [tid, thread] : d.confined) {
+        ApplyCompileCores(thread, after > 0);
+    }
+}
+
+bool CompileCoresWide() {
+    return DriverThreads().wide.load(std::memory_order_relaxed) > 0;
 }
 
 int CurrentCoreIsFast() {
@@ -242,6 +442,18 @@ void PreferPerformanceCores() {}
 void PreferEfficiencyCores() {}
 
 void AllowAllCores() {}
+
+bool HybridCpu() {
+    return false;
+}
+
+void ConfineDriverCompileThreads() {}
+
+void SetCompileCoresWide(bool) {}
+
+bool CompileCoresWide() {
+    return false;
+}
 
 int CurrentCoreIsFast() {
     return -1;

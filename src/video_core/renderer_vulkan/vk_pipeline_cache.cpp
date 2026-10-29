@@ -321,6 +321,7 @@ public:
         const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
                                       CompileConcurrency(), 12u);
         queue.SetExtraRunning(on ? widest - CompileConcurrency() : 0);
+        Common::SetCompileCoresWide(on); // PERF-GT7-024: off the compile cores meanwhile
     }
 
 private:
@@ -366,8 +367,12 @@ private:
                     backlog = false;
                 }
             }
-            if (backlog != all_cores) {
-                all_cores = backlog;
+            // PERF-GT7-024: on a CPU with one kind of core a backlog stays on the compile cores
+            // (in a race, compiles on every core slowed the game and the recorder by ~40%);
+            // every core only while a draw waits for its pipeline.
+            const bool want_all = (backlog && Common::HybridCpu()) || Common::CompileCoresWide();
+            if (want_all != all_cores) {
+                all_cores = want_all;
                 if (all_cores) {
                     Common::AllowAllCores();
                 } else {
