@@ -309,8 +309,8 @@ public:
         queue.NotifyAll();
     }
 
-    void Push(std::function<void()>&& job, bool urgent) {
-        queue.Push(std::move(job), urgent ? BuildQueue::Kind::Urgent : BuildQueue::Kind::Normal);
+    void Push(std::function<void()>&& job, BuildQueue::Kind kind) {
+        queue.Push(std::move(job), kind);
     }
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
@@ -1151,7 +1151,7 @@ void PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& bu
     }
 }
 
-void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool urgent) {
+void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind) {
     if (!build_workers) {
         build_workers = std::make_unique<PipelineBuildWorkers>();
     }
@@ -1160,13 +1160,16 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool
             FinishBuild(*build);
         }
     };
-    build_workers->Push(std::move(job), urgent);
+    build_workers->Push(std::move(job), kind);
 }
 
-std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent) {
+std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent,
+                                                                               bool in_order) {
     auto build = MakePipelineBuild();
     build->urgent = urgent;
-    QueueBuild(build, urgent);
+    QueueBuild(build, !urgent    ? BuildQueue::Kind::Normal
+                      : in_order ? BuildQueue::Kind::Soon
+                                 : BuildQueue::Kind::Urgent);
     return build;
 }
 
@@ -1842,6 +1845,12 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         ++Common::GetWorkCounters().pipelines_compiled;
         last_pipeline_miss = std::chrono::steady_clock::now();
         GraphicsPipeline::NotePipelineMiss();
+        // PERF-GT7-025: a draw that goes on without its pipeline (PERF-076, below) queues it in
+        // draw order, after the builds a thread waits for and before the read-ahead's. Last-first,
+        // a new track's start had the workers on the furthest draws' pipelines while the recorder
+        // built the next one-off target's itself (25 of 50, one after the other, in a 17 s freeze).
+        const bool goes_on = !force_wait && AsyncPipelines() && !LegacyWaits() &&
+                             !WritesMemory(S().infos) && !NeverSkipped(S().infos) && !MenusWait();
         auto* const queued_states = liverpool->PipeReadAheadStates();
         if (queued_states) {
             queued_states->NoteMiss();
@@ -1860,17 +1869,17 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             }
         } else if (Common::PerfFeatureEnabled(19) && !liverpool->Pipelined()) {
             const auto key = S().graphics_key;
-            build = StartPipelineBuild(true);
+            build = StartPipelineBuild(true, goes_on);
             ReadAhead(params);
             ASSERT_MSG(S().graphics_key == key, "Read-ahead changed the current pipeline key");
         } else if (queued_states) {
             // PERF-034: a worker builds it while this thread starts the builds the command
             // thread's read-ahead queues meanwhile.
-            build = StartPipelineBuild(true);
+            build = StartPipelineBuild(true, goes_on);
         } else if (CompileMode() == 2 && AsyncPipelines()) {
             // Queue even when read-ahead/draw-pipe helpers are disabled. Retain the job
             // in pending_builds below so a later draw installs its completed pipeline.
-            build = StartPipelineBuild(true);
+            build = StartPipelineBuild(true, goes_on);
         }
         // PERF-076: a draw does not wait for a new pipeline. Its build goes on on a worker, the
         // draws that need it are skipped until it is done (a frame or two of a missing object),

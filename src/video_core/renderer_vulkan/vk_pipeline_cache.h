@@ -25,6 +25,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
+#include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -198,11 +199,12 @@ private:
     const AmdGpu::Regs& Regs() const;
     bool HasSupportedColorTargets() const;
     class PipelineBuildWorkers;
-    /// PERF-019: builds the pipeline for the current key on a worker thread.
-    std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
+    /// PERF-019: builds the pipeline for the current key on a worker thread. PERF-GT7-025:
+    /// in_order: an urgent build in draw order (a draw that goes on without it), not first.
+    std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent, bool in_order = false);
     /// A build of the current key, infos and modules.
     std::shared_ptr<PipelineBuild> MakePipelineBuild();
-    void QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool urgent);
+    void QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind);
     /// Builds the pipeline unless a worker already started; returns when it is built.
     void FinishBuild(PipelineBuild& build);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.

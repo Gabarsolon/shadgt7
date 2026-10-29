@@ -13,12 +13,13 @@
 
 namespace Vulkan {
 
-/// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, then
-/// normal ones (read-ahead) in order, on at most `max_running` workers at once.
+/// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, the last
+/// one first; then PERF-GT7-025's soon ones (draws that went on without their pipeline) in draw
+/// order; then normal ones (read-ahead) in order; on at most `max_running` workers at once.
 class BuildQueue {
 public:
     using Job = std::function<void()>;
-    enum class Kind { Urgent, Normal };
+    enum class Kind { Urgent, Soon, Normal };
 
     explicit BuildQueue(u32 max_running_) : max_running{max_running_} {}
 
@@ -27,6 +28,9 @@ public:
             std::scoped_lock lk{mutex};
             if (kind == Kind::Urgent) {
                 jobs.push_front(std::move(job));
+                ++urgent;
+            } else if (kind == Kind::Soon) {
+                soon.push_back(std::move(job));
             } else {
                 jobs.push_back(std::move(job));
             }
@@ -37,12 +41,19 @@ public:
     /// Waits for the next job. False once stopped. A job must be followed by Finished.
     bool Pop(Job& job, std::stop_token stop) {
         std::unique_lock lk{mutex};
-        if (!cv.wait(lk, stop,
-                     [&] { return !jobs.empty() && running < max_running + extra_running; })) {
+        if (!cv.wait(lk, stop, [&] {
+                return (!jobs.empty() || !soon.empty()) && running < max_running + extra_running;
+            })) {
             return false;
         }
-        job = std::move(jobs.front());
-        jobs.pop_front();
+        if (urgent == 0 && !soon.empty()) {
+            job = std::move(soon.front());
+            soon.pop_front();
+        } else {
+            job = std::move(jobs.front());
+            jobs.pop_front();
+            urgent -= urgent != 0 ? 1 : 0;
+        }
         ++running;
         return true;
     }
@@ -58,13 +69,13 @@ public:
     /// PERF-101: no draw or read-ahead build is queued or running.
     bool ForegroundIdle() {
         std::scoped_lock lk{mutex};
-        return jobs.empty() && running == 0;
+        return jobs.empty() && soon.empty() && running == 0;
     }
 
     /// PERF-160: jobs waiting for a worker.
     size_t Pending() {
         std::scoped_lock lk{mutex};
-        return jobs.size();
+        return jobs.size() + soon.size();
     }
 
     /// Wakes the workers waiting for jobs, so they can see a stop request.
@@ -85,7 +96,9 @@ private:
     const u32 max_running;
     std::mutex mutex;
     std::condition_variable_any cv;
-    std::deque<Job> jobs;
+    std::deque<Job> jobs; ///< urgent ones at the front, normal ones after
+    std::deque<Job> soon; ///< PERF-GT7-025
+    u32 urgent{};         ///< urgent jobs at the front of `jobs`
     u32 running{};
     u32 extra_running{}; ///< PERF-GT7-021
 };
