@@ -730,8 +730,12 @@ void WriteSpike(const State::SpikeRequest& req) {
         flips.size(), flip_gap,
         flip_gap >= req.median + 0.5 * excess ? "the game itself was late"
                                               : "the game was on time: the delay is after the flip");
-    if (number > 400) {
+    // DIAG-GT7-006: past 400 spikes only their first lines are written, except for stalls of a
+    // second and more (a 6 s freeze late in a mission kept nothing), and each entry reaches the
+    // file at once (the short ones stayed in the buffer and were lost when the game closed).
+    if (number > 400 && req.ms < 1000.0) {
         std::fputs(text.c_str(), s.spikes_txt);
+        std::fflush(s.spikes_txt);
         return;
     }
     std::string zones;
@@ -1110,8 +1114,15 @@ void WriterThread() {
             const auto req = s.spike_queue.front();
             s.spike_queue.pop_front();
             lk.unlock();
-            // Let the window's last zones and samples land.
-            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            // Let the window's last zones and samples land: 100 ms after it ended (DIAG-GT7-006:
+            // not 100 ms for every queued spike, which left the writer a minute behind in bursts).
+            const u64 now_tsc = __rdtsc();
+            const double since_ms =
+                now_tsc > req.window_end ? TicksToMs(now_tsc - req.window_end) : 0.0;
+            if (since_ms < 100.0) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds{static_cast<s64>((100.0 - since_ms) * 1000.0)});
+            }
             WriteSpike(req);
             lk.lock();
         }
