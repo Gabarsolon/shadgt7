@@ -392,10 +392,12 @@ Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
         const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
         const Id from_scratch =
             ctx.OpLogicalAnd(ctx.U1[1], ctx.lds_enabled, ctx.OpLogicalNot(ctx.U1[1], in_range));
+        // FIX-GT7-010: FIX-GT7-005's guard on this read too (the array isn't defined for an
+        // LS stride of 0, which the LDS emulation accepts).
         const auto own_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
         const Id own_value = ctx.OpLoad(
-            ctx.F32[1], ctx.OpAccessChain(own_ptr, ctx.input_attr_array, vertex_index, attr_index,
-                                          comp_index));
+            ctx.F32[1], ctx.OpAccessChain(own_ptr, AttrArray(ctx.input_attr_array, "in_attrs"),
+                                          vertex_index, attr_index, comp_index));
         const Id own_label = ctx.last_label;
         const Id scratch_label = ctx.OpLabel();
         const Id merge_label = ctx.OpLabel();
