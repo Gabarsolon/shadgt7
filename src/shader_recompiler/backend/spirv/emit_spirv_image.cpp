@@ -241,6 +241,20 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     operands.AddOffset(ctx, texture.view_type, offset);
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, fixed_coords,
                                                    operands.mask, operands.operands);
+    // DIAG-232 (diagnosis, RYGT_DIAG_HS_SAMPLE_ZERO=1): hull shader texture samples read 0 (GT7's
+    // car hull shaders cull patches against a depth pyramid with them).
+    static const bool hs_zero = std::getenv("RYGT_DIAG_HS_SAMPLE_ZERO") != nullptr;
+    if (hs_zero && ctx.sw_stage == SwStage::TessellationControl && !texture.is_integer) {
+        return ctx.ConstantNull(ctx.F32[4]);
+    }
+    // DIAG-236 (diagnosis, RYGT_DIAG_HS_SAMPLE_SCALE=<float>): hull shader samples scaled.
+    static const float hs_scale = [] {
+        const char* env = std::getenv("RYGT_DIAG_HS_SAMPLE_SCALE");
+        return env && *env ? std::strtof(env, nullptr) : 0.0f;
+    }();
+    if (hs_scale != 0.0f && ctx.sw_stage == SwStage::TessellationControl && !texture.is_integer) {
+        return ctx.OpVectorTimesScalar(ctx.F32[4], sample, ctx.ConstF32(hs_scale));
+    }
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
 }
 

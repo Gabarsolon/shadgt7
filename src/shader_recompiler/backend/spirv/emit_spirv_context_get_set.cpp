@@ -322,8 +322,15 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
             ctx.OpAccessChain(ctx.output_f32, ctx.cull_distances, ctx.ConstU32(element)));
     case IR::Attribute::PointSize:
         return op_store(ctx.output_point_size);
-    case IR::Attribute::RenderTargetIndex:
+    case IR::Attribute::RenderTargetIndex: {
+        // DIAG-231 (diagnosis, RYGT_DIAG_TES_LAYER0=1): domain shaders draw into layer 0.
+        static const bool tes_layer0 = std::getenv("RYGT_DIAG_TES_LAYER0") != nullptr;
+        if (tes_layer0 && ctx.sw_stage == SwStage::TessellationEval) {
+            value = ctx.ConstF32(0.0f);
+            return op_store(ctx.output_layer);
+        }
         return op_store(ctx.output_layer);
+    }
     case IR::Attribute::ViewportIndex:
         return op_store(ctx.output_viewport_index);
     case IR::Attribute::Depth:
@@ -347,6 +354,15 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
 }
 
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
+    // DIAG-238 (diagnosis, RYGT_DIAG_TCS_CLAMP_VERTEX=1): hull shader input reads stay inside the
+    // patch (an index past gl_PatchVerticesIn reads undefined values in Vulkan).
+    static const bool clamp_vertex = std::getenv("RYGT_DIAG_TCS_CLAMP_VERTEX") != nullptr;
+    if (clamp_vertex && ctx.sw_stage == SwStage::TessellationControl &&
+        Sirit::ValidId(ctx.patch_vertices)) {
+        const Id last = ctx.OpISub(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.patch_vertices),
+                                   ctx.u32_one_value);
+        vertex_index = ctx.OpUMin(ctx.U32[1], vertex_index, last);
+    }
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
     return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.input_attr_array,
                                                     vertex_index, attr_index, comp_index));
@@ -401,6 +417,12 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
             UNREACHABLE_MSG("Patch {}", u32(patch));
         }
     }()};
+    // DIAG-229 (diagnosis, RYGT_DIAG_TESS_MIN1=1): tessellation levels below 1 or NaN become 1,
+    // so no patch is culled by its factors.
+    static const bool min1 = std::getenv("RYGT_DIAG_TESS_MIN1") != nullptr;
+    if (min1 && !IR::IsGeneric(patch)) {
+        value = ctx.OpNMax(ctx.F32[1], value, ctx.ConstF32(1.0f));
+    }
     ctx.OpStore(pointer, value);
 }
 

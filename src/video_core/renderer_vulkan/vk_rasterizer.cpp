@@ -6173,7 +6173,18 @@ void Rasterizer::UpdateDepthStencilState() const {
     if (depth_test_enabled) {
         dynamic_state.SetDepthWriteEnabled(regs.depth_control.depth_write_enable &&
                                            !regs.depth_render_control.depth_clear_enable);
-        dynamic_state.SetDepthCompareOp(LiverpoolToVK::CompareOp(regs.depth_control.depth_func));
+        // DIAG-227 (diagnosis, RYGT_DIAG_GEQUAL_ALWAYS=1): GREATER_EQUAL depth tests always pass
+        // (whether the colour pass after a depth pre-pass fails its depth test).
+        static const bool gequal_always = std::getenv("RYGT_DIAG_GEQUAL_ALWAYS") != nullptr;
+        auto op = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
+        static const bool tess_always = std::getenv("RYGT_DIAG_TESS_ALWAYS") != nullptr;
+        if (tess_always && regs.stage_enable.hs_en) {
+            op = vk::CompareOp::eAlways; // DIAG-227: tessellated draws only
+        }
+        if (gequal_always && op == vk::CompareOp::eGreaterOrEqual) {
+            op = vk::CompareOp::eAlways;
+        }
+        dynamic_state.SetDepthCompareOp(op);
     }
 
     const auto depth_bounds_test_enabled = regs.depth_control.depth_bounds_enable;
@@ -6182,14 +6193,38 @@ void Rasterizer::UpdateDepthStencilState() const {
         dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
     }
 
-    const auto depth_bias_enabled = regs.polygon_control.NeedsBias();
+    // DIAG-228 (diagnosis, RYGT_DIAG_NO_DEPTH_BIAS=1): no depth bias at all.
+    static const bool no_bias = std::getenv("RYGT_DIAG_NO_DEPTH_BIAS") != nullptr;
+    // FIX-224: a tessellated draw tested GREATER(_EQUAL) or LESS(_EQUAL) against depth a depth
+    // pre-pass wrote for the same surface from its plain triangles gets a small bias toward the
+    // camera. GT7 draws the car's body once untessellated into depth and then tessellated in colour
+    // with GREATER_EQUAL: close up, many of the tessellated sub-triangles came out a rounding error
+    // behind the pre-pass and failed, leaving black patches with zero motion on the car in the race
+    // start's close-ups. RYGT_TESS_DEPTH_BIAS=<units of minimum resolvable depth>, 0 turns it off.
+    static const float tess_bias = [] {
+        const char* env = std::getenv("RYGT_TESS_DEPTH_BIAS");
+        return env && *env ? std::strtof(env, nullptr) : 16.0f;
+    }();
+    const auto func = regs.depth_control.depth_func;
+    const bool toward_greater = func == AmdGpu::CompareFunc::Greater ||
+                                func == AmdGpu::CompareFunc::GreaterEqual;
+    const bool toward_less =
+        func == AmdGpu::CompareFunc::Less || func == AmdGpu::CompareFunc::LessEqual;
+    const bool tess_biased = tess_bias != 0.0f && regs.stage_enable.hs_en && depth_test_enabled &&
+                             (toward_greater || toward_less);
+    const auto depth_bias_enabled =
+        (regs.polygon_control.NeedsBias() && !no_bias) || tess_biased;
     dynamic_state.SetDepthBiasEnabled(depth_bias_enabled);
     if (depth_bias_enabled) {
+        const bool own = regs.polygon_control.NeedsBias() && !no_bias;
         const bool front = regs.polygon_control.enable_polygon_offset_front;
+        const float extra = tess_biased ? (toward_greater ? tess_bias : -tess_bias) : 0.0f;
         dynamic_state.SetDepthBias(
-            front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset,
-            regs.poly_offset.depth_bias,
-            (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f);
+            (own ? (front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset) : 0.0f) +
+                extra,
+            own ? float(regs.poly_offset.depth_bias) : 0.0f,
+            own ? (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f
+                : 0.0f);
     }
 
     const auto stencil_test_enabled =

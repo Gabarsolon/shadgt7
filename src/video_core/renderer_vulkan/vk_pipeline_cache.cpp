@@ -613,6 +613,18 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.num_threads = regs.ls_hs_config.hs_output_control_points;
         info.sw.tcs.tess_type = regs.tess_config.type;
         info.sw.tcs.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
+        // DIAG-239 (diagnosis, RYGT_DIAG_TCS_CONFIG=1): the LS/HS configuration, 60 lines at most.
+        if (static const bool diag = std::getenv("RYGT_DIAG_TCS_CONFIG") != nullptr; diag) {
+            static std::atomic<u32> lines{};
+            if (lines++ < 60) {
+                LOG_WARNING(Render_Vulkan, "DIAG-239: hs patches {} input cp {} output threads {} "
+                            "offchip {} tess type {}",
+                            u32(regs.ls_hs_config.num_patches),
+                            u32(regs.ls_hs_config.hs_input_control_points),
+                            u32(regs.ls_hs_config.hs_output_control_points),
+                            u32(regs.hs_program.settings.oc_lds_en), u32(regs.tess_config.type));
+            }
+        }
         break;
     }
     case SwStage::TessellationEval: {
@@ -680,8 +692,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             instance_.IsAmdShaderExplicitVertexParameterSupported(),
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
+        // DIAG-230 (diagnosis): RYGT_DIAG_NO_MANUAL_INTERP turns off per-vertex interpolation.
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
-                                      instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+                                      instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
+                                      !std::getenv("RYGT_DIAG_NO_MANUAL_INTERP"),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .intel_arc_workarounds = instance.IsIntel(),
@@ -1351,6 +1365,24 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     if (!key_valid) {
         return nullptr;
+    }
+    {
+        // DIAG-225 (diagnosis, RYGT_DIAG_AA_MASK=1): draws with no pixel shader while
+        // PA_SC_AA_MASK hides pixels (the quad sample mask is applied in the pixel shader only).
+        static const bool diag = std::getenv("RYGT_DIAG_AA_MASK") != nullptr;
+        const auto& r = Regs();
+        if (diag && !S().infos[u32(SwStage::Fragment)] &&
+            (r.reg_array[0xa30e] != ~0u || r.reg_array[0xa30f] != ~0u)) {
+            static u32 count = 0;
+            if (++count <= 30 || count % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-225: draw {} with no pixel shader under AA mask {:08x} {:08x}, "
+                            "depth write {}, depth test {}",
+                            count, r.reg_array[0xa30e], r.reg_array[0xa30f],
+                            u32(r.depth_control.depth_write_enable),
+                            u32(r.depth_control.depth_enable));
+            }
+        }
     }
     // D10: a key of new translations whose pipeline is not built yet. It is built in the
     // background; meanwhile the draw uses the key made of the old renderer's translations.

@@ -512,6 +512,18 @@ private:
     std::vector<Probe> probes;
     /// FIX-175 (diagnosis): rectangles of presented pictures on their way back from the GPU.
     std::vector<Probe> display_probes;
+    /// DIAG-226: copies of watched colour targets taken at each new pass of a dumped frame.
+    struct PassSnap {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        std::string name;
+    };
+    std::vector<PassSnap> pass_snaps;
+    std::array<const Native::ImageEntry*, 3> last_snap_key{};
+    u32 pass_snap_index = 0;
+    void SnapPass(const Targets& targets);
+    void NoteStaleFlats(const Shader::Info& stage);
+    void CheckStaleFlats();
+    void SnapProgramMips(std::span<const Shader::Info* const> stages, const DrawBindings& b);
     /// DIAG-170 (diagnosis): blocks of a watched draw's target read back right after it.
     struct DrawProbe {
         std::unique_ptr<Native::Rhi::Buffer> buffer;
