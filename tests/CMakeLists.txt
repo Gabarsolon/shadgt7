@@ -23,6 +23,11 @@ target_link_libraries(shadps4_stencil_test PRIVATE GTest::gtest_main fmt::fmt)
 include(GoogleTest)
 gtest_discover_tests(shadps4_stencil_test)
 
+add_executable(shadps4_ryty_config_test test_ryty_config.cpp)
+target_include_directories(shadps4_ryty_config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_ryty_config_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_ryty_config_test)
+
 add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp)
 target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)

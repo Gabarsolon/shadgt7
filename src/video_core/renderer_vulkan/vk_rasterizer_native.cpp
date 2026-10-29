@@ -299,11 +299,21 @@ bool NativeModeRequested() {
     // NAT-160: the launcher's renderer choice (GPU.native_renderer in the game's settings, so
     // GTSport.exe started on its own follows it too); RYGT_NATIVE=1 or =0 overrides it.
     static const bool requested = [] {
+        // FIX-230: logged, with where the choice came from (GT7 does not boot without it).
         if (const char* env = std::getenv("RYGT_NATIVE"); env && *env) {
-            return env[0] == '1';
+            const bool on = env[0] == '1';
+            LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} (RYGT_NATIVE={})",
+                        on ? "on" : "off", env);
+            return on;
         }
         const auto value = Common::RytyGameConfigValue("native_renderer");
-        return value && *value == "true";
+        const bool on = value && *value == "true";
+        LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} ({})", on ? "on" : "off",
+                    value ? "native_renderer in user\\custom_configs\\CUSA03220.json"
+                    : Common::RytyGameConfigText().empty()
+                        ? "the launcher's settings file could not be read: default off"
+                        : "no native_renderer setting: default off");
+        return on;
     }();
     return requested;
 }

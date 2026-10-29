@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <fmt/format.h>
 
+#include "common/ryty_config.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/debug_state.h"
@@ -547,21 +548,23 @@ void ServeReplacement(void* file, u8* begin, s64 read) {
 }
 
 void LoadScriptReplacements() {
-    char exe[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string dir{exe};
-    dir = dir.substr(0, dir.find_last_of("\\/") + 1) + "patches\\scripts\\";
-    WIN32_FIND_DATAA found{};
-    HANDLE find = FindFirstFileA((dir + "*.ADC").c_str(), &found);
+    // FIX-230: Unicode and long-path safe.
+    const std::wstring dir = Common::RytyExeDirW() + L"patches\\scripts\\";
+    WIN32_FIND_DATAW found{};
+    HANDLE find = FindFirstFileW((dir + L"*.ADC").c_str(), &found);
     if (find == INVALID_HANDLE_VALUE) {
         return;
     }
     do {
-        FILE* f = std::fopen((dir + found.cFileName).c_str(), "rb");
+        FILE* f = _wfopen((dir + found.cFileName).c_str(), L"rb");
         if (!f) {
             continue;
         }
-        ScriptReplacement replacement{found.cFileName, {}};
+        std::string name;
+        for (const wchar_t* c = found.cFileName; *c; ++c) {
+            name += *c < 0x80 ? static_cast<char>(*c) : '?';
+        }
+        ScriptReplacement replacement{name, {}};
         std::fseek(f, 0, SEEK_END);
         replacement.data.resize(static_cast<size_t>(std::ftell(f)));
         std::fseek(f, 0, SEEK_SET);
@@ -569,10 +572,10 @@ void LoadScriptReplacements() {
         std::fclose(f);
         if (got == replacement.data.size() && got >= 128) {
             std::fprintf(stderr, "[patch] GTS-005 script replacement %s (%zu bytes)\n",
-                         found.cFileName, got);
+                         replacement.name.c_str(), got);
             g_script_replacements.push_back(std::move(replacement));
         }
-    } while (FindNextFileA(find, &found));
+    } while (FindNextFileW(find, &found));
     FindClose(find);
 }
 
@@ -878,23 +881,11 @@ bool WetReflectionsWanted() {
     if (const char* env = std::getenv("RYGT_WET_REFLECTIONS")) {
         return env[0] != '0';
     }
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+    // FIX-230: Unicode and long-path safe.
+    const std::string text = Common::RytyReadGameConfig();
+    if (text.empty()) {
         return true;
     }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return true;
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
     const size_t key = text.find("\"wet_reflections\"");
     if (key == std::string::npos) {
         return true;
@@ -909,23 +900,11 @@ bool WetReflectionsWanted() {
 // a call to a stub that also skips every other time, so the mirror is redrawn every second frame
 // (its picture is kept in between). GPU.mirror_half_rate=true (launcher) or RYGT_MIRROR_HALF=1.
 bool ConfigFlag(const char* key, bool fallback) {
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+    // FIX-230: Unicode and long-path safe.
+    const std::string text = Common::RytyReadGameConfig();
+    if (text.empty()) {
         return fallback;
     }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return fallback;
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
     const std::string quoted = std::string{"\""} + key + "\"";
     const size_t at = text.find(quoted);
     if (at == std::string::npos) {
@@ -940,23 +919,11 @@ bool ConfigFlag(const char* key, bool fallback) {
 
 // A setting of the GT Sport config as written (a string without its quotes, a number), or "".
 static std::string ConfigValue(const char* key) {
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+    // FIX-230: Unicode and long-path safe.
+    const std::string text = Common::RytyReadGameConfig();
+    if (text.empty()) {
         return {};
     }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return {};
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
     const std::string quoted = std::string{"\""} + key + "\"";
     const size_t at = text.find(quoted);
     if (at == std::string::npos) {
