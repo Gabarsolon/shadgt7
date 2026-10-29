@@ -2147,6 +2147,7 @@ void NativeRenderer::RefreshRegion(Region& region) {
     // FIX-173: each page as it was before the CPU wrote it (taken at the write fault).
     // PERF-104: all under one lock, and each run of pages watched again at once (one protect).
     std::vector<std::unique_ptr<std::array<u8, 4096>>> befores(pages.size());
+    std::vector<bool> opened_ahead(pages.size()); // FIX-GT7-006
     {
         std::scoped_lock lock{region_dirty_mutex};
         for (size_t k = 0; k < pages.size(); ++k) {
@@ -2154,6 +2155,7 @@ void NativeRenderer::RefreshRegion(Region& region) {
                 befores[k] = std::move(it->second);
                 page_snapshots.erase(it);
             }
+            opened_ahead[k] = ahead_pages.erase(pages[k]) != 0;
         }
     }
     // NAT-145: only the pages copied in are watched again (the region was watched whole
@@ -2199,9 +2201,19 @@ void NativeRenderer::RefreshRegion(Region& region) {
             return env && env[0] == '1';
         }();
         const auto known = region.cpu_pages.find(page);
-        const bool compare = !always_whole &&
-                             (!region_writeback || (known != region.cpu_pages.end() &&
-                                                    frame - known->second <= RegionRecentFrames));
+        const bool recent = known != region.cpu_pages.end() &&
+                            frame - known->second <= RegionRecentFrames;
+        // FIX-GT7-006: a page PERF-GT7-030 opened with a fault next to it may not have been
+        // written: copied whole, guest memory would go over what the GPU wrote there (in the
+        // region only, as no write-back follows a page the CPU didn't write lately). FaultAhead
+        // opens only pages the CPU wrote lately; one that stopped being so meanwhile is still
+        // compared, and without its copy from before it copies nothing in.
+        if (opened_ahead[k] && !recent && region_writeback && !always_whole && !before) {
+            ++stats.region_partial_pages;
+            continue;
+        }
+        const bool compare =
+            !always_whole && (!region_writeback || recent || opened_ahead[k]);
         region.cpu_pages[page] = frame;
         std::array<u8, 4096> now;
         if (!compare || !before ||
@@ -2244,6 +2256,18 @@ void NativeRenderer::RefreshRegion(Region& region) {
         stats.region_partial_bytes += changed;
     }
     flush_whole();
+    {
+        // FIX-GT7-006: FaultAhead's view of cpu_pages (each page refreshed here was set above).
+        std::scoped_lock lock{region_dirty_mutex};
+        if (cpu_recent_pages.size() >= 1'000'000) {
+            cpu_recent_pages.clear(); // only fewer pages opened ahead until they come again
+        }
+        for (const VAddr page : pages) {
+            if (const auto it = region.cpu_pages.find(page); it != region.cpu_pages.end()) {
+                cpu_recent_pages[page] = it->second;
+            }
+        }
+    }
     s.buffers_written = true;
     ++stats.region_refreshes;
     if (stats.region_partial_pages != 0 && Sample(logged_partial)) {
@@ -2861,8 +2885,10 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
             continue;
         }
         if (to - from > MaxWriteback || !direct) {
+            std::scoped_lock lock{region_dirty_mutex}; // FIX-GT7-006
             for (const VAddr page : pages) {
                 region.cpu_pages.erase(page); // copied in whole at the next CPU write
+                cpu_recent_pages.erase(page);
             }
             stats.region_pages_forgotten += pages.size();
             continue;
@@ -2950,8 +2976,10 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
                         {run_from, run_to, r.scheduler.CurrentTick() + 1, frame});
                 }
             } else {
+                std::scoped_lock lock{region_dirty_mutex}; // FIX-GT7-006
                 for (size_t k = i; k < j; ++k) {
                     region.cpu_pages.erase(pages[k]);
+                    cpu_recent_pages.erase(pages[k]);
                 }
             }
             i = j;
@@ -10000,6 +10028,18 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
             }
         }
     }
+    {
+        // FIX-GT7-006: only pages the CPU wrote lately (FIX-194: for those guest memory gets what
+        // the GPU writes there too, so the refresh can't put stale bytes over the GPU's).
+        std::scoped_lock lock{region_dirty_mutex};
+        pages.erase(std::remove_if(pages.begin(), pages.end(),
+                                   [&](VAddr page) {
+                                       const auto it = cpu_recent_pages.find(page);
+                                       return it == cpu_recent_pages.end() ||
+                                              now - it->second > RegionRecentFrames;
+                                   }),
+                    pages.end());
+    }
     if (pages.empty()) {
         return;
     }
@@ -10022,6 +10062,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
             if (!slot) {
                 slot = std::move(copy); // the first copy since the page was copied in counts
             }
+            ahead_pages.insert(page); // FIX-GT7-006
         }
     }
     // Opened, then noted as written, in runs (one protect each), as OnCpuWrite does.

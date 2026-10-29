@@ -469,6 +469,11 @@ private:
     /// within the last 8 frames: GT7 writes such chunks whole, a page at a time, every ~4 frames.
     void FaultAhead(VAddr begin, VAddr end);
     std::unordered_map<VAddr, u64> fault_chunks; ///< 64 KB chunk: frame of its last fault
+    /// FIX-GT7-006 (under region_dirty_mutex): the regions' cpu_pages as FaultAhead may read
+    /// them from any thread (page: frame the CPU last wrote it), and the pages it opened that no
+    /// refresh has copied in yet.
+    std::unordered_map<VAddr, u64> cpu_recent_pages;
+    std::unordered_set<VAddr> ahead_pages;
     std::atomic<u64> fault_ahead_faults{};
     std::atomic<u64> fault_ahead_pages{};
     u64 draws_at_frame = 0; ///< DIAG-GT7-011: stats.draws at the last frame's end
