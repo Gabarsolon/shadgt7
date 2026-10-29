@@ -337,11 +337,11 @@ std::atomic<bool> g_reuse_on{[] {
     const char* env = std::getenv("RYGT_NATIVE_REUSE");
     return !(env && env[0] == '0');
 }()};
-// PERF-GT7-010 (RYGT_NATIVE_GPU_PRIORITY=1; DIAG-GT7-003 switches it while the game runs): the
-// recorder and the command processor run above normal priority.
+// PERF-GT7-010 (on; RYGT_NATIVE_GPU_PRIORITY=0 off; DIAG-GT7-003 switches it while the game
+// runs): the recorder and the command processor run above normal priority.
 std::atomic<bool> g_boost_on{[] {
     const char* env = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
-    return env && env[0] == '1';
+    return !(env && env[0] == '0');
 }()};
 } // namespace
 
