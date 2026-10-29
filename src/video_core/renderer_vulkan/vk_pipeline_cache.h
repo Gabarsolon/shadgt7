@@ -225,6 +225,12 @@ private:
     bool LegacyWaits() const;
     /// PERF-076: logs the background pipeline counts every 2 s.
     void ReportAsyncPipelines(std::chrono::steady_clock::time_point now);
+    /// PERF-GT7-029: a draw skipped for a pipeline still building (counted for the catch-up; one
+    /// skipped again moves its build to the front once, `again`).
+    void NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again);
+    /// PERF-GT7-029: while many draws are skipped for their builds, compiles use every core, 8 at
+    /// a time; back on the compile cores once few are. RYGT_COMPILE_CATCH_UP=0 turns it off.
+    void UpdateCatchUp(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Returns at once if no worker took the build, which
     /// FinishBuild then does on this thread.
@@ -458,6 +464,16 @@ private:
         u64 tessellated{}; ///< FIX-GT7-005: not kept
     } blocked_stats;
     std::shared_ptr<PipelineBuild> skipped_build; ///< PERF-GT7-020
+    std::atomic<u64> catch_up_skips{}; ///< PERF-GT7-029: since the last look
+    std::atomic<u64> catch_up_bumped{};
+    std::mutex catch_up_mutex;
+    struct {
+        bool on = false;
+        std::chrono::steady_clock::time_point window_start{};
+        std::chrono::steady_clock::time_point since{};
+        u32 calm = 0;
+        u64 skipped = 0;
+    } catch_up;
     struct {
         std::atomic<u64> waits{};
         std::atomic<u64> built_here{};

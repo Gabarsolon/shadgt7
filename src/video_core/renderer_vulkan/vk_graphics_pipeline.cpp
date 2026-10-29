@@ -189,6 +189,8 @@ private:
 // summary (the driver figure) needs hundreds of new ones at once. With every build worker on one,
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
 // At most two of them are created at the same time; -DisablePerf 79 lets them all run.
+// PERF-GT7-029: three while compiles use every core (a catch-up, or a draw waiting): GT7's
+// tessellated road and terrain blinked for two minutes on a new track while theirs built.
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -197,7 +199,14 @@ public:
             return;
         }
         const auto start = std::chrono::steady_clock::now();
-        Semaphore().acquire();
+        {
+            auto& gate = Gate();
+            std::unique_lock lk{gate.mutex};
+            while (gate.running >= (Common::CompileCoresWide() ? 3 : 2)) {
+                gate.cv.wait_for(lk, std::chrono::milliseconds{50}); // the limit can change
+            }
+            ++gate.running;
+        }
         held = true;
         const auto waited = std::chrono::steady_clock::now() - start;
         if (waited >= std::chrono::seconds{1}) {
@@ -212,14 +221,24 @@ public:
     }
     ~HeavyBuildGate() {
         if (held) {
-            Semaphore().release();
+            auto& gate = Gate();
+            {
+                std::scoped_lock lk{gate.mutex};
+                --gate.running;
+            }
+            gate.cv.notify_one();
         }
     }
 
 private:
-    static std::counting_semaphore<64>& Semaphore() {
-        static std::counting_semaphore<64> semaphore{2};
-        return semaphore;
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        int running = 0;
+    };
+    static State& Gate() {
+        static State state;
+        return state;
     }
     bool held = false;
 };

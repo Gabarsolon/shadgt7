@@ -316,15 +316,39 @@ public:
         return queue.ForegroundIdle();
     }
     /// PERF-GT7-021: while a draw into a one-off target waits (the game stopped anyway), up to
-    /// all but four hardware threads build at once instead of CompileConcurrency (4).
+    /// all but four hardware threads build at once instead of CompileConcurrency (4). Calls nest
+    /// (two threads can wait at once).
     void Widen(bool on) {
-        const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
-                                      CompileConcurrency(), 12u);
-        queue.SetExtraRunning(on ? widest - CompileConcurrency() : 0);
+        {
+            std::scoped_lock lk{extra_mutex};
+            waiting += on ? 1 : -1;
+            ApplyExtra();
+        }
         Common::SetCompileCoresWide(on); // PERF-GT7-024: off the compile cores meanwhile
+    }
+    /// PERF-GT7-029: during a catch-up, 8 at a time on every core.
+    void SetCatchUp(bool on) {
+        {
+            std::scoped_lock lk{extra_mutex};
+            catch_up = on;
+            ApplyExtra();
+        }
+        Common::SetCompileCoresWide(on);
     }
 
 private:
+    void ApplyExtra() {
+        const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
+                                      CompileConcurrency(), 12u);
+        const u32 width = waiting > 0 ? widest
+                          : catch_up  ? std::clamp(8u, CompileConcurrency(), widest)
+                                      : CompileConcurrency();
+        queue.SetExtraRunning(width - CompileConcurrency());
+    }
+    std::mutex extra_mutex;
+    int waiting = 0;
+    bool catch_up = false;
+
     static u32 AllCores() {
         return std::max(std::thread::hardware_concurrency(), NumWorkers());
     }
@@ -415,6 +439,7 @@ struct PipelineCache::PipelineBuild {
     // Whoever sets this first builds the pipeline: a worker, or the command thread when a
     // draw needs it before a worker got to it.
     std::atomic<bool> started{};
+    std::atomic<bool> bumped{}; ///< PERF-GT7-029: queued again at the front
     // The cached infos the copies were made from; the pipeline points at them once built.
     std::array<const Shader::Info*, MaxShaderStages> canonical{};
 };
@@ -1556,6 +1581,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
     BuildQueuedStates(params, false);
     ReportAsyncPipelines(std::chrono::steady_clock::now());
+    UpdateCatchUp(std::chrono::steady_clock::now()); // PERF-GT7-029
     S().draw_indirect_params = params;
     ++draws_since_scan;
     // FIX-078: missing translations of this draw's stages are queued together first; then the
@@ -1733,6 +1759,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             !MenusWait()) {
             ++async_stats.skipped_draws;
             NoteSkippedDraw(); // PERF-103
+            NoteAsyncSkip(pending->second, true); // PERF-GT7-029
             skipped_build = pending->second; // PERF-GT7-020
             return nullptr;
         }
@@ -1863,6 +1890,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 graphics_pipelines.erase(it);
                 ++async_stats.skipped_draws;
                 NoteSkippedDraw(); // PERF-103
+                NoteAsyncSkip(stored, true); // PERF-GT7-029
                 skipped_build = stored; // PERF-GT7-020
                 return nullptr;
             }
@@ -1928,6 +1956,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             ++async_stats.deferred;
             ++async_stats.skipped_draws;
             NoteSkippedDraw(); // PERF-103
+            NoteAsyncSkip(build, false); // PERF-GT7-029
             skipped_build = build; // PERF-GT7-020
             return nullptr;
         }
@@ -2692,6 +2721,68 @@ bool PipelineCache::AsyncPipelines() {
         return on && Common::PerfFeatureEnabled(76);
     }();
     return enabled;
+}
+
+void PipelineCache::NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again) {
+    catch_up_skips.fetch_add(1, std::memory_order_relaxed);
+    // A draw skipped again comes back frame after frame: it is on screen. Its build, if no worker
+    // has started it, goes to the front of the queue (the job already queued finds it started
+    // and does nothing).
+    if (again && build_workers && !build->started.load(std::memory_order_relaxed) &&
+        !build->bumped.exchange(true)) {
+        QueueBuild(build, BuildQueue::Kind::Urgent);
+        catch_up_bumped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_COMPILE_CATCH_UP");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || !build_workers) {
+        return;
+    }
+    std::unique_lock lk{catch_up_mutex, std::try_to_lock};
+    if (!lk.owns_lock()) {
+        return;
+    }
+    auto& c = catch_up;
+    if (now - c.window_start < std::chrono::milliseconds{250}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - c.window_start).count();
+    c.window_start = now;
+    const u64 skips = catch_up_skips.exchange(0, std::memory_order_relaxed);
+    const double rate = double(skips) / seconds;
+    // In: 3,000 skipped draws a second (100 a frame at 30 fps; a new track's start skipped up to
+    // 25,000 a second for two minutes). Out: under 1,000 a second for a second.
+    if (!c.on) {
+        if (rate >= 3000.0) {
+            c.on = true;
+            c.since = now;
+            c.calm = 0;
+            c.skipped = skips;
+            catch_up_bumped.store(0, std::memory_order_relaxed);
+            build_workers->SetCatchUp(true);
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-GT7-029: {:.0f} draws a second skipped while their pipelines build: "
+                        "compiles on every core, 8 at a time",
+                        rate);
+        }
+        return;
+    }
+    c.skipped += skips;
+    c.calm = rate < 1000.0 ? c.calm + 1 : 0;
+    if (c.calm >= 4) {
+        c.on = false;
+        build_workers->SetCatchUp(false);
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-GT7-029: catch-up over after {:.1f} s ({} draws skipped meanwhile, {} "
+                    "builds of draws on screen moved to the front); compiles back on their cores",
+                    std::chrono::duration<double>(now - c.since).count(), c.skipped,
+                    catch_up_bumped.exchange(0));
+    }
 }
 
 void PipelineCache::ReportAsyncPipelines(std::chrono::steady_clock::time_point now) {
