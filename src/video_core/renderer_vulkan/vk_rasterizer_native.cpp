@@ -2251,9 +2251,19 @@ void NativeRenderer::RefreshRegion(Region& region) {
 bool NativeRenderer::OneOffDiagOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_DIAG_ONE_OFF_REDRAW");
-        return RyDiag::Enabled() && !(env && env[0] == '0');
+        return (RyDiag::Enabled() && !(env && env[0] == '0')) || OneOffDiagAll();
     }();
     return on;
+}
+
+bool NativeRenderer::OneOffDiagAll() {
+    // RYGT_DIAG_ONE_OFF_REDRAW=1: also the draws that found their pipeline built (they would
+    // have waited for it), so any race start counts, not only one whose pipelines are new.
+    static const bool all = [] {
+        const char* env = std::getenv("RYGT_DIAG_ONE_OFF_REDRAW");
+        return env && env[0] == '1';
+    }();
+    return all;
 }
 
 void NativeRenderer::WatchOneOffs() {
@@ -6937,6 +6947,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         pipeline = r.AcquireGraphicsPipelineWaiting(params);
         ++stats.one_off_waits;
         WatchOneOffs(); // DIAG-GT7-008
+    } else if (pipeline && OneOffDiagAll() && DrawMustNotSkip(regs)) {
+        WatchOneOffs(); // DIAG-GT7-008: it would have waited
     }
     if (!pipeline) {
         ++stats.no_pipeline;

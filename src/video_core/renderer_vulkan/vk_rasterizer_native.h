@@ -382,6 +382,7 @@ private:
     /// 64 frames), with the draws that waited for each. Whether a new scene's first frame may skip
     /// them as later frames do.
     static bool OneOffDiagOn();
+    static bool OneOffDiagAll(); ///< RYGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
     void WatchOneOffs();     ///< after a FIX-198 wait: its pictures, from one_off_hits
     void CheckOneOffs();     ///< each frame
     std::string OneOffText(); ///< the window's counts, then cleared
