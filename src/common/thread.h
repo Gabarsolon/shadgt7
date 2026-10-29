@@ -34,9 +34,12 @@ int CurrentCoreIsFast();
 
 /// PERF-097: on hybrid CPUs, keeps the calling thread on the efficiency cores (shader and
 /// pipeline compiles, so a burst of them leaves the fast cores to the game and the renderer).
-/// SHADGT_BUILD_ON_SLOW_CORES=0 turns it off. PERF-GT7-024: on CPUs with one kind of core, on the
-/// compile cores (the last third of the cores, both hardware threads of each).
+/// SHADGT_BUILD_ON_SLOW_CORES=0 turns it off.
 void PreferEfficiencyCores();
+
+/// PERF-GT7-024: pipeline builds: on hybrid CPUs as PreferEfficiencyCores; on CPUs with one kind
+/// of core, the compile cores (the last third of the cores, both hardware threads of each).
+void PreferCompileCores();
 
 /// Undoes PreferPerformanceCores/PreferEfficiencyCores for the calling thread.
 void AllowAllCores();
@@ -44,9 +47,10 @@ void AllowAllCores();
 /// PERF-088: the CPU has fast and slow cores.
 bool HybridCpu();
 
-/// PERF-GT7-024: on a CPU with one kind of core, the threads of the driver's shader compiler
-/// (started in nvgpucomp*.dll) found since the last call are kept on the compile cores too.
-/// Called every 2 s. RYGT_COMPILE_CORES=0 turns the compile cores off.
+/// PERF-GT7-024: on a CPU with one kind of core, the threads of the driver's shader compiler are
+/// kept on the compile cores too: unnamed threads busy since the last call are sampled, and one
+/// found running in nvgpucomp64.dll is moved. Called every 2 s. RYGT_COMPILE_CORES=0 turns the
+/// compile cores off.
 void ConfineDriverCompileThreads();
 
 /// PERF-GT7-024: while a draw waits for its pipeline (the game is stopped anyway), compile work

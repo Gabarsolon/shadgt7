@@ -210,21 +210,23 @@ void PreferEfficiencyCores() {
         return !(env && env[0] == '0');
     }();
     const auto& classes = GetCoreClasses();
-    if (!enabled) {
-        return;
-    }
-    if (!classes.hybrid) {
-        if (CompileCoresOn() && !classes.compile_ids.empty()) { // PERF-GT7-024
-            SetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
-                                     static_cast<ULONG>(classes.compile_ids.size()));
-        }
-        return;
-    }
-    if (classes.slow_ids.empty()) {
+    if (!enabled || !classes.hybrid || classes.slow_ids.empty()) {
         return;
     }
     SetThreadSelectedCpuSets(GetCurrentThread(), classes.slow_ids.data(),
                              static_cast<ULONG>(classes.slow_ids.size()));
+}
+
+void PreferCompileCores() {
+    const auto& classes = GetCoreClasses();
+    if (classes.hybrid) {
+        PreferEfficiencyCores();
+        return;
+    }
+    if (CompileCoresOn() && !classes.compile_ids.empty()) {
+        SetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
+                                 static_cast<ULONG>(classes.compile_ids.size()));
+    }
 }
 
 void AllowAllCores() {
@@ -236,11 +238,19 @@ bool HybridCpu() {
 }
 
 namespace {
-// PERF-GT7-024: the driver's compiler threads kept on the compile cores.
+// PERF-GT7-024: the driver's compiler threads kept on the compile cores. Its threads all start in
+// ucrtbase.dll like most others (first try: by start module, none found), so an unnamed thread
+// busy since the last look is stopped for an instant and its instruction pointer read.
 struct DriverCompileThreads {
+    struct Thread {
+        HANDLE handle = nullptr;
+        u64 cpu_100ns = 0;
+        u32 outside = 0;       ///< samples outside the compiler
+        bool confined = false; ///< the compiler's: on the compile cores
+    };
     std::mutex mutex;
-    std::unordered_map<DWORD, HANDLE> confined;
-    std::unordered_map<DWORD, std::wstring> checked; // thread: the module it started in
+    std::unordered_map<DWORD, Thread> threads; ///< unnamed threads still looked at, and confined
+    std::unordered_map<DWORD, bool> left;      ///< threads not looked at again
     std::atomic<int> wide{0};
     u32 calls = 0;
     u32 reports = 0;
@@ -260,31 +270,28 @@ void ApplyCompileCores(HANDLE thread, bool wide) {
     }
 }
 
-// The module a thread started in (its Win32 start address), lower case.
-std::wstring StartModule(HANDLE thread) {
-    using QueryFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    static const auto query = reinterpret_cast<QueryFn>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-    constexpr ULONG ThreadQuerySetWin32StartAddress = 9;
-    PVOID start = nullptr;
-    if (!query || query(thread, ThreadQuerySetWin32StartAddress, &start, sizeof(start), nullptr) < 0 ||
-        !start) {
-        return L"?";
+// The compiler's code: nvgpucomp64.dll's image, once loaded.
+bool CompilerRange(uintptr_t& begin, uintptr_t& end) {
+    const HMODULE module = GetModuleHandleW(L"nvgpucomp64.dll");
+    if (!module) {
+        return false;
     }
-    HMODULE module = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            static_cast<LPCWSTR>(start), &module)) {
-        return L"(no module)";
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const u8*>(module) + dos->e_lfanew);
+    begin = reinterpret_cast<uintptr_t>(module);
+    end = begin + nt->OptionalHeader.SizeOfImage;
+    return true;
+}
+
+bool Unnamed(HANDLE thread) {
+    PWSTR description = nullptr;
+    const bool unnamed = FAILED(GetThreadDescription(thread, &description)) || !description ||
+                         description[0] == L'\0';
+    if (description) {
+        LocalFree(description);
     }
-    wchar_t path[MAX_PATH];
-    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
-    std::wstring name{path, length};
-    if (const auto slash = name.find_last_of(L"\\/"); slash != std::wstring::npos) {
-        name.erase(0, slash + 1);
-    }
-    std::ranges::transform(name, name.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
-    return name;
+    return unnamed;
 }
 } // namespace
 
@@ -293,15 +300,20 @@ void ConfineDriverCompileThreads() {
     if (classes.hybrid || classes.compile_ids.empty() || !CompileCoresOn()) {
         return;
     }
+    uintptr_t compiler_begin = 0, compiler_end = 0;
+    if (!CompilerRange(compiler_begin, compiler_end)) {
+        return;
+    }
     std::vector<DWORD> tids;
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return;
     }
     const DWORD pid = GetCurrentProcessId();
+    const DWORD self = GetCurrentThreadId();
     THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
     for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
-        if (entry.th32OwnerProcessID == pid) {
+        if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != self) {
             tids.push_back(entry.th32ThreadID);
         }
     }
@@ -312,52 +324,91 @@ void ConfineDriverCompileThreads() {
     std::scoped_lock lk{d.mutex};
     ++d.calls;
     const auto alive = [&](DWORD tid) { return std::ranges::binary_search(tids, tid); };
-    std::erase_if(d.confined, [&](const auto& item) {
+    std::erase_if(d.threads, [&](auto& item) {
         if (alive(item.first)) {
             return false;
         }
-        CloseHandle(item.second);
+        CloseHandle(item.second.handle);
         return true;
     });
-    std::erase_if(d.checked, [&](const auto& item) { return !alive(item.first); });
+    std::erase_if(d.left, [&](const auto& item) { return !alive(item.first); });
     u32 found = 0;
     for (const DWORD tid : tids) {
-        if (d.checked.contains(tid)) {
+        if (d.left.contains(tid)) {
             continue;
         }
-        const HANDLE thread =
-            OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_LIMITED_INFORMATION, FALSE, tid);
-        if (!thread) {
-            d.checked.emplace(tid, L"(not opened)");
+        auto [it, first] = d.threads.try_emplace(tid);
+        auto& thread = it->second;
+        if (first) {
+            thread.handle = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_LIMITED_INFORMATION |
+                                           THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                       FALSE, tid);
+            if (!thread.handle || !Unnamed(thread.handle)) {
+                // Ours and the game's threads have names; so do most others.
+                if (thread.handle) {
+                    CloseHandle(thread.handle);
+                }
+                d.threads.erase(it);
+                d.left.emplace(tid, false);
+                continue;
+            }
+        }
+        if (thread.confined) {
             continue;
         }
-        std::wstring module = StartModule(thread);
-        if (module.starts_with(L"nvgpucomp")) {
-            ApplyCompileCores(thread, d.wide.load() > 0);
-            d.confined.emplace(tid, thread);
+        FILETIME creation, exit, kernel, user;
+        if (!GetThreadTimes(thread.handle, &creation, &exit, &kernel, &user)) {
+            continue;
+        }
+        const u64 cpu = (u64(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
+                        (u64(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+        const u64 used = cpu - thread.cpu_100ns;
+        thread.cpu_100ns = cpu;
+        if (first || used < 1'000'000) { // under 100 ms in the last 2 s: not compiling now
+            continue;
+        }
+        // Only GetThreadContext between the two calls: the stopped thread may hold any lock.
+        uintptr_t ip = 0;
+        if (SuspendThread(thread.handle) != DWORD(-1)) {
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL;
+            const bool read = GetThreadContext(thread.handle, &context) != FALSE;
+            ResumeThread(thread.handle);
+            if (read) {
+                ip = uintptr_t(context.Rip);
+            }
+        }
+        if (ip >= compiler_begin && ip < compiler_end) {
+            thread.confined = true;
+            ApplyCompileCores(thread.handle, d.wide.load() > 0);
             ++found;
-        } else {
-            CloseHandle(thread);
+        } else if (++thread.outside >= 12) {
+            // Busy, but never in the compiler when looked at.
+            CloseHandle(thread.handle);
+            d.threads.erase(it);
+            d.left.emplace(tid, true);
         }
-        d.checked.emplace(tid, std::move(module));
     }
     if (found != 0 && d.reports < 20) {
         ++d.reports;
+        u32 confined = 0;
+        for (const auto& [tid, thread] : d.threads) {
+            confined += thread.confined ? 1 : 0;
+        }
         LOG_INFO(Common, "PERF-GT7-024: {} driver compiler threads moved to the compile cores ({} "
-                 "now)", found, d.confined.size());
+                 "now)", found, confined);
     }
-    if (d.calls == 30) {
-        // After a minute, the threads by the module they started in: the compiler's should be there.
-        std::map<std::wstring, u32> modules;
-        for (const auto& [tid, module] : d.checked) {
-            ++modules[module];
+    if (d.calls == 60) {
+        u32 confined = 0, watched = 0, busy_left = 0;
+        for (const auto& [tid, thread] : d.threads) {
+            (thread.confined ? confined : watched) += 1;
         }
-        std::string text;
-        for (const auto& [module, count] : modules) {
-            text += fmt::format(" {} {}", UTF16ToUTF8(module), count);
+        for (const auto& [tid, busy] : d.left) {
+            busy_left += busy ? 1 : 0;
         }
-        LOG_INFO(Common, "PERF-GT7-024: threads by start module:{}; {} on the compile cores", text,
-                 d.confined.size());
+        LOG_INFO(Common, "PERF-GT7-024: after 2 minutes, {} driver compiler threads on the compile "
+                 "cores, {} unnamed threads still looked at, {} busy ones left (never in the "
+                 "compiler)", confined, watched, busy_left);
     }
 }
 
@@ -369,8 +420,10 @@ void SetCompileCoresWide(bool wide) {
         return;
     }
     std::scoped_lock lk{d.mutex};
-    for (const auto& [tid, thread] : d.confined) {
-        ApplyCompileCores(thread, after > 0);
+    for (const auto& [tid, thread] : d.threads) {
+        if (thread.confined) {
+            ApplyCompileCores(thread.handle, after > 0);
+        }
     }
 }
 
@@ -440,6 +493,8 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 void PreferPerformanceCores() {}
 
 void PreferEfficiencyCores() {}
+
+void PreferCompileCores() {}
 
 void AllowAllCores() {}
 

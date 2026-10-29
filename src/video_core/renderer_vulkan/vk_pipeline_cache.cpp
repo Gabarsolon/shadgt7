@@ -344,8 +344,9 @@ private:
 
     void Work(std::stop_token stop) {
         Common::SetCurrentThreadName("shadGT:PipelineBuild");
-        // PERF-097: driver compiles stay off the cores the game and the recorder run on.
-        Common::PreferEfficiencyCores();
+        // PERF-097, PERF-GT7-024: driver compiles stay off the cores the game and the recorder
+        // run on.
+        Common::PreferCompileCores();
         bool low_priority = false;
         bool all_cores = false;
         bool backlog = false;
@@ -376,7 +377,7 @@ private:
                 if (all_cores) {
                     Common::AllowAllCores();
                 } else {
-                    Common::PreferEfficiencyCores();
+                    Common::PreferCompileCores();
                 }
             }
             if (backlog != low_priority) {
