@@ -947,9 +947,10 @@ void Instance::ReportDeviceLost() const {
         LOG_CRITICAL(Render_Vulkan, "DIAG-243: device fault ({}): {}; {} addresses, {} vendor infos",
                      static_cast<int>(result), info.description, counts.addressInfoCount,
                      counts.vendorInfoCount);
-        static constexpr const char* types[] = {"none", "invalid pointer", "read invalid",
-                                                "write invalid", "execute invalid",
-                                                "instruction pointer unknown",
+        // VkDeviceFaultAddressTypeEXT.
+        static constexpr const char* types[] = {"none", "read invalid", "write invalid",
+                                                "execute invalid",
+                                                "instruction pointer (a running wave)",
                                                 "instruction pointer invalid",
                                                 "instruction pointer fault"};
         for (u32 i = 0; i < counts.addressInfoCount; ++i) {
