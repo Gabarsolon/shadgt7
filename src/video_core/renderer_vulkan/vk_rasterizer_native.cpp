@@ -20,7 +20,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <immintrin.h>
+#include <sstream>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -31,6 +33,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
@@ -649,6 +652,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
+    LoadOneOffKinds(); // PERF-GT7-023
     if (const u64 address = HwWatchAddress(); address != 0) {
         const char* env = std::getenv("RYGT_DIAG_HW_WATCH");
         const char* comma = std::strchr(env, ',');
@@ -662,6 +666,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
 
 NativeRenderer::~NativeRenderer() {
     std::scoped_lock lock{mutex};
+    SaveOneOffKinds(true); // PERF-GT7-023
     // PERF-GT7-018: commands still in the ring use this renderer's lists.
     r.scheduler.SyncCommandThread();
     const vk::Device vk_device = r.instance.GetDevice();
@@ -2266,8 +2271,126 @@ bool NativeRenderer::OneOffDiagAll() {
     return all;
 }
 
-void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs) {
-    if (!OneOffDiagOn()) {
+bool NativeRenderer::OneOffLearnOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_LEARN");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+bool NativeRenderer::OneOffTrackOn() {
+    return OneOffLearnOn() || OneOffDiagOn();
+}
+
+namespace {
+// PERF-GT7-023: pictures of a kind redrawn after their wait before it stops waiting (the 128x128
+// colour and 256x128 depth pictures of GT7's races had 34 and 137 in five runs, none sampled
+// first).
+constexpr u32 OneOffSafeCount = 8;
+
+bool OneOffKindExempt(u32 safe, u32 harmful) {
+    return harmful == 0 && safe >= OneOffSafeCount;
+}
+
+std::filesystem::path OneOffKindsPath() {
+    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           fmt::format("{}.one_off_kinds.txt", serial);
+}
+} // namespace
+
+size_t NativeRenderer::OneOffKindHash::operator()(const OneOffKind& kind) const noexcept {
+    const std::array<u64, 4> words{u64(kind.depth) << 32 | kind.pitch,
+                                   u64(kind.height) << 32 | kind.slices,
+                                   u64(kind.samples) << 32 | kind.format,
+                                   u64(kind.number_format) << 32 | kind.tile};
+    return MemoHash(words.data(), words.size(), 0x198);
+}
+
+NativeRenderer::OneOffKind NativeRenderer::KindOf(const OneOffHit& hit) {
+    return {.depth = hit.depth,
+            .pitch = hit.pitch,
+            .height = hit.height,
+            .slices = hit.slices,
+            .samples = hit.samples,
+            .format = hit.format,
+            .number_format = hit.number_format,
+            .tile = hit.tile};
+}
+
+bool NativeRenderer::OneOffExempt(const OneOffHit& hit) const {
+    if (!OneOffLearnOn()) {
+        return false;
+    }
+    const auto it = one_off_kinds.find(KindOf(hit));
+    return it != one_off_kinds.end() && OneOffKindExempt(it->second.safe, it->second.harmful);
+}
+
+void NativeRenderer::LoadOneOffKinds() {
+    if (!OneOffLearnOn()) {
+        return;
+    }
+    std::ifstream file{OneOffKindsPath()};
+    std::string line;
+    u32 exempt = 0;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream in{line};
+        std::string what;
+        OneOffKind kind{};
+        OneOffKindStats seen{};
+        if (!(in >> what >> kind.pitch >> kind.height >> kind.slices >> kind.samples >>
+              kind.format >> kind.number_format >> kind.tile >> seen.safe >> seen.harmful)) {
+            continue;
+        }
+        kind.depth = what == "depth";
+        one_off_kinds[kind] = seen;
+        exempt += OneOffKindExempt(seen.safe, seen.harmful) ? 1 : 0;
+    }
+    LOG_INFO(Render_Vulkan,
+             "PERF-GT7-023: {} kinds of one-off pictures known, {} of them no longer waited for",
+             one_off_kinds.size(), exempt);
+}
+
+void NativeRenderer::SaveOneOffKinds(bool wait) {
+    if (!OneOffLearnOn() || !one_off_kinds_changed) {
+        return;
+    }
+    one_off_kinds_changed = false;
+    std::string text = "# PERF-GT7-023: FIX-198 picture kinds (kind pitch height slices samples "
+                       "format number_format tile safe harmful)\n";
+    for (const auto& [kind, seen] : one_off_kinds) {
+        text += fmt::format("{} {} {} {} {} {} {} {} {} {}\n", kind.depth ? "depth" : "color",
+                            kind.pitch, kind.height, kind.slices, kind.samples, kind.format,
+                            kind.number_format, kind.tile, seen.safe, seen.harmful);
+    }
+    auto write = [path = OneOffKindsPath(), text = std::move(text)] {
+        static std::mutex write_mutex;
+        std::scoped_lock lk{write_mutex};
+        auto temp = path;
+        temp += ".tmp";
+        {
+            std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+            out << text;
+            if (!out) {
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(temp, path, ec);
+    };
+    if (wait) {
+        write();
+    } else {
+        std::thread(std::move(write)).detach(); // a cold file open costs the recorder ~5 ms
+    }
+}
+
+void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs, bool skipped) {
+    if (!OneOffTrackOn()) {
         return;
     }
     u64 ps_hash = 0;
@@ -2287,7 +2410,9 @@ void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs) {
             it->second.hit = hit;
             it->second.frame = frame;
             it->second.ps_hash = ps_hash;
+            it->second.skipped = skipped;
         }
+        it->second.skipped &= skipped;
         ++it->second.waits;
         if (it->second.frame == frame) {
             ++it->second.draws;
@@ -2297,7 +2422,7 @@ void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs) {
 }
 
 void NativeRenderer::CheckOneOffs() {
-    if (!OneOffDiagOn() || one_off_watch.empty()) {
+    if (!OneOffTrackOn() || one_off_watch.empty()) {
         return;
     }
     std::erase_if(one_off_watch, [&](const auto& item) {
@@ -2318,6 +2443,28 @@ void NativeRenderer::CheckOneOffs() {
             return false; // still watched
         }
         const auto& hit = watch.hit;
+        if (OneOffLearnOn()) {
+            // PERF-GT7-023: what its kind learns. A picture whose draws were all skipped proves
+            // nothing when redrawn (nothing waited), only when sampled first.
+            auto& seen = one_off_kinds[KindOf(hit)];
+            if (outcome <= 4 && !watch.skipped) {
+                ++seen.safe;
+                one_off_kinds_changed = true;
+            } else if (outcome == 5) {
+                if (seen.harmful++ == 0 && seen.safe >= OneOffSafeCount) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-GT7-023: picture {:#x} ({} {}x{} format {}/{}) sampled "
+                                "before its redraw{}: its kind waits again",
+                                address, hit.depth ? "depth" : "color", hit.pitch, hit.height,
+                                hit.format, hit.number_format,
+                                watch.skipped ? " after a skipped draw" : "");
+                }
+                one_off_kinds_changed = true;
+            }
+        }
+        if (!OneOffDiagOn()) {
+            return true;
+        }
         const size_t why = hit.never ? 0 : 1;
         ++one_off_stats.pictures[why][outcome];
         one_off_stats.waits[why][outcome] += watch.waits;
@@ -2375,6 +2522,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         return !(env && env[0] == '0');
     }();
     if (!enabled) {
+        one_off_hits.clear();
         return false;
     }
     // DIAG-220 (diagnosis, RYGT_DIAG_ONE_OFF=1): why targets count as one-off: never drawn
@@ -2407,12 +2555,12 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
         if (!entry) {
             note(0);
-            if (OneOffDiagOn()) {
+            if (OneOffTrackOn()) {
                 described.address = address;
                 described.never = true;
                 one_off_hits.push_back(described);
             }
-            return false; // never drawn into
+            return OneOffExempt(described); // never drawn into; PERF-GT7-023: unless its kind
         }
         const u64 last = entry->written_frame.load(std::memory_order_relaxed);
         const u64 earlier =
@@ -2428,18 +2576,18 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         const bool lately = earlier != 0 && frame - earlier <= window;
         if (!lately) {
             note(earlier == 0 ? 0 : frame - earlier);
-            if (OneOffDiagOn()) {
+            if (OneOffTrackOn()) {
                 described.address = address;
                 described.never = earlier == 0;
                 one_off_hits.push_back(described);
             }
         }
-        return lately;
+        return lately || OneOffExempt(described); // PERF-GT7-023
     };
     if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
         for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
             const auto& col_buf = regs.color_buffers[cb];
-            if (OneOffDiagOn() && col_buf) {
+            if (OneOffTrackOn() && col_buf) {
                 described = {.depth = false,
                              .cb = cb,
                              .pitch = col_buf.Pitch(),
@@ -2456,7 +2604,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             }
         }
     }
-    if (OneOffDiagOn() && regs.depth_buffer.DepthValid()) {
+    if (OneOffTrackOn() && regs.depth_buffer.DepthValid()) {
         const auto& db = regs.depth_buffer;
         described = {.depth = true,
                      .pitch = db.Pitch(),
@@ -6995,9 +7143,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[0]};
         pipeline = r.AcquireGraphicsPipelineWaiting(params);
         ++stats.one_off_waits;
-        WatchOneOffs(regs); // DIAG-GT7-008
+        WatchOneOffs(regs, false); // DIAG-GT7-008, PERF-GT7-023
+    } else if (!pipeline && !one_off_hits.empty()) {
+        // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
+        // draws are, and still watched (one sampled before its redraw makes its kind wait again).
+        ++stats.one_off_exempt;
+        WatchOneOffs(regs, true);
     } else if (pipeline && OneOffDiagAll() && DrawMustNotSkip(regs)) {
-        WatchOneOffs(regs); // DIAG-GT7-008: it would have waited
+        WatchOneOffs(regs, false); // DIAG-GT7-008: it would have waited
     }
     if (!pipeline) {
         ++stats.no_pipeline;
@@ -9216,8 +9369,8 @@ bool NativeRenderer::SeqTraced(const Native::ImageEntry* entry) const {
 
 void NativeRenderer::SeqBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
                              bool storage, u64 program) {
-    if (!storage && !entry.from_cpu && OneOffDiagOn()) {
-        // DIAG-GT7-008: a picture the GPU drew, sampled.
+    if (!storage && !entry.from_cpu && OneOffTrackOn()) {
+        // DIAG-GT7-008, PERF-GT7-023: a picture the GPU drew, sampled.
         const_cast<Native::ImageEntry&>(entry).sampled_frame.store(frame,
                                                                    std::memory_order_relaxed);
     }
@@ -10547,6 +10700,11 @@ void NativeRenderer::Report() {
         LOG_INFO(Render_Vulkan, "FIX-198: {} draws into pictures not drawn lately waited for their "
                  "new pipeline", std::exchange(stats.one_off_waits, 0));
     }
+    if (stats.one_off_exempt != 0) {
+        LOG_INFO(Render_Vulkan, "PERF-GT7-023: {} draws into one-off pictures of kinds always "
+                 "redrawn skipped instead of waiting", std::exchange(stats.one_off_exempt, 0));
+    }
+    SaveOneOffKinds(false); // PERF-GT7-023
     if (OneOffDiagOn()) {
         if (std::string text = OneOffText(); !text.empty()) {
             LOG_WARNING(Render_Vulkan, "DIAG-GT7-008 (10 s): {}", text);

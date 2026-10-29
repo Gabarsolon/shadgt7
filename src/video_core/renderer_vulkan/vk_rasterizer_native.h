@@ -383,7 +383,8 @@ private:
     /// them as later frames do.
     static bool OneOffDiagOn();
     static bool OneOffDiagAll(); ///< RYGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
-    void WatchOneOffs(const AmdGpu::Regs& regs); ///< after a FIX-198 wait: from one_off_hits
+    /// After a FIX-198 wait (or a draw PERF-GT7-023 skipped instead): from one_off_hits.
+    void WatchOneOffs(const AmdGpu::Regs& regs, bool skipped);
     void CheckOneOffs();     ///< each frame
     std::string OneOffText(); ///< the window's counts, then cleared
     /// What the draw that first waited for a picture says of it: is it a colour target (and
@@ -402,6 +403,7 @@ private:
         u64 ps_hash = 0;   ///< that draw's pixel shader
         u32 draws = 0;     ///< draws into it in the frame of the first wait (with a wait)
         u32 waits = 0;
+        bool skipped = false; ///< PERF-GT7-023: every draw into it so far skipped, none waited
     };
     std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
     std::unordered_map<VAddr, OneOffWatch> one_off_watch;
@@ -411,6 +413,33 @@ private:
         std::array<std::array<u64, 7>, 2> pictures{};
         std::array<std::array<u64, 7>, 2> waits{};
     } one_off_stats;
+    /// PERF-GT7-023: FIX-198's waits learned by kind of picture (colour or depth, pitch, height,
+    /// slices, samples, format, tiling). A kind whose pictures were redrawn after a wait, without
+    /// being sampled before, at least 8 times, no longer waits: its draws are skipped while their
+    /// pipeline builds, as other draws are. One picture of the kind sampled before its redraw makes
+    /// it wait again. Kept from run to run (<cache folder>/<serial>.one_off_kinds.txt).
+    /// RYGT_ONE_OFF_LEARN=0: every one-off picture waits, as before.
+    struct OneOffKind {
+        bool depth = false;
+        u32 pitch = 0, height = 0, slices = 0, samples = 0;
+        u32 format = 0, number_format = 0, tile = 0;
+        bool operator==(const OneOffKind&) const = default;
+    };
+    struct OneOffKindHash {
+        size_t operator()(const OneOffKind& kind) const noexcept;
+    };
+    struct OneOffKindStats {
+        u32 safe = 0;    ///< pictures redrawn after a wait, not sampled before
+        u32 harmful = 0; ///< pictures sampled in a later frame before any redraw
+    };
+    static OneOffKind KindOf(const OneOffHit& hit);
+    static bool OneOffLearnOn();
+    static bool OneOffTrackOn(); ///< PERF-GT7-023 or DIAG-GT7-008
+    bool OneOffExempt(const OneOffHit& hit) const;
+    void LoadOneOffKinds();
+    void SaveOneOffKinds(bool wait); ///< when changed; wait: on this thread
+    std::unordered_map<OneOffKind, OneOffKindStats, OneOffKindHash> one_off_kinds;
+    bool one_off_kinds_changed = false;
     /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
     /// yet run by the GPU (guest range, GPU tick), and CPU writes that met one.
     struct PendingWriteback {
@@ -1158,6 +1187,7 @@ private:
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
         u64 indirect_draws = 0, indirect_skipped = 0; ///< NAT-161: recorded, and not
         u64 one_off_waits = 0; ///< FIX-198: draws that waited for their new pipeline
+        u64 one_off_exempt = 0; ///< PERF-GT7-023: draws into exempt pictures, skipped
         u64 writeback_befores = 0, precise_writebacks = 0; ///< FIX-203
         /// DIAG-188: a direct dispatch's recorder time by part (pipeline, bindings, images,
         /// barrier with write-backs, recording, notes), and the write-backs' share.
