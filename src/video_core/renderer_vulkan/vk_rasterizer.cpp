@@ -6203,7 +6203,7 @@ void Rasterizer::UpdateDepthStencilState() const {
     // start's close-ups. RYGT_TESS_DEPTH_BIAS=<units of minimum resolvable depth>, 0 turns it off.
     static const float tess_bias = [] {
         const char* env = std::getenv("RYGT_TESS_DEPTH_BIAS");
-        return env && *env ? std::strtof(env, nullptr) : 16.0f;
+        return env && *env ? std::strtof(env, nullptr) : 0.0f; // off: a bias, not accuracy
     }();
     const auto func = regs.depth_control.depth_func;
     const bool toward_greater = func == AmdGpu::CompareFunc::Greater ||

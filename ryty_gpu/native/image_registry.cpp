@@ -329,7 +329,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             // the car in the race start's close-ups). RYGT_NATIVE_LAYER_VIEWS=0: as before.
             static const bool layer_views = [] {
                 const char* env = std::getenv("RYGT_NATIVE_LAYER_VIEWS");
-                return !(env && env[0] == '0');
+                return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
             }();
             ImageEntry* layered = nullptr;
             for (auto it = first; layer_views && it != last; ++it) {
@@ -1759,7 +1759,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // their next use. RYGT_NATIVE_SOURCES_AFTER_UPLOAD=0: as before.
         static const bool sources_after_upload = [] {
             const char* env = std::getenv("RYGT_NATIVE_SOURCES_AFTER_UPLOAD");
-            return !(env && env[0] == '0');
+            return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
         }();
         if (sources_after_upload) {
             bool has_sources;
