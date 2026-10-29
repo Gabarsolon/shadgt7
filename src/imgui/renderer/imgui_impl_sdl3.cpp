@@ -413,6 +413,10 @@ void FollowGamepad() {
 }
 } // namespace
 
+void FollowReassignedGamepad() {
+    FollowGamepad();
+}
+
 bool ProcessEvent(const SDL_Event* event) {
     SdlData* bd = GetBackendData();
     IM_ASSERT(bd != nullptr &&

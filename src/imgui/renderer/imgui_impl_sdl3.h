@@ -16,6 +16,9 @@ bool Init(SDL_Window* window);
 void Shutdown();
 void NewFrame(bool is_reusing);
 bool ProcessEvent(const SDL_Event* event);
+/// FIX-GT7-007: after the game's controllers were reassigned (the window does it after this
+/// backend saw the event), the overlay follows the new first player's gamepad.
+void FollowReassignedGamepad();
 void OnResize();
 
 // Gamepad selection automatically starts in AutoFirst mode, picking first available SDL_Gamepad.
