@@ -35,16 +35,19 @@ inline bool IsCompleteSpirv(std::span<const u32> words) {
     return last_opcode == OpFunctionEnd;
 }
 
-/// FIX-GT7-011: how a module makes a float atomic min/max from integer atomics (without
-/// VK_EXT_shader_atomic_float2): both atomics, then an OpSelect by the value's sign (before
-/// FIX-226, or RYGT_FLOAT_ATOMIC_EXACT=0), or only the one the sign picks, its result from an
-/// OpPhi (FIX-226). The pairs are UMin + SMax (max) and UMax + SMin (min), each result maybe
-/// through one OpBitcast. Words of a whole module (IsCompleteSpirv).
+/// FIX-GT7-011: how a module makes a float atomic min/max of a buffer from integer atomics
+/// (without VK_EXT_shader_atomic_float2): both atomics, each result bitcast to a float, then an
+/// OpSelect by the value's sign (before FIX-226, or RYGT_FLOAT_ATOMIC_EXACT=0), or only the one
+/// the sign picks, the two results merged by an OpPhi that is bitcast to a float (FIX-226). The
+/// pairs are UMin + SMax (max) and UMax + SMin (min). FIX-GT7-013: image atomics (on an
+/// OpImageTexelPointer) are not counted: FIX-226 left their emulation as it was, so a module of
+/// them would be translated again into the same form every session. Nor are atomics whose
+/// results are selected or merged as integers. Words of a whole module (IsCompleteSpirv).
 enum class FloatAtomicEmulation { None, BothAtomics, OneAtomic };
 
 inline FloatAtomicEmulation FindFloatAtomicEmulation(std::span<const u32> words) {
     constexpr u32 HeaderWords = 5;
-    constexpr u32 OpBitcast = 124, OpSelect = 169, OpPhi = 245;
+    constexpr u32 OpImageTexelPointer = 60, OpBitcast = 124, OpSelect = 169, OpPhi = 245;
     constexpr u32 OpAtomicSMin = 236, OpAtomicUMin = 237, OpAtomicSMax = 238, OpAtomicUMax = 239;
     const auto each = [&](auto&& visit) {
         for (size_t at = HeaderWords; at < words.size();) {
@@ -56,45 +59,55 @@ inline FloatAtomicEmulation FindFloatAtomicEmulation(std::span<const u32> words)
             at += count;
         }
     };
-    // Result id: the atomic's opcode, or a bitcast's source.
-    std::unordered_map<u32, std::pair<u32, u32>> defs;
-    bool atomics = false;
+    // Image texel pointers first (an atomic's pointer is defined before it).
+    std::unordered_map<u32, u32> texel_pointers;
+    std::unordered_map<u32, u32> atomics; // result id: opcode, buffer atomics only
+    std::unordered_map<u32, u32> bitcasts; // result id: source id
     each([&](u32 op, std::span<const u32> operands) {
-        if (op >= OpAtomicSMin && op <= OpAtomicUMax && operands.size() >= 2) {
-            defs.emplace(operands[1], std::pair{op, 0u});
-            atomics = true;
+        if (op == OpImageTexelPointer && operands.size() >= 2) {
+            texel_pointers.emplace(operands[1], 0u);
+        } else if (op >= OpAtomicSMin && op <= OpAtomicUMax && operands.size() >= 3 &&
+                   !texel_pointers.contains(operands[2])) {
+            atomics.emplace(operands[1], op);
         } else if (op == OpBitcast && operands.size() >= 3) {
-            defs.emplace(operands[1], std::pair{op, operands[2]});
+            bitcasts.emplace(operands[1], operands[2]);
         }
     });
-    if (!atomics) {
+    if (atomics.empty()) {
         return FloatAtomicEmulation::None;
     }
     const auto atomic_of = [&](u32 id) -> u32 {
-        auto it = defs.find(id);
-        if (it != defs.end() && it->second.first == OpBitcast) {
-            it = defs.find(it->second.second);
-        }
-        return it != defs.end() && it->second.first != OpBitcast ? it->second.first : 0u;
+        const auto it = atomics.find(id);
+        return it != atomics.end() ? it->second : 0u;
     };
-    const auto pair = [&](u32 a, u32 b) {
-        const u32 x = atomic_of(a);
-        const u32 y = atomic_of(b);
+    const auto bitcast_atomic_of = [&](u32 id) -> u32 {
+        const auto it = bitcasts.find(id);
+        return it != bitcasts.end() ? atomic_of(it->second) : 0u;
+    };
+    const auto pair = [&](u32 x, u32 y) {
         const auto is = [&](u32 p, u32 q) { return (x == p && y == q) || (x == q && y == p); };
         return is(OpAtomicUMin, OpAtomicSMax) || is(OpAtomicUMax, OpAtomicSMin);
     };
     bool both = false;
-    bool one = false;
+    std::unordered_map<u32, u32> phis; // OpPhi results merging such a pair
     each([&](u32 op, std::span<const u32> operands) {
-        if (op == OpSelect && operands.size() == 5 && pair(operands[3], operands[4])) {
+        if (op == OpSelect && operands.size() == 5 &&
+            pair(bitcast_atomic_of(operands[3]), bitcast_atomic_of(operands[4]))) {
             both = true;
-        } else if (op == OpPhi && operands.size() == 6 && pair(operands[2], operands[4])) {
-            one = true;
+        } else if (op == OpPhi && operands.size() == 6 &&
+                   pair(atomic_of(operands[2]), atomic_of(operands[4]))) {
+            phis.emplace(operands[1], 0u);
         }
     });
-    return both  ? FloatAtomicEmulation::BothAtomics
-           : one ? FloatAtomicEmulation::OneAtomic
-                 : FloatAtomicEmulation::None;
+    if (both) {
+        return FloatAtomicEmulation::BothAtomics;
+    }
+    for (const auto& [id, source] : bitcasts) {
+        if (phis.contains(source)) {
+            return FloatAtomicEmulation::OneAtomic;
+        }
+    }
+    return FloatAtomicEmulation::None;
 }
 
 } // namespace Vulkan

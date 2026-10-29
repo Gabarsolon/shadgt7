@@ -22,7 +22,7 @@ std::vector<u32> Module(std::initializer_list<std::vector<u32>> instructions) {
     words.push_back(1u << 16 | 56); // OpFunctionEnd
     return words;
 }
-constexpr u32 OpBitcast = 124, OpSelect = 169, OpPhi = 245;
+constexpr u32 OpImageTexelPointer = 60, OpBitcast = 124, OpSelect = 169, OpPhi = 245;
 constexpr u32 OpAtomicSMin = 236, OpAtomicUMin = 237, OpAtomicSMax = 238, OpAtomicUMax = 239;
 } // namespace
 
@@ -60,4 +60,34 @@ TEST(SpirvCheck, IgnoresOtherAtomicsAndSelects) {
     EXPECT_EQ(FindFloatAtomicEmulation(module), FloatAtomicEmulation::None);
     EXPECT_EQ(FindFloatAtomicEmulation(Module({{OpBitcast, 2, 21, 20}})),
               FloatAtomicEmulation::None);
+}
+
+TEST(SpirvCheck, IgnoresImageAtomics) {
+    // FIX-GT7-013: an image's float atomic max keeps both atomics and the OpSelect (FIX-226 left
+    // image atomics as they were): translating it again would make the same module.
+    const auto module = Module({
+        {OpImageTexelPointer, 3, 9, 40, 41, 42},
+        {OpAtomicUMin, 1, 20, 9, 10, 11, 12},
+        {OpBitcast, 2, 21, 20},
+        {OpAtomicSMax, 1, 22, 9, 10, 11, 12},
+        {OpBitcast, 2, 23, 22},
+        {OpSelect, 2, 24, 13, 21, 23},
+    });
+    EXPECT_EQ(FindFloatAtomicEmulation(module), FloatAtomicEmulation::None);
+}
+
+TEST(SpirvCheck, IgnoresIntegerSelectsAndPhis) {
+    // FIX-GT7-013: the same pairs selected or merged as integers are no float emulation.
+    const auto select = Module({
+        {OpAtomicUMin, 1, 20, 9, 10, 11, 12},
+        {OpAtomicSMax, 1, 22, 9, 10, 11, 12},
+        {OpSelect, 1, 24, 13, 20, 22},
+    });
+    EXPECT_EQ(FindFloatAtomicEmulation(select), FloatAtomicEmulation::None);
+    const auto phi = Module({
+        {OpAtomicUMax, 1, 20, 9, 10, 11, 12},
+        {OpAtomicSMin, 1, 22, 9, 10, 11, 12},
+        {OpPhi, 1, 24, 20, 30, 22, 31},
+    });
+    EXPECT_EQ(FindFloatAtomicEmulation(phi), FloatAtomicEmulation::None);
 }
