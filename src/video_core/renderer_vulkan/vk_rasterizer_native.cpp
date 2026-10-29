@@ -2266,21 +2266,32 @@ bool NativeRenderer::OneOffDiagAll() {
     return all;
 }
 
-void NativeRenderer::WatchOneOffs() {
+void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs) {
     if (!OneOffDiagOn()) {
         return;
     }
-    for (const auto& [address, never] : one_off_hits) {
-        auto [it, first] = one_off_watch.try_emplace(address);
+    u64 ps_hash = 0;
+    if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+        if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+            pgm && pgm->Address<u32*>()) {
+            ps_hash = AmdGpu::GetParams(*pgm).hash;
+        }
+    }
+    for (const OneOffHit& hit : one_off_hits) {
+        auto [it, first] = one_off_watch.try_emplace(hit.address);
         if (first) {
             if (one_off_watch.size() > 4096) {
                 one_off_watch.erase(it);
                 continue;
             }
+            it->second.hit = hit;
             it->second.frame = frame;
-            it->second.never = never;
+            it->second.ps_hash = ps_hash;
         }
         ++it->second.waits;
+        if (it->second.frame == frame) {
+            ++it->second.draws;
+        }
     }
     one_off_hits.clear();
 }
@@ -2306,9 +2317,21 @@ void NativeRenderer::CheckOneOffs() {
         } else {
             return false; // still watched
         }
-        const size_t why = watch.never ? 0 : 1;
+        const auto& hit = watch.hit;
+        const size_t why = hit.never ? 0 : 1;
         ++one_off_stats.pictures[why][outcome];
         one_off_stats.waits[why][outcome] += watch.waits;
+        static constexpr std::array<const char*, 7> Outcomes{
+            "redrawn", "redrawn", "redrawn", "redrawn", "redrawn", "sampled first", "neither"};
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GT7-008 picture {:#x} {}{} {}x{} slices {} samples {} format {}/{} tile "
+                    "{} ps {:#x} {} first frame {} draws {} waits {}: {} after {} frames",
+                    address, hit.depth ? "depth" : "color", hit.depth ? "" : std::to_string(hit.cb),
+                    hit.pitch, hit.height, hit.slices, hit.samples, hit.format, hit.number_format,
+                    hit.tile, watch.ps_hash, hit.never ? "never" : "gap", watch.frame, watch.draws,
+                    watch.waits, Outcomes[outcome],
+                    outcome <= 4 ? written - watch.frame
+                                 : (outcome == 5 ? sampled - watch.frame : frame - watch.frame));
         return true;
     });
 }
@@ -2378,13 +2401,16 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         }
     };
     one_off_hits.clear(); // DIAG-GT7-008
+    OneOffHit described{};
     const auto drawn_lately = [&](VAddr address) {
         const Native::ImageEntry* entry = registry->FindExisting(
             address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
         if (!entry) {
             note(0);
             if (OneOffDiagOn()) {
-                one_off_hits.emplace_back(address, true);
+                described.address = address;
+                described.never = true;
+                one_off_hits.push_back(described);
             }
             return false; // never drawn into
         }
@@ -2403,7 +2429,9 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         if (!lately) {
             note(earlier == 0 ? 0 : frame - earlier);
             if (OneOffDiagOn()) {
-                one_off_hits.emplace_back(address, earlier == 0);
+                described.address = address;
+                described.never = earlier == 0;
+                one_off_hits.push_back(described);
             }
         }
         return lately;
@@ -2411,11 +2439,32 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
         for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
             const auto& col_buf = regs.color_buffers[cb];
+            if (OneOffDiagOn() && col_buf) {
+                described = {.depth = false,
+                             .cb = cb,
+                             .pitch = col_buf.Pitch(),
+                             .height = col_buf.Height(),
+                             .slices = col_buf.NumSlices(),
+                             .samples = col_buf.NumSamples(),
+                             .format = u32(col_buf.GetDataFmt()),
+                             .number_format = u32(col_buf.GetNumberFmt()),
+                             .tile = u32(col_buf.GetTileMode())};
+            }
             if (col_buf && regs.color_target_mask.GetMask(cb) != 0 &&
                 !drawn_lately(col_buf.Address())) {
                 return true;
             }
         }
+    }
+    if (OneOffDiagOn() && regs.depth_buffer.DepthValid()) {
+        const auto& db = regs.depth_buffer;
+        described = {.depth = true,
+                     .pitch = db.Pitch(),
+                     .height = db.Height(),
+                     .slices = regs.depth_view.NumSlices(),
+                     .samples = db.NumSamples(),
+                     .format = u32(db.z_info.format),
+                     .tile = u32(db.GetTileMode())};
     }
     if (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
         regs.depth_buffer.DepthValid() && !drawn_lately(regs.depth_buffer.DepthAddress())) {
@@ -6946,9 +6995,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[0]};
         pipeline = r.AcquireGraphicsPipelineWaiting(params);
         ++stats.one_off_waits;
-        WatchOneOffs(); // DIAG-GT7-008
+        WatchOneOffs(regs); // DIAG-GT7-008
     } else if (pipeline && OneOffDiagAll() && DrawMustNotSkip(regs)) {
-        WatchOneOffs(); // DIAG-GT7-008: it would have waited
+        WatchOneOffs(regs); // DIAG-GT7-008: it would have waited
     }
     if (!pipeline) {
         ++stats.no_pipeline;

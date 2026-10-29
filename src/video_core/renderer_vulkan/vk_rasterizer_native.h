@@ -383,15 +383,27 @@ private:
     /// them as later frames do.
     static bool OneOffDiagOn();
     static bool OneOffDiagAll(); ///< RYGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
-    void WatchOneOffs();     ///< after a FIX-198 wait: its pictures, from one_off_hits
+    void WatchOneOffs(const AmdGpu::Regs& regs); ///< after a FIX-198 wait: from one_off_hits
     void CheckOneOffs();     ///< each frame
     std::string OneOffText(); ///< the window's counts, then cleared
-    struct OneOffWatch {
-        u64 frame = 0; ///< the frame of the first wait
+    /// What the draw that first waited for a picture says of it: is it a colour target (and
+    /// which) or the depth buffer, its pitch, height, slices, samples, format and tiling.
+    struct OneOffHit {
+        VAddr address = 0;
         bool never = false;
+        bool depth = false;
+        u32 cb = 0;
+        u32 pitch = 0, height = 0, slices = 0, samples = 0;
+        u32 format = 0, number_format = 0, tile = 0;
+    };
+    struct OneOffWatch {
+        OneOffHit hit;
+        u64 frame = 0;     ///< the frame of the first wait
+        u64 ps_hash = 0;   ///< that draw's pixel shader
+        u32 draws = 0;     ///< draws into it in the frame of the first wait (with a wait)
         u32 waits = 0;
     };
-    std::vector<std::pair<VAddr, bool>> one_off_hits; ///< (address, never drawn) of the last check
+    std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
     std::unordered_map<VAddr, OneOffWatch> one_off_watch;
     struct {
         /// [never drawn, not lately][redrawn after 1, 2-4, 5-16, 17-64, 65-300 frames; sampled
