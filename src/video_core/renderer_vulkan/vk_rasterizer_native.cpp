@@ -344,10 +344,15 @@ std::atomic<bool> g_boost_on{[] {
     const char* env = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
     return !(env && env[0] == '0');
 }()};
-// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1; DIAG-GT7-003 switches it while the game runs).
+// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1).
 std::atomic<bool> g_next_on{[] {
     const char* env = std::getenv("RYGT_NATIVE_NEXT");
     return env && env[0] == '1';
+}()};
+// PERF-GT7-018 (on; RYGT_NATIVE_RING=0 off; DIAG-GT7-003 switches it while the game runs).
+std::atomic<bool> g_ring_on{[] {
+    const char* env = std::getenv("RYGT_NATIVE_RING");
+    return !(env && env[0] == '0');
 }()};
 
 // PERF-GT7-013: the memo tables' slot for a key of a few words (XXH3's cost showed at the
@@ -371,6 +376,10 @@ bool NativeRenderer::ReuseOn() {
     return g_reuse_on.load(std::memory_order_relaxed);
 }
 
+bool NativeRenderer::RingOn() {
+    return g_ring_on.load(std::memory_order_relaxed);
+}
+
 bool NativeRenderer::PreparedOn() {
     return PrepareEnabled();
 }
@@ -388,6 +397,18 @@ void NativeRenderer::ApplyRecorderPriority() {
         recorder_boosted = boost;
         Common::SetCurrentThreadPriority(boost ? Common::ThreadPriority::High
                                                : Common::ThreadPriority::Normal);
+    }
+    // PERF-GT7-018: the command thread records the native lists: it runs at the same priority
+    // (set there, from the ring).
+    if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
+        const bool command_boost = boost && RingOn();
+        if (command_boost != command_boosted) {
+            command_boosted = command_boost;
+            ring->RecordControl([command_boost](Scheduler&) {
+                Common::SetCurrentThreadPriority(command_boost ? Common::ThreadPriority::High
+                                                               : Common::ThreadPriority::Normal);
+            });
+        }
     }
 }
 
@@ -429,9 +450,8 @@ std::string NativeRenderer::DispatchPartsText() const {
 }
 
 u32 NativeRenderer::AbMode() const {
-    // A reference, B the defaults (OPT-013..015, PERF-GT7-006..011), C as B with the changes
-    // under test (PERF-GT7-013..016).
-    return u32(ab_window % 3);
+    // A the defaults without PERF-GT7-018, B with it.
+    return u32(ab_window % 2);
 }
 
 void NativeRenderer::ForgetBindings(Stream& s) {
@@ -573,7 +593,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         if (!gathered) {
             return source;
         }
-        const vk::CommandBuffer cmd{Handle<VkCommandBuffer_T>(list.NativeHandle())};
+        const CmdBuf cmd = CmdOf(list); // PERF-GT7-018
         const vk::Buffer dst{Handle<VkBuffer_T>(gathered->NativeHandle())};
         const bool all = direct->ForEachPart(
             address, size, [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
@@ -624,9 +644,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     ASSERT_MSG(gds && gds->Mapped(), "NAT-100: no GDS buffer");
     std::memset(gds->Mapped(), 0, gds->Size());
     if (AbOn()) {
-        g_reuse_on.store(false, std::memory_order_relaxed); // DIAG-GT7-003: window 0 is A
-        g_boost_on.store(false, std::memory_order_relaxed);
-        g_next_on.store(false, std::memory_order_relaxed);
+        g_ring_on.store(false, std::memory_order_relaxed); // DIAG-GT7-003: window 0 is A
         RyDiag::SetProfileTag(1);
     }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
@@ -644,6 +662,8 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
 
 NativeRenderer::~NativeRenderer() {
     std::scoped_lock lock{mutex};
+    // PERF-GT7-018: commands still in the ring use this renderer's lists.
+    r.scheduler.SyncCommandThread();
     const vk::Device vk_device = r.instance.GetDevice();
     for (const auto pool : free_pools) {
         vk_device.destroyDescriptorPool(pool);
@@ -716,9 +736,7 @@ void NativeRenderer::BeginHudStream() {
     if (s.list) {
         return;
     }
-    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
-    s.list->Begin();
-    s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+    AcquireList(s); // PERF-GT7-018
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
@@ -766,7 +784,7 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     RetireSnapshots(s, tick); // PERF-GT7-007
     s.keep.clear();
     s.list = nullptr;
-    s.cmd = vk::CommandBuffer{};
+    s.cmd = CmdBuf{};
     ++s.serial;        // OPT-015: the list's upload memory retires with it
     ForgetBindings(s); // OPT-014
 }
@@ -1083,6 +1101,36 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
     return slot->Handle();
 }
 
+void NativeRenderer::AcquireList(Stream& s) {
+    // PERF-GT7-018: with the scheduler's command thread, the list's commands go into its ring and
+    // the command thread makes the Vulkan calls, the list's own (made, reset, begun, ended) too.
+    // In races about a fifth of the recorder's time went to the driver recording these lists;
+    // the caches still run here, in order, so nothing about what is recorded changes.
+    if (CommandRing* ring = r.scheduler.CommandThreadRing(); ring && RingOn()) {
+        if (Native::Rhi::CommandList* list = device->AcquireDeferredCommandList(ring)) {
+            s.list = list;
+            s.list->Begin();
+            s.cmd = CmdBuf{ring, reinterpret_cast<const vk::CommandBuffer*>(list->NativeHandleSlot())};
+            return;
+        }
+    }
+    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+    s.list->Begin();
+    s.cmd = CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())}};
+}
+
+CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
+    if (stream.list == &list) {
+        return stream.cmd;
+    }
+    if (hud_stream.list == &list) {
+        return hud_stream.cmd;
+    }
+    ASSERT_MSG(list.NativeHandleSlot() == nullptr,
+               "PERF-GT7-018: commands for a deferred list of no stream");
+    return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
+}
+
 NativeRenderer::Stream& NativeRenderer::Begin() {
     Stream& s = stream;
     if (s.list) {
@@ -1091,14 +1139,13 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
         r.scheduler.EndRendering();
-        s.cmd = r.scheduler.DirectCommandBuffer();
+        const vk::CommandBuffer direct = r.scheduler.DirectCommandBuffer();
+        s.cmd = CmdBuf{direct};
         s.wrapped_list = device->WrapCommandBuffer(
-            reinterpret_cast<u64>(static_cast<VkCommandBuffer>(s.cmd)));
+            reinterpret_cast<u64>(static_cast<VkCommandBuffer>(direct)));
         s.list = s.wrapped_list.get();
     } else {
-        s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
-        s.list->Begin();
-        s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+        AcquireList(s); // PERF-GT7-018
     }
     s.rendering = false;
     s.dynamic.Invalidate();
@@ -1120,6 +1167,11 @@ void NativeRenderer::BeginAhead() {
     // is begun while the recorder waits for work instead. Not on Intel (FIX-188: the native
     // work goes in the scheduler's own command buffer there).
     if (!ReuseOn() || r.instance.IsIntel()) {
+        return;
+    }
+    // PERF-GT7-018: a list begins at little cost when the command thread makes it; and the
+    // command processor may record into the ring meanwhile (it drained the recorder to submit).
+    if (RingOn() && r.scheduler.HasCommandThread()) {
         return;
     }
     std::scoped_lock lock{mutex};
@@ -8358,8 +8410,9 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
         });
     }
     s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
-                            vk::ImageLayout::eGeneral, static_cast<u32>(copies.size()),
-                            copies.data());
+                            vk::ImageLayout::eGeneral,
+                            vk::ArrayProxy<const vk::BufferImageCopy>(
+                                static_cast<u32>(copies.size()), copies.data()));
     Written(&entry, entry.rewrite_clock); // NAT-148
     s.buffers_written = true; // the next work waits for the fill
     ++s.commands;
@@ -9550,8 +9603,7 @@ void NativeRenderer::Splice() {
     }
     r.scheduler.EndRendering();
     if (!wrapped) {
-        const vk::CommandBuffer secondary = s.cmd;
-        r.scheduler.CommandBuffer().executeCommands(secondary);
+        r.scheduler.CommandBuffer().executeCommands(s.cmd); // PERF-GT7-018: its slot's
     }
     const u64 tick = r.scheduler.CurrentTick();
     GpuTimeCollect(); // DIAG-GT7-001: lists the GPU finished
@@ -9578,7 +9630,7 @@ void NativeRenderer::Splice() {
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();
     s.list = nullptr;
-    s.cmd = vk::CommandBuffer{};
+    s.cmd = CmdBuf{};
     s.rendering = false;
     ++s.serial;        // OPT-015: the list's upload memory retires with it
     ForgetBindings(s); // OPT-014
@@ -10247,8 +10299,7 @@ void NativeRenderer::Report() {
     stats.push_constants_skipped = stats.uploads_reused = 0;
     if (AbOn()) {
         // DIAG-GT7-003 (RYGT_NATIVE_AB=1): the recorder's cost in the window that ends (A the
-        // reference, B with the changes under test, C as B with prepared draws), then the next
-        // window in the next mode.
+        // defaults without PERF-GT7-018, B with it), then the next window in the next mode.
         const auto per_draw = [&](u64 ns) {
             return stats.timed_draws ? ns / 1000.0 / stats.timed_draws : 0.0;
         };
@@ -10275,9 +10326,10 @@ void NativeRenderer::Report() {
         ab_frame = frame;
         ++ab_window;
         const u32 mode = AbMode();
-        g_reuse_on.store(mode != 0, std::memory_order_relaxed);
-        g_boost_on.store(mode != 0, std::memory_order_relaxed); // PERF-GT7-010 (B and C)
-        g_next_on.store(mode == 2, std::memory_order_relaxed);  // PERF-GT7-013..016
+        g_ring_on.store(mode == 1, std::memory_order_relaxed); // PERF-GT7-018 (B; new lists)
+        // DIAG-GT7-007: where the window begins, for the frames of each mode.
+        RyDiag::Timeline('W', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
+                         (ab_window << 8) | mode);
         targets_memo.valid = false;
         ForgetBindings(stream);
         ForgetBindings(hud_stream);

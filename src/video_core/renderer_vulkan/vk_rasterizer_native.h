@@ -135,6 +135,8 @@ public:
     static bool BoostOn();
     /// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.
     static bool NextOn();
+    /// PERF-GT7-018: whether new lists are recorded by the scheduler's command thread.
+    static bool RingOn();
     /// PERF-GT7-008 (B): on the recorder when it runs out of work, the next list is begun.
     void BeginAhead();
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
@@ -230,7 +232,8 @@ private:
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
         Native::Rhi::CommandList* list = nullptr;
-        vk::CommandBuffer cmd{};
+        /// PERF-GT7-018: into the command thread's ring for a list it records (RingOn).
+        CmdBuf cmd{};
         bool rendering = false;
         RenderState render{};
         DynamicState dynamic{};
@@ -307,6 +310,10 @@ private:
                             bool is_depth);
 
     Stream& Begin();
+    /// PERF-GT7-018: a list for the stream, with its commands going where RingOn says.
+    void AcquireList(Stream& s);
+    /// Where commands for `list` (a stream's) are recorded.
+    CmdBuf CmdOf(Native::Rhi::CommandList& list) const;
     void EndRendering();
     void BeginRendering(const RenderState& state);
     void GlobalBarrier();
@@ -529,9 +536,9 @@ private:
     /// OPT-013..015 (RYGT_NATIVE_REUSE=0 turns them off): work the previous draws of the list
     /// already did is not done again.
     static bool ReuseOn();
-    /// DIAG-GT7-003 (RYGT_NATIVE_AB=1): the changes under test alternate with the reference
-    /// every 10 s report window (A reference, B the defaults, C as B with the changes under
-    /// test), each window's cost logged.
+    /// DIAG-GT7-003 (RYGT_NATIVE_AB=1): the change under test alternates with the defaults
+    /// every 10 s report window (A the defaults without PERF-GT7-018, B with it), each window's
+    /// cost logged.
     static bool AbOn();
     u32 AbMode() const;
     /// DIAG-GT7-004: the window's dispatch costs by part and piece.
@@ -539,6 +546,7 @@ private:
     /// PERF-GT7-010: the calling thread (the recorder) at the priority BoostOn asks for.
     void ApplyRecorderPriority();
     bool recorder_boosted = false;
+    bool command_boosted = false; ///< PERF-GT7-018: the command thread's priority
     u64 ab_window = 0;
     u64 ab_frame = 0;
     /// OPT-013: the targets the previous draw resolved, by the registers that name them, while
