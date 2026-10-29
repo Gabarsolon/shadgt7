@@ -435,6 +435,8 @@ private:
     /// A kind of picture at one address (GT7 keeps its per-frame targets at fixed addresses): such
     /// a place no longer waits after 4 redraws, none sampled first, even when its kind was sampled
     /// first elsewhere (the 256x256 depth pool at 0x100a0e8000 against the probes of that size).
+    /// A family, the pictures of one format at one address whatever their size (a place with no
+    /// pitch, height, slices or samples), after 8 (0x100a0b0000 holds pictures of 21 sizes).
     struct OneOffPlace {
         VAddr address = 0;
         OneOffKind kind{};

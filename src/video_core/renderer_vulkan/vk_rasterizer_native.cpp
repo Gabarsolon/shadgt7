@@ -2299,6 +2299,13 @@ bool OneOffPlaceExempt(u32 safe, u32 harmful) {
     return harmful == 0 && safe >= OneOffPlaceSafeCount;
 }
 
+// The family of a kind: its format and tiling, whatever its size.
+template <typename Kind>
+Kind FamilyOf(Kind kind) {
+    kind.pitch = kind.height = kind.slices = kind.samples = 0;
+    return kind;
+}
+
 std::filesystem::path OneOffKindsPath() {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -2336,6 +2343,10 @@ bool NativeRenderer::OneOffExempt(const OneOffHit& hit) const {
     const OneOffKind kind = KindOf(hit);
     if (const auto it = one_off_kinds.find(kind);
         it != one_off_kinds.end() && OneOffKindExempt(it->second.safe, it->second.harmful)) {
+        return true;
+    }
+    if (const auto it = one_off_places.find({hit.address, FamilyOf(kind)});
+        it != one_off_places.end() && OneOffKindExempt(it->second.safe, it->second.harmful)) {
         return true;
     }
     const auto it = one_off_places.find({hit.address, kind});
@@ -2489,13 +2500,16 @@ void NativeRenderer::CheckOneOffs() {
             const bool was_exempt = OneOffExempt(hit);
             auto& seen = one_off_kinds[KindOf(hit)];
             auto& here = one_off_places[{address, KindOf(hit)}];
+            auto& family = one_off_places[{address, FamilyOf(KindOf(hit))}];
             if (outcome <= 4 && !watch.skipped) {
                 ++seen.safe;
                 ++here.safe;
+                ++family.safe;
                 one_off_kinds_changed = true;
             } else if (outcome == 5) {
                 ++seen.harmful;
                 ++here.harmful;
+                ++family.harmful;
                 if (was_exempt) {
                     LOG_WARNING(Render_Vulkan,
                                 "PERF-GT7-023: picture {:#x} ({} {}x{} format {}/{}) sampled "
