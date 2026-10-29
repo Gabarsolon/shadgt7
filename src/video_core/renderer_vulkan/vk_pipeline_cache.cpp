@@ -873,7 +873,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
 // driver ~1 s to build (0x2f3cb32d18925709, 0xe1682ae083e54205), on the command thread while
 // the game waits for them: two frames of ~1 s in every race the driver's cache lacks them (after
 // a driver update, or a cleared cache). Each compute pipeline is kept once as a recipe, and
-// built again in the background at each start (quick for those the driver has).
+// built again in the background at each start, the largest first (quick for those the driver
+// has).
 // RYGT_WARM_COMPUTE=0: neither.
 static bool WarmComputeOn() {
     static const bool on = [] {
@@ -894,11 +895,19 @@ void PipelineCache::WarmComputePipelines(std::stop_token stop) {
     Common::PreferCompileCores();
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
     std::error_code ec;
-    std::vector<std::filesystem::path> files;
+    // The largest SPIR-V first: the ones that take the driver longest (GT7's two of ~1 s are
+    // ~95 KB recipes, most others under half that). A race uses ~100 compute pipelines.
+    std::vector<std::pair<u64, std::filesystem::path>> sized;
     for (const auto& entry : std::filesystem::directory_iterator(WarmComputeDir(), ec)) {
-        if (entry.path().extension() == ".bin" && files.size() < 64) {
-            files.push_back(entry.path());
+        if (entry.path().extension() == ".bin" && sized.size() < 1024) {
+            std::error_code size_ec;
+            sized.emplace_back(entry.file_size(size_ec), entry.path());
         }
+    }
+    std::ranges::sort(sized, std::greater{}, &std::pair<u64, std::filesystem::path>::first);
+    std::vector<std::filesystem::path> files;
+    for (auto& [size, path] : sized) {
+        files.push_back(std::move(path));
     }
     if (files.empty()) {
         return;
