@@ -226,7 +226,13 @@ private:
     void ReadAheadAtBufferStart();
     /// PERF-034: with the draw pipe, starts builds for the upcoming draw states the command
     /// thread queued. During a draw (`restore`), its key is computed again afterwards.
-    void BuildQueuedStates(const DrawIndirectParams params, bool restore);
+    /// FIX-GT7-015: `waiting`: a draw waits for its pipeline (as with `restore`).
+    void BuildQueuedStates(const DrawIndirectParams params, bool restore, bool waiting = false);
+    /// FIX-GT7-015: read-ahead builds no draw asked for that no worker started in 30 s are
+    /// cancelled (every 2 s).
+    void DropStaleReadAheadBuilds(std::chrono::steady_clock::time_point now);
+    std::chrono::steady_clock::time_point stale_check{};
+    u64 stale_dropped = 0;
     /// Claims a build nobody started, so it is never built; false if one started.
     static bool CancelBuild(PipelineBuild& build);
     /// FIX-110: in the menus draws wait for new pipelines instead of being skipped.
@@ -491,6 +497,7 @@ private:
         u64 started{};
         u64 dropped{};
         u64 tessellated{}; ///< FIX-GT7-005: not kept
+        u64 expired{};     ///< FIX-GT7-015: dropped unretried, no draw waiting
     } blocked_stats;
     std::shared_ptr<PipelineBuild> skipped_build; ///< PERF-GT7-020
     std::atomic<u64> catch_up_skips{}; ///< PERF-GT7-029: since the last look

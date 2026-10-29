@@ -1366,7 +1366,7 @@ void PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& bu
     if (widen && !here) {
         while (build->done.wait_for(std::chrono::milliseconds{5}) != std::future_status::ready) {
             if (lookup_mutex.try_lock()) {
-                BuildQueuedStates(S().draw_indirect_params, false);
+                BuildQueuedStates(S().draw_indirect_params, false, true);
                 lookup_mutex.unlock();
             }
         }
@@ -1617,7 +1617,8 @@ bool PipelineCache::RetryReadAhead() {
     return on;
 }
 
-void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool restore) {
+void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool restore,
+                                      bool waiting) {
     auto* states = liverpool->PipeReadAheadStates();
     if (!states || (states->Empty() && blocked_states.empty())) {
         return;
@@ -1709,7 +1710,22 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         }
     };
     // PERF-GT7-021: the states kept earlier, once their wait is over.
-    if (RetryReadAhead()) {
+    // FIX-GT7-015: only while a draw waits for its pipeline (the game stopped, as at a new
+    // track's start, which they were for). Evaluated again in a race, up to 3 s after their
+    // draw, their user data had moved on: in a GT7 race at 60 fps they started ~500 builds a
+    // second of keys no draw ever asked for (1-33 installed in 2 s), 16,000 of them pending
+    // and queued, compiled by the workers for minutes (the compile notice never went away).
+    // Otherwise they are dropped once 3 s old, as before.
+    if (RetryReadAhead() && !(restore || waiting)) {
+        const auto now = std::chrono::steady_clock::now();
+        while (!blocked_states.empty() &&
+               now - blocked_states.front().first >= std::chrono::seconds{3}) {
+            blocked_free.push_back(std::move(blocked_states.front().ranges));
+            blocked_states.pop_front();
+            ++blocked_stats.expired;
+        }
+    }
+    if (RetryReadAhead() && (restore || waiting)) {
         const auto now = std::chrono::steady_clock::now();
         for (size_t left = blocked_states.size(); left != 0 && in_budget(); --left) {
             BlockedState blocked = std::move(blocked_states.front());
@@ -1771,11 +1787,13 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
                     "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
                     "({:.1f} ms); {} pending; PERF-GT7-021: {} states kept for their shaders, {} "
                     "evaluated again, {} builds started from them, {} dropped, {} kept now; "
-                    "FIX-GT7-005: {} tessellated not kept",
+                    "FIX-GT7-005: {} tessellated not kept; FIX-GT7-015: {} expired unretried, "
+                    "{} stale builds cancelled",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
                     stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
                     blocked_stats.kept, blocked_stats.retried, blocked_stats.started,
-                    blocked_stats.dropped, blocked_states.size(), blocked_stats.tessellated);
+                    blocked_stats.dropped, blocked_states.size(), blocked_stats.tessellated,
+                    blocked_stats.expired, std::exchange(stale_dropped, 0));
         stats = {};
         stats.since = now;
         blocked_stats = {};
@@ -1819,6 +1837,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     BuildQueuedStates(params, false);
     ReportAsyncPipelines(std::chrono::steady_clock::now());
     UpdateCatchUp(std::chrono::steady_clock::now()); // PERF-GT7-029
+    DropStaleReadAheadBuilds(std::chrono::steady_clock::now()); // FIX-GT7-015
     S().draw_indirect_params = params;
     ++draws_since_scan;
     // FIX-078: missing translations of this draw's stages are queued together first; then the
@@ -3253,6 +3272,25 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
         build_workers->SetCatchUp(true);
         note("the catch-up's compiles resume");
+    }
+}
+
+void PipelineCache::DropStaleReadAheadBuilds(std::chrono::steady_clock::time_point now) {
+    if (now - stale_check < std::chrono::seconds{2}) {
+        return;
+    }
+    stale_check = now;
+    // A read-ahead build (not async: no draw has asked for it) still queued after 30 s. Its job
+    // finds it started and does nothing; a draw that needs the key later builds it again.
+    for (auto it = pending_builds.begin(); it != pending_builds.end();) {
+        auto& build = *it->second;
+        if (build.async || now - build.queued < std::chrono::seconds{30} ||
+            build.started.load(std::memory_order_relaxed) || !CancelBuild(build)) {
+            ++it;
+            continue;
+        }
+        ++stale_dropped;
+        it = pending_builds.erase(it);
     }
 }
 
