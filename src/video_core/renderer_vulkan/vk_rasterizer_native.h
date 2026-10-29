@@ -376,6 +376,28 @@ private:
     /// FIX-198: whether a draw whose pipeline is still building must wait for it: it draws
     /// into a picture no recent frame drew into.
     bool DrawMustNotSkip(const AmdGpu::Regs& regs);
+    /// DIAG-GT7-008 (RYGT_DIAG=1; RYGT_DIAG_ONE_OFF_REDRAW=0 off): what became of the pictures
+    /// FIX-198 made draws wait for: drawn again in a later frame (how soon), sampled in a later
+    /// frame before that, or neither in 300 frames; by why they waited (never drawn, or not for
+    /// 64 frames), with the draws that waited for each. Whether a new scene's first frame may skip
+    /// them as later frames do.
+    static bool OneOffDiagOn();
+    void WatchOneOffs();     ///< after a FIX-198 wait: its pictures, from one_off_hits
+    void CheckOneOffs();     ///< each frame
+    std::string OneOffText(); ///< the window's counts, then cleared
+    struct OneOffWatch {
+        u64 frame = 0; ///< the frame of the first wait
+        bool never = false;
+        u32 waits = 0;
+    };
+    std::vector<std::pair<VAddr, bool>> one_off_hits; ///< (address, never drawn) of the last check
+    std::unordered_map<VAddr, OneOffWatch> one_off_watch;
+    struct {
+        /// [never drawn, not lately][redrawn after 1, 2-4, 5-16, 17-64, 65-300 frames; sampled
+        /// in a later frame first; neither in 300 frames]: pictures, and the draws that waited.
+        std::array<std::array<u64, 7>, 2> pictures{};
+        std::array<std::array<u64, 7>, 2> waits{};
+    } one_off_stats;
     /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
     /// yet run by the GPU (guest range, GPU tick), and CPU writes that met one.
     struct PendingWriteback {

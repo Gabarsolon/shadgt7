@@ -2248,6 +2248,87 @@ void NativeRenderer::RefreshRegion(Region& region) {
     }
 }
 
+bool NativeRenderer::OneOffDiagOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DIAG_ONE_OFF_REDRAW");
+        return RyDiag::Enabled() && !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void NativeRenderer::WatchOneOffs() {
+    if (!OneOffDiagOn()) {
+        return;
+    }
+    for (const auto& [address, never] : one_off_hits) {
+        auto [it, first] = one_off_watch.try_emplace(address);
+        if (first) {
+            if (one_off_watch.size() > 4096) {
+                one_off_watch.erase(it);
+                continue;
+            }
+            it->second.frame = frame;
+            it->second.never = never;
+        }
+        ++it->second.waits;
+    }
+    one_off_hits.clear();
+}
+
+void NativeRenderer::CheckOneOffs() {
+    if (!OneOffDiagOn() || one_off_watch.empty()) {
+        return;
+    }
+    std::erase_if(one_off_watch, [&](const auto& item) {
+        const auto& [address, watch] = item;
+        const Native::ImageEntry* entry = registry->FindExisting(
+            address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
+        const u64 written = entry ? entry->written_frame.load(std::memory_order_relaxed) : 0;
+        const u64 sampled = entry ? entry->sampled_frame.load(std::memory_order_relaxed) : 0;
+        size_t outcome;
+        if (written > watch.frame) {
+            const u64 after = written - watch.frame;
+            outcome = after <= 1 ? 0 : after <= 4 ? 1 : after <= 16 ? 2 : after <= 64 ? 3 : 4;
+        } else if (sampled > watch.frame) {
+            outcome = 5;
+        } else if (frame - watch.frame > 300) {
+            outcome = 6;
+        } else {
+            return false; // still watched
+        }
+        const size_t why = watch.never ? 0 : 1;
+        ++one_off_stats.pictures[why][outcome];
+        one_off_stats.waits[why][outcome] += watch.waits;
+        return true;
+    });
+}
+
+std::string NativeRenderer::OneOffText() {
+    u64 total = 0;
+    for (const auto& row : one_off_stats.pictures) {
+        for (const u64 n : row) {
+            total += n;
+        }
+    }
+    if (total == 0 && one_off_watch.empty()) {
+        return {};
+    }
+    const auto row = [&](size_t why) {
+        const auto& p = one_off_stats.pictures[why];
+        const auto& w = one_off_stats.waits[why];
+        return fmt::format("redrawn after 1 frame {} ({} waits), 2-4 {} ({}), 5-16 {} ({}), 17-64 {} "
+                           "({}), 65-300 {} ({}); sampled in a later frame before any redraw {} "
+                           "({}); neither in 300 frames {} ({})",
+                           p[0], w[0], p[1], w[1], p[2], w[2], p[3], w[3], p[4], w[4], p[5], w[5],
+                           p[6], w[6]);
+    };
+    std::string text = fmt::format("pictures FIX-198 waited for, never drawn: {}; not drawn for 64 "
+                                   "frames: {}; {} still watched",
+                                   row(0), row(1), one_off_watch.size());
+    one_off_stats = {};
+    return text;
+}
+
 bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // FIX-198: GPU.compile_mode 2 (keep going) skips a draw while its new pipeline builds, so
     // the game never stops for a compile: what it draws shows a frame or so later, as it's drawn
@@ -2286,11 +2367,15 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             buckets = {};
         }
     };
+    one_off_hits.clear(); // DIAG-GT7-008
     const auto drawn_lately = [&](VAddr address) {
         const Native::ImageEntry* entry = registry->FindExisting(
             address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
         if (!entry) {
             note(0);
+            if (OneOffDiagOn()) {
+                one_off_hits.emplace_back(address, true);
+            }
             return false; // never drawn into
         }
         const u64 last = entry->written_frame.load(std::memory_order_relaxed);
@@ -2307,6 +2392,9 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         const bool lately = earlier != 0 && frame - earlier <= window;
         if (!lately) {
             note(earlier == 0 ? 0 : frame - earlier);
+            if (OneOffDiagOn()) {
+                one_off_hits.emplace_back(address, earlier == 0);
+            }
         }
         return lately;
     };
@@ -6848,6 +6936,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[0]};
         pipeline = r.AcquireGraphicsPipelineWaiting(params);
         ++stats.one_off_waits;
+        WatchOneOffs(); // DIAG-GT7-008
     }
     if (!pipeline) {
         ++stats.no_pipeline;
@@ -9066,6 +9155,11 @@ bool NativeRenderer::SeqTraced(const Native::ImageEntry* entry) const {
 
 void NativeRenderer::SeqBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
                              bool storage, u64 program) {
+    if (!storage && !entry.from_cpu && OneOffDiagOn()) {
+        // DIAG-GT7-008: a picture the GPU drew, sampled.
+        const_cast<Native::ImageEntry&>(entry).sampled_frame.store(frame,
+                                                                   std::memory_order_relaxed);
+    }
     if (!SeqTraced(&entry)) {
         return;
     }
@@ -9649,6 +9743,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     ++frame;
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
+    CheckOneOffs(); // DIAG-GT7-008
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
     Native::ImageEntry* entry =
@@ -10390,6 +10485,11 @@ void NativeRenderer::Report() {
     if (stats.one_off_waits != 0) {
         LOG_INFO(Render_Vulkan, "FIX-198: {} draws into pictures not drawn lately waited for their "
                  "new pipeline", std::exchange(stats.one_off_waits, 0));
+    }
+    if (OneOffDiagOn()) {
+        if (std::string text = OneOffText(); !text.empty()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-008 (10 s): {}", text);
+        }
     }
     if (WritebackRaceDiag()) {
         LOG_INFO(Render_Vulkan, "DIAG-176: {} CPU write faults, {} into pending write-backs so far",
