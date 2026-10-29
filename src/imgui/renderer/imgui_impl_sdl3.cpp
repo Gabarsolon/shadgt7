@@ -3,7 +3,9 @@
 
 // Based on imgui_impl_sdl3.cpp from Dear ImGui repository
 
+#include <chrono>
 #include <imgui.h>
+#include "common/logging/log.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -849,11 +851,26 @@ void NewFrame(bool is_reusing_frame) {
         io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     }
 
+    // DIAG-GT7-009: these parts go through SDL's mouse and joystick state; one over 20 ms is
+    // logged.
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    const auto t0 = Clock::now();
     UpdateMouseData();
+    const auto t1 = Clock::now();
     UpdateMouseCursor();
+    const auto t2 = Clock::now();
 
     // Update game controllers (if enabled and available)
     UpdateGamepads();
+    const auto t3 = Clock::now();
+    if (ms(t0, t3) > 20.0) {
+        LOG_WARNING(ImGui, "DIAG-GT7-009: imgui SDL frame {:.1f} ms: mouse data {:.1f}, mouse "
+                           "cursor {:.1f}, gamepads {:.1f}",
+                    ms(t0, t3), ms(t0, t1), ms(t1, t2), ms(t2, t3));
+    }
 }
 
 void OnResize() {

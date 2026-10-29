@@ -1524,7 +1524,40 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+namespace {
+// DIAG-GT7-009: the steps of a present (ms): swapchain checks and image acquisition, the imgui
+// frame (SDL input), recording, the frame's work submitted, the flush, the submit lock, the queue
+// present. A present over 50 ms is logged by step (a Bluetooth device's removal held presents
+// for ~250 ms).
+struct PresentSteps {
+    static constexpr std::array<const char*, 7> Names{
+        "acquire", "imgui frame", "record", "frame's submit", "flush", "submit lock", "present"};
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::array<double, 7> ms{};
+    void Lap(size_t step) {
+        const auto now = std::chrono::steady_clock::now();
+        ms[step] += std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+    }
+    void Report() const {
+        double total = 0.0;
+        for (const double step : ms) {
+            total += step;
+        }
+        if (total < 50.0) {
+            return;
+        }
+        std::string text;
+        for (size_t i = 0; i < ms.size(); ++i) {
+            text += fmt::format("{}{} {:.1f}", i == 0 ? "" : ", ", Names[i], ms[i]);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-GT7-009: present took {:.1f} ms: {}", total, text);
+    }
+};
+} // namespace
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    PresentSteps steps; // DIAG-GT7-009
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1565,6 +1598,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             return;
         }
     }
+    steps.Lap(0);
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
@@ -1574,6 +1608,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
+    steps.Lap(1);
 
     const vk::Image swapchain_image = swapchain.Image();
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
@@ -1769,6 +1804,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
+    steps.Lap(2);
 
     // Flush vulkan commands.
     if (pending_screenshot) {
@@ -1782,21 +1818,26 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (frame->ready_scheduler) {
         frame->ready_scheduler->WaitSubmitted(frame->ready_tick);
     }
+    steps.Lap(3);
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    steps.Lap(4);
 
     // Present to swapchain.
     {
         RYDIAG_SCOPE(Present);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        steps.Lap(5);
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
+        steps.Lap(6);
     }
+    steps.Report();
 
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
