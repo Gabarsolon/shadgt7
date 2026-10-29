@@ -6880,7 +6880,21 @@ void NativeRenderer::RecordIndirect(const IndirectDraw& indirect, const Indirect
 bool NativeRenderer::PrepareEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_NATIVE_PREPARE");
-        return env && env[0] == '1';
+        if (!(env && env[0] == '1')) {
+            return false;
+        }
+        // FIX-229: prepared draws (GT7-PREP) lost the GPU device with FIX-227's hull-shader LDS
+        // emulation on (two of three Alsace runs with eight workers); ignored unless forced.
+        const char* lds = std::getenv("RYGT_TESS_LDS_EMULATION");
+        const char* force = std::getenv("RYGT_NATIVE_PREPARE_FORCE");
+        if (!(lds && lds[0] == '0') && !(force && force[0] == '1')) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-229: RYGT_NATIVE_PREPARE=1 is ignored: prepared draws are not safe "
+                        "with the race-start car fix (FIX-227); RYGT_NATIVE_PREPARE_FORCE=1 uses "
+                        "them anyway");
+            return false;
+        }
+        return true;
     }();
     return enabled;
 }

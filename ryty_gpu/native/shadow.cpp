@@ -48,10 +48,17 @@ const bool g_compare = [] {
     return env && env[0] == '1';
 }();
 // OPT-010: native mode prepares each draw's bindings on the job's thread (no comparisons).
+// FIX-229: not while FIX-227's hull-shader LDS emulation is on (RYGT_TESS_LDS_EMULATION, on by
+// default) unless RYGT_NATIVE_PREPARE_FORCE=1: with eight prepare workers two of three Alsace
+// runs lost the GPU device (NativeRenderer::PrepareEnabled logs it).
 const bool g_prepare = [] {
     const char* env = std::getenv("RYGT_NATIVE_PREPARE");
     const char* native = std::getenv("RYGT_NATIVE");
-    return env && env[0] == '1' && native && native[0] == '1';
+    const char* lds = std::getenv("RYGT_TESS_LDS_EMULATION");
+    const char* force = std::getenv("RYGT_NATIVE_PREPARE_FORCE");
+    const bool lds_on = !(lds && lds[0] == '0');
+    const bool forced = force && force[0] == '1';
+    return env && env[0] == '1' && native && native[0] == '1' && (!lds_on || forced);
 }();
 const bool g_enabled = g_compare || g_prepare;
 
