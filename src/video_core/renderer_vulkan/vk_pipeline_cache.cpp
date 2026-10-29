@@ -338,6 +338,19 @@ public:
     size_t Pending() {
         return queue.Pending(); // DIAG-GT7-012
     }
+    /// PERF-GT7-034: a build is queued or running.
+    bool Busy() {
+        return !queue.ForegroundIdle();
+    }
+    /// PERF-GT7-034: at most this many builds at once, unless a draw waits for its own.
+    void SetPace(u32 limit) {
+        std::scoped_lock lk{extra_mutex};
+        pace = limit;
+        ApplyExtra();
+    }
+    static u32 UsualWidth() {
+        return CompileConcurrency();
+    }
     /// PERF-GT7-021: while a draw into a one-off target waits (the game stopped anyway), up to
     /// all but four hardware threads build at once instead of CompileConcurrency (4). Calls nest
     /// (two threads can wait at once).
@@ -382,16 +395,21 @@ private:
     void ApplyExtra() {
         const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
                                       CompileConcurrency(), 12u);
-        const u32 width = waiting > 0      ? widest
-                          : foreground > 0 ? CompileConcurrency()
-                          : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
-                                           : CompileConcurrency();
-        queue.SetExtraRunning(width - CompileConcurrency());
+        u32 width = waiting > 0      ? widest
+                    : foreground > 0 ? CompileConcurrency()
+                    : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
+                                     : CompileConcurrency();
+        if (waiting == 0) {
+            width = std::clamp(pace, 1u, width); // PERF-GT7-034
+        }
+        queue.SetMaxRunning(std::min(width, CompileConcurrency()));
+        queue.SetExtraRunning(width > CompileConcurrency() ? width - CompileConcurrency() : 0);
     }
     std::mutex extra_mutex;
     int waiting = 0;
     int foreground = 0;
     bool catch_up = false;
+    u32 pace = 64; ///< PERF-GT7-034: no limit
 
     static u32 AllCores() {
         return std::max(std::thread::hardware_concurrency(), NumWorkers());
@@ -3016,11 +3034,6 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             c.calm = 0;
             c.skipped = skips;
             c.stepped_back = false;
-            c.pace_start = now;
-            const auto totals = Common::GetGameFrameTotals();
-            c.pace_frames = totals.frames;
-            c.pace_us = totals.us;
-            c.fast = 0;
             c.step_backs = 0;
             c.stepped_seconds = 0;
             catch_up_bumped.store(0, std::memory_order_relaxed);
@@ -3031,31 +3044,46 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
                         rate,
                         PipelineBuildWorkers::CatchUpLow() ? ", below normal priority" : "");
         }
-        return;
-    }
-    c.skipped += skips;
-    c.calm = rate < 1000.0 ? c.calm + 1 : 0;
-    if (c.calm >= 4) {
-        c.on = false;
-        if (c.stepped_back) {
-            c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
-        } else {
-            build_workers->SetCatchUp(false);
+    } else {
+        c.skipped += skips;
+        c.calm = rate < 1000.0 ? c.calm + 1 : 0;
+        if (c.calm >= 4) {
+            c.on = false;
+            if (c.stepped_back) {
+                c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
+            } else {
+                build_workers->SetCatchUp(false);
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-GT7-029: catch-up over after {:.1f} s ({} draws skipped meanwhile, "
+                        "{} builds of draws on screen moved ahead; PERF-GT7-033: stepped back {} "
+                        "times, {:.1f} s in all); compiles back on their cores",
+                        std::chrono::duration<double>(now - c.since).count(), c.skipped,
+                        catch_up_bumped.exchange(0), c.step_backs, c.stepped_seconds);
         }
-        LOG_WARNING(Render_Vulkan,
-                    "PERF-GT7-029: catch-up over after {:.1f} s ({} draws skipped meanwhile, {} "
-                    "builds of draws on screen moved ahead; PERF-GT7-033: stepped back {} times, "
-                    "{:.1f} s in all); compiles back on their cores",
-                    std::chrono::duration<double>(now - c.since).count(), c.skipped,
-                    catch_up_bumped.exchange(0), c.step_backs, c.stepped_seconds);
+    }
+    // PERF-GT7-033, PERF-GT7-034: the background compiles follow the game's frame rate in races.
+    // Each second the game takes more than 34 ms a frame on average (one frame of 66 ms in a
+    // second already makes 34.4), they take one step back: a catch-up goes back to the usual
+    // compiles (4 at a time on the compile cores, normal priority), then one fewer at a time,
+    // down to one. After three seconds under 33.8 ms they take one step forward again. With 4
+    // compiles on the compile cores (the driver's compiler threads ~95% each, the process ~930%
+    // of 1,600), the command thread still decoded 9-11 ms a submit instead of 6-7 in GT7's
+    // heavy scenes (the pit straight, ~3,000 draws): every 5-10 frames one took 66 ms. A draw
+    // waiting for its pipeline still widens the compiles; the draws on screen still build first
+    // (FIX-GT7-009). RYGT_CATCH_UP_PACE=0: never.
+    if (!paced) {
         return;
     }
-    // PERF-GT7-033: the catch-up steps back to the usual compiles (4 at a time on the compile
-    // cores, normal priority) while the game runs slower than 30 fps, and comes back once it is
-    // at 30 fps again. On a new track its 8 compiles on every core slowed the command thread's
-    // decoding by 3-6 ms a submit in heavy scenes: the game ran at ~40 ms a frame for minutes.
-    // The draws on screen still build first (FIX-GT7-009). RYGT_CATCH_UP_PACE=0: never.
-    if (!paced || now - c.pace_start < std::chrono::seconds{1}) {
+    if (c.pace_start == std::chrono::steady_clock::time_point{}) {
+        c.pace_start = now;
+        const auto totals = Common::GetGameFrameTotals();
+        c.pace_frames = totals.frames;
+        c.pace_us = totals.us;
+        c.pace_limit = PipelineBuildWorkers::UsualWidth();
+        return;
+    }
+    if (now - c.pace_start < std::chrono::seconds{1}) {
         return;
     }
     const auto totals = Common::GetGameFrameTotals();
@@ -3066,30 +3094,54 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     c.pace_start = now;
     c.pace_frames = totals.frames;
     c.pace_us = totals.us;
-    if (!c.stepped_back) {
-        if (frame_ms > 36.0) {
+    const u32 usual = PipelineBuildWorkers::UsualWidth();
+#ifdef RYTY_GPU
+    if (!RytyGtsInRace()) {
+        // Menus run at their own rates: the usual compiles there.
+        if (c.pace_limit != usual) {
+            c.pace_limit = usual;
+            build_workers->SetPace(64);
+        }
+        c.fast = 0;
+        return;
+    }
+#endif
+    const auto note = [&](const char* what) {
+        if (++c.pace_changes <= 40) {
+            LOG_WARNING(Render_Vulkan, "PERF-GT7-034: the game at {:.1f} ms a frame: {}",
+                        frame_ms, what);
+        }
+    };
+    if (frame_ms > 34.0) {
+        c.fast = 0;
+        if (c.on && !c.stepped_back) {
             c.stepped_back = true;
             c.stepped_since = now;
-            c.fast = 0;
+            ++c.step_backs;
             build_workers->SetCatchUp(false);
-            if (++c.step_backs <= 10) {
-                LOG_WARNING(Render_Vulkan,
-                            "PERF-GT7-033: the game at {:.1f} ms a frame during the catch-up: "
-                            "compiles back to 4 at a time on their cores until it is at 30 fps",
-                            frame_ms);
-            }
+            note("the catch-up's compiles back to 4 at a time on their cores");
+        } else if (c.pace_limit > 1 && build_workers->Busy()) {
+            --c.pace_limit;
+            build_workers->SetPace(c.pace_limit);
+            note(c.pace_limit == 1 ? "compiles one at a time"
+                                   : fmt::format("compiles {} at a time", c.pace_limit).c_str());
         }
         return;
     }
-    c.fast = frame_ms < 34.5 ? c.fast + 1 : 0;
-    if (c.fast >= 2) {
+    c.fast = frame_ms < 33.8 ? c.fast + 1 : 0;
+    if (c.fast < 3) {
+        return;
+    }
+    c.fast = 0;
+    if (c.pace_limit < usual) {
+        ++c.pace_limit;
+        build_workers->SetPace(c.pace_limit == usual ? 64 : c.pace_limit);
+        note(fmt::format("compiles {} at a time", c.pace_limit).c_str());
+    } else if (c.on && c.stepped_back) {
         c.stepped_back = false;
         c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
         build_workers->SetCatchUp(true);
-        if (c.step_backs <= 10) {
-            LOG_WARNING(Render_Vulkan,
-                        "PERF-GT7-033: the game at 30 fps again: the catch-up's compiles resume");
-        }
+        note("the catch-up's compiles resume");
     }
 }
 

@@ -493,6 +493,8 @@ private:
         u32 fast = 0;
         u32 step_backs = 0;
         double stepped_seconds = 0;
+        u32 pace_limit = 0;   ///< PERF-GT7-034: builds at once (the usual width: no limit)
+        u32 pace_changes = 0; ///< PERF-GT7-034: logged ones
     } catch_up;
     std::mutex on_screen_mutex; ///< FIX-GT7-009
     std::vector<std::shared_ptr<PipelineBuild>> on_screen;

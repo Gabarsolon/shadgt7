@@ -98,6 +98,15 @@ public:
         cv.notify_all();
     }
 
+    /// PERF-GT7-034: the limit itself (fewer while the game runs late).
+    void SetMaxRunning(u32 limit) {
+        {
+            std::scoped_lock lk{mutex};
+            max_running = limit;
+        }
+        cv.notify_all();
+    }
+
     /// PERF-GT7-021: this many more jobs may run at once (0: back to the limit).
     void SetExtraRunning(u32 extra) {
         {
@@ -108,7 +117,7 @@ public:
     }
 
 private:
-    const u32 max_running;
+    u32 max_running;
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<Job> jobs;        ///< urgent ones at the front, normal ones after

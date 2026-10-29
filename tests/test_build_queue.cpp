@@ -112,3 +112,26 @@ TEST(BuildQueue, ExtraRunningWidens) {
     queue.Finished();
     EXPECT_TRUE(queue.ForegroundIdle());
 }
+
+TEST(BuildQueue, MaxRunningNarrows) {
+    BuildQueue queue{2};
+    queue.SetMaxRunning(1);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    std::stop_source stop;
+    BuildQueue::Job job;
+    ASSERT_TRUE(queue.Pop(job, stop.get_token()));
+    std::atomic<bool> got{};
+    std::thread second{[&] {
+        BuildQueue::Job next;
+        if (queue.Pop(next, stop.get_token())) {
+            got = true;
+            queue.Finished();
+        }
+    }};
+    std::this_thread::sleep_for(50ms);
+    EXPECT_FALSE(got.load()) << "one job at a time after SetMaxRunning(1)";
+    queue.Finished();
+    second.join();
+    EXPECT_TRUE(got.load());
+}
