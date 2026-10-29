@@ -1466,9 +1466,16 @@ void Liverpool::Process(std::stop_token stoken) {
                             submit_stats.decode_us += us(decoded - *submitted);
                             submit_stats.record_us += us(recorded - *submitted);
                         }
-                        rasterizer->WhenGpuDone([this, start = *submitted, us, gpu_range] {
+                        // DIAG-GT7-007: the submission's way through the pipe, and its GPU end.
+                        static std::atomic<u64> timeline_number{};
+                        const u64 number = ++timeline_number;
+                        RyDiag::Timeline('S', RyDiag::Seconds(*submitted), RyDiag::Seconds(decoded),
+                                         RyDiag::Seconds(recorded), 0.0, number);
+                        rasterizer->WhenGpuDone([this, start = *submitted, us, gpu_range, number] {
                             Common::Nvtx::End(gpu_range);
-                            const u64 gpu = us(std::chrono::steady_clock::now() - start);
+                            const auto gpu_done = std::chrono::steady_clock::now();
+                            RyDiag::Timeline('G', RyDiag::Seconds(gpu_done), 0.0, 0.0, 0.0, number);
+                            const u64 gpu = us(gpu_done - start);
                             std::scoped_lock lk{submit_timing_mutex};
                             submit_stats.gpu_us += gpu;
                             ++submit_stats.gpu_count;

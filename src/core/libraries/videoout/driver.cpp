@@ -305,6 +305,7 @@ void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
     // FIX-193: the game learns of the flip once the GPU has drawn the frame.
+    const auto wait_start = std::chrono::steady_clock::now(); // DIAG-GT7-007
     if (req.index != -1) {
         presenter->WaitFrameDrawn(req.frame);
     }
@@ -318,6 +319,9 @@ void VideoOutDriver::Flip(const Request& req) {
     }
     {
         const auto now = std::chrono::steady_clock::now();
+        RyDiag::Timeline('P', RyDiag::Seconds(req.submitted), RyDiag::Seconds(wait_start),
+                         RyDiag::Seconds(present_start), RyDiag::Seconds(now),
+                         u64(u32(req.index))); // DIAG-GT7-007
         std::scoped_lock lk{g_flip_stats.mutex};
         auto& st = g_flip_stats;
         const double present_ms =
@@ -429,6 +433,8 @@ bool VideoOutDriver::DrawLastFrame() {
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
+    RyDiag::Timeline('R', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
+                     u64(u32(index)) | (u64(is_eop) << 32)); // DIAG-GT7-007
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -464,6 +470,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
+    const auto queued = std::chrono::steady_clock::now();
     {
         std::scoped_lock lock{mutex};
         requests.push({
@@ -472,9 +479,11 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
-            .submitted = std::chrono::steady_clock::now(),
+            .submitted = queued,
         });
     }
+    RyDiag::Timeline('Q', RyDiag::Seconds(queued), 0.0, 0.0, 0.0,
+                     u64(u32(index)) | (u64(is_eop) << 32)); // DIAG-GT7-007
     requests_cv.notify_one(); // GT-FF
 }
 
@@ -548,9 +557,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         const int flip_rate = LockedFlipRate(main_port.flip_rate, locked ? FpsLock() : 0,
                                              EmulatorSettings.GetVblankFrequency());
         if (vblank_status.count % (flip_rate + 1) == 0) {
+            size_t queued_flips = 0; // DIAG-GT7-007
             {
                 std::scoped_lock lk{mutex, g_flip_stats.mutex};
                 ++g_flip_stats.vblanks;
+                queued_flips = requests.size();
                 g_flip_stats.max_queue =
                     std::max<u32>(g_flip_stats.max_queue, static_cast<u32>(requests.size()));
                 if (requests.empty()) {
@@ -564,6 +575,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                                           last_flip_time >=
                                                       flip_interval - std::chrono::milliseconds(1);
             const auto request = may_flip ? receive_request() : Request{};
+            RyDiag::Timeline('V', RyDiag::Seconds(tick_start), double(queued_flips), 0.0, 0.0,
+                             request ? 1 : 0); // DIAG-GT7-007
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
