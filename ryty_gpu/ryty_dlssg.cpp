@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "video_core/texture_cache/image.h"
 
 // Streamline's headers (MIT, ryty_gpu/streamline). Its functions are loaded from
@@ -540,16 +541,40 @@ bool InitUpscale() {
 
 namespace {
 
-// The DLSS quality mode whose render size range holds input for output, or -1.
+// The DLSS mode for the launcher's Upscaling quality (eOff for Auto).
+sl::DLSSMode PreferredMode() {
+    switch (RytyUpscale::GetQuality()) {
+    case RytyUpscale::Quality::Native:
+        return sl::DLSSMode::eDLAA;
+    case RytyUpscale::Quality::Quality:
+        return sl::DLSSMode::eMaxQuality;
+    case RytyUpscale::Quality::Balanced:
+        return sl::DLSSMode::eBalanced;
+    case RytyUpscale::Quality::Performance:
+        return sl::DLSSMode::eMaxPerformance;
+    case RytyUpscale::Quality::UltraPerformance:
+        return sl::DLSSMode::eUltraPerformance;
+    default:
+        return sl::DLSSMode::eOff;
+    }
+}
+
+// The DLSS quality mode whose render size range holds input for output, or -1: the chosen
+// quality's mode when it fits, else the first that does.
 int FindMode(vk::Extent2D input, vk::Extent2D output) {
     if (input.width > output.width || input.height > output.height) {
         return -1;
     }
-    static constexpr sl::DLSSMode modes[] = {
+    static constexpr sl::DLSSMode all[] = {
         sl::DLSSMode::eDLAA,           sl::DLSSMode::eUltraQuality,
         sl::DLSSMode::eMaxQuality,     sl::DLSSMode::eBalanced,
         sl::DLSSMode::eMaxPerformance, sl::DLSSMode::eUltraPerformance,
     };
+    std::vector<sl::DLSSMode> modes;
+    if (const sl::DLSSMode preferred = PreferredMode(); preferred != sl::DLSSMode::eOff) {
+        modes.push_back(preferred);
+    }
+    modes.insert(modes.end(), std::begin(all), std::end(all));
     for (const sl::DLSSMode mode : modes) {
         sl::DLSSOptions options{};
         options.mode = mode;
