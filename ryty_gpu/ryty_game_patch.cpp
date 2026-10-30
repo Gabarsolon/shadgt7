@@ -1054,8 +1054,8 @@ void InstallTriggerTelemetry(u8* base) {
 }
 
 // GT7 (CUSA24769 v1.71): the same Simulator Interface packet (magic, layout and the service's
-// +0x1dc offset as GT Sport's), from GT7's own SimulatorInterface::update. Off by default for GT7:
-// RYGT_ADAPTIVE_TRIGGERS=1. xacidr4inx's trigger feedback, ported.
+// +0x1dc offset as GT Sport's), from GT7's own SimulatorInterface::update; on while the launcher's
+// trigger strength slider is above 0%. xacidr4inx's trigger feedback, ported.
 TelemetryUpdateFn g_telemetry_update_gt7{};
 void PS4_SYSV_ABI TelemetryUpdateHookGt7(void* service, void* context) {
     g_telemetry_update_gt7(service, context);
@@ -1102,8 +1102,11 @@ void InstallTriggerTelemetryGt7(u8* base) {
         *slot != original || std::memcmp(base + 0x1d10f53, magic, sizeof(magic)) != 0) {
         return;
     }
+    // On whenever the launcher's trigger strength slider is above 0% (the bridge scales the effects
+    // by it and releases the triggers at 0%, also while the game runs); RYGT_ADAPTIVE_TRIGGERS=0
+    // forces it off, =1 on even at 0%.
     const char* enabled = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
-    if (!enabled || enabled[0] != '1') return;
+    if (enabled && enabled[0] == '0') return;
     DWORD protection;
     if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
     g_telemetry_update_gt7 = original;

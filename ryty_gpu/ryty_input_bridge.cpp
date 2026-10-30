@@ -355,7 +355,13 @@ void ForwardInput() {
             }
             // Telemetry describes the locally driven car (player 1 only). Explicit
             // game trigger commands take priority, including an explicit release.
-            const unsigned strength = TriggerStrength();
+            // RYGT_ADAPTIVE_TRIGGERS=1 forces the effects on even with the slider at 0%.
+            static const bool forced = [] {
+                const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+                return env && env[0] == '1';
+            }();
+            const unsigned slider = TriggerStrength();
+            const unsigned strength = forced && slider == 0 ? 100 : slider;
             const auto feedback = slot == 0 ? Input::TriggerFeedback::CurrentOutput(strength)
                                            : Input::TriggerFeedback::Output{};
             u8 left_rumble = feedback.left_rumble, right_rumble = feedback.right_rumble;
