@@ -378,6 +378,24 @@ void ForwardInput() {
                 left_rumble = right_rumble = 0;
             }
             controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
+            {
+                // (diagnosis) RYGT_ADAPTIVE_TRIGGERS_LOG=1: the trigger effects sent, once a second.
+                static const bool log = [] {
+                    const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_LOG");
+                    return env && env[0] == '1';
+                }();
+                static auto next_log = std::chrono::steady_clock::time_point{};
+                const auto now = std::chrono::steady_clock::now();
+                if (log && slot == 0 && now >= next_log) {
+                    next_log = now + std::chrono::seconds(1);
+                    std::fprintf(stderr,
+                                 "[triggers] slot 0: L %02x %02x %02x %02x  R %02x %02x %02x %02x  "
+                                 "rumble %u/%u strength %u%%%s\n",
+                                 left[0], left[1], left[2], left[3], right[0], right[1], right[2],
+                                 right[3], left_rumble, right_rumble, strength,
+                                 saved.triggerTouched ? " (game's own command)" : "");
+                }
+            }
             const auto state = controller.ReadState();
             RytyPadInputState input{};
             input.buttons = static_cast<std::uint32_t>(state.buttonsState);

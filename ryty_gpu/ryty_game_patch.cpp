@@ -1069,8 +1069,7 @@ void PS4_SYSV_ABI TelemetryUpdateHookGt7(void* service, void* context) {
     if (log && ++calls % 300 == 1) {
         float speed = 0;
         std::memcpy(&speed, packet + 0x4c, sizeof(speed));
-        std::fprintf(stderr, "[triggers] GT7 telemetry #%llu: speed %.1f m/s throttle %u brake %u
-",
+        std::fprintf(stderr, "[triggers] GT7 telemetry #%llu: speed %.1f m/s throttle %u brake %u\n",
                      static_cast<unsigned long long>(calls), speed, packet[0x91], packet[0x92]);
     }
 }
@@ -1092,8 +1091,7 @@ void InstallTriggerTelemetryGt7(u8* base) {
     *slot = &TelemetryUpdateHookGt7;
     DWORD ignored;
     VirtualProtect(slot, sizeof(*slot), protection, &ignored);
-    std::fprintf(stderr, "[triggers] GT7 adaptive triggers on (telemetry hook installed)
-");
+    std::fprintf(stderr, "[triggers] GT7 adaptive triggers on (telemetry hook installed)\n");
 }
 } // namespace
 
