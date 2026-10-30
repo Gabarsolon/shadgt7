@@ -308,8 +308,21 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
 // two coarsest levels said the whole screen was covered and buildings in view were eliminated (black,
 // with the depth of their occluder). Those ifs are GCN EXEC scopes around arithmetic: without the
 // branch every invocation runs the arithmetic, which nothing else sees, the ifs directly inside test
-// the removed condition as well, and the lane read is in uniform control flow.
+// the removed condition as well, and the lane read is in uniform control flow. A branch whose own
+// blocks ask which invocations are active is kept: without it, more of them are.
 // RYGT_LANE_READ_UNBRANCH=0: as before.
+static bool ReadsActiveLanes(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::ReadFirstLane:
+    case IR::Opcode::Ballot:
+    case IR::Opcode::GroupAny:
+    case IR::Opcode::GetExec:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runtime,
                                    const Profile& profile) {
     static const bool enabled = [] {
@@ -403,6 +416,10 @@ static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runt
                            inst.GetOpcode() != IR::Opcode::ConditionRef;
                 })) {
                 return refuse("the branch has side effects");
+            }
+            if (!open.empty() && scopes.contains(open.back()) &&
+                std::ranges::any_of(list[i].data.block->Instructions(), ReadsActiveLanes)) {
+                return refuse("the branch reads which lanes are active");
             }
             break;
         case Type::Loop:
