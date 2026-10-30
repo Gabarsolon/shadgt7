@@ -872,13 +872,15 @@ GraphicsPipeline::GraphicsPipeline(
     // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
     // summary their library compiles (with link-time optimization info kept) took the process
     // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
-    // PERF-GT7-040 (RYGT_GPL=1, off by default, also turns on PERF-GT7-041): tessellated
+    // PERF-GT7-040 (on by default, RYGT_GPL=0 turns it and PERF-GT7-041 off): tessellated
     // pipelines are built from libraries too (still without optimization), so GT7's cars share compiled fragment and pre-raster
     // libraries across their many state combinations and only fast-link. FIX-057's memory blow-up
     // came with link-time optimization info kept in the libraries, which SHD-001 no longer does.
     static const bool gpl_tessellated = [] {
+        // Four cold race starts (Deep Forest x3, Monza): car pipelines 607 -> 309 ms each, the
+        // same pictures, no new errors.
         const char* env = std::getenv("RYGT_GPL");
-        return env && env[0] == '1' && !LinkTimeOptimization();
+        return !(env && env[0] == '0') && !LinkTimeOptimization();
     }();
     static const bool whole_tessellated = Common::PerfFeatureEnabled(80) && !gpl_tessellated;
     // DIAG-058 (SHADGT_NO_LIBRARIES=1): every pipeline is compiled whole, never fast-linked from
