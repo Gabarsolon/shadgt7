@@ -400,6 +400,12 @@ public:
         return ring != nullptr;
     }
 
+    /// PERF-GT7-018: the command thread's ring (nullptr without one), for lists the command
+    /// thread makes and records; recorded into from the thread that records, like CommandBuffer.
+    CommandRing* CommandThreadRing() const noexcept {
+        return ring.get();
+    }
+
     /// PERF-084: waits until the command thread replayed everything recorded so far.
     void SyncCommandThread();
 

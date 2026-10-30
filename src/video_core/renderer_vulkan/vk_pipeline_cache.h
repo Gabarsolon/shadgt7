@@ -14,6 +14,8 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -24,6 +26,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
+#include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -147,6 +150,31 @@ public:
         force_wait = on;
     }
 
+    struct PipelineBuild;
+    /// PERF-GT7-020: while set (the lookup lock held), GetGraphicsPipeline waits for a draw's
+    /// shaders (translations, the store's listing) as with SetForceWait, but not for its
+    /// pipeline: the draw is skipped, and TakeSkippedBuild gives the build to wait for.
+    void SetWaitForShaders(bool on) {
+        wait_for_shaders = on;
+    }
+    /// PERF-GT7-020 (lookup lock held): the build the last GetGraphicsPipeline skipped its draw
+    /// for, when it skipped it for a pipeline still building.
+    std::shared_ptr<PipelineBuild> TakeSkippedBuild() {
+        return std::move(skipped_build);
+    }
+    /// PERF-GT7-036: with SetWaitForShaders, GetGraphicsPipeline does not wait for the draw's
+    /// translations on the workers either: it returns no pipeline, and TakeShaderWait (lookup
+    /// lock held) gives what waits for them, to call without the lock. Empty when none.
+    void SetShadersUnlocked(bool on) {
+        shaders_unlocked = on;
+    }
+    std::function<void()> TakeShaderWait();
+    /// PERF-GT7-020 (without the lookup lock): builds the pipeline here unless a worker started
+    /// it, and returns once it is built. PERF-GT7-021: meanwhile more workers build at once, and
+    /// the read-ahead states blocked by their shaders are evaluated again (the lock taken when
+    /// free).
+    void FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build);
+
     /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
     /// registers installed with Liverpool::SetThreadDrawState), or nullptr. Nothing is
     /// translated, loaded, built or waited for, and the selection made by the threads above is
@@ -182,13 +210,13 @@ private:
     /// registers at an upcoming draw (PERF-019).
     const AmdGpu::Regs& Regs() const;
     bool HasSupportedColorTargets() const;
-    struct PipelineBuild;
     class PipelineBuildWorkers;
-    /// PERF-019: builds the pipeline for the current key on a worker thread.
-    std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
+    /// PERF-019: builds the pipeline for the current key on a worker thread. PERF-GT7-025:
+    /// in_order: an urgent build in draw order (a draw that goes on without it), not first.
+    std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent, bool in_order = false);
     /// A build of the current key, infos and modules.
     std::shared_ptr<PipelineBuild> MakePipelineBuild();
-    void QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool urgent);
+    void QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind);
     /// Builds the pipeline unless a worker already started; returns when it is built.
     void FinishBuild(PipelineBuild& build);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.
@@ -198,7 +226,13 @@ private:
     void ReadAheadAtBufferStart();
     /// PERF-034: with the draw pipe, starts builds for the upcoming draw states the command
     /// thread queued. During a draw (`restore`), its key is computed again afterwards.
-    void BuildQueuedStates(const DrawIndirectParams params, bool restore);
+    /// FIX-GT7-015: `waiting`: a draw waits for its pipeline (as with `restore`).
+    void BuildQueuedStates(const DrawIndirectParams params, bool restore, bool waiting = false);
+    /// FIX-GT7-015: read-ahead builds no draw asked for that no worker started in 30 s are
+    /// cancelled (every 2 s).
+    void DropStaleReadAheadBuilds(std::chrono::steady_clock::time_point now);
+    std::chrono::steady_clock::time_point stale_check{};
+    u64 stale_dropped = 0;
     /// Claims a build nobody started, so it is never built; false if one started.
     static bool CancelBuild(PipelineBuild& build);
     /// FIX-110: in the menus draws wait for new pipelines instead of being skipped.
@@ -209,6 +243,15 @@ private:
     bool LegacyWaits() const;
     /// PERF-076: logs the background pipeline counts every 2 s.
     void ReportAsyncPipelines(std::chrono::steady_clock::time_point now);
+    /// PERF-GT7-029: a draw skipped for a pipeline still building (counted for the catch-up; one
+    /// skipped again moves its build to the front once, `again`).
+    void NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again);
+    /// FIX-GT7-009: a worker's screen job: builds the not yet started build of a draw on screen
+    /// skipped most lately.
+    void BuildOnScreen();
+    /// PERF-GT7-029: while many draws are skipped for their builds, compiles use every core, 8 at
+    /// a time; back on the compile cores once few are. RYGT_COMPILE_CATCH_UP=0 turns it off.
+    void UpdateCatchUp(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Returns at once if no worker took the build, which
     /// FinishBuild then does on this thread.
@@ -363,6 +406,11 @@ private:
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
     std::filesystem::path driver_cache_path;
+    /// PERF-GT7-037: the recipes of compute pipelines that took the driver long to build, and
+    /// the thread that builds them again in the background at start.
+    static std::filesystem::path WarmComputeDir();
+    void WarmComputePipelines(std::stop_token stop);
+    std::jthread warm_compute_thread;
     u32 pipelines_at_driver_save{};
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::atomic<bool> driver_cache_writing{}; // PERF-036
@@ -424,6 +472,66 @@ private:
     bool translation_skipped{};
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
     bool force_wait = false; ///< FIX-198
+    bool wait_for_shaders = false;                ///< PERF-GT7-020
+    bool shaders_unlocked = false; ///< PERF-GT7-036
+    /// PERF-GT7-036: translations a draw would have waited for under the lookup lock.
+    struct TranslateJob;
+    std::vector<std::shared_ptr<TranslateJob>> skipped_translations;
+    void NoteUnlockedShaderWait(u64 hash);
+    /// PERF-GT7-021: read-ahead states whose key waited for shaders (a translation queued or not
+    /// taken yet, the store's listing), evaluated again until they have one (3 s at most). They
+    /// were dropped: the first frame of a new track decoded every draw while its shaders were
+    /// made, and the recorder then built each one-off target's pipeline itself, one at a time.
+    static bool RetryReadAhead();
+    struct BlockedState {
+        std::vector<u32> ranges; ///< ReadAheadStates::Ranges, in order
+        std::chrono::steady_clock::time_point first;
+        std::chrono::steady_clock::time_point next;
+    };
+    std::deque<BlockedState> blocked_states;
+    std::vector<std::vector<u32>> blocked_free;
+    bool read_ahead_blocked = false; ///< set by GetProgram for the state being evaluated
+    struct {
+        u64 kept{};
+        u64 retried{};
+        u64 started{};
+        u64 dropped{};
+        u64 tessellated{}; ///< FIX-GT7-005: not kept
+        u64 expired{};     ///< FIX-GT7-015: dropped unretried, no draw waiting
+        u64 failed{};      ///< FIX-GT7-016: their key failed a check (stale code)
+    } blocked_stats;
+    std::shared_ptr<PipelineBuild> skipped_build; ///< PERF-GT7-020
+    std::atomic<u64> catch_up_skips{}; ///< PERF-GT7-029: since the last look
+    std::atomic<u64> catch_up_bumped{};
+    std::mutex catch_up_mutex;
+    struct {
+        bool on = false;
+        std::chrono::steady_clock::time_point window_start{};
+        std::chrono::steady_clock::time_point since{};
+        u32 calm = 0;
+        u64 skipped = 0;
+        // PERF-GT7-033: stepped back while the game runs slower than 30 fps.
+        bool stepped_back = false;
+        std::chrono::steady_clock::time_point pace_start{};
+        std::chrono::steady_clock::time_point stepped_since{};
+        u64 pace_frames = 0;
+        u64 pace_us = 0;
+        u32 fast = 0;
+        u32 step_backs = 0;
+        double stepped_seconds = 0;
+        u32 pace_limit = 0;   ///< PERF-GT7-034: builds at once (the usual width: no limit)
+        u32 pace_changes = 0; ///< PERF-GT7-034: logged ones
+    } catch_up;
+    std::mutex on_screen_mutex; ///< FIX-GT7-009
+    std::vector<std::shared_ptr<PipelineBuild>> on_screen;
+    struct {
+        std::atomic<u64> waits{};
+        std::atomic<u64> built_here{};
+        std::atomic<u64> wait_us{};
+        std::atomic<s64> since_ms{};
+        std::atomic<u64> shader_waits{};   ///< PERF-GT7-036
+        std::atomic<u64> shader_wait_us{}; ///< PERF-GT7-036
+    } unlocked_stats; ///< PERF-GT7-020
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of
@@ -487,6 +595,24 @@ private:
         std::chrono::steady_clock::time_point since{};
     } translate_stats;
     std::unique_ptr<TranslateWorkers> translate_workers;
+
+    /// PERF-GT7-019: the shader store's reads (a new program's stored permutations, then their
+    /// SPIR-V files) on threads of their own. The first open of a stored file took ~5 ms (it is
+    /// scanned on open; 0.1 ms after), and a new track's first race read ~2,000 of them one at
+    /// a time on the GPU threads: a 6 s stop. Eight readers open them at once.
+    class StoreReaders;
+    /// PERF-GT7-019 (lookup lock held): whether the program's stored permutations were read (by a
+    /// store reader). When `may_skip`, false while they are read; otherwise waits for them.
+    bool StoredListingReady(u64 pgm_hash, bool may_skip);
+    std::unordered_map<u64, std::future<StoredListing>> pending_listings;
+    struct {
+        u64 listed{};
+        u64 skipped{};
+        u64 waited{};
+        double wait_ms{};
+        std::chrono::steady_clock::time_point since{};
+    } store_stats;
+    std::unique_ptr<StoreReaders> store_readers;
 
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;

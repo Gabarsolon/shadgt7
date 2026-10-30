@@ -572,7 +572,14 @@ private:
     /// Records a draw or dispatch together with the registers written since the previous one.
     /// `direct_draw`: a draw packet with its counts in the packet (PERF-047 selects its pipeline
     /// here, while decoding).
-    void RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw = false);
+    /// PERF-GT7-031: an indirect draw's base vertex and instance SGPRs (its pipeline is
+    /// selected ahead with them).
+    struct IndirectSgprs {
+        u16 vertex;
+        u16 instance;
+    };
+    void RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw = false,
+                    const IndirectSgprs* indirect = nullptr);
     /// MT-005: set by the indexed direct draw packets for the next RecordDraw (its index offset).
     std::optional<u32> staged_index_offset;
     /// Waits for the recorder thread to finish, before the command thread uses the rasterizer.

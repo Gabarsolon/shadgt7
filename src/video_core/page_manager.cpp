@@ -1069,6 +1069,14 @@ bool PageManager::IsUnwatched(VAddr page) const {
                       state->num_guards == 0);
 }
 
+bool PageManager::IsNativeWatched(VAddr page) const {
+    if (page >= (VAddr{1} << Impl::ADDRESS_BITS)) {
+        return false;
+    }
+    const auto* state = impl->cached_pages.find(page >> PM_PAGE_BITS);
+    return state && state->native_watch != 0;
+}
+
 #ifdef RYTY_GPU
 void PageManager::ReapplyProtection(VAddr address, u64 size) {
     impl->ReapplyProtection(address, size);

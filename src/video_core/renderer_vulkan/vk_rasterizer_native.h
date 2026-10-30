@@ -26,6 +26,9 @@
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/regs_color.h"
+#include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_texture.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -126,6 +129,16 @@ public:
 
     /// OPT-010 (RYGT_NATIVE_PREPARE=1): whether game job threads prepare draws.
     static bool PrepareEnabled();
+    /// Whether the prepared draws are used (the recorder takes them, the command thread trusts them).
+    static bool PreparedOn();
+    /// PERF-GT7-010: whether the recorder and the command processor run above normal priority.
+    static bool BoostOn();
+    /// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.
+    static bool NextOn();
+    /// PERF-GT7-018: whether new lists are recorded by the scheduler's command thread.
+    static bool RingOn();
+    /// PERF-GT7-008 (B): on the recorder when it runs out of work, the next list is begun.
+    void BeginAhead();
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
     /// (with its stages): then the command thread doesn't select its pipeline.
     bool HasPrepared(const void* packet);
@@ -183,11 +196,44 @@ private:
         void Clear();
     };
 
+    /// DIAG-GT7-001 (RYGT_DIAG_GPU_TIME=1): what the GPU ran between two timestamps of a list.
+    struct GpuSegment {
+        u32 draws = 0, dispatches = 0, uploads = 0;
+        u64 upload_bytes = 0;
+        u64 max_groups = 0, max_groups_cs = 0; ///< the largest direct dispatch and its program
+        u64 max_prims = 0, max_prims_ps = 0;   ///< the largest draw (indices x instances), its PS
+    };
+    /// DIAG-GT7-001: a list's timestamps (at its start, after each global barrier, at its end).
+    struct GpuTiming {
+        vk::QueryPool pool{};
+        u32 used = 0;
+        u64 tick = 0;
+        u64 frame = 0;
+        double cpu_s = 0.0;     ///< when the recorder began it
+        double cpu_end_s = 0.0; ///< when the recorder ended it
+        std::vector<GpuSegment> segments;
+        u64 uploads_at = 0, upload_bytes_at = 0; ///< registry counters at the segment's start
+    };
+    /// OPT-014: what a list bound in one set of its last graphics pipeline layout.
+    struct SetMemo {
+        bool valid = false;
+        u64 generation = 0;
+        std::vector<u64> signature;
+    };
+    /// OPT-015: the small upload memory a stage's set last filled in a list.
+    struct UploadMemo {
+        u64 list = ~u64{0};
+        vk::Buffer buffer{};
+        u64 offset = 0;
+        std::vector<u8> bytes;
+    };
+
     /// The command list being recorded and its state.
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
         Native::Rhi::CommandList* list = nullptr;
-        vk::CommandBuffer cmd{};
+        /// PERF-GT7-018: into the command thread's ring for a list it records (RingOn).
+        CmdBuf cmd{};
         bool rendering = false;
         RenderState render{};
         DynamicState dynamic{};
@@ -214,7 +260,19 @@ private:
         u64 chunk_used = 0;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
+        /// PERF-GT7-007: FIX-203 copies this list reads, back to the pool when it ran.
+        std::vector<std::unique_ptr<Native::Rhi::Buffer>> pooled;
         u32 commands = 0;
+        std::unique_ptr<GpuTiming> gpu_timing; ///< DIAG-GT7-001
+        /// OPT-014: the sets and push constants this list bound for its last graphics pipeline
+        /// layout (a draw binding the same ones binds nothing again).
+        vk::PipelineLayout memo_layout{};
+        bool push_known = false;
+        Shader::PushData last_push{};
+        std::array<SetMemo, 5> set_memos{};
+        /// OPT-015: which list the upload memos belong to (moves on when a list begins or ends).
+        u64 serial = 0;
+        std::array<UploadMemo, 5 * 3> upload_memos{};
     };
 
     struct ViewRecord {
@@ -247,8 +305,15 @@ private:
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
                            bool is_depth);
+    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool).
+    vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
+                            bool is_depth);
 
     Stream& Begin();
+    /// PERF-GT7-018: a list for the stream, with its commands going where RingOn says.
+    void AcquireList(Stream& s);
+    /// Where commands for `list` (a stream's) are recorded.
+    CmdBuf CmdOf(Native::Rhi::CommandList& list) const;
     void EndRendering();
     void BeginRendering(const RenderState& state);
     void GlobalBarrier();
@@ -300,6 +365,7 @@ private:
         VAddr begin = 0; ///< the pages copied
         VAddr end = 0;
         std::unique_ptr<Native::Rhi::Buffer> copy;
+        bool pooled = false; ///< PERF-GT7-007: goes back to the pool
     };
     std::vector<WrittenBefore> written_befores;
     std::unique_ptr<Native::Rhi::PipelineLayout> writeback_layout;
@@ -310,6 +376,116 @@ private:
     /// FIX-198: whether a draw whose pipeline is still building must wait for it: it draws
     /// into a picture no recent frame drew into.
     bool DrawMustNotSkip(const AmdGpu::Regs& regs);
+    /// DIAG-GT7-008 (RYGT_DIAG=1; RYGT_DIAG_ONE_OFF_REDRAW=0 off): what became of the pictures
+    /// FIX-198 made draws wait for: drawn again in a later frame (how soon), sampled in a later
+    /// frame before that, or neither in 300 frames; by why they waited (never drawn, or not for
+    /// 64 frames), with the draws that waited for each. Whether a new scene's first frame may skip
+    /// them as later frames do.
+    static bool OneOffDiagOn();
+    static bool OneOffDiagAll(); ///< RYGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
+    /// After a FIX-198 wait (or a draw PERF-GT7-023 skipped instead): from one_off_hits.
+    void WatchOneOffs(const AmdGpu::Regs& regs, bool skipped);
+    void CheckOneOffs();     ///< each frame
+    std::string OneOffText(); ///< the window's counts, then cleared
+    /// What the draw that first waited for a picture says of it: is it a colour target (and
+    /// which) or the depth buffer, its pitch, height, slices, samples, format and tiling.
+    struct OneOffHit {
+        VAddr address = 0;
+        bool never = false;
+        bool depth = false;
+        u32 cb = 0;
+        u32 pitch = 0, height = 0, slices = 0, samples = 0;
+        u32 format = 0, number_format = 0, tile = 0;
+    };
+    struct OneOffWatch {
+        OneOffHit hit;
+        u64 frame = 0;     ///< the frame of the first wait
+        u64 ps_hash = 0;   ///< that draw's pixel shader
+        u32 draws = 0;     ///< draws into it in the frame of the first wait (with a wait)
+        u32 waits = 0;
+        bool skipped = false; ///< PERF-GT7-023: every draw into it so far skipped, none waited
+    };
+    std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
+    std::unordered_map<VAddr, OneOffWatch> one_off_watch;
+    struct {
+        /// [never drawn, not lately][redrawn after 1, 2-4, 5-16, 17-64, 65-300 frames; sampled
+        /// in a later frame first; neither in 300 frames]: pictures, and the draws that waited.
+        std::array<std::array<u64, 7>, 2> pictures{};
+        std::array<std::array<u64, 7>, 2> waits{};
+    } one_off_stats;
+    /// PERF-GT7-023: FIX-198's waits learned by kind of picture (colour or depth, pitch, height,
+    /// slices, samples, format, tiling). A kind whose pictures were redrawn after a wait, without
+    /// being sampled before, at least 8 times, no longer waits: its draws are skipped while their
+    /// pipeline builds, as other draws are. One picture of the kind sampled before its redraw makes
+    /// it wait again. Kept from run to run (<cache folder>/<serial>.one_off_kinds.txt).
+    /// RYGT_ONE_OFF_LEARN=0: every one-off picture waits, as before.
+    struct OneOffKind {
+        bool depth = false;
+        u32 pitch = 0, height = 0, slices = 0, samples = 0;
+        u32 format = 0, number_format = 0, tile = 0;
+        bool operator==(const OneOffKind&) const = default;
+    };
+    struct OneOffKindHash {
+        size_t operator()(const OneOffKind& kind) const noexcept;
+    };
+    struct OneOffKindStats {
+        u32 safe = 0;    ///< pictures redrawn after a wait, not sampled before
+        u32 harmful = 0; ///< pictures sampled in a later frame before any redraw
+    };
+    /// A kind of picture at one address (GT7 keeps its per-frame targets at fixed addresses): such
+    /// a place no longer waits after 4 redraws, none sampled first, even when its kind was sampled
+    /// first elsewhere (the 256x256 depth pool at 0x100a0e8000 against the probes of that size).
+    /// A family, the pictures of one format at one address whatever their size (a place with no
+    /// pitch, height, slices or samples), after 8 (0x100a0b0000 holds pictures of 21 sizes).
+    struct OneOffPlace {
+        VAddr address = 0;
+        OneOffKind kind{};
+        bool operator==(const OneOffPlace&) const = default;
+    };
+    struct OneOffPlaceHash {
+        size_t operator()(const OneOffPlace& place) const noexcept;
+    };
+    static OneOffKind KindOf(const OneOffHit& hit);
+    static bool OneOffLearnOn();
+    static bool OneOffTrackOn(); ///< PERF-GT7-023 or DIAG-GT7-008
+    bool OneOffExempt(const OneOffHit& hit) const;
+    void LoadOneOffKinds();
+    void SaveOneOffKinds(bool wait); ///< when changed; wait: on this thread
+    std::unordered_map<OneOffKind, OneOffKindStats, OneOffKindHash> one_off_kinds;
+    std::unordered_map<OneOffPlace, OneOffKindStats, OneOffPlaceHash> one_off_places;
+    /// DIAG-GT7-010 (with RYGT_DIAG): the pages CPU write faults hit, by frame, to find the ones
+    /// the game writes every frame (watched again and faulted again each frame: 4-7 ms a frame of
+    /// faults on the game's threads in a heavy scene) and what they hold.
+    struct FaultPage {
+        u64 last_frame = 0;
+        u32 frames = 0; ///< bit n: written n frames before last_frame
+        u32 faults = 0;
+    };
+    std::mutex fault_pages_mutex;
+    std::unordered_map<VAddr, FaultPage> fault_pages;
+    void NoteFaultPages(VAddr begin, VAddr end);
+    /// PERF-GT7-030: after a write fault in a region page (its copy kept, FIX-173), the other
+    /// still watched pages of its 64 KB chunk and region are opened too, when the chunk faulted
+    /// within the last 8 frames: GT7 writes such chunks whole, a page at a time, every ~4 frames.
+    void FaultAhead(VAddr begin, VAddr end);
+    std::unordered_map<VAddr, u64> fault_chunks; ///< 64 KB chunk: frame of its last fault
+    /// FIX-GT7-006 (under region_dirty_mutex): the regions' cpu_pages as FaultAhead may read
+    /// them from any thread (page: frame the CPU last wrote it), and the pages it opened that no
+    /// refresh has copied in yet.
+    std::unordered_map<VAddr, u64> cpu_recent_pages;
+    std::unordered_set<VAddr> ahead_pages;
+    std::atomic<u64> fault_ahead_faults{};
+    std::atomic<u64> fault_ahead_pages{};
+    std::atomic<u64> fault_ahead_pictures{}; ///< FIX-GT7-018: pages left shut for a picture
+    /// FIX-GT7-020 (under region_dirty_mutex): region pages a picture's download writes, copied
+    /// in whole at their next refresh; of them (recorder), those that had a copy from before,
+    /// and those PERF-GT7-030 had opened.
+    std::unordered_set<VAddr> downloaded_pages;
+    u64 downloaded_with_copy = 0;
+    u64 downloaded_ahead = 0;
+    u64 draws_at_frame = 0; ///< DIAG-GT7-011: stats.draws at the last frame's end
+    std::string FaultPagesText(); ///< the window's pages, then cleared
+    bool one_off_kinds_changed = false;
     /// DIAG-176 (diagnosis, RYGT_DIAG_WRITEBACK_RACE=1): FIX-194's write-backs recorded and not
     /// yet run by the GPU (guest range, GPU tick), and CPU writes that met one.
     struct PendingWriteback {
@@ -419,14 +595,22 @@ private:
     /// OPT-002: what a T# resolved to the last time (picture and views), by the T# and how the
     /// shader reads it, valid while the registry made or dropped no picture and no memory was
     /// unmapped since.
-    struct TextureMemo {
+    /// PERF-GT7-012: up to 4 views again. PERF-GT7-009's 16 (for storage images indexed by mip)
+    /// found GT7's compute slots at 1.3 views and doubled the table (3 MB), whose first touch
+    /// at each texture slot was then the recorder's costliest line of BindTextures.
+    static constexpr u32 TextureMemoViews = 4;
+    template <u32 Views>
+    struct TextureMemoOf {
         std::array<u64, 4> sharp{};
         u32 flags = 0;
         u64 generation = ~u64{0};
         Native::ImageEntry* entry = nullptr;
-        std::array<vk::ImageView, 4> views{};
+        std::array<vk::ImageView, Views> views{};
     };
+    using TextureMemo = TextureMemoOf<TextureMemoViews>;
+    using JobTextureMemo = TextureMemoOf<4>; ///< OPT-010's, per job thread (thread-local)
     std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
+    size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 memo_flags) const;
     std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
     /// buffer of the list (none when part of it is not imported).
@@ -438,6 +622,73 @@ private:
                                                           bool mirror = false);
 
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
+    /// DIAG-GT7-001: GPU timestamps of the main stream's lists.
+    static bool GpuTimeOn();
+    void GpuTimeBegin(Stream& s);
+    void GpuTimeMark(Stream& s);
+    void GpuTimeEnd(Stream& s, u64 tick);
+    void GpuTimeCollect();
+    GpuSegment* GpuSeg() {
+        auto* t = stream.gpu_timing.get();
+        return t && !t->segments.empty() ? &t->segments.back() : nullptr;
+    }
+    static constexpr u32 GpuTimeQueries = 1024;
+    std::deque<std::unique_ptr<GpuTiming>> gpu_timing_pending;
+    std::vector<vk::QueryPool> gpu_timing_pools;
+    u64 gpu_timing_prev_end = 0;
+    double gpu_timing_prev_cpu_end = 0.0;
+    std::chrono::steady_clock::time_point gpu_timing_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point gpu_timing_report = std::chrono::steady_clock::now();
+    struct GpuTimeStats {
+        u64 lists = 0, slow = 0;
+        double busy_ms = 0.0, max_list_ms = 0.0, max_gap_ms = 0.0;
+    } gpu_time_stats;
+    /// OPT-013..015 (RYGT_NATIVE_REUSE=0 turns them off): work the previous draws of the list
+    /// already did is not done again.
+    static bool ReuseOn();
+    /// DIAG-GT7-003 (RYGT_NATIVE_AB=1): the change under test alternates with the defaults
+    /// every 10 s report window (A the defaults without PERF-GT7-018, B with it), each window's
+    /// cost logged.
+    static bool AbOn();
+    u32 AbMode() const;
+    /// DIAG-GT7-004: the window's dispatch costs by part and piece.
+    std::string DispatchPartsText() const;
+    /// PERF-GT7-010: the calling thread (the recorder) at the priority BoostOn asks for.
+    void ApplyRecorderPriority();
+    bool recorder_boosted = false;
+    bool command_boosted = false; ///< PERF-GT7-018: the command thread's priority
+    u64 ab_window = 0;
+    u64 ab_frame = 0;
+    /// OPT-013: the targets the previous draw resolved, by the registers that name them, while
+    /// the registry made or dropped no picture and no memory was unmapped. Clears, rewrites,
+    /// depth twins and last uses are still done at every draw.
+    struct TargetsMemo {
+        bool valid = false;
+        u64 generation = 0;
+        u32 mrt_mask = 0;
+        u32 color_mode = 0;
+        u32 target_mask = 0;
+        u32 num_colors = 0;
+        std::array<AmdGpu::ColorBuffer, 8> color_buffers{};
+        std::array<AmdGpu::CbDbExtent, 8> cb_extents{};
+        bool depth_used = false;
+        u32 depth_flags = 0; ///< depth and stencil enable, depth write enable
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        VAddr htile = 0;
+        AmdGpu::CbDbExtent db_extent{};
+        std::array<VAddr, 8> cmasks{};
+        bool htile_meta = false; ///< the depth image has HTILE (FIX-156)
+        Targets targets{};
+    } targets_memo;
+    bool TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
+    /// OPT-014: the list's binding memos are no longer what is bound.
+    static void ForgetBindings(Stream& s);
+    /// OPT-015: upload memory of the list holding `data` (an earlier draw's with the same bytes).
+    std::pair<vk::Buffer, u64> UploadBytes(u32 slot, const void* data, u32 size, u64 align);
+    /// Everything OPT-014 depends on: pictures made or dropped, memory unmapped, regions or
+    /// mirrors made or dropped.
+    u64 ReuseGeneration() const;
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
@@ -909,7 +1160,15 @@ private:
         }
     } in_place;
     bool InPlaceSampled() const {
-        return (frame & 7) == 0;
+        // PERF-GT7-001: diagnosis only (RYGT_NATIVE_INPLACE_STATS=1). Sampled frames put every
+        // 64 KB page of every binding in a set and looked each vertex attribute up in full
+        // (no OPT-004 shortcut): in GT7's busy scenes (~3,000 draws) those frames missed the
+        // 30 fps deadline.
+        static const bool on = [] {
+            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            return env && env[0] == '1';
+        }();
+        return on && (frame & 7) == 0;
     }
     /// NAT-150: the counter for a binding of that kind, by what GuestBuffer bound.
     u32 BoundKind(u32 kind) const {
@@ -919,11 +1178,22 @@ private:
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
     std::deque<Chunk> retiring_chunks;
+    /// PERF-GT7-007 (B): the device buffers of FIX-203's copies before the work (~2,000 a
+    /// second in GT7, each made and destroyed), kept by size class and used again once the GPU
+    /// ran the list that read them.
+    std::vector<Chunk> free_snapshots;
+    std::deque<Chunk> retiring_snapshots;
+    u64 snapshot_pool_bytes = 0;
+    std::unique_ptr<Native::Rhi::Buffer> TakeSnapshotBuffer(u64 size);
+    void RetireSnapshots(Stream& s, u64 tick);
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
 
     std::mutex sampler_mutex;
+    /// FIX-GT7-002: by the state the device sees; sampler_lookup by the raw S#.
     std::unordered_map<u64, std::unique_ptr<VideoCore::Sampler>> samplers;
+    std::unordered_map<u64, vk::Sampler> sampler_lookup;
+    vk::Sampler last_sampler{};
 
     std::mutex views_mutex;
     std::unordered_map<const Native::ImageEntry*, std::vector<ViewRecord>> views;
@@ -962,6 +1232,10 @@ private:
         u64 timed_draws = 0;     ///< OPT-001
         u64 vertex_near = 0;     ///< OPT-004
         u64 vertex_skipped = 0;  ///< OPT-005
+        /// OPT-013..015: targets from the memo, sets bound again without a new one, sets
+        /// written, pushed sets and push constants not pushed again, uploads reused.
+        u64 targets_reused = 0, sets_reused = 0, sets_written = 0, pushes_skipped = 0,
+            push_constants_skipped = 0, uploads_reused = 0;
         /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:
         /// another pipeline, other user data, memory unmapped, pictures or buffers changed.
         u64 prepared_used = 0, prepared_missing = 0;
@@ -977,11 +1251,24 @@ private:
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
         u64 indirect_draws = 0, indirect_skipped = 0; ///< NAT-161: recorded, and not
         u64 one_off_waits = 0; ///< FIX-198: draws that waited for their new pipeline
+        u64 one_off_exempt = 0; ///< PERF-GT7-023: draws into exempt pictures, skipped
         u64 writeback_befores = 0, precise_writebacks = 0; ///< FIX-203
         /// DIAG-188: a direct dispatch's recorder time by part (pipeline, bindings, images,
         /// barrier with write-backs, recording, notes), and the write-backs' share.
         std::array<u64, 6> dispatch_part_ns{};
         u64 writeback_ns = 0;
+        /// DIAG-GT7-004: a direct dispatch's bindings part by piece (list begin, buffers,
+        /// textures, FIX-203 copies before the work, fill shader read; the rest is the
+        /// difference), its notes' region write-backs and GPU-write notes, and the region
+        /// refreshes inside its bindings.
+        std::array<u64, 5> dispatch_bind_ns{};
+        std::array<u64, 2> dispatch_note_ns{};
+        u64 dispatch_refresh_ns = 0;
+        /// PERF-GT7-007: FIX-203 copies by bytes, and their buffers made and reused.
+        u64 snapshot_bytes = 0, snapshots_made = 0, snapshots_reused = 0;
+        u64 lists_ahead = 0; ///< PERF-GT7-008: lists begun while the recorder waited
+        /// PERF-GT7-009: compute stages' image slots looked up, from the memo, and bindings.
+        u64 compute_texture_lookups = 0, compute_texture_hits = 0, compute_texture_bindings = 0;
         u64 small_rewrites = 0; ///< FIX-202: small textures uploaded again after big writes
         u64 lds_emulated_draws = 0; // FIX-227
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,

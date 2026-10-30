@@ -376,9 +376,20 @@ public:
     u64 NativeHandle() const override {
         return reinterpret_cast<u64>(static_cast<VkCommandBuffer>(cmd));
     }
+    const u64* NativeHandleSlot() const override {
+        static_assert(sizeof(vk::CommandBuffer) == sizeof(u64));
+        return ring ? reinterpret_cast<const u64*>(&cmd) : nullptr;
+    }
 
     /// Whether the GPU is done with the list (its retire fence reached the value).
     bool Retired() const;
+
+    /// PERF-GT7-018: where commands go: the command buffer, or the ring for one replayed there.
+    Vulkan::CmdBuf C() const {
+        return ring ? Vulkan::CmdBuf{ring, &cmd} : Vulkan::CmdBuf{cmd};
+    }
+    /// Makes (deferred lists: or resets) and begins the command buffer.
+    void BeginHere();
 
     VulkanDevice& device;
     ThreadPool* pool;
@@ -389,6 +400,8 @@ public:
     std::atomic<const Fence*> retire_fence{nullptr};
     std::atomic<u64> retire_value{~0ULL};
     vk::DescriptorPool descriptor_pool{}; // descriptor sets of layouts too big to push
+    /// PERF-GT7-018: the ring a deferred list's commands go into (AcquireDeferredCommandList).
+    Vulkan::CommandRing* ring = nullptr;
     const VulkanPipeline* graphics = nullptr;
     const VulkanPipeline* compute = nullptr;
     vk::PipelineBindPoint last_bind = vk::PipelineBindPoint::eGraphics;
@@ -459,6 +472,7 @@ public:
     std::unique_ptr<Fence> CreateFence(u64 initial) override;
     std::unique_ptr<Fence> ImportFence(u64 native_handle) override;
     CommandList* AcquireCommandList(CommandListLevel level) override;
+    CommandList* AcquireDeferredCommandList(void* command_ring) override;
     std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) override;
     void ReleaseUnsubmitted(CommandList* list) override;
     void MarkExecuted(CommandList* list, FenceValue retire) override;
@@ -492,7 +506,7 @@ public:
     /// Queues the first layout change of a new image (UNDEFINED to GENERAL).
     void InitImageLayout(vk::Image image, vk::ImageAspectFlags aspect);
     std::unique_ptr<Image> CreateImageFrom(const VkImageCreateInfo& image_ci, const ImageDesc& desc);
-    void RecordImageInit(vk::CommandBuffer cmd, std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images);
+    void RecordImageInit(Vulkan::CmdBuf cmd, std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images);
 
     VulkanContext ctx;
     vk::Device device;
@@ -733,7 +747,7 @@ void VulkanDevice::InitImageLayout(vk::Image image, vk::ImageAspectFlags aspect)
     pending_init.emplace_back(image, aspect);
 }
 
-void VulkanDevice::RecordImageInit(vk::CommandBuffer cmd,
+void VulkanDevice::RecordImageInit(Vulkan::CmdBuf cmd,
                                    std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images) {
     std::vector<vk::ImageMemoryBarrier2> barriers;
     barriers.reserve(images.size());
@@ -771,7 +785,7 @@ void VulkanDevice::RecordPendingImageInit(CommandList& list) {
         std::scoped_lock lock{init_mutex};
         images.swap(pending_init);
     }
-    RecordImageInit(static_cast<VulkanCommandList&>(list).cmd, images);
+    RecordImageInit(static_cast<VulkanCommandList&>(list).C(), images);
 }
 
 void VulkanDevice::UseExternalTimeline(Fence* fence, std::function<u64()> current) {
@@ -1252,6 +1266,53 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
     return list;
 }
 
+CommandList* VulkanDevice::AcquireDeferredCommandList(void* command_ring) {
+    // PERF-GT7-018: these lists' pool (under no thread's id) is used only by the thread that
+    // replays the ring, which makes, resets, records and ends its command buffers; the caller
+    // keeps the books (which lists are free) and resets their descriptor pools, which it uses.
+    ThreadPool* pool;
+    {
+        std::scoped_lock lock{pools_mutex};
+        auto& slot = pools[std::thread::id{}];
+        if (!slot) {
+            slot = std::make_unique<ThreadPool>();
+            const auto [result, command_pool] = device.createCommandPool(vk::CommandPoolCreateInfo{
+                .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+                .queueFamilyIndex = ctx.queue_family,
+            });
+            ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: command pool failed");
+            slot->pool = command_pool;
+        }
+        pool = slot.get();
+    }
+    for (size_t scanned = 0; !pool->used.empty() && scanned < 64; ++scanned) {
+        VulkanCommandList* list = pool->used.front();
+        if (!list->Retired()) {
+            break;
+        }
+        pool->used.pop_front();
+        if (list->descriptor_pool) {
+            std::ignore = device.resetDescriptorPool(list->descriptor_pool);
+        }
+        pool->free_secondary.push_back(list);
+    }
+    VulkanCommandList* list;
+    if (!pool->free_secondary.empty()) {
+        list = pool->free_secondary.back();
+        pool->free_secondary.pop_back();
+    } else {
+        // Its command buffer is made by its first Begin, where the ring is replayed.
+        pool->all.push_back(std::make_unique<VulkanCommandList>(*this, pool, vk::CommandBuffer{},
+                                                                CommandListLevel::Secondary));
+        list = pool->all.back().get();
+    }
+    list->ring = static_cast<Vulkan::CommandRing*>(command_ring);
+    list->retire_fence.store(nullptr, std::memory_order_relaxed);
+    list->retire_value.store(~0ULL, std::memory_order_relaxed);
+    pool->used.push_back(list);
+    return list;
+}
+
 std::unique_ptr<CommandList> VulkanDevice::WrapCommandBuffer(u64 native_cmdbuf) {
     vk::CommandBuffer cmdbuf{reinterpret_cast<VkCommandBuffer>(native_cmdbuf)};
     return std::make_unique<VulkanCommandList>(*this, nullptr, cmdbuf, CommandListLevel::Primary);
@@ -1309,7 +1370,7 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
         std::ignore = init_cmd.begin(vk::CommandBufferBeginInfo{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         });
-        device.RecordImageInit(init_cmd, device.pending_init);
+        device.RecordImageInit(Vulkan::CmdBuf{init_cmd}, device.pending_init);
         std::ignore = init_cmd.end();
         buffers.push_back(init_cmd);
     }
@@ -1372,6 +1433,31 @@ void VulkanCommandList::Begin() {
     if (!pool) {
         return; // Externally begun
     }
+    if (ring) {
+        // PERF-GT7-018: made or reset and begun where the ring is replayed.
+        ring->Record<Vulkan::CmdTarget::Slot>(0, [this](Vulkan::CommandRing::Extra&) {
+            return [list = this](vk::CommandBuffer) { list->BeginHere(); };
+        });
+        return;
+    }
+    BeginHere();
+}
+
+void VulkanCommandList::BeginHere() {
+    if (ring) {
+        if (!cmd) {
+            const auto [result, buffers] =
+                device.device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
+                    .commandPool = pool->pool,
+                    .level = vk::CommandBufferLevel::eSecondary,
+                    .commandBufferCount = 1,
+                });
+            ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: command buffer failed");
+            cmd = buffers[0];
+        } else {
+            std::ignore = cmd.reset();
+        }
+    }
     // Secondary lists run outside render passes of the command buffer that executes them; they
     // begin and end their own rendering.
     const vk::CommandBufferInheritanceInfo inheritance{};
@@ -1385,7 +1471,7 @@ void VulkanCommandList::End() {
     if (!pool) {
         return; // Externally ended
     }
-    std::ignore = cmd.end();
+    C().end();
 }
 
 void VulkanCommandList::BeginRendering(const RenderingDesc& desc) {
@@ -1426,7 +1512,7 @@ void VulkanCommandList::BeginRendering(const RenderingDesc& desc) {
         .storeOp = store(depth.stencil_store),
         .clearValue{.depthStencil{.depth = depth.clear_depth, .stencil = depth.clear_stencil}},
     };
-    cmd.beginRendering(vk::RenderingInfo{
+    C().beginRendering(vk::RenderingInfo{
         .renderArea{.offset{0, 0}, .extent{desc.width, desc.height}},
         .layerCount = desc.layers,
         .colorAttachmentCount = desc.color_count,
@@ -1437,7 +1523,7 @@ void VulkanCommandList::BeginRendering(const RenderingDesc& desc) {
 }
 
 void VulkanCommandList::EndRendering() {
-    cmd.endRendering();
+    C().endRendering();
 }
 
 void VulkanCommandList::SetViewports(std::span<const Viewport> viewports) {
@@ -1447,7 +1533,7 @@ void VulkanCommandList::SetViewports(std::span<const Viewport> viewports) {
         out[i] = {viewports[i].x, viewports[i].y, viewports[i].width, viewports[i].height,
                   viewports[i].min_depth, viewports[i].max_depth};
     }
-    cmd.setViewport(0, count, out.data());
+    C().setViewport(0, vk::ArrayProxy<const vk::Viewport>(count, out.data()));
 }
 
 void VulkanCommandList::SetScissors(std::span<const Rect> scissors) {
@@ -1456,50 +1542,50 @@ void VulkanCommandList::SetScissors(std::span<const Rect> scissors) {
     for (u32 i = 0; i < count; ++i) {
         out[i] = {{scissors[i].x, scissors[i].y}, {scissors[i].width, scissors[i].height}};
     }
-    cmd.setScissor(0, count, out.data());
+    C().setScissor(0, vk::ArrayProxy<const vk::Rect2D>(count, out.data()));
 }
 
 void VulkanCommandList::SetBlendConstants(const std::array<float, 4>& constants) {
-    cmd.setBlendConstants(constants.data());
+    C().setBlendConstants(constants.data());
 }
 void VulkanCommandList::SetStencilReference(u8 front, u8 back) {
-    cmd.setStencilReference(vk::StencilFaceFlagBits::eFront, front);
-    cmd.setStencilReference(vk::StencilFaceFlagBits::eBack, back);
+    C().setStencilReference(vk::StencilFaceFlagBits::eFront, front);
+    C().setStencilReference(vk::StencilFaceFlagBits::eBack, back);
 }
 void VulkanCommandList::SetStencilMasks(u8 compare_front, u8 compare_back, u8 write_front,
                                         u8 write_back) {
-    cmd.setStencilCompareMask(vk::StencilFaceFlagBits::eFront, compare_front);
-    cmd.setStencilCompareMask(vk::StencilFaceFlagBits::eBack, compare_back);
-    cmd.setStencilWriteMask(vk::StencilFaceFlagBits::eFront, write_front);
-    cmd.setStencilWriteMask(vk::StencilFaceFlagBits::eBack, write_back);
+    C().setStencilCompareMask(vk::StencilFaceFlagBits::eFront, compare_front);
+    C().setStencilCompareMask(vk::StencilFaceFlagBits::eBack, compare_back);
+    C().setStencilWriteMask(vk::StencilFaceFlagBits::eFront, write_front);
+    C().setStencilWriteMask(vk::StencilFaceFlagBits::eBack, write_back);
 }
 void VulkanCommandList::SetDepthBias(float constant, float clamp, float slope) {
-    cmd.setDepthBias(constant, clamp, slope);
+    C().setDepthBias(constant, clamp, slope);
 }
 void VulkanCommandList::SetDepthBounds(float min, float max) {
-    cmd.setDepthBounds(min, max);
+    C().setDepthBounds(min, max);
 }
 void VulkanCommandList::SetLineWidth(float width) {
-    cmd.setLineWidth(width);
+    C().setLineWidth(width);
 }
 
 void VulkanCommandList::SetRasterState(const DynamicRasterState& state) {
-    cmd.setCullMode(static_cast<vk::CullModeFlagBits>(static_cast<u32>(state.cull)));
-    cmd.setFrontFace(state.front_counter_clockwise ? vk::FrontFace::eCounterClockwise
+    C().setCullMode(static_cast<vk::CullModeFlagBits>(static_cast<u32>(state.cull)));
+    C().setFrontFace(state.front_counter_clockwise ? vk::FrontFace::eCounterClockwise
                                                    : vk::FrontFace::eClockwise);
-    cmd.setDepthBiasEnable(state.depth_bias);
-    cmd.setPrimitiveRestartEnable(state.primitive_restart);
-    cmd.setRasterizerDiscardEnable(state.rasterizer_discard);
+    C().setDepthBiasEnable(state.depth_bias);
+    C().setPrimitiveRestartEnable(state.primitive_restart);
+    C().setRasterizerDiscardEnable(state.rasterizer_discard);
 }
 
 void VulkanCommandList::SetDepthStencilState(const DynamicDepthStencilState& state) {
-    cmd.setDepthTestEnable(state.depth_test);
-    cmd.setDepthWriteEnable(state.depth_write);
-    cmd.setDepthCompareOp(ToVk(state.depth_compare));
-    cmd.setDepthBoundsTestEnable(state.depth_bounds_test);
-    cmd.setStencilTestEnable(state.stencil_test);
+    C().setDepthTestEnable(state.depth_test);
+    C().setDepthWriteEnable(state.depth_write);
+    C().setDepthCompareOp(ToVk(state.depth_compare));
+    C().setDepthBoundsTestEnable(state.depth_bounds_test);
+    C().setStencilTestEnable(state.stencil_test);
     const auto op = [&](vk::StencilFaceFlags face, const StencilFace& s) {
-        cmd.setStencilOp(face, ToVk(s.fail), ToVk(s.pass), ToVk(s.depth_fail), ToVk(s.compare));
+        C().setStencilOp(face, ToVk(s.fail), ToVk(s.pass), ToVk(s.depth_fail), ToVk(s.compare));
     };
     op(vk::StencilFaceFlagBits::eFront, state.stencil_front);
     op(vk::StencilFaceFlagBits::eBack, state.stencil_back);
@@ -1507,7 +1593,7 @@ void VulkanCommandList::SetDepthStencilState(const DynamicDepthStencilState& sta
 
 void VulkanCommandList::BindPipeline(const Pipeline* pipeline) {
     const auto* vulkan_pipeline = static_cast<const VulkanPipeline*>(pipeline);
-    cmd.bindPipeline(vulkan_pipeline->bind_point, vulkan_pipeline->pipeline);
+    C().bindPipeline(vulkan_pipeline->bind_point, vulkan_pipeline->pipeline);
     if (vulkan_pipeline->bind_point == vk::PipelineBindPoint::eCompute) {
         compute = vulkan_pipeline;
     } else {
@@ -1582,8 +1668,9 @@ void VulkanCommandList::PushBindings(std::span<const Binding> bindings) {
         }
     }
     if (pipeline->layout->push_bindings) {
-        cmd.pushDescriptorSetKHR(pipeline->bind_point, pipeline->layout->layout, 0,
-                                 static_cast<u32>(count), writes.data());
+        C().pushDescriptorSetKHR(
+            pipeline->bind_point, pipeline->layout->layout, 0,
+            vk::ArrayProxy<const vk::WriteDescriptorSet>(static_cast<u32>(count), writes.data()));
         return;
     }
     // More bindings than can be pushed: a descriptor set from this list's pool, freed with it.
@@ -1619,7 +1706,7 @@ void VulkanCommandList::PushBindings(std::span<const Binding> bindings) {
         writes[i].dstSet = sets[0];
     }
     device.device.updateDescriptorSets(static_cast<u32>(count), writes.data(), 0, nullptr);
-    cmd.bindDescriptorSets(pipeline->bind_point, pipeline->layout->layout, 0, sets[0], {});
+    C().bindDescriptorSets(pipeline->bind_point, pipeline->layout->layout, 0, sets[0], {});
 }
 
 void VulkanCommandList::PushConstants(u32 offset, std::span<const u8> data) {
@@ -1628,7 +1715,7 @@ void VulkanCommandList::PushConstants(u32 offset, std::span<const u8> data) {
     if (!pipeline) {
         return;
     }
-    cmd.pushConstants(pipeline->layout->layout, pipeline->layout->push_stages, offset,
+    C().pushConstants(pipeline->layout->layout, pipeline->layout->push_stages, offset,
                       static_cast<u32>(data.size()), data.data());
 }
 
@@ -1639,32 +1726,32 @@ void VulkanCommandList::BindVertexBuffers(u32 first, std::span<const Buffer* con
     for (u32 i = 0; i < count; ++i) {
         out[i] = buffers[i] ? static_cast<const VulkanBuffer*>(buffers[i])->buffer : vk::Buffer{};
     }
-    cmd.bindVertexBuffers(first, count, out.data(), offsets.data());
+    C().bindVertexBuffers(first, count, out.data(), offsets.data());
 }
 
 void VulkanCommandList::BindIndexBuffer(const Buffer* buffer, u64 offset, IndexType type) {
-    cmd.bindIndexBuffer(static_cast<const VulkanBuffer*>(buffer)->buffer, offset,
+    C().bindIndexBuffer(static_cast<const VulkanBuffer*>(buffer)->buffer, offset,
                         type == IndexType::U16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
 }
 
 void VulkanCommandList::Draw(u32 vertices, u32 instances, u32 first_vertex, u32 first_instance) {
-    cmd.draw(vertices, instances, first_vertex, first_instance);
+    C().draw(vertices, instances, first_vertex, first_instance);
 }
 
 void VulkanCommandList::DrawIndexed(u32 indices, u32 instances, u32 first_index,
                                     s32 vertex_offset, u32 first_instance) {
-    cmd.drawIndexed(indices, instances, first_index, vertex_offset, first_instance);
+    C().drawIndexed(indices, instances, first_index, vertex_offset, first_instance);
 }
 
 void VulkanCommandList::Dispatch(u32 x, u32 y, u32 z) {
-    cmd.dispatch(x, y, z);
+    C().dispatch(x, y, z);
 }
 
 void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back) {
     vk::MemoryBarrier2 barrier{};
     ScopeToVk(wait_for, true, barrier.srcStageMask, barrier.srcAccessMask);
     ScopeToVk(hold_back, false, barrier.dstStageMask, barrier.dstAccessMask);
-    cmd.pipelineBarrier2(vk::DependencyInfo{
+    C().pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
@@ -1673,7 +1760,7 @@ void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back) {
 void VulkanCommandList::CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst,
                                    u64 dst_offset, u64 size) {
     const vk::BufferCopy region{.srcOffset = src_offset, .dstOffset = dst_offset, .size = size};
-    cmd.copyBuffer(static_cast<const VulkanBuffer*>(src)->buffer,
+    C().copyBuffer(static_cast<const VulkanBuffer*>(src)->buffer,
                    static_cast<const VulkanBuffer*>(dst)->buffer, region);
 }
 
@@ -1703,21 +1790,21 @@ std::vector<vk::BufferImageCopy> ToVkRegions(std::span<const BufferImageCopy> re
 void VulkanCommandList::CopyBufferToImage(const Buffer* src, const Image* dst,
                                           std::span<const BufferImageCopy> regions) {
     const auto out = ToVkRegions(regions);
-    cmd.copyBufferToImage(static_cast<const VulkanBuffer*>(src)->buffer,
+    C().copyBufferToImage(static_cast<const VulkanBuffer*>(src)->buffer,
                           static_cast<const VulkanImage*>(dst)->image, vk::ImageLayout::eGeneral,
-                          static_cast<u32>(out.size()), out.data());
+                          vk::ArrayProxy<const vk::BufferImageCopy>(out));
 }
 
 void VulkanCommandList::CopyImageToBuffer(const Image* src, const Buffer* dst,
                                           std::span<const BufferImageCopy> regions) {
     const auto out = ToVkRegions(regions);
-    cmd.copyImageToBuffer(static_cast<const VulkanImage*>(src)->image, vk::ImageLayout::eGeneral,
+    C().copyImageToBuffer(static_cast<const VulkanImage*>(src)->image, vk::ImageLayout::eGeneral,
                           static_cast<const VulkanBuffer*>(dst)->buffer,
-                          static_cast<u32>(out.size()), out.data());
+                          vk::ArrayProxy<const vk::BufferImageCopy>(out));
 }
 
 void VulkanCommandList::FillBuffer(const Buffer* dst, u64 offset, u64 size, u32 value) {
-    cmd.fillBuffer(static_cast<const VulkanBuffer*>(dst)->buffer, offset, size, value);
+    C().fillBuffer(static_cast<const VulkanBuffer*>(dst)->buffer, offset, size, value);
 }
 
 void VulkanCommandList::ClearColorImage(const Image* image, const std::array<float, 4>& color) {
@@ -1729,7 +1816,7 @@ void VulkanCommandList::ClearColorImage(const Image* image, const std::array<flo
         .baseArrayLayer = 0,
         .layerCount = VK_REMAINING_ARRAY_LAYERS,
     };
-    cmd.clearColorImage(static_cast<const VulkanImage*>(image)->image, vk::ImageLayout::eGeneral,
+    C().clearColorImage(static_cast<const VulkanImage*>(image)->image, vk::ImageLayout::eGeneral,
                         value, range);
 }
 
@@ -1738,15 +1825,18 @@ void VulkanCommandList::BeginMarker(std::string_view name) {
         return;
     }
     const std::string label{name};
-    cmd.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{.pLabelName = label.c_str()});
+    C().beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{.pLabelName = label.c_str()});
 }
 
 void VulkanCommandList::ExecuteSecondary(std::span<CommandList* const> lists) {
+    ASSERT_MSG(!ring, "PERF-GT7-018: secondary lists run from a deferred list");
     std::array<vk::CommandBuffer, 64> buffers{};
     for (size_t first = 0; first < lists.size(); first += buffers.size()) {
         const size_t count = std::min(buffers.size(), lists.size() - first);
         for (size_t i = 0; i < count; ++i) {
-            buffers[i] = static_cast<VulkanCommandList*>(lists[first + i])->cmd;
+            const auto* list = static_cast<VulkanCommandList*>(lists[first + i]);
+            ASSERT_MSG(!list->ring, "PERF-GT7-018: a deferred list run as a secondary");
+            buffers[i] = list->cmd;
         }
         cmd.executeCommands(static_cast<u32>(count), buffers.data());
     }
@@ -1757,7 +1847,7 @@ void VulkanCommandList::ExecuteSecondary(std::span<CommandList* const> lists) {
 
 void VulkanCommandList::EndMarker() {
     if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdEndDebugUtilsLabelEXT) {
-        cmd.endDebugUtilsLabelEXT();
+        C().endDebugUtilsLabelEXT();
     }
 }
 

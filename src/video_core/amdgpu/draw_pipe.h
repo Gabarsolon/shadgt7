@@ -19,6 +19,54 @@
 
 namespace AmdGpu {
 
+/// DIAG-GT7-005 (RYGT_NATIVE_AB=1 or RYGT_DIAG_RECORDER_PARTS=1): the recorder thread's time
+/// while it runs jobs, by part. Each part counts its own time only (a draw inside a draw job is
+/// the draw's); the time waiting for jobs is not counted.
+namespace RecorderParts {
+enum class Part : u32 {
+    Jobs,       ///< jobs outside the parts below (copies, waits, events...)
+    DrawJobs,   ///< a draw or dispatch job around the renderer's draw: registers, selection
+    Draws,      ///< the native renderer's draws
+    Dispatches, ///< and dispatches
+    Labels,     ///< label and fence writes
+    Dmas,       ///< DMA copies
+    Splices,    ///< native lists run in the scheduler's command buffer
+    Submits,    ///< scheduler flushes and submits (around the splices)
+    Uploads,    ///< image uploads and inits before the work (PrepareImages)
+    WriteBacks, ///< pictures written back to guest memory (NAT-112)
+    GpuWaits,   ///< waits for the GPU (scheduler Wait)
+    Ahead,      ///< PERF-GT7-008: lists begun while the recorder waits for jobs
+    Count,
+};
+inline constexpr u32 PartCount = static_cast<u32>(Part::Count);
+bool On();
+/// The recorder runs jobs from here to the end of the scope (Jobs until a part starts).
+class Running {
+public:
+    Running() noexcept;
+    ~Running();
+    Running(const Running&) = delete;
+    Running& operator=(const Running&) = delete;
+
+private:
+    bool active;
+};
+/// A part, from here to the end of the scope (nothing outside Running, or on other threads).
+class Scope {
+public:
+    explicit Scope(Part part) noexcept;
+    ~Scope();
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    Part previous{};
+    bool active;
+};
+/// This thread's nanoseconds by part since the last call.
+std::array<u64, PartCount> Take();
+} // namespace RecorderParts
+
 /// PERF-031: the second stage of the GPU command processor. The command thread (stage A) keeps
 /// decoding PM4 and the register file; the work that records Vulkan commands and touches the
 /// buffer and texture caches (draws, dispatches, copies, fences) runs here, in submission
@@ -43,9 +91,14 @@ public:
     /// `thread_init` runs first on the recorder thread (thread name, thread-local state).
     explicit DrawPipe(std::function<void()> thread_init, size_t max_pending = 4096);
 
-    /// D5: runs on the recorder each time it runs out of work, before it waits.
+    /// D5: runs on the recorder each time it runs out of work, before it waits. Set once (the
+    /// recorder may already run: it calls the hook only once it saw it set).
     void SetIdleHook(std::function<void()>&& hook) {
-        idle_hook = std::move(hook);
+        {
+            std::scoped_lock lk{mutex};
+            idle_hook = std::move(hook);
+        }
+        has_idle_hook.store(true, std::memory_order_release);
     }
     ~DrawPipe();
 
@@ -206,6 +259,7 @@ private:
     std::atomic<std::thread::id> recorder_id{};
     std::function<void()> thread_init;
     std::function<void()> idle_hook; // D5
+    std::atomic<bool> has_idle_hook{false};
     Stats stats{};
     std::jthread recorder;
     std::mutex idle_mutex; // DIAG-114

@@ -189,6 +189,7 @@ private:
 // summary (the driver figure) needs hundreds of new ones at once. With every build worker on one,
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
 // At most two of them are created at the same time; -DisablePerf 79 lets them all run.
+// (PERF-GT7-029's three while compiles use every core gave way to PERF-172's limit.)
 // PERF-172: GT7's tessellated pipelines are compiled without optimization (FIX-057, PERF-081),
 // and two at a time held its cars back for most of a race start; up to RYGT_TESS_BUILDS
 // (default 4) run at once while the process commits under half the RAM and 4 GB stay free, two

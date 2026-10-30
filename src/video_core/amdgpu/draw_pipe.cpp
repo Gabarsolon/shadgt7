@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <utility>
 
 #include <immintrin.h>
 #include <string>
@@ -30,6 +32,67 @@ u64 MicrosecondsSince(std::chrono::steady_clock::time_point start) {
                                 .count());
 }
 } // namespace
+
+namespace RecorderParts {
+namespace {
+thread_local bool t_running = false;
+thread_local Part t_part = Part::Jobs;
+thread_local std::chrono::steady_clock::time_point t_since{};
+thread_local std::array<u64, PartCount> t_ns{};
+
+void Charge(std::chrono::steady_clock::time_point now) {
+    t_ns[static_cast<u32>(t_part)] +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_since).count();
+    t_since = now;
+}
+} // namespace
+
+bool On() {
+    static const bool on = [] {
+        const char* ab = std::getenv("RYGT_NATIVE_AB");
+        const char* parts = std::getenv("RYGT_DIAG_RECORDER_PARTS");
+        return (ab && ab[0] == '1') || (parts && parts[0] == '1');
+    }();
+    return on;
+}
+
+Running::Running() noexcept : active{On() && !t_running} {
+    if (active) {
+        t_running = true;
+        t_part = Part::Jobs;
+        t_since = std::chrono::steady_clock::now();
+    }
+}
+
+Running::~Running() {
+    if (active) {
+        Charge(std::chrono::steady_clock::now());
+        t_running = false;
+    }
+}
+
+Scope::Scope(Part part) noexcept : active{t_running} {
+    if (active) {
+        Charge(std::chrono::steady_clock::now());
+        previous = t_part;
+        t_part = part;
+    }
+}
+
+Scope::~Scope() {
+    if (active) {
+        Charge(std::chrono::steady_clock::now());
+        t_part = previous;
+    }
+}
+
+std::array<u64, PartCount> Take() {
+    if (t_running) {
+        Charge(std::chrono::steady_clock::now());
+    }
+    return std::exchange(t_ns, {});
+}
+} // namespace RecorderParts
 
 DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
     : max_pending{max_pending_}, thread_init{std::move(thread_init_)} {
@@ -469,15 +532,19 @@ void DrawPipe::Run(std::stop_token stop) {
 
     std::deque<Work> batch;
     while (true) {
-        RunUrgent();
-        if (idle_hook) {
+        {
+            RecorderParts::Running running; // DIAG-GT7-005
+            RunUrgent();
+        }
+        if (has_idle_hook.load(std::memory_order_acquire)) {
             bool empty;
             {
                 std::scoped_lock lk{mutex};
                 empty = queue.empty();
             }
             if (empty) {
-                idle_hook(); // D5
+                RecorderParts::Running running; // DIAG-GT7-005
+                idle_hook(); // D5, PERF-GT7-008
             }
         }
         {
@@ -511,6 +578,7 @@ void DrawPipe::Run(std::stop_token stop) {
         const auto start = std::chrono::steady_clock::now();
         u64 ran = 0;
         Common::Nvtx::Scope nvtx{"recording"}; // DIAG-056
+        RecorderParts::Running running;        // DIAG-GT7-005
         while (!batch.empty()) {
             Work work = std::move(batch.front());
             batch.pop_front();

@@ -28,6 +28,12 @@
 
 namespace RyDiag {
 
+std::atomic<u32> g_profile_tag{0}; // DIAG-GT7-002
+
+void SetProfileTag(u32 tag) {
+    g_profile_tag.store(tag, std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr const char* ZoneName(Zone zone) {
@@ -177,6 +183,11 @@ struct State {
     std::map<std::string, std::pair<u32, double>> fault_sites;
     std::chrono::steady_clock::time_point last_screenshot{};
     FILE* spikes_txt{};
+    // DIAG-GT7-007: timeline.csv, buffered and written by the writer thread.
+    std::chrono::steady_clock::time_point steady_origin{};
+    std::mutex timeline_mutex;
+    std::string timeline_buf;
+    FILE* timeline_csv{};
 };
 
 State& GetState() {
@@ -409,6 +420,7 @@ void SamplerThread() {
             Sample sample{};
             sample.cycles = used;
             sample.tid = t.tid;
+            sample.pad = g_profile_tag.load(std::memory_order_relaxed); // DIAG-GT7-002
             const bool stop = stack_tick && t.stack_base && SuspendThread(t.handle) != DWORD(-1);
             CONTEXT ctx{};
             ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
@@ -723,8 +735,13 @@ void WriteSpike(const State::SpikeRequest& req) {
         flips.size(), flip_gap,
         flip_gap >= req.median + 0.5 * excess ? "the game itself was late"
                                               : "the game was on time: the delay is after the flip");
-    if (number > 400) {
+    // DIAG-GT7-006: past 400 spikes only their first lines are written, except for stalls of a
+    // second and more (a 6 s freeze late in a mission kept nothing) and every 10th spike (the
+    // race after 20 minutes of other ones had no detailed spike), and each entry reaches the file
+    // at once (the short ones stayed in the buffer and were lost when the game closed).
+    if (number > 400 && req.ms < 1000.0 && number % 10 != 0) {
         std::fputs(text.c_str(), s.spikes_txt);
+        std::fflush(s.spikes_txt);
         return;
     }
     std::string zones;
@@ -924,8 +941,90 @@ void WriteSpike(const State::SpikeRequest& req) {
     std::fclose(f);
 }
 
+// DIAG-GT7-002: where the GPU recorder thread is, from every stack sample since the start, by the
+// mode the renderer set (A/B/C: 1/2/3), as module+offset (system frames with their first caller in
+// the renderer library). Symbolize offline with the build's PDB.
+void WriteRecorderProfile() {
+    auto& s = GetState();
+    static u64 read_upto = 0;
+    static std::map<std::pair<u32, std::string>, u64> counts;
+    static std::map<u32, u64> totals;
+    u32 recorder = 0;
+    {
+        std::scoped_lock lk{s.threads_mutex};
+        for (const auto& [tid, name] : s.thread_names) {
+            if (name == "shadGT:GpuRecorder") {
+                recorder = tid;
+            }
+        }
+    }
+    const u64 head = s.sample_head.load(std::memory_order_acquire);
+    if (head - read_upto > SampleRingSize) {
+        read_upto = head - SampleRingSize;
+    }
+    // Every sample as taken too (window, mode, the frame and the callers found on the stack), for
+    // inclusive costs and per-window cuts offline; the renderer's tag is window << 8 | mode.
+    static FILE* raw = nullptr;
+    if (!raw && recorder != 0) {
+        raw = _wfopen((s.dir / "recorder_samples.csv").c_str(), L"w");
+        if (raw) {
+            std::fputs("window,mode,frames\n", raw);
+        }
+    }
+    for (; read_upto < head; ++read_upto) {
+        const Sample sm = s.samples[read_upto % SampleRingSize];
+        if (recorder == 0 || sm.tid != recorder || sm.rip == 0) {
+            continue;
+        }
+        const u32 mode = sm.pad & 0xff;
+        std::string key = Symbol(sm.rip);
+        std::string frames = key;
+        bool keyed = key.starts_with("libSceVideoOut");
+        for (const u64 caller : sm.callers) {
+            if (!caller) {
+                break;
+            }
+            const std::string sym = Symbol(caller);
+            frames += " " + sym;
+            if (!keyed && sym.starts_with("libSceVideoOut")) {
+                key += " < " + sym;
+                keyed = true;
+            }
+        }
+        if (raw) {
+            std::fprintf(raw, "%u,%u,%s\n", sm.pad >> 8, mode, frames.c_str());
+        }
+        ++counts[{mode, key}];
+        ++totals[mode];
+    }
+    if (raw) {
+        std::fflush(raw);
+    }
+    std::string text = "ryGT recorder profile (DIAG-GT7-002): stack samples of shadGT:GpuRecorder "
+                       "by tag (renderer A/B mode)\n";
+    for (const auto& [tag, total] : totals) {
+        text += fmt::format("\n== tag {}: {} samples\n", tag, total);
+        std::vector<std::pair<u64, std::string>> top;
+        for (const auto& [key, n] : counts) {
+            if (key.first == tag) {
+                top.emplace_back(n, key.second);
+            }
+        }
+        std::sort(top.begin(), top.end(), std::greater{});
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 400); ++i) {
+            text += fmt::format("{:8} {:6.2f}%  {}\n", top[i].first,
+                                100.0 * top[i].first / total, top[i].second);
+        }
+    }
+    if (FILE* f = _wfopen((s.dir / "recorder_profile.txt").c_str(), L"w")) {
+        std::fputs(text.c_str(), f);
+        std::fclose(f);
+    }
+}
+
 void WriteSummary() {
     auto& s = GetState();
+    WriteRecorderProfile(); // DIAG-GT7-002
     std::vector<float> sorted;
     {
         std::scoped_lock lk{s.frames_mutex};
@@ -1021,12 +1120,31 @@ void WriterThread() {
             const auto req = s.spike_queue.front();
             s.spike_queue.pop_front();
             lk.unlock();
-            // Let the window's last zones and samples land.
-            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            // Let the window's last zones and samples land: 100 ms after it ended (DIAG-GT7-006:
+            // not 100 ms for every queued spike, which left the writer a minute behind in bursts).
+            const u64 now_tsc = __rdtsc();
+            const double since_ms =
+                now_tsc > req.window_end ? TicksToMs(now_tsc - req.window_end) : 0.0;
+            if (since_ms < 100.0) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds{static_cast<s64>((100.0 - since_ms) * 1000.0)});
+            }
             WriteSpike(req);
             lk.lock();
         }
         lk.unlock();
+        {
+            // DIAG-GT7-007: the timeline lines since the last pass.
+            std::string lines;
+            {
+                std::scoped_lock tl{s.timeline_mutex};
+                lines.swap(s.timeline_buf);
+            }
+            if (s.timeline_csv && !lines.empty()) {
+                std::fputs(lines.c_str(), s.timeline_csv);
+                std::fflush(s.timeline_csv);
+            }
+        }
         if (std::chrono::steady_clock::now() >= next_summary) {
             next_summary = std::chrono::steady_clock::now() + std::chrono::seconds{10};
             WriteSummary();
@@ -1040,6 +1158,7 @@ void WriterThread() {
 void Init(State& s) {
     s.ticks_per_ms = CalibrateTicksPerMs();
     s.start_tsc = __rdtsc();
+    s.steady_origin = std::chrono::steady_clock::now(); // DIAG-GT7-007
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::filesystem::path dir = std::filesystem::path{exe}.parent_path() / L"diag";
@@ -1052,6 +1171,15 @@ void Init(State& s) {
     s.dir = dir;
     s.frames_csv = _wfopen((dir / "frames.csv").c_str(), L"w");
     s.spikes_txt = _wfopen((dir / "spikes.txt").c_str(), L"w");
+    s.timeline_csv = _wfopen((dir / "timeline.csv").c_str(), L"w");
+    if (s.timeline_csv) {
+        // DIAG-GT7-007: S gfx submit (submitted, decoded, recorded; arg its number), G its GPU work
+        // done (arg the number), E the game asks for a flip after its next command buffers (arg
+        // the buffer), R flip submitted (arg index | EOP << 32), Q flip queued for the
+        // screen, V flip vblank (t1 flips queued; arg 1 when one was taken), P flip shown (t0
+        // queued, t1 waited for the GPU from, t2 drawn, t3 presented; arg index).
+        std::fputs("kind,t0,t1,t2,t3,arg\n", s.timeline_csv);
+    }
     if (s.frames_csv) {
         std::string header = "frame,time_s,frame_ms,since_game_flip_ms,spike";
         for (const Zone z : RendererZones) {
@@ -1069,6 +1197,26 @@ void Init(State& s) {
 }
 
 } // namespace
+
+void Timeline(char kind, double t0, double t1, double t2, double t3, u64 arg) {
+    if (!Enabled()) {
+        return;
+    }
+    auto& s = GetState();
+    std::scoped_lock lk{s.timeline_mutex};
+    if (s.timeline_buf.size() > (64u << 20)) {
+        return; // the writer is far behind: drop rather than grow
+    }
+    fmt::format_to(std::back_inserter(s.timeline_buf), "{},{:.6f},{:.6f},{:.6f},{:.6f},{}\n",
+                   kind, t0, t1, t2, t3, arg);
+}
+
+double Seconds(std::chrono::steady_clock::time_point tp) {
+    if (!Enabled()) {
+        return 0.0;
+    }
+    return std::chrono::duration<double>(tp - GetState().steady_origin).count();
+}
 
 bool Enabled() {
     static const bool enabled = [] {

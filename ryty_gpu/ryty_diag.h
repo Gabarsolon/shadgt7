@@ -79,10 +79,24 @@ inline void Mark(Zone zone, u64 arg = 0) {
 /// Called once per presented game frame (the screen clock).
 void FrameShown();
 
+/// DIAG-GT7-002: tags the stack samples taken from now on (the renderer's A/B window << 8 | mode).
+void SetProfileTag(u32 tag);
+
+/// DIAG-GT7-007: a line of timeline.csv (kind, four times or values, an integer), for each
+/// frame's way from the game's submit to the screen. Times are seconds on frames.csv's clock.
+void Timeline(char kind, double t0, double t1 = 0.0, double t2 = 0.0, double t3 = 0.0, u64 arg = 0);
+/// A steady_clock time point on that clock.
+double Seconds(std::chrono::steady_clock::time_point tp);
+
 #ifndef RYTY_DIAG
 inline void Record(Zone, u64, u64, u64) {}
 inline void RecordElapsed(Zone, std::chrono::steady_clock::duration, u64) {}
 inline void FrameShown() {}
+inline void SetProfileTag(u32) {}
+inline void Timeline(char, double, double, double, double, u64) {}
+inline double Seconds(std::chrono::steady_clock::time_point) {
+    return 0.0;
+}
 #endif
 
 class Scope {

@@ -58,7 +58,8 @@ void PushEventPushContext::Initialize() {
     }
     s64 new_id = g_current_push_event_push_context_id;
     std::memset(&this->id, 0, sizeof(this->id));
-    std::memcpy(&this->id, &new_id, sizeof(s64));
+    std::snprintf(this->id.uuid, sizeof(this->id.uuid), "00000000-0000-4000-8000-%012llx",
+                  static_cast<unsigned long long>(new_id));
 }
 
 }; // namespace Libraries::Np::NpWebApi2

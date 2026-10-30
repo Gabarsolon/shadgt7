@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -133,9 +136,16 @@ public:
 
     // Returns the actual numerical id currently stored in id.
     s64 GetFakeId() {
-        s64 fake_id{};
-        std::memcpy(&fake_id, &id, sizeof(s64));
-        return fake_id;
+        return FakeIdOf(&id);
+    }
+
+    // The index in a push context ID ("00000000-0000-4000-8000-<12 hex digits>"); games keep the
+    // ID as text, so it has to be a real UUID string.
+    static s64 FakeIdOf(const OrbisNpWebApi2PushEventPushContextId* push_ctx_id) {
+        if (strnlen(push_ctx_id->uuid, sizeof(push_ctx_id->uuid)) != 36) {
+            return 0;
+        }
+        return static_cast<s64>(std::strtoull(push_ctx_id->uuid + 24, nullptr, 16));
     }
 
     void Start() {

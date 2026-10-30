@@ -73,6 +73,10 @@ struct RecentView {
 };
 thread_local std::array<RecentView, 8> t_recent_views{};
 thread_local u32 t_recent_next = 0;
+// PERF-GT7-002: ranges a thread found imported whole (over one view or several), by their start:
+// GT7's busy scenes bind thousands of ranges a frame over more views than the eight above hold,
+// and each miss walked the view map page by page under the lock.
+thread_local std::array<RecentView, 256> t_recent_ranges{};
 
 } // namespace
 
@@ -217,16 +221,47 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
-bool DirectMemory::ImportView(VAddr address) {
+namespace {
+// PERF-GT7-022: a view was a whole allocation (up to 4 GiB): importing GT7's 2 GiB one pinned its
+// pages for ~440 ms, and the driver held every other call meanwhile, the present's submit too
+// (a frozen loading screen). Views are now pieces of at most this size, imported when something
+// in them is used. RYGT_D1_VIEW_MB=0: whole allocations as before.
+u64 ViewPiece() {
+    static const u64 piece = [] {
+        const char* env = std::getenv("RYGT_D1_VIEW_MB");
+        const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 256;
+        return mb == 0 ? u64{1} << 32 : mb << 20;
+    }();
+    return piece;
+}
+} // namespace
+
+bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
 #ifdef _WIN32
-    const VAddr base = GuestViewBase(address);
-    if (base == 0) {
+    const VAddr allocation = GuestViewBase(address);
+    if (allocation == 0) {
         return false;
+    }
+    // PERF-GT7-022: the piece holding the address (pieces start at the allocation's base).
+    const u64 piece = ViewPiece();
+    VAddr base = allocation + (address - allocation) / piece * piece;
+    // After a view ending inside this piece (one cut short by the next view or the committed range).
+    if (auto next = views.upper_bound(address); next != views.begin()) {
+        base = std::max(base, std::prev(next)->second.end);
     }
     if (std::ranges::binary_search(failed, base)) {
         return false;
     }
-    const VAddr end = GuestViewEnd(base, 1ULL << 32);
+    // Up to the pieces `want_end` reaches (two at most), not into a view imported after them.
+    const VAddr pieces_end =
+        want_end > base + piece
+            ? std::min(base + 2 * piece, allocation + (want_end - 1 - allocation) / piece * piece +
+                                             piece)
+            : base + piece;
+    VAddr end = std::min(GuestViewEnd(base, pieces_end - base), pieces_end);
+    if (const auto next = views.upper_bound(base); next != views.end()) {
+        end = std::min(end, next->second.begin);
+    }
     const auto fail = [&](const char* why) {
         failed.insert(std::ranges::upper_bound(failed, base), base);
         if (++failed_count <= 40) {
@@ -237,6 +272,9 @@ bool DirectMemory::ImportView(VAddr address) {
     };
     if (end <= base || (base & (PageSize - 1)) != 0 || ((end - base) & (PageSize - 1)) != 0) {
         return fail("not whole pages");
+    }
+    if (end <= address) {
+        return fail("the address is past the piece"); // PERF-GT7-022: not expected
     }
     const auto map_alias = MapAlias();
     if (!map_alias) {
@@ -357,6 +395,10 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             return true;
         }
     }
+    RecentView& range = t_recent_ranges[(address >> 12) % t_recent_ranges.size()];
+    if (range.generation == generation && address >= range.begin && end <= range.end) {
+        return true;
+    }
     std::scoped_lock lk{mutex};
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
         auto it = views.upper_bound(page);
@@ -371,10 +413,11 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
                 continue;
             }
         }
-        if (!ImportView(page)) {
+        if (!ImportView(page, end)) {
             return false;
         }
     }
+    range = {generation, address, end};
     return true;
 }
 

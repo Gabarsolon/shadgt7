@@ -278,9 +278,9 @@ void UserContext::CreatePushContext(OrbisNpWebApi2PushEventPushContextId* push_c
 PushEventPushContext* UserContext::GetPushContext(
     const OrbisNpWebApi2PushEventPushContextId* push_ctx_id) {
     parent_ctx->Lock();
-    s64 raw_id{};
-    std::memcpy(&raw_id, push_ctx_id, sizeof(s64));
+    s64 raw_id = PushEventPushContext::FakeIdOf(push_ctx_id);
     if (!push_contexts.contains(raw_id)) {
+        parent_ctx->Unlock();
         return nullptr;
     }
     PushEventPushContext* push_ctx = push_contexts[raw_id];

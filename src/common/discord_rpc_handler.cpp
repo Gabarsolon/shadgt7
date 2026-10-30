@@ -13,8 +13,9 @@ constexpr const char* RunningOn = "Running on shadGT";
 
 // One Discord application per game: its name is the "Playing" line.
 constexpr const char* GtsApplicationId = "1557422166931275906"; // "Gran Turismo Sport"
-constexpr const char* Gt7ApplicationId = "1563296318623977472"; // "Gran Turismo 7"
-// Its icon (the game's), as the large image.
+// Discord's official game id for Gran Turismo 7 (a string: it is above 2^53).
+constexpr const char* Gt7ApplicationId = "1440143189372567552"; // "Gran Turismo 7"
+// The game's icon as the large image (a public URL, uploaded to the earlier RyGT application).
 constexpr const char* Gt7Icon = "https://cdn.discordapp.com/app-icons/1563296318623977472/"
                                 "184b3f0882be7369afbcdbb523416da6.png?size=512";
 

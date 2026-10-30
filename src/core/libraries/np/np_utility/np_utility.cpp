@@ -455,49 +455,65 @@ s32 PS4_SYSV_ABI sceNpAppLaunchLinkIntInitialize() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestAbort() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
+// The bandwidth test measures the connection to PSN's servers, which are gone. Games size their
+// network traffic from its result (GT Sport's lobby picked its slowest setting, cars updated twice a
+// second, from the 0 Kbps a timed-out test gives), so it finishes at once with a good connection.
+namespace {
+struct BandwidthTestResult {
+    double upload_bps;
+    double download_bps;
+    s32 result;
+    u8 padding[4];
+};
+constexpr double kBandwidthUploadBps = 20'000'000.0;
+constexpr double kBandwidthDownloadBps = 50'000'000.0;
+constexpr s32 kBandwidthTestContext = 1;
+constexpr s32 kBandwidthTestFinished = 2;  // SCE_NP_BANDWIDTH_TEST_STATUS_FINISHED
+} // namespace
+
+s32 PS4_SYSV_ABI sceNpBandwidthTestAbort(s32 ctx_id) {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestDownloadOnlyInitStart() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpBandwidthTestDownloadOnlyInitStart(const void* param) {
+    return kBandwidthTestContext;
+}
+
+s32 PS4_SYSV_ABI sceNpBandwidthTestGetStatus(s32 ctx_id, s32* status) {
+    if (status) *status = kBandwidthTestFinished;
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestGetStatus() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpBandwidthTestInitStart(const void* param) {
+    LOG_INFO(Lib_NpUtility, "bandwidth test: reporting {} Mbps up, {} Mbps down", kBandwidthUploadBps / 1e6,
+             kBandwidthDownloadBps / 1e6);
+    return kBandwidthTestContext;
+}
+
+s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartDownload(const void* param) {
+    return kBandwidthTestContext;
+}
+
+s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartUpload(const void* param) {
+    return kBandwidthTestContext;
+}
+
+s32 PS4_SYSV_ABI sceNpBandwidthTestShutdown(s32 ctx_id, void* result) {
+    if (result) {
+        auto* out = static_cast<BandwidthTestResult*>(result);
+        *out = {};
+        out->upload_bps = kBandwidthUploadBps;
+        out->download_bps = kBandwidthDownloadBps;
+    }
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestInitStart() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceNpBandwidthTestShutdownWithDetailedInfo(s32 ctx_id, void* result) {
+    return sceNpBandwidthTestShutdown(ctx_id, result);
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartDownload() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartUpload() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpBandwidthTestShutdown() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpBandwidthTestShutdownWithDetailedInfo() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpBandwidthTestUploadOnlyInitStart() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceNpBandwidthTestUploadOnlyInitStart(const void* param) {
+    return kBandwidthTestContext;
 }
 
 s32 PS4_SYSV_ABI sceNpLookupNetAbortRequest() {
