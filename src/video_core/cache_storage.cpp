@@ -5,6 +5,7 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
+#include "common/scm_rev.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 
@@ -35,6 +36,112 @@ bool ar_is_read_only{true};
 } // namespace
 
 namespace Storage {
+
+namespace {
+
+// SHD-010: the translated shaders and pipeline keys a renderer build stored come from its
+// recompiler; a newer release's may translate differently, and its stored binaries would be used
+// unchecked. Each store is stamped with the build that filled it (its commit: a release is one
+// commit), and a store of another build (or of none, from before the stamp) is cleared once
+// when a different build opens it. Only this store: the GPU driver's own caches are left alone.
+// RYGT_KEEP_SHADER_CACHE=1 keeps it (tests across builds).
+constexpr const char* StampName = "renderer_build.txt";
+
+bool KeepShaderCache() {
+    const char* env = std::getenv("RYGT_KEEP_SHADER_CACHE");
+    return env && env[0] == '1';
+}
+
+std::string ReadStamp(const std::filesystem::path& stamp) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(stamp, ec)) {
+        return {};
+    }
+    Common::FS::IOFile file{stamp, Common::FS::FileAccessMode::Read};
+    std::string text(file.GetSize(), '\0');
+    file.ReadRaw<char>(text.data(), text.size());
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) {
+        text.pop_back();
+    }
+    return text;
+}
+
+bool WriteStamp(const std::filesystem::path& stamp) {
+    Common::FS::IOFile file{stamp, Common::FS::FileAccessMode::Create};
+    if (!file.IsOpen()) {
+        return false;
+    }
+    const std::string text = std::string{Common::g_scm_rev} + "\n";
+    return file.WriteRaw<char>(text.data(), text.size()) == text.size();
+}
+
+/// The store at `store` (a folder, or an archive with its stamp at `stamp`) as this build's:
+/// cleared first when another build filled it. The stamp is written only after the clear.
+void ClaimStore(const std::filesystem::path& store, const std::filesystem::path& stamp,
+                bool is_folder) {
+    const std::string build = Common::g_scm_rev;
+    if (build.empty()) {
+        return; // a build without its commit: nothing to compare
+    }
+    const std::string stored = ReadStamp(stamp);
+    if (stored == build) {
+        return;
+    }
+    std::error_code ec;
+    u64 files = 0, bytes = 0;
+    if (is_folder && std::filesystem::is_directory(store, ec)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(store, ec)) {
+            if (entry.is_regular_file(ec) && entry.path().filename() != StampName) {
+                ++files;
+                bytes += entry.file_size(ec);
+            }
+        }
+    } else if (!is_folder && std::filesystem::is_regular_file(store, ec)) {
+        files = 1;
+        bytes = std::filesystem::file_size(store, ec);
+    }
+    if (files != 0 && KeepShaderCache()) {
+        LOG_WARNING(Render, "SHD-010: shader store {} is from build {} (this is {}); kept "
+                            "(RYGT_KEEP_SHADER_CACHE=1)",
+                    store.string(), stored.empty() ? "unknown" : stored, build);
+        return;
+    }
+    if (files != 0) {
+        bool cleared = true;
+        if (is_folder) {
+            for (const auto& entry : std::filesystem::directory_iterator(store, ec)) {
+                if (entry.path().filename() == StampName) {
+                    continue;
+                }
+                std::error_code remove_ec;
+                std::filesystem::remove_all(entry.path(), remove_ec);
+                cleared &= !remove_ec;
+            }
+        } else {
+            std::error_code remove_ec;
+            std::filesystem::remove(store, remove_ec);
+            cleared = !remove_ec;
+        }
+        if (!cleared) {
+            // The stamp stays as it was: the next start tries again.
+            LOG_ERROR(Render, "SHD-010: could not clear the shader store {} of build {}",
+                      store.string(), stored.empty() ? "unknown" : stored);
+            return;
+        }
+        LOG_WARNING(Render, "SHD-010: new renderer build {} (store from {}): cleared {} files "
+                            "({:.1f} MB) from {}; shaders are translated again as they are needed",
+                    build, stored.empty() ? "unknown" : stored, files, bytes / 1048576.0,
+                    store.string());
+    }
+    if (is_folder) {
+        std::filesystem::create_directories(store, ec);
+    }
+    if (!WriteStamp(stamp)) {
+        LOG_ERROR(Render, "SHD-010: could not write {}", stamp.string());
+    }
+}
+
+} // namespace
 
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadGT:PipelineCacheIO");
@@ -102,6 +209,11 @@ void DataBase::Open() {
 
         cache_path = GetUserPath(PathType::CacheDir) /
                      std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip");
+        {
+            auto stamp = cache_path;
+            stamp.replace_extension(".build.txt");
+            ClaimStore(cache_path, stamp, false); // SHD-010
+        }
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
@@ -121,6 +233,7 @@ void DataBase::Open() {
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
+        ClaimStore(cache_path, cache_path / StampName, true); // SHD-010
     }
 
     io_worker = std::jthread{ProcessIO};
@@ -135,6 +248,14 @@ void DataBase::OpenLegacy() {
     cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / game_info.GameSerial();
     std::error_code ec;
     opened = std::filesystem::is_directory(cache_path, ec);
+    // SHD-010: another build's store is not read (the old renderer clears it when it opens it).
+    if (opened && ReadStamp(cache_path / StampName) != Common::g_scm_rev && !KeepShaderCache()) {
+        LOG_INFO(Render, "SHD-010: old renderer's shader store at {} is from another build; not "
+                         "read",
+                 cache_path.string());
+        opened = false;
+        return;
+    }
     LOG_INFO(Render, "D10: old renderer's shader store {} at {}", opened ? "found" : "not found",
              cache_path.string());
 }
