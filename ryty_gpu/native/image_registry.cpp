@@ -810,9 +810,11 @@ bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
         entry.layer_samples[l] = h;
     }
     // FIX-GT7-027: the samples miss a layer rewritten where they don't look (four 64-byte
-    // samples of a 16 or 64 KB layer: one per page). Tokyo's buildings stayed black at their first
-    // close-up, lit by probes that stayed as uploaded. Each frame, about 4 MB of whole layers are
-    // also compared with their hashes at the last upload, in turn (the 24 MB pool in 6 frames).
+    // samples of a 16 or 64 KB layer: one per page). Tokyo's buildings went black at their first
+    // close-ups, and the scene's draws there sample these pools (suspected, not yet confirmed:
+    // frame dumps list the layers differing from their upload). Each frame, about 4 MB of whole
+    // layers are also compared with their hashes at the last upload, in turn (the 24 MB pool in
+    // 6 frames).
     // RYGT_NATIVE_LAYER_HASH=0: samples only, as before.
     static const bool whole_layers = [] {
         const char* env = std::getenv("RYGT_NATIVE_LAYER_HASH");
