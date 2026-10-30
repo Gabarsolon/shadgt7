@@ -267,6 +267,7 @@ static std::atomic<s64> g_last_skip_ns{};
 
 // FIX-GT7-023: the live cache, saved before the window's close ends the process.
 static std::atomic<PipelineCache*> g_exit_save_cache{};
+static std::mutex g_exit_save_mutex; // FIX-GT7-025
 
 static u32 CompileMode() {
 #ifdef RYTY_GPU
@@ -896,10 +897,19 @@ static bool WarmComputeOn() {
     return on;
 }
 
-std::filesystem::path PipelineCache::WarmComputeDir() {
+std::filesystem::path PipelineCache::WarmComputeDir() const {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    // FIX-GT7-026: a folder per GPU and driver (the pipeline cache UUID changes with the
+    // driver): recipes hold the subgroup size and push descriptors of the device that made them,
+    // so another GPU's are never built here. Those of the folder itself (before) are left there.
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    std::string uuid;
+    for (const u8 byte : props.pipelineCacheUUID) {
+        uuid += fmt::format("{:02x}", byte);
+    }
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           fmt::format("{}.warm_compute", serial);
+           fmt::format("{}.warm_compute", serial) /
+           fmt::format("{:04x}-{:04x}-{}", props.vendorID, props.deviceID, uuid);
 }
 
 void PipelineCache::WarmComputePipelines(std::stop_token stop) {
@@ -1085,7 +1095,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
-    g_exit_save_cache.store(nullptr); // FIX-GT7-023
+    {
+        std::scoped_lock lk{g_exit_save_mutex}; // FIX-GT7-025: after an exit save in progress
+        g_exit_save_cache.store(nullptr);       // FIX-GT7-023
+    }
     if (warm_compute_thread.joinable()) { // PERF-GT7-037: before the caches go
         warm_compute_thread.request_stop();
         warm_compute_thread.join();
@@ -1217,9 +1230,11 @@ void PipelineCache::SaveDriverCache(bool wait) {
     if (driver_cache_writer.joinable()) {
         driver_cache_writer.join();
     }
-    pipelines_at_driver_save = num_new_pipelines;
+    // FIX-GT7-025: the count this save holds at least (its data is read after).
+    const u32 count = num_new_pipelines.load();
+    pipelines_at_driver_save = count;
     driver_cache_saved_at = std::chrono::steady_clock::now();
-    const auto write = [path = driver_cache_path](std::vector<u8> data) {
+    const auto write = [this, path = driver_cache_path, count](std::vector<u8> data) {
         // PERF-164: a cache over 1 GB is not written (GT Sport's reached 3.7 GB and stalled);
         // the file from before stays.
         if (data.size() > DriverCacheMaxBytes()) {
@@ -1237,8 +1252,14 @@ void PipelineCache::SaveDriverCache(bool wait) {
                 return;
             }
         }
+        // FIX-GT7-025: only over an older save (the exit save may have written a newer one).
         std::error_code ec;
-        std::filesystem::rename(temp, path, ec);
+        if (!driver_cache_file.Commit(count, [&] {
+                std::filesystem::rename(temp, path, ec);
+                return !ec;
+            })) {
+            std::filesystem::remove(temp, ec);
+        }
     };
     const vk::Device device = instance.GetDevice();
     const vk::PipelineCache cache = *pipeline_cache;
@@ -1286,8 +1307,10 @@ int PipelineCache::SaveDriverCacheNow() {
     // 5-minute session on a new GT7 track (a city) kept none of its pipelines: the next race
     // there built them again, buildings missing or black meanwhile. Read and written on the
     // closing thread, beside a save in progress (another temporary file).
-    if (driver_cache_path.empty() || !pipeline_cache ||
-        num_new_pipelines == pipelines_at_driver_save) {
+    // FIX-GT7-025: compared with the save the file holds, not the last one asked for: an
+    // automatic save still writing when the window closes is cut short by the process's end.
+    const u32 count = num_new_pipelines.load();
+    if (driver_cache_path.empty() || !pipeline_cache || count <= driver_cache_file.Kept()) {
         return -1;
     }
     auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
@@ -1303,11 +1326,19 @@ int PipelineCache::SaveDriverCacheNow() {
         }
     }
     std::error_code ec;
-    std::filesystem::rename(temp, driver_cache_path, ec);
-    return ec ? -1 : static_cast<int>(data.size() >> 20);
+    if (!driver_cache_file.Commit(count, [&] {
+            std::filesystem::rename(temp, driver_cache_path, ec);
+            return !ec;
+        })) {
+        std::filesystem::remove(temp, ec); // a newer automatic save is in the file already
+        return -1;
+    }
+    return static_cast<int>(data.size() >> 20);
 }
 
 int SaveDriverCacheAtExit() {
+    // FIX-GT7-025: the cache isn't destroyed during the save (the destructor takes the lock).
+    std::scoped_lock lk{g_exit_save_mutex};
     PipelineCache* const cache = g_exit_save_cache.load();
     return cache ? cache->SaveDriverCacheNow() : -1;
 }

@@ -27,6 +27,7 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/build_queue.h"
+#include "video_core/renderer_vulkan/driver_cache_file.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -408,7 +409,9 @@ private:
                             const Shader::RuntimeInfo& runtime_info,
                             Shader::Backend::Bindings& binding);
     ComputePipelineKey compute_key{};
-    u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    // New pipelines added to the cache since the game start (FIX-GT7-025: atomic, the window's
+    // closing thread reads it).
+    std::atomic<u32> num_new_pipelines{};
 
     // The driver's VkPipelineCache, kept on disk so cached pipelines are not recompiled by the
     // driver on every launch.
@@ -418,13 +421,14 @@ private:
     std::filesystem::path driver_cache_path;
     /// PERF-GT7-037: the recipes of compute pipelines that took the driver long to build, and
     /// the thread that builds them again in the background at start.
-    static std::filesystem::path WarmComputeDir();
+    std::filesystem::path WarmComputeDir() const;
     void WarmComputePipelines(std::stop_token stop);
     std::jthread warm_compute_thread;
     u32 pipelines_at_driver_save{};
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::atomic<bool> driver_cache_writing{}; // PERF-036
     std::jthread driver_cache_writer;
+    DriverCacheFile driver_cache_file; ///< FIX-GT7-025: the save the file holds
     /// FIX-217: pixel shaders (by code address) with a V_INTERP_MOV of a vertex's own value.
     bool ReadsVertexValues(const AmdGpu::ShaderProgram& program);
     std::unordered_map<VAddr, bool> vertex_value_programs;
