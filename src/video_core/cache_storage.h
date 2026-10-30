@@ -13,6 +13,9 @@
 
 namespace Storage {
 
+/// FIX-018/020's marks: up to which stored permutation each program was translated before a fix.
+[[nodiscard]] std::filesystem::path RetranslationMarksPath();
+
 enum class BlobType : u32 {
     ShaderMeta,
     ShaderBinary,
