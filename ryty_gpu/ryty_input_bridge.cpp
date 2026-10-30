@@ -379,15 +379,15 @@ void ForwardInput() {
             }
             controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
             {
-                // (diagnosis) RYGT_ADAPTIVE_TRIGGERS_LOG=1: the trigger effects sent, once a second.
+                // (diagnosis) RYGT_ADAPTIVE_TRIGGERS_LOG=1: the trigger effects sent, at each change.
                 static const bool log = [] {
                     const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_LOG");
                     return env && env[0] == '1';
                 }();
-                static auto next_log = std::chrono::steady_clock::time_point{};
-                const auto now = std::chrono::steady_clock::now();
-                if (log && slot == 0 && now >= next_log) {
-                    next_log = now + std::chrono::seconds(1);
+                static Input::TriggerFeedback::Effect logged_left{}, logged_right{};
+                if (log && slot == 0 && (left != logged_left || right != logged_right)) {
+                    logged_left = left;
+                    logged_right = right;
                     std::fprintf(stderr,
                                  "[triggers] slot 0: L %02x %02x %02x %02x  R %02x %02x %02x %02x  "
                                  "rumble %u/%u strength %u%%%s\n",

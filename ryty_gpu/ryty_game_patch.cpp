@@ -1066,11 +1066,30 @@ void PS4_SYSV_ABI TelemetryUpdateHookGt7(void* service, void* context) {
         return env && env[0] == '1';
     }();
     static u64 calls = 0;
-    if (log && ++calls % 300 == 1) {
+    if (log && ++calls % 30 == 1) {
         float speed = 0;
         std::memcpy(&speed, packet + 0x4c, sizeof(speed));
-        std::fprintf(stderr, "[triggers] GT7 telemetry #%llu: speed %.1f m/s throttle %u brake %u\n",
-                     static_cast<unsigned long long>(calls), speed, packet[0x91], packet[0x92]);
+        u32 id = 0;
+        u16 flags = 0;
+        float omega = 0, radius = 0;
+        std::memcpy(&id, packet + 0x70, sizeof(id));
+        std::memcpy(&flags, packet + 0x8e, sizeof(flags));
+        std::memcpy(&omega, packet + 0xa4, sizeof(omega));
+        std::memcpy(&radius, packet + 0xb4, sizeof(radius));
+        // Wheel speed against car speed: lock (below 1) and spin (above 1), the worst wheel.
+        float lock = 0, spin = 0;
+        for (int i = 0; i < 4 && speed > 1; ++i) {
+            float w = 0, r = 0;
+            std::memcpy(&w, packet + 0xa4 + 4 * i, sizeof(w));
+            std::memcpy(&r, packet + 0xb4 + 4 * i, sizeof(r));
+            const float ratio = std::abs(w) * r / speed;
+            lock = std::max(lock, 1 - ratio);
+            spin = std::max(spin, ratio - 1);
+        }
+        std::fprintf(stderr, "[triggers] GT7 telemetry #%llu: packet %u flags %#x speed %.1f m/s "
+                     "throttle %u brake %u wheel0 %.1f rad/s r %.3f lock %.3f spin %.3f\n",
+                     static_cast<unsigned long long>(calls), id, flags, speed, packet[0x91],
+                     packet[0x92], omega, radius, lock, spin);
     }
 }
 void InstallTriggerTelemetryGt7(u8* base) {
