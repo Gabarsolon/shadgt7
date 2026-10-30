@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -433,9 +434,14 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         entry->image = device.CreateImage(DescOf(info, render_target, false, false));
     }
     if (!entry->image) {
-        LOG_WARNING(Render_Vulkan, "NAT-020: no image for {:#x} ({}x{}, format {})",
-                    info.guest_address, info.size.width, info.size.height,
-                    vk::to_string(info.pixel_format));
+        // FIX-232: logged the first 8 times and then every 1000th (a tester's log grew to
+        // 484 MB in 22 minutes of one format the driver refused).
+        static std::atomic<u32> missing{};
+        if (const u32 n = ++missing; n <= 8 || n % 1000 == 0) {
+            LOG_WARNING(Render_Vulkan, "NAT-020: no image for {:#x} ({}x{}, format {}); {} so far",
+                        info.guest_address, info.size.width, info.size.height,
+                        vk::to_string(info.pixel_format), n);
+        }
         return nullptr;
     }
     entry->last_use.store(frame, std::memory_order_relaxed);
