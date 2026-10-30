@@ -477,6 +477,12 @@ private:
     std::atomic<u64> fault_ahead_faults{};
     std::atomic<u64> fault_ahead_pages{};
     std::atomic<u64> fault_ahead_pictures{}; ///< FIX-GT7-018: pages left shut for a picture
+    /// FIX-GT7-020 (under region_dirty_mutex): region pages a picture's download writes, copied
+    /// in whole at their next refresh; of them (recorder), those that had a copy from before,
+    /// and those PERF-GT7-030 had opened.
+    std::unordered_set<VAddr> downloaded_pages;
+    u64 downloaded_with_copy = 0;
+    u64 downloaded_ahead = 0;
     u64 draws_at_frame = 0; ///< DIAG-GT7-011: stats.draws at the last frame's end
     std::string FaultPagesText(); ///< the window's pages, then cleared
     bool one_off_kinds_changed = false;

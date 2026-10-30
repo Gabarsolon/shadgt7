@@ -1484,9 +1484,14 @@ void NativeRenderer::FlushWritebacks() {
             NoteHistory(address, size, 8, 0); // DIAG-187 (diagnosis)
             // NAT-146: regions over the picture's memory copy it in before their next use.
             if (Region* region = RegionOver(address, size)) {
+                std::scoped_lock lock{region_dirty_mutex}; // FIX-GT7-020
+                if (downloaded_pages.size() >= 1'000'000) {
+                    downloaded_pages.clear(); // only compared again, as before FIX-GT7-020
+                }
                 for (VAddr page = Common::AlignDown(std::max<VAddr>(address, region->begin), 4096);
                      page < std::min<VAddr>(address + size, region->end); page += 4096) {
                     region->dirty_pages.push_back(page);
+                    downloaded_pages.insert(page);
                 }
             }
             // NAT-150: so do mirrors.
@@ -2162,6 +2167,20 @@ void NativeRenderer::RefreshRegion(Region& region) {
                 page_snapshots.erase(it);
             }
             opened_ahead[k] = ahead_pages.erase(pages[k]) != 0;
+            // FIX-GT7-020: a page a picture's download wrote is copied in whole. The compare
+            // below reads guest memory now, before the GPU runs the download (recorded in this
+            // list or one not run yet): with a copy from before, it found nothing changed there
+            // and the region kept stale bytes where the picture went. PERF-GT7-030 took such
+            // copies of thousands of pages a second in GT7 races, where pictures and CPU data
+            // share the per-frame memory: long black triangles on some frames.
+            if (downloaded_pages.erase(pages[k]) != 0) {
+                if (befores[k]) {
+                    ++downloaded_with_copy;
+                    downloaded_ahead += opened_ahead[k] ? 1 : 0;
+                }
+                befores[k].reset();
+                opened_ahead[k] = false;
+            }
         }
     }
     // NAT-145: only the pages copied in are watched again (the region was watched whole
@@ -10270,8 +10289,8 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
     // each copied first while still protected and kept under the lock before it opens, as the
     // faulting page is (PERF-107), so a kept copy never holds a CPU write the region lacks; a
     // page left unwritten copies nothing in at the refresh. RYGT_NATIVE_FAULT_AHEAD=0: as before.
-    // FIX-GT7-019: on again. Off since FIX-GT7-017 for the black triangles of GT7 races, which
-    // FIX-GT7-018 below fixed (a race with it showed none).
+    // FIX-GT7-019: on again since FIX-GT7-018. FIX-GT7-017 had turned it off for the black
+    // triangles of GT7 races; FIX-GT7-018 below and FIX-GT7-020 (RefreshRegion) fix their causes.
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_NATIVE_FAULT_AHEAD");
         return !(env && env[0] == '0');
@@ -11463,6 +11482,11 @@ void NativeRenderer::Report() {
         LOG_INFO(Render_Vulkan, "PERF-GT7-030: {} write faults in region chunks written lately "
                  "opened {} more pages with them; FIX-GT7-018: {} left shut under a picture",
                  fault_ahead_faults.exchange(0), opened, fault_ahead_pictures.exchange(0));
+    }
+    if (downloaded_with_copy != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-GT7-020: {} region pages a picture's download wrote had a "
+                 "copy from before ({} opened by PERF-GT7-030): copied in whole",
+                 std::exchange(downloaded_with_copy, 0), std::exchange(downloaded_ahead, 0));
     }
     if (RyDiag::Enabled()) {
         if (std::string text = FaultPagesText(); !text.empty()) {
