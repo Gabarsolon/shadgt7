@@ -1154,6 +1154,25 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         state.max_lod.Assign(sharp.max_lod.Value());
         state.lod_bias.Assign(sharp.lod_bias.Value());
     }
+    // GFX-GT7-001 (the launcher's Texture sharpness, RYGT_TEXTURE_LOD_BIAS=<levels>): added to every
+    // sampler's bias, negative for sharper textures. Compare samplers keep theirs: a bias sharpens
+    // nothing in a shadow test.
+    static const float texture_lod_bias = [this] {
+        const char* env = std::getenv("RYGT_TEXTURE_LOD_BIAS");
+        const float bias = env && *env ? std::strtof(env, nullptr) : 0.0f;
+        if (!std::isfinite(bias) || bias == 0.0f) {
+            return 0.0f;
+        }
+        LOG_INFO(Render_Vulkan, "GFX-GT7-001: LOD bias {} on every sampler, device limit +-{}",
+                 bias, r.instance.MaxSamplerLodBias());
+        return bias;
+    }();
+    if (texture_lod_bias != 0.0f && !is_depth) {
+        // Vulkan bounds the bias's absolute value; sampler.cpp only bounds it from above.
+        const float max_bias = r.instance.MaxSamplerLodBias();
+        const float bias = std::clamp(state.LodBias() + texture_lod_bias, -max_bias, max_bias);
+        state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
+    }
     struct Key {
         AmdGpu::Sampler state;
         std::array<float, 4> color;
