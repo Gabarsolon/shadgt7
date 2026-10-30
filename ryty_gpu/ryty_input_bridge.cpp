@@ -355,7 +355,13 @@ void ForwardInput() {
             }
             // Telemetry describes the locally driven car (player 1 only). Explicit
             // game trigger commands take priority, including an explicit release.
-            const unsigned strength = TriggerStrength();
+            // RYGT_ADAPTIVE_TRIGGERS=1 forces the effects on even with the slider at 0%.
+            static const bool forced = [] {
+                const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+                return env && env[0] == '1';
+            }();
+            const unsigned slider = TriggerStrength();
+            const unsigned strength = forced && slider == 0 ? 100 : slider;
             const auto feedback = slot == 0 ? Input::TriggerFeedback::CurrentOutput(strength)
                                            : Input::TriggerFeedback::Output{};
             u8 left_rumble = feedback.left_rumble, right_rumble = feedback.right_rumble;
@@ -378,6 +384,24 @@ void ForwardInput() {
                 left_rumble = right_rumble = 0;
             }
             controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
+            {
+                // (diagnosis) RYGT_ADAPTIVE_TRIGGERS_LOG=1: the trigger effects sent, at each change.
+                static const bool log = [] {
+                    const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_LOG");
+                    return env && env[0] == '1';
+                }();
+                static Input::TriggerFeedback::Effect logged_left{}, logged_right{};
+                if (log && slot == 0 && (left != logged_left || right != logged_right)) {
+                    logged_left = left;
+                    logged_right = right;
+                    std::fprintf(stderr,
+                                 "[triggers] slot 0: L %02x %02x %02x %02x  R %02x %02x %02x %02x  "
+                                 "rumble %u/%u strength %u%%%s\n",
+                                 left[0], left[1], left[2], left[3], right[0], right[1], right[2],
+                                 right[3], left_rumble, right_rumble, strength,
+                                 saved.triggerTouched ? " (game's own command)" : "");
+                }
+            }
             const auto state = controller.ReadState();
             RytyPadInputState input{};
             input.buttons = static_cast<std::uint32_t>(state.buttonsState);

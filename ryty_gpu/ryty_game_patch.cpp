@@ -1052,6 +1052,69 @@ void InstallTriggerTelemetry(u8* base) {
     DWORD ignored;
     VirtualProtect(slot, sizeof(*slot), protection, &ignored);
 }
+
+// GT7 (CUSA24769 v1.71): the same Simulator Interface packet (magic, layout and the service's
+// +0x1dc offset as GT Sport's), from GT7's own SimulatorInterface::update; on while the launcher's
+// trigger strength slider is above 0%. xacidr4inx's trigger feedback, ported.
+TelemetryUpdateFn g_telemetry_update_gt7{};
+void PS4_SYSV_ABI TelemetryUpdateHookGt7(void* service, void* context) {
+    g_telemetry_update_gt7(service, context);
+    const auto* packet = static_cast<const u8*>(service) + 0x1dc;
+    Input::TriggerFeedback::Publish(packet);
+    static const bool log = [] {
+        const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_LOG");
+        return env && env[0] == '1';
+    }();
+    static u64 calls = 0;
+    if (log && ++calls % 30 == 1) {
+        float speed = 0;
+        std::memcpy(&speed, packet + 0x4c, sizeof(speed));
+        u32 id = 0;
+        u16 flags = 0;
+        float omega = 0, radius = 0;
+        std::memcpy(&id, packet + 0x70, sizeof(id));
+        std::memcpy(&flags, packet + 0x8e, sizeof(flags));
+        std::memcpy(&omega, packet + 0xa4, sizeof(omega));
+        std::memcpy(&radius, packet + 0xb4, sizeof(radius));
+        // Wheel speed against car speed: lock (below 1) and spin (above 1), the worst wheel.
+        float lock = 0, spin = 0;
+        for (int i = 0; i < 4 && speed > 1; ++i) {
+            float w = 0, r = 0;
+            std::memcpy(&w, packet + 0xa4 + 4 * i, sizeof(w));
+            std::memcpy(&r, packet + 0xb4 + 4 * i, sizeof(r));
+            const float ratio = std::abs(w) * r / speed;
+            lock = std::max(lock, 1 - ratio);
+            spin = std::max(spin, ratio - 1);
+        }
+        std::fprintf(stderr, "[triggers] GT7 telemetry #%llu: packet %u flags %#x speed %.1f m/s "
+                     "throttle %u brake %u wheel0 %.1f rad/s r %.3f lock %.3f spin %.3f\n",
+                     static_cast<unsigned long long>(calls), id, flags, speed, packet[0x91],
+                     packet[0x92], omega, radius, lock, spin);
+    }
+}
+void InstallTriggerTelemetryGt7(u8* base) {
+    // Converter RVAs: the virtual slot, the update function, and its packet-magic store.
+    auto* slot = reinterpret_cast<TelemetryUpdateFn*>(base + 0x53efcb0);
+    auto original = reinterpret_cast<TelemetryUpdateFn>(base + 0x1d10f10);
+    const u8 magic[] = {0xc7, 0x87, 0xdc, 0x01, 0, 0, 0x30, 0x53, 0x37, 0x47};
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(base + 0x53efcb0, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+        *slot != original || std::memcmp(base + 0x1d10f53, magic, sizeof(magic)) != 0) {
+        return;
+    }
+    // On whenever the launcher's trigger strength slider is above 0% (the bridge scales the effects
+    // by it and releases the triggers at 0%, also while the game runs); RYGT_ADAPTIVE_TRIGGERS=0
+    // forces it off, =1 on even at 0%.
+    const char* enabled = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+    if (enabled && enabled[0] == '0') return;
+    DWORD protection;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
+    g_telemetry_update_gt7 = original;
+    *slot = &TelemetryUpdateHookGt7;
+    DWORD ignored;
+    VirtualProtect(slot, sizeof(*slot), protection, &ignored);
+    std::fprintf(stderr, "[triggers] GT7 adaptive triggers on (telemetry hook installed)\n");
+}
 } // namespace
 
 namespace {
@@ -1141,6 +1204,7 @@ void InstallFatalErrorDiag(u8* base) {
 void RytyApplyGamePatches() {
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops

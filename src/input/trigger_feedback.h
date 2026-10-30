@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -44,9 +45,19 @@ inline bool Decode(const std::uint8_t* data, Sample& sample) {
 struct Feedback {
     std::uint8_t left{}, right{};
 };
+// Telemetry from the car being driven: on track (flags bit 0), not paused or loading (bits 1, 2).
+// (diagnosis) RYGT_ADAPTIVE_TRIGGERS_REPLAY=1 also takes replays and demos (bit 0 clear), to check
+// the effects without driving.
+inline bool Driving(std::uint16_t flags) {
+    static const bool replays = [] {
+        const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_REPLAY");
+        return env && env[0] == '1';
+    }();
+    return ((flags & 1) || replays) && !(flags & 6);
+}
 inline Feedback Calculate(const Sample& sample) {
     // Never actuate in menus, pause/loading, or at near-zero speed.
-    if (!(sample.flags & 1) || (sample.flags & 6) || sample.speed < 3) return {};
+    if (!Driving(sample.flags) || sample.speed < 3) return {};
     float lock = 0, spin = 0;
     for (unsigned i = 0; i < 4; ++i) {
         const float ratio = std::abs(sample.omega[i]) * sample.radius[i] / sample.speed;
@@ -163,7 +174,7 @@ struct Output {
 inline Output CurrentOutput(unsigned percent) {
     std::lock_guard lock(sample_mutex);
     if (stopping || !have_sample || Clock::now() - updated > std::chrono::milliseconds(250) ||
-        !(latest_sample.flags & 1) || (latest_sample.flags & 6)) return {};
+        !Driving(latest_sample.flags)) return {};
     const auto feedback = Calculate(latest_sample);
     Output output;
     output.left_rumble = Scale(feedback.left, percent);
