@@ -11805,7 +11805,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             list += fmt::format("{} -> {} {:#x} {}x{} mips {} layers {} {}, {} sources, "
                                 "version {}{}; memory {}; {}; uploads {}, stale {}; "
                                 "total uploads {} kind {}, tiled {} mode {} bits {} size {:#x}; "
-                                "hash now {:016x} uploaded {:016x}{}\n",
+                                "hash now {:016x} uploaded {:016x}{}{}\n",
                                 key, entry->from_cpu ? "texture" : "target", info.guest_address,
                                 info.size.width, info.size.height, info.resources.levels,
                                 info.resources.layers, vk::to_string(info.pixel_format), sources,
@@ -11823,7 +11823,16 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
                                 hash_now, entry->content_hash,
                                 hash_now && entry->content_hash && hash_now != entry->content_hash
                                     ? " CHANGED"
-                                    : "");
+                                    : "",
+                                [&] { // FIX-GT7-027
+                                    const int differing =
+                                        registry->LayersDifferingFromUpload(*entry);
+                                    return differing < 0
+                                               ? std::string{}
+                                               : fmt::format("; layers differing from their "
+                                                             "upload {} of {}",
+                                                             differing, info.resources.layers);
+                                }());
             jobs.emplace_back(entry, fmt::format("tex_{}{}.bin", key,
                                                  info.props.is_depth ? "_depth" : ""));
         }

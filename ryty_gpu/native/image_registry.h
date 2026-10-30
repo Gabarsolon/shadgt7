@@ -120,6 +120,10 @@ public:
     /// FIX-221: a hash of a few samples of each layer, checked once a frame while it is used.
     std::vector<u64> layer_samples;
     u64 layer_check_frame = 0;
+    /// FIX-GT7-027: each layer's whole hash when the texture was last uploaded, and the next
+    /// layer the frame's check compares with memory.
+    std::vector<u64> layer_uploaded;
+    u32 layer_cursor = 0;
     /// FIX-198: the native renderer's frame the picture was last written in, and the last frame
     /// before that one it was written in (0: none).
     std::atomic<u64> written_frame{0};
@@ -288,6 +292,9 @@ public:
     /// FIX-221: a large layered texture whose layers' memory changed with no CPU write seen is
     /// uploaded again (true when it was asked for).
     bool LayersRewritten(ImageEntry& entry, u64 frame);
+    /// FIX-GT7-027 (diagnosis, frame dumps): how many layers' memory differs from their upload
+    /// now (-1: their upload's hashes aren't known).
+    int LayersDifferingFromUpload(const ImageEntry& entry) const;
     static bool SmallRewritesOn();
     static constexpr u64 SmallRewriteSize = 64 * 1024;
 
