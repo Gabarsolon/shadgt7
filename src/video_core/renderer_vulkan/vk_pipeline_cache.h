@@ -87,6 +87,9 @@ bool CompileSlowMotion();
 u32 PipelineBuildsRunning();
 /// Active shader translation or driver pipeline compilation, independent of guest-clock holds.
 bool CompilationInProgress();
+/// FIX-GT7-023: saves the driver pipeline cache before the window's close ends the process.
+/// The MB written, or -1 if there was nothing new to save (or no cache file).
+int SaveDriverCacheAtExit();
 
 /// NAT-031: the pipeline cache's lookup lock. The command and recorder threads take it
 /// exclusively (as before); game job threads looking pipelines up take it shared, and step aside
@@ -203,6 +206,9 @@ public:
     auto& GetProfile() const {
         return profile;
     }
+
+    /// FIX-GT7-023: see SaveDriverCacheAtExit.
+    int SaveDriverCacheNow();
 
 private:
     bool RefreshGraphicsKey();

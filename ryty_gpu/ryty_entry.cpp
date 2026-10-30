@@ -106,6 +106,14 @@ void RunWindowThread() {
         (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
+    // FIX-GT7-023: the driver pipeline cache first (the destructor's save never runs).
+    const auto save_start = std::chrono::steady_clock::now();
+    if (const int saved_mb = Vulkan::SaveDriverCacheAtExit(); saved_mb >= 0) {
+        std::fprintf(stderr, "[window] driver pipeline cache saved: %d MB in %lld ms\n", saved_mb,
+                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                std::chrono::steady_clock::now() - save_start)
+                                                .count()));
+    }
     std::fprintf(stderr, "[window] closed: the game ends\n");
     std::fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
