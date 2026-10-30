@@ -38,6 +38,7 @@ struct Pools {
 /// FIX-020: true when the code reads single lanes or lane masks and has a loop (a backward
 /// branch). On hosts with 32-wide subgroups, translations before FIX-020 left those reads 32-wide
 /// in compute shaders with more than 32 invocations per workgroup.
+[[nodiscard]] bool HasLaneReads(std::span<const u32> code);
 [[nodiscard]] bool HasLaneReadsAndLoop(std::span<const u32> code);
 
 /// FIX-190: true when a branch body turns every lane on (a wave-wide sum, see

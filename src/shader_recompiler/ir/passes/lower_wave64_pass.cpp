@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
@@ -297,6 +301,141 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
     return inst->GetOpcode() == IR::Opcode::Ballot ? inst : nullptr;
 }
 
+// FIX-GT7-028: a read of a lane past the host's subgroup (subgroupBroadcast of lane 32 on NVIDIA) has
+// an undefined result, and its lowering needs a barrier, which control flow that differs between
+// invocations cannot hold. GT7's occlusion pyramid reads lane 32 inside ifs on the invocation's
+// position, when it makes a level from an 8x8 tile: the second row of the 4x2 level was lost, so the
+// two coarsest levels said the whole screen was covered and buildings in view were eliminated (black,
+// with the depth of their occluder). Those ifs are GCN EXEC scopes around arithmetic: without the
+// branch every invocation runs the arithmetic, which nothing else sees, the ifs directly inside test
+// the removed condition as well, and the lane read is in uniform control flow.
+// RYGT_LANE_READ_UNBRANCH=0: as before.
+static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runtime,
+                                   const Profile& profile) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_LANE_READ_UNBRANCH");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled) {
+        return;
+    }
+    using Type = IR::AbstractSyntaxNode::Type;
+    auto& list = program.syntax_list;
+    // The ifs that differ between invocations around a read of an upper lane.
+    std::vector<size_t> open;
+    std::unordered_set<size_t> scopes;
+    u32 loops = 0;
+    for (size_t i = 0; i < list.size(); ++i) {
+        switch (list[i].type) {
+        case Type::If:
+            open.push_back(i);
+            break;
+        case Type::EndIf:
+            open.pop_back();
+            break;
+        case Type::Loop:
+            ++loops;
+            break;
+        case Type::Repeat:
+            --loops;
+            break;
+        case Type::Block:
+            if (loops == 0 && !open.empty() &&
+                std::ranges::any_of(list[i].data.block->Instructions(), [&](const IR::Inst& inst) {
+                    return inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate() &&
+                           inst.Arg(1).U32() >= profile.subgroup_size;
+                })) {
+                for (const size_t scope : open) {
+                    if (IsDivergentLoopCondition(list[scope].data.if_node.cond, runtime)) {
+                        scopes.insert(scope);
+                    }
+                }
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    if (scopes.empty()) {
+        return;
+    }
+    // Without their branch they must change nothing: no side effects in their own blocks and no phi
+    // after them. The ifs directly inside get the conditions that were around them.
+    open.clear();
+    const auto refuse = [&](std::string_view why) {
+        LOG_WARNING(Render_Recompiler,
+                    "FIX-GT7-028: shader {:#x}: upper lane read left in its branch: {}",
+                    program.info.pgm_hash, why);
+    };
+    struct InnerIf {
+        size_t node;
+        std::vector<size_t> around;
+    };
+    std::vector<InnerIf> inner_ifs;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const bool inside =
+            std::ranges::any_of(open, [&](size_t scope) { return scopes.contains(scope); });
+        switch (list[i].type) {
+        case Type::If:
+            if (scopes.contains(i)) {
+                if (std::ranges::any_of(list[i].data.if_node.merge->Instructions(),
+                                        [](const IR::Inst& inst) { return IR::IsPhi(inst); })) {
+                    return refuse("a value leaves the branch");
+                }
+            } else if (!open.empty() && scopes.contains(open.back())) {
+                if (i == 0 || list[i - 1].type != Type::Block) {
+                    return refuse("an inner if has no block before it");
+                }
+                InnerIf inner{i, {}};
+                std::ranges::copy_if(open, std::back_inserter(inner.around),
+                                     [&](size_t scope) { return scopes.contains(scope); });
+                inner_ifs.push_back(std::move(inner));
+            }
+            open.push_back(i);
+            break;
+        case Type::EndIf:
+            open.pop_back();
+            break;
+        case Type::Block:
+            if (!open.empty() && scopes.contains(open.back()) &&
+                std::ranges::any_of(list[i].data.block->Instructions(), [](const IR::Inst& inst) {
+                    return inst.MayHaveSideEffects() &&
+                           inst.GetOpcode() != IR::Opcode::ConditionRef;
+                })) {
+                return refuse("the branch has side effects");
+            }
+            break;
+        case Type::Loop:
+        case Type::Repeat:
+        case Type::Break:
+        case Type::Return:
+        case Type::Unreachable:
+            if (inside) {
+                return refuse("the branch has other control flow");
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    for (const InnerIf& inner : inner_ifs) {
+        IR::Block* const before = list[inner.node - 1].data.block;
+        IR::IREmitter ir{*before, before->end()};
+        IR::U1 condition = list[inner.node].data.if_node.cond;
+        for (const size_t scope : inner.around) {
+            condition = ir.LogicalAnd(list[scope].data.if_node.cond, condition);
+        }
+        list[inner.node].data.if_node.cond = ir.ConditionRef(condition);
+    }
+    for (const size_t scope : scopes) {
+        list[scope].data.if_node.cond = IR::U1{IR::Value{true}};
+    }
+    LOG_WARNING(Render_Recompiler,
+                "FIX-GT7-028: shader {:#x}: {} branches removed for an upper lane read, {} inner ifs "
+                "test their conditions",
+                program.info.pgm_hash, scopes.size(), inner_ifs.size());
+}
+
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {
@@ -308,6 +447,8 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     if (num_threads <= 32) {
         return;
     }
+
+    UnbranchUpperLaneReads(program, runtime_info, profile);
 
     std::vector<IR::Inst*> worklist;
     const auto uniform_blocks = FindUniformBlocks(program, runtime_info);
