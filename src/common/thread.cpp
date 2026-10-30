@@ -504,6 +504,24 @@ struct ForegroundSelf {
     std::vector<ULONG> sets;
 };
 thread_local ForegroundSelf foreground_self;
+
+// FIX-GT7-022: GetThreadSelectedCpuSets looked up at run time. Wine and Proton don't export it,
+// and a direct import kept the whole library from loading there (the game crashed at start).
+using GetThreadSelectedCpuSetsFn = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
+GetThreadSelectedCpuSetsFn GetThreadSelectedCpuSetsProc() {
+    static const auto proc = [] {
+        for (const wchar_t* name : {L"kernelbase.dll", L"kernel32.dll"}) {
+            if (const HMODULE module = GetModuleHandleW(name)) {
+                if (const auto found = reinterpret_cast<GetThreadSelectedCpuSetsFn>(
+                        reinterpret_cast<void*>(GetProcAddress(module, "GetThreadSelectedCpuSets")))) {
+                    return found;
+                }
+            }
+        }
+        return GetThreadSelectedCpuSetsFn{};
+    }();
+    return proc;
+}
 } // namespace
 
 void BeginForegroundCompile() {
@@ -518,12 +536,12 @@ void BeginForegroundCompile() {
         // Off the compile cores, where the other compiles stay meanwhile (its own sets kept).
         const auto& classes = GetCoreClasses();
         self.moved = false;
-        if (!classes.hybrid && CompileCoresOn() && !classes.game_ids.empty()) {
+        const auto get_sets = GetThreadSelectedCpuSetsProc();
+        if (get_sets && !classes.hybrid && CompileCoresOn() && !classes.game_ids.empty()) {
             ULONG count = 0;
-            GetThreadSelectedCpuSets(current, nullptr, 0, &count);
+            get_sets(current, nullptr, 0, &count);
             self.sets.resize(count);
-            if (count == 0 ||
-                GetThreadSelectedCpuSets(current, self.sets.data(), count, &count)) {
+            if (count == 0 || get_sets(current, self.sets.data(), count, &count)) {
                 self.sets.resize(count);
                 self.moved = SetThreadSelectedCpuSets(current, classes.game_ids.data(),
                                                       ULONG(classes.game_ids.size())) != FALSE;
