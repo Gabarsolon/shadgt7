@@ -8,6 +8,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/ryty_config.h"
 #include "common/debug.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -181,6 +182,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 
     CreateDevice();
     CollectPhysicalMemoryInfo();
+    ApplyVideoMemorySetting();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
@@ -787,6 +789,38 @@ void Instance::CollectPhysicalMemoryInfo() {
     const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
     total_memory_budget =
         static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
+}
+
+// NAT-VRAM-001: the launcher's video memory setting (GPU.vram_budget_mb, 0 = Auto) or
+// RYGT_VRAM_BUDGET_MB caps the budget the texture cache's garbage collector plans with, so it
+// frees cached images the game hasn't used lately once the process uses more than the setting.
+// Auto keeps the driver-reported budget (VK_EXT_memory_budget) unchanged.
+u64 Instance::VideoMemorySettingBytes() {
+    static const u64 bytes = [] {
+        if (const char* env = std::getenv("RYGT_VRAM_BUDGET_MB"); env && *env) {
+            return u64{std::strtoull(env, nullptr, 10)} << 20;
+        }
+        if (const auto value = Common::RytyGameConfigValue("vram_budget_mb")) {
+            return u64{std::strtoull(value->c_str(), nullptr, 10)} << 20;
+        }
+        return u64{0};
+    }();
+    return bytes;
+}
+
+void Instance::ApplyVideoMemorySetting() {
+    const u64 driver_budget = total_memory_budget;
+    const u64 setting = VideoMemorySettingBytes();
+    if (setting != 0) {
+        // Not below 1 GB: the renderer's own targets and buffers need about that much.
+        total_memory_budget = std::min(driver_budget, std::max<u64>(setting, 1_GB));
+    }
+    LOG_WARNING(Render_Vulkan,
+                "NAT-VRAM-001: video memory budget {} MB ({}; driver budget {} MB, memory budget "
+                "extension {})",
+                total_memory_budget >> 20,
+                setting != 0 ? fmt::format("setting {} MB", setting >> 20) : std::string{"Auto"},
+                driver_budget >> 20, supports_memory_budget ? "on" : "off");
 }
 
 void Instance::CollectImageFormatInfo() {
