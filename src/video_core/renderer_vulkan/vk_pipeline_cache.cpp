@@ -3990,6 +3990,7 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         if (!insert) {
             return true;
         }
+        LogNewPermutation(program, hw_stage, params, runtime_info, binding); // DIAG-GT7-013
         size_t perm_idx = program.modules.size();
         if (const auto end = stored_perm_end.find(hash); end != stored_perm_end.end()) {
             perm_idx = std::max(perm_idx, end->second);
@@ -4572,10 +4573,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             if (!S().stage_deferred || skip_wait || unlocked ||
                 (read_ahead && RetryReadAhead())) {
                 S().stage_deferred = true;
-                if (QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding) &&
-                    !read_ahead) {
-                    LogNewPermutation(*program, hw_stage, params, runtime_info, binding);
-                }
+                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
             }
             if (unlocked) {
                 NoteUnlockedShaderWait(params.hash);
@@ -4657,12 +4655,16 @@ void PipelineCache::LogNewPermutation(const Program& program, Shader::HwStage hw
                                       const Shader::ShaderParams& params,
                                       const Shader::RuntimeInfo& runtime_info,
                                       const Shader::Backend::Bindings& binding) {
-    // DIAG-GT7-013: why a draw of a known program needs a new translation (each one is a pipeline
-    // compile, up to a second, with the draw skipped meanwhile): how the lookup differs from each
-    // existing permutation, with the V# of a differing buffer.
+    // DIAG-GT7-013: why a known program gets a new permutation (each one is a pipeline compile,
+    // up to a second, with its draws skipped meanwhile), when its translation is taken: for a
+    // draw or for a read-ahead state, how the lookup differs from each existing permutation,
+    // with the V# of a differing buffer.
+    if (std::ranges::none_of(program.modules, [](const auto& m) { return bool(m.info); })) {
+        return;
+    }
     static u64 events = 0;
     const u64 event = ++events;
-    if (program.modules.empty() || (event > 60 && event % 200 != 0)) {
+    if (event > 80 && event % 100 != 0) {
         return;
     }
     std::string reasons;
@@ -4690,9 +4692,9 @@ void PipelineCache::LogNewPermutation(const Program& program, Shader::HwStage hw
                                    words[2], words[3]);
         }
     }
-    LOG_WARNING(Render_Vulkan, "DIAG-GT7-013: new translation {} of {}_{:#x} for a draw; {}:{}",
-                event, hw_stage, params.hash,
-                listed ? "existing permutations differ in" : "no permutation translated yet",
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GT7-013: new permutation {} of {}_{:#x} for {}; existing ones differ in:{}",
+                event, hw_stage, params.hash, regs_override ? "a read-ahead state" : "a draw",
                 reasons);
 }
 
