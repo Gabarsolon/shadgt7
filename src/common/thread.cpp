@@ -4,7 +4,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cwctype>
 #include <ctime>
+#include <map>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <string>
 #include <thread>
@@ -23,6 +28,7 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include <tlhelp32.h>
 #include "common/string_util.h"
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -93,7 +99,17 @@ struct CoreClasses {
     std::vector<ULONG> slow_ids;
     std::vector<s8> fast_by_index; // by group * 64 + logical processor index: 1 fast, 0 slow
     bool hybrid = false;
+    std::vector<ULONG> compile_ids; // PERF-GT7-024: one kind of core: the compile cores
+    std::vector<ULONG> game_ids;    // PERF-GT7-032: and the other cores
 };
+
+bool CompileCoresOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_COMPILE_CORES");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
 const CoreClasses& GetCoreClasses() {
     static const CoreClasses classes = [] {
         CoreClasses result;
@@ -135,6 +151,38 @@ const CoreClasses& GetCoreClasses() {
         }
         LOG_INFO(Common, "PERF-088: {} CPU, {} fast logical processors",
                  result.hybrid ? "hybrid" : "uniform", result.fast_ids.size());
+        if (!result.hybrid) {
+            // PERF-GT7-024: in a GT7 race after a new track's start, ~1,100 new pipelines took four
+            // cores for ~90 s, the driver's compiler threads anywhere: the game and the renderer
+            // ran ~40% slower and frames doubled. Compiles get the last third of the cores (both
+            // hardware threads of each), the others stay the game's and the renderer's.
+            std::map<u32, std::vector<ULONG>> cores;
+            for (ULONG offset = 0; offset < length;) {
+                const auto& entry =
+                    *reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+                if (entry.Type == CpuSetInformation) {
+                    cores[u32(entry.CpuSet.Group) << 8 | entry.CpuSet.CoreIndex].push_back(
+                        entry.CpuSet.Id);
+                }
+                offset += entry.Size;
+            }
+            if (cores.size() >= 4) {
+                const size_t count = std::max<size_t>(2, (cores.size() + 2) / 3);
+                auto it = cores.begin();
+                std::advance(it, cores.size() - count);
+                for (auto other = cores.begin(); other != it; ++other) {
+                    result.game_ids.insert(result.game_ids.end(), other->second.begin(),
+                                           other->second.end());
+                }
+                for (; it != cores.end(); ++it) {
+                    result.compile_ids.insert(result.compile_ids.end(), it->second.begin(),
+                                              it->second.end());
+                }
+                LOG_INFO(Common, "PERF-GT7-024: compiles on {} of {} cores ({} logical processors){}",
+                         count, cores.size(), result.compile_ids.size(),
+                         CompileCoresOn() ? "" : ", off (RYGT_COMPILE_CORES=0)");
+            }
+        }
         return result;
     }();
     return classes;
@@ -174,8 +222,338 @@ void PreferEfficiencyCores() {
                              static_cast<ULONG>(classes.slow_ids.size()));
 }
 
+void PreferCompileCores() {
+    const auto& classes = GetCoreClasses();
+    if (classes.hybrid) {
+        PreferEfficiencyCores();
+        return;
+    }
+    if (CompileCoresOn() && !classes.compile_ids.empty()) {
+        SetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
+                                 static_cast<ULONG>(classes.compile_ids.size()));
+    }
+}
+
 void AllowAllCores() {
     SetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+}
+
+bool HybridCpu() {
+    return GetCoreClasses().hybrid;
+}
+
+namespace {
+// PERF-GT7-024: the driver's compiler threads kept on the compile cores. Its threads all start in
+// ucrtbase.dll like most others (first try: by start module, none found), so an unnamed thread
+// busy since the last look is stopped for an instant and its instruction pointer read.
+struct DriverCompileThreads {
+    struct Thread {
+        HANDLE handle = nullptr;
+        u64 cpu_100ns = 0;
+        u32 outside = 0;       ///< samples outside the compiler
+        bool confined = false; ///< the compiler's: on the compile cores
+        int priority = THREAD_PRIORITY_NORMAL; ///< PERF-GT7-032: its own, when confined
+    };
+    std::mutex mutex;
+    std::unordered_map<DWORD, Thread> threads; ///< unnamed threads still looked at, and confined
+    std::unordered_map<DWORD, bool> left;      ///< threads not looked at again
+    // Under the mutex: draws waiting for their pipeline (PERF-GT7-024), catch-ups running and
+    // builds a thread waits for on itself (PERF-GT7-032), and what the confined threads have
+    // (FIX-GT7-008).
+    int waits = 0;
+    int catch_up = 0;
+    int foreground = 0;
+    bool applied_wide = false;
+    bool applied_low = false;
+    std::atomic<bool> wide_now{false};
+    std::atomic<bool> low_now{false};
+    u32 calls = 0;
+    u32 reports = 0;
+};
+
+DriverCompileThreads& DriverThreads() {
+    static DriverCompileThreads threads;
+    return threads;
+}
+
+void ApplyCompileCores(HANDLE thread, bool wide) {
+    const auto& ids = GetCoreClasses().compile_ids;
+    if (wide) {
+        SetThreadSelectedCpuSets(thread, nullptr, 0);
+    } else {
+        SetThreadSelectedCpuSets(thread, ids.data(), static_cast<ULONG>(ids.size()));
+    }
+}
+
+void ApplyCompilePriority(const DriverCompileThreads::Thread& thread, bool low) {
+    SetThreadPriority(thread.handle,
+                      low ? std::min(thread.priority, int(THREAD_PRIORITY_BELOW_NORMAL))
+                          : thread.priority);
+}
+
+// PERF-GT7-032: the confined threads follow the counts (under the mutex). A draw waiting for its
+// pipeline: every core, normal priority (the game is stopped, the compiles are what it waits
+// for). A build a thread waits for on itself: the compile cores, below normal (it goes first). A
+// catch-up: every core, below normal (the time the game's and the renderer's threads leave).
+void ApplyCompileState(DriverCompileThreads& d) {
+    const bool wide = d.waits > 0 || (d.catch_up > 0 && d.foreground == 0);
+    const bool low = d.waits == 0 && (d.foreground > 0 || d.catch_up > 0);
+    d.wide_now.store(wide, std::memory_order_relaxed);
+    d.low_now.store(low, std::memory_order_relaxed);
+    const bool cores = wide != d.applied_wide;
+    const bool priority = low != d.applied_low;
+    d.applied_wide = wide;
+    d.applied_low = low;
+    if (!cores && !priority) {
+        return;
+    }
+    for (const auto& [tid, thread] : d.threads) {
+        if (!thread.confined) {
+            continue;
+        }
+        if (cores) {
+            ApplyCompileCores(thread.handle, wide);
+        }
+        if (priority) {
+            ApplyCompilePriority(thread, low);
+        }
+    }
+}
+
+// The compiler's code: nvgpucomp64.dll's image, once loaded.
+bool CompilerRange(uintptr_t& begin, uintptr_t& end) {
+    const HMODULE module = GetModuleHandleW(L"nvgpucomp64.dll");
+    if (!module) {
+        return false;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const u8*>(module) + dos->e_lfanew);
+    begin = reinterpret_cast<uintptr_t>(module);
+    end = begin + nt->OptionalHeader.SizeOfImage;
+    return true;
+}
+
+bool Unnamed(HANDLE thread) {
+    PWSTR description = nullptr;
+    const bool unnamed = FAILED(GetThreadDescription(thread, &description)) || !description ||
+                         description[0] == L'\0';
+    if (description) {
+        LocalFree(description);
+    }
+    return unnamed;
+}
+} // namespace
+
+void ConfineDriverCompileThreads() {
+    const auto& classes = GetCoreClasses();
+    if (classes.hybrid || classes.compile_ids.empty() || !CompileCoresOn()) {
+        return;
+    }
+    uintptr_t compiler_begin = 0, compiler_end = 0;
+    if (!CompilerRange(compiler_begin, compiler_end)) {
+        return;
+    }
+    std::vector<DWORD> tids;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    const DWORD pid = GetCurrentProcessId();
+    const DWORD self = GetCurrentThreadId();
+    THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
+    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != self) {
+            tids.push_back(entry.th32ThreadID);
+        }
+    }
+    CloseHandle(snapshot);
+    std::ranges::sort(tids);
+
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    ++d.calls;
+    const auto alive = [&](DWORD tid) { return std::ranges::binary_search(tids, tid); };
+    std::erase_if(d.threads, [&](auto& item) {
+        if (alive(item.first)) {
+            return false;
+        }
+        CloseHandle(item.second.handle);
+        return true;
+    });
+    std::erase_if(d.left, [&](const auto& item) { return !alive(item.first); });
+    u32 found = 0;
+    for (const DWORD tid : tids) {
+        if (d.left.contains(tid)) {
+            continue;
+        }
+        auto [it, first] = d.threads.try_emplace(tid);
+        auto& thread = it->second;
+        if (first) {
+            thread.handle = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_LIMITED_INFORMATION |
+                                           THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                       FALSE, tid);
+            if (!thread.handle || !Unnamed(thread.handle)) {
+                // Ours and the game's threads have names; so do most others.
+                if (thread.handle) {
+                    CloseHandle(thread.handle);
+                }
+                d.threads.erase(it);
+                d.left.emplace(tid, false);
+                continue;
+            }
+        }
+        if (thread.confined) {
+            continue;
+        }
+        FILETIME creation, exit, kernel, user;
+        if (!GetThreadTimes(thread.handle, &creation, &exit, &kernel, &user)) {
+            continue;
+        }
+        const u64 cpu = (u64(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
+                        (u64(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+        const u64 used = cpu - thread.cpu_100ns;
+        thread.cpu_100ns = cpu;
+        if (first || used < 1'000'000) { // under 100 ms in the last 2 s: not compiling now
+            continue;
+        }
+        // Only GetThreadContext between the two calls: the stopped thread may hold any lock.
+        uintptr_t ip = 0;
+        if (SuspendThread(thread.handle) != DWORD(-1)) {
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL;
+            const bool read = GetThreadContext(thread.handle, &context) != FALSE;
+            ResumeThread(thread.handle);
+            if (read) {
+                ip = uintptr_t(context.Rip);
+            }
+        }
+        if (ip >= compiler_begin && ip < compiler_end) {
+            thread.confined = true;
+            // PERF-GT7-032: its own priority, given back after a catch-up.
+            if (const int own = GetThreadPriority(thread.handle);
+                own != THREAD_PRIORITY_ERROR_RETURN) {
+                thread.priority = own;
+            }
+            ApplyCompileCores(thread.handle, d.applied_wide);
+            if (d.applied_low) {
+                ApplyCompilePriority(thread, true);
+            }
+            ++found;
+        } else if (++thread.outside >= 12) {
+            // Busy, but never in the compiler when looked at.
+            CloseHandle(thread.handle);
+            d.threads.erase(it);
+            d.left.emplace(tid, true);
+        }
+    }
+    if (found != 0 && d.reports < 20) {
+        ++d.reports;
+        u32 confined = 0;
+        for (const auto& [tid, thread] : d.threads) {
+            confined += thread.confined ? 1 : 0;
+        }
+        LOG_INFO(Common, "PERF-GT7-024: {} driver compiler threads moved to the compile cores ({} "
+                 "now)", found, confined);
+    }
+    if (d.calls == 60) {
+        u32 confined = 0, watched = 0, busy_left = 0;
+        for (const auto& [tid, thread] : d.threads) {
+            (thread.confined ? confined : watched) += 1;
+        }
+        for (const auto& [tid, busy] : d.left) {
+            busy_left += busy ? 1 : 0;
+        }
+        LOG_INFO(Common, "PERF-GT7-024: after 2 minutes, {} driver compiler threads on the compile "
+                 "cores, {} unnamed threads still looked at, {} busy ones left (never in the "
+                 "compiler)", confined, watched, busy_left);
+    }
+}
+
+void SetCompileCoresWide(bool wide) {
+    auto& d = DriverThreads();
+    // FIX-GT7-008: the count changes and the threads follow it under one lock. Applied from the
+    // count read before the lock, two transitions at once could leave the threads on the cores
+    // the earlier one asked for (all cores with the count at 0, or the other way round).
+    std::scoped_lock lk{d.mutex};
+    d.waits += wide ? 1 : -1;
+    ApplyCompileState(d);
+}
+
+bool CompileCoresWide() {
+    return DriverThreads().wide_now.load(std::memory_order_relaxed);
+}
+
+void SetCompileCatchUp(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.catch_up += on ? 1 : -1;
+    ApplyCompileState(d);
+}
+
+bool CompileThreadsLow() {
+    return DriverThreads().low_now.load(std::memory_order_relaxed);
+}
+
+namespace {
+// PERF-GT7-032: the calling thread's own cores and priority during a foreground compile.
+struct ForegroundSelf {
+    int depth = 0;
+    int priority = THREAD_PRIORITY_ERROR_RETURN;
+    bool moved = false;
+    std::vector<ULONG> sets;
+};
+thread_local ForegroundSelf foreground_self;
+} // namespace
+
+void BeginForegroundCompile() {
+    auto& self = foreground_self;
+    if (self.depth++ == 0) {
+        const HANDLE current = GetCurrentThread();
+        self.priority = GetThreadPriority(current);
+        if (self.priority != THREAD_PRIORITY_ERROR_RETURN &&
+            self.priority < THREAD_PRIORITY_ABOVE_NORMAL) {
+            SetThreadPriority(current, THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+        // Off the compile cores, where the other compiles stay meanwhile (its own sets kept).
+        const auto& classes = GetCoreClasses();
+        self.moved = false;
+        if (!classes.hybrid && CompileCoresOn() && !classes.game_ids.empty()) {
+            ULONG count = 0;
+            GetThreadSelectedCpuSets(current, nullptr, 0, &count);
+            self.sets.resize(count);
+            if (count == 0 ||
+                GetThreadSelectedCpuSets(current, self.sets.data(), count, &count)) {
+                self.sets.resize(count);
+                self.moved = SetThreadSelectedCpuSets(current, classes.game_ids.data(),
+                                                      ULONG(classes.game_ids.size())) != FALSE;
+            }
+        }
+    }
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    ++d.foreground;
+    ApplyCompileState(d);
+}
+
+void EndForegroundCompile() {
+    {
+        auto& d = DriverThreads();
+        std::scoped_lock lk{d.mutex};
+        --d.foreground;
+        ApplyCompileState(d);
+    }
+    auto& self = foreground_self;
+    if (--self.depth == 0) {
+        const HANDLE current = GetCurrentThread();
+        if (self.moved) {
+            SetThreadSelectedCpuSets(current, self.sets.empty() ? nullptr : self.sets.data(),
+                                     ULONG(self.sets.size()));
+        }
+        if (self.priority != THREAD_PRIORITY_ERROR_RETURN) {
+            SetThreadPriority(current, self.priority);
+        }
+    }
 }
 
 int CurrentCoreIsFast() {
@@ -241,7 +619,31 @@ void PreferPerformanceCores() {}
 
 void PreferEfficiencyCores() {}
 
+void PreferCompileCores() {}
+
 void AllowAllCores() {}
+
+bool HybridCpu() {
+    return false;
+}
+
+void ConfineDriverCompileThreads() {}
+
+void SetCompileCoresWide(bool) {}
+
+bool CompileCoresWide() {
+    return false;
+}
+
+void SetCompileCatchUp(bool) {}
+
+bool CompileThreadsLow() {
+    return false;
+}
+
+void BeginForegroundCompile() {}
+
+void EndForegroundCompile() {}
 
 int CurrentCoreIsFast() {
     return -1;

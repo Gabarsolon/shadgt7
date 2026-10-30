@@ -82,13 +82,20 @@ public:
         bool is_quad_list{};
         const GraphicsPipeline* quad_tess_pipeline{};
         std::array<SelectedStage, Shader::MaxStageTypes> quad_tess_stages{};
+        /// PERF-GT7-031: selected for an indirect draw with these base vertex and instance
+        /// SGPRs; the recorder takes it only for the same ones.
+        bool indirect{};
+        u16 vertex_sgpr_offset{};
+        u32 instance_sgpr_offset{};
     };
     /// PERF-047: whether pipelines are selected on the command thread (draw pipe on and
     /// -DisablePerf 59 not given).
     bool SelectsPipelinesAhead() const;
     /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
     /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
-    std::optional<SelectedPipeline> SelectPipelineAhead();
+    /// PERF-GT7-031: `indirect`: for an indirect draw, with its parameters.
+    std::optional<SelectedPipeline> SelectPipelineAhead(
+        const DrawIndirectParams* indirect = nullptr);
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
     /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
@@ -286,6 +293,8 @@ public:
                           bool flush = true);
     /// D5: submits fences deferred without a submit of their own (recorder out of work).
     void FlushDeferredFences();
+    /// PERF-GT7-008: the recorder ran out of work (the native renderer begins its next list).
+    void OnRecorderIdle();
     /// D6: the imported guest memory holding a range read in place, when direct mode can.
     std::optional<std::pair<const VideoCore::Buffer*, u64>> DirectReadBuffer(VAddr address,
                                                                              u64 size);

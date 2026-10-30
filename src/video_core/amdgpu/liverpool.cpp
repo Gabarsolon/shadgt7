@@ -391,6 +391,11 @@ void Liverpool::StartDrawPipe() {
         recorder_tid = gettid();
 #endif
     });
+    // PERF-GT7-008: the native renderer's next list is begun while the recorder waits for work
+    // (in mode B only; RYGT_NATIVE_REUSE=0 or A/B mode A: as before).
+    if (rasterizer) {
+        draw_pipe->SetIdleHook([this] { rasterizer->OnRecorderIdle(); });
+    }
     pipe_report_start = std::chrono::steady_clock::now();
     pipelined.store(true, std::memory_order_release);
     // PERF-063: SHADGT_EARLY_FENCES=1 signals graphics fences at decode when the work before
@@ -452,6 +457,7 @@ void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 sr
         }
         draw_pipe->Push(
             [this, seq, work = std::move(work)]() mutable {
+                RecorderParts::Scope part{RecorderParts::Part::Dmas}; // DIAG-GT7-005
                 work();
                 if (seq != 0) {
                     labels_done.store(seq, std::memory_order_release);
@@ -480,6 +486,7 @@ void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 sr
     // Covered by the window's capture, but a barrier for the buffer stage (it changes buffers).
     DrawPipe::SetPushTag("captured dma"); // DIAG-069
     draw_pipe->Push([this, work = std::move(work), capture = window_capture]() mutable {
+        RecorderParts::Scope part{RecorderParts::Part::Dmas}; // DIAG-GT7-005
         rasterizer->SetReadCapture(capture.get());
         work();
         rasterizer->SetReadCapture(nullptr);
@@ -736,7 +743,8 @@ void Liverpool::ReportEarlyFences() {
 // FIX-014 (below): draws the rasterizer filters out.
 static bool FilteredDraw(const Regs& state);
 
-void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw) {
+void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw,
+                           const IndirectSgprs* indirect) {
     if (!draw_pipe) {
         draw();
         return;
@@ -762,7 +770,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // that selection).
     if (!compute && direct_draw && decode_draw_packet &&
         regs.primitive_type != PrimitiveType::QuadList &&
-        Vulkan::NativeRenderer::PrepareEnabled()) {
+        Vulkan::NativeRenderer::PreparedOn()) { // DIAG-GT7-003: off in A/B windows
         if (auto* native = rasterizer->Native()) {
             prepared_draw = native->HasPrepared(decode_draw_packet);
         }
@@ -773,8 +781,29 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         selected = compute ? rasterizer->SelectComputePipelineAhead()
                            : rasterizer->SelectPipelineAhead();
     }
+    // PERF-GT7-031: an indirect draw's pipeline is selected now too, with its parameters (its
+    // arguments, in GPU memory, don't change it). In GT7's pause menu a fifth of the draws are
+    // indirect, and the recorder selected each one itself under the lookup lock. Only the
+    // pipeline: the draw's reads are neither hashed, captured nor staged ahead, as before.
+    // RYGT_INDIRECT_AHEAD=0: as before.
+    static const bool indirect_ahead = [] {
+        const char* env = std::getenv("RYGT_INDIRECT_AHEAD");
+        return !(env && env[0] == '0');
+    }();
+    bool indirect_selected = false;
+    if (indirect && !compute && indirect_ahead && !selected &&
+        rasterizer->SelectsPipelinesAhead()) {
+        const Vulkan::DrawIndirectParams params{
+            .vertex_sgpr_offset = indirect->vertex,
+            .instance_sgpr_offset = indirect->instance,
+            .tessellate_quads = true,
+            .is_indirect = true,
+        };
+        selected = rasterizer->SelectPipelineAhead(&params);
+        indirect_selected = selected.has_value();
+    }
 #ifdef RYTY_GPU
-    if (!compute && Native::ShadowComparing()) {
+    if (!compute && !indirect_selected && Native::ShadowComparing()) {
         // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
         Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected.has_value());
     }
@@ -782,14 +811,14 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // PERF-062: the upload epoch this draw is decoded in; its pages are hashed now, on this
     // thread, and the recorder uses those hashes for this draw.
     const u32 decode_epoch = VideoCore::g_upload_epoch.load(std::memory_order_acquire);
-    if (selected) {
+    if (selected && !indirect_selected) {
         rasterizer->HashDrawPagesAhead(*selected, decode_epoch);
     }
     // PERF-063: the pages the draw reads that the CPU can rewrite without a fault are copied
     // now; the recorder reads the copies.
     std::shared_ptr<Common::ReadCapture> capture;
     if (early_fences_mode) {
-        if (selected) {
+        if (selected && !indirect_selected) {
             if (!window_capture) {
                 window_capture = TakeCapture();
             }
@@ -836,7 +865,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         staged_index_bytes = regs.num_indices * index_size;
     }
     staged_index_offset.reset();
-    if (draw_pipe->HasStage() && selected) {
+    if (draw_pipe->HasStage() && selected && !indirect_selected) {
         staged = std::make_shared<StagedDraw>();
         staged->selected = std::move(selected);
         selected.reset();
@@ -869,7 +898,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
-                     decode_epoch, capture = std::move(capture), staged]() mutable {
+                     decode_epoch, capture = std::move(capture), staged,
+                     indirect_selected]() mutable {
+        RecorderParts::Scope part{RecorderParts::Part::DrawJobs}; // DIAG-GT7-005
         auto& sel = staged ? staged->selected : selected;
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
@@ -882,7 +913,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             VerifyRecorderRegs(*expected);
         }
         rasterizer->SetSelectedPipeline(sel ? &*sel : nullptr);
-        rasterizer->SetDrawEpoch(sel ? decode_epoch : 0);
+        rasterizer->SetDrawEpoch(sel && !indirect_selected ? decode_epoch : 0);
         rasterizer->SetReadCapture(capture.get());
         rasterizer->SetBufferPlan(staged ? &staged->plan : nullptr);
         draw();
@@ -1004,6 +1035,7 @@ void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
     }
     DrawPipe::SetPushTag("label write"); // DIAG-069
     draw_pipe->Push([this, address, job, label_seq, work = std::move(work)] {
+        RecorderParts::Scope part{RecorderParts::Part::Labels}; // DIAG-GT7-005
         work();
         if (label_seq != 0) {
             labels_done.store(label_seq, std::memory_order_release);
@@ -1306,6 +1338,7 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
+    [[maybe_unused]] bool boosted = false;
 
     while (!stoken.stop_requested()) {
         if (draw_pipe) {
@@ -1319,6 +1352,15 @@ void Liverpool::Process(std::stop_token stoken) {
         if (stoken.stop_requested()) {
             break;
         }
+#ifdef RYTY_GPU
+        // PERF-GT7-010: above normal priority while the native renderer asks for it, as the
+        // recorder (the shader compiler's threads and the game's spinning jobs took cores).
+        if (const bool boost = Vulkan::NativeRenderer::BoostOn(); boost != boosted) {
+            boosted = boost;
+            Common::SetCurrentThreadPriority(boost ? Common::ThreadPriority::High
+                                                   : Common::ThreadPriority::Normal);
+        }
+#endif
         if (!draw_pipe && rasterizer && DrawPipeRequested()) {
             StartDrawPipe();
         }
@@ -1447,9 +1489,16 @@ void Liverpool::Process(std::stop_token stoken) {
                             submit_stats.decode_us += us(decoded - *submitted);
                             submit_stats.record_us += us(recorded - *submitted);
                         }
-                        rasterizer->WhenGpuDone([this, start = *submitted, us, gpu_range] {
+                        // DIAG-GT7-007: the submission's way through the pipe, and its GPU end.
+                        static std::atomic<u64> timeline_number{};
+                        const u64 number = ++timeline_number;
+                        RyDiag::Timeline('S', RyDiag::Seconds(*submitted), RyDiag::Seconds(decoded),
+                                         RyDiag::Seconds(recorded), 0.0, number);
+                        rasterizer->WhenGpuDone([this, start = *submitted, us, gpu_range, number] {
                             Common::Nvtx::End(gpu_range);
-                            const u64 gpu = us(std::chrono::steady_clock::now() - start);
+                            const auto gpu_done = std::chrono::steady_clock::now();
+                            RyDiag::Timeline('G', RyDiag::Seconds(gpu_done), 0.0, 0.0, 0.0, number);
+                            const u64 gpu = us(gpu_done - start);
                             std::scoped_lock lk{submit_timing_mutex};
                             submit_stats.gpu_us += gpu;
                             ++submit_stats.gpu_count;
@@ -1999,6 +2048,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const VAddr args_addr = indirect_args_addr;
                 const u16 base_vtx_loc = draw_indirect->base_vtx_loc;
                 const u16 start_inst_loc = draw_indirect->start_inst_loc;
+                const IndirectSgprs indirect_sgprs{base_vtx_loc, start_inst_loc}; // PERF-GT7-031
                 RecordDraw(
                     [this, cmd_address, args_addr, offset, stride, base_vtx_loc, start_inst_loc] {
                         rasterizer->ScopeMarker(
@@ -2007,7 +2057,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                          base_vtx_loc, start_inst_loc);
                             });
                     },
-                    false);
+                    false, false, &indirect_sgprs);
                 break;
             }
             case PM4ItOpcode::DrawIndirectMulti: {
@@ -2026,6 +2076,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 max_count = draw_indirect->count;
                 const u16 base_vtx_loc = draw_indirect->base_vtx_loc;
                 const u16 start_inst_loc = draw_indirect->start_inst_loc;
+                const IndirectSgprs indirect_sgprs{base_vtx_loc, start_inst_loc}; // PERF-GT7-031
                 RecordDraw(
                     [this, cmd_address, args_addr, offset, stride, max_count, base_vtx_loc,
                      start_inst_loc] {
@@ -2036,7 +2087,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                          start_inst_loc);
                             });
                     },
-                    false);
+                    false, false, &indirect_sgprs);
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirect: {
@@ -2054,6 +2105,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const VAddr args_addr = indirect_args_addr;
                 const u16 base_vtx_loc = draw_index_indirect->base_vtx_loc;
                 const u16 start_inst_loc = draw_index_indirect->start_inst_loc;
+                const IndirectSgprs indirect_sgprs{base_vtx_loc, start_inst_loc}; // PERF-GT7-031
                 RecordDraw(
                     [this, cmd_address, args_addr, offset, stride, base_vtx_loc, start_inst_loc] {
                         rasterizer->ScopeMarker(
@@ -2062,7 +2114,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                          base_vtx_loc, start_inst_loc);
                             });
                     },
-                    false);
+                    false, false, &indirect_sgprs);
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectMulti: {
@@ -2081,6 +2133,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 max_count = draw_index_indirect->count;
                 const u16 base_vtx_loc = draw_index_indirect->base_vtx_loc;
                 const u16 start_inst_loc = draw_index_indirect->start_inst_loc;
+                const IndirectSgprs indirect_sgprs{base_vtx_loc, start_inst_loc}; // PERF-GT7-031
                 RecordDraw(
                     [this, cmd_address, args_addr, offset, stride, max_count, base_vtx_loc,
                      start_inst_loc] {
@@ -2091,7 +2144,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         0, base_vtx_loc, start_inst_loc);
                                                 });
                     },
-                    false);
+                    false, false, &indirect_sgprs);
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectCountMulti: {
@@ -2113,6 +2166,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                              : 0;
                 const u16 base_vtx_loc = draw_index_indirect->base_vtx_loc;
                 const u16 start_inst_loc = draw_index_indirect->start_inst_loc;
+                const IndirectSgprs indirect_sgprs{base_vtx_loc, start_inst_loc}; // PERF-GT7-031
                 RecordDraw(
                     [this, cmd_address, args_addr, offset, stride, max_count, count_addr,
                      base_vtx_loc, start_inst_loc] {
@@ -2123,7 +2177,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         count_addr, base_vtx_loc, start_inst_loc);
                                                 });
                     },
-                    false);
+                    false, false, &indirect_sgprs);
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {

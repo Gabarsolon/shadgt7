@@ -105,7 +105,10 @@ private:
         vk::DeviceAddress device_address;
         std::shared_ptr<Buffer> wrapper; // D6: owns `buffer`; bound as vertex/index buffer
     };
-    bool ImportView(VAddr address);
+    /// Imports the view holding `address`: PERF-GT7-022: the 256 MiB piece of its allocation
+    /// that holds it, or up to `want_end` (512 MiB at most) when the pieces up to there are not
+    /// imported yet, so a range asked for in one go stays in one view.
+    bool ImportView(VAddr address, VAddr want_end);
     void MapPages(VAddr begin, VAddr end, vk::DeviceAddress device_address);
     void UnmapPages(VAddr begin, VAddr end);
     u64* L2For(VAddr address, bool create);

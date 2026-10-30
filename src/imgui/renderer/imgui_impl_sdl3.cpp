@@ -3,7 +3,12 @@
 
 // Based on imgui_impl_sdl3.cpp from Dear ImGui repository
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <vector>
 #include <imgui.h>
+#include "common/logging/log.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -378,6 +383,40 @@ static ImGuiViewport* GetViewportForWindowId(SDL_WindowID window_id) {
 // inputs to dear imgui, and hide them from your application based on those two flags. If you have
 // multiple SDL events and some of them are not meant to be used by dear imgui, you may need to
 // filter events based on their windowID field.
+// FIX-GT7-004: the overlay's gamepad, kept from SDL's gamepad events on the event thread. The
+// present thread read it with SDL_GetGamepadButton/Axis every frame, which take SDL's joystick
+// lock, and SDL holds that lock while it enumerates devices again: a Bluetooth device's removal held
+// presents for 100-250 ms (DIAG-GT7-009). The present thread now reads this copy only.
+namespace {
+std::atomic<SDL_JoystickID> g_pad_followed{0};
+std::atomic<u32> g_pad_buttons{0}; // bit per SDL_GamepadButton
+std::array<std::atomic<s16>, SDL_GAMEPAD_AXIS_COUNT> g_pad_axes{};
+std::vector<SDL_Gamepad*> g_pads_opened; // event thread only
+
+// Event thread: the gamepad the overlay follows, the game's first controller's if it has one,
+// else the first one connected (the old AutoFirst mode).
+void FollowGamepad() {
+    SDL_JoystickID id = 0;
+    auto& controllers = *Common::Singleton<Input::GameControllers>::Instance();
+    if (SDL_Gamepad* main = controllers[0]->m_sdl_gamepad) {
+        id = SDL_GetGamepadID(main);
+    } else if (!g_pads_opened.empty()) {
+        id = SDL_GetGamepadID(g_pads_opened.front());
+    }
+    if (id != g_pad_followed.load(std::memory_order_relaxed)) {
+        g_pad_buttons.store(0, std::memory_order_relaxed);
+        for (auto& axis : g_pad_axes) {
+            axis.store(0, std::memory_order_relaxed);
+        }
+        g_pad_followed.store(id, std::memory_order_release);
+    }
+}
+} // namespace
+
+void FollowReassignedGamepad() {
+    FollowGamepad();
+}
+
 bool ProcessEvent(const SDL_Event* event) {
     SdlData* bd = GetBackendData();
     IM_ASSERT(bd != nullptr &&
@@ -499,14 +538,57 @@ bool ProcessEvent(const SDL_Event* event) {
         io.AddFocusEvent(event->type == SDL_EVENT_WINDOW_FOCUS_GAINED);
         return true;
     }
-    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_ADDED: {
+        // FIX-GT7-004: opened here (events come only from opened gamepads), not on the present
+        // thread.
+        if (SDL_Gamepad* pad = SDL_OpenGamepad(event->gdevice.which)) {
+            g_pads_opened.push_back(pad);
+        }
+        FollowGamepad();
+        return true;
+    }
     case SDL_EVENT_GAMEPAD_REMOVED: {
-        bd->want_update_gamepads_list = true;
+        std::erase_if(g_pads_opened, [&](SDL_Gamepad* pad) {
+            if (SDL_GetGamepadID(pad) != event->gdevice.which) {
+                return false;
+            }
+            SDL_CloseGamepad(pad);
+            return true;
+        });
+        FollowGamepad();
         return true;
     }
     case SDL_EVENT_CHANGE_CONTROLLER:
-        bd->want_update_gamepads_list = true;
+        FollowGamepad();
         return false;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+        // FIX-GT7-004: kept for the overlay; the game still gets the event. A gamepad the game
+        // opened before this backend saw it added is followed from its first event.
+        if (g_pad_followed.load(std::memory_order_relaxed) == 0) {
+            FollowGamepad();
+        }
+        const u8 button = event->gbutton.button;
+        if (event->gbutton.which == g_pad_followed.load(std::memory_order_relaxed) &&
+            button < 32) {
+            if (event->gbutton.down) {
+                g_pad_buttons.fetch_or(1u << button, std::memory_order_relaxed);
+            } else {
+                g_pad_buttons.fetch_and(~(1u << button), std::memory_order_relaxed);
+            }
+        }
+        return false;
+    }
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+        if (g_pad_followed.load(std::memory_order_relaxed) == 0) {
+            FollowGamepad();
+        }
+        if (event->gaxis.which == g_pad_followed.load(std::memory_order_relaxed) &&
+            event->gaxis.axis < SDL_GAMEPAD_AXIS_COUNT) {
+            g_pad_axes[event->gaxis.axis].store(event->gaxis.value, std::memory_order_relaxed);
+        }
+        return false;
+    }
     }
     return false;
 }
@@ -713,10 +795,9 @@ void SetGamepadMode(GamepadMode mode, SDL_Gamepad** manual_gamepads_array,
 
 static void UpdateGamepadButton(SdlData* bd, ImGuiIO& io, ImGuiKey key,
                                 SDL_GamepadButton button_no) {
-    bool merged_value = false;
-    for (SDL_Gamepad* gamepad : bd->gamepads)
-        merged_value |= SDL_GetGamepadButton(gamepad, button_no) != 0;
-    io.AddKeyEvent(key, merged_value);
+    // FIX-GT7-004: from the copy the event thread keeps.
+    const u32 buttons = g_pad_buttons.load(std::memory_order_relaxed);
+    io.AddKeyEvent(key, button_no >= 0 && button_no < 32 && (buttons >> button_no & 1) != 0);
 }
 
 static inline float Saturate(float v) {
@@ -724,12 +805,9 @@ static inline float Saturate(float v) {
 }
 static void UpdateGamepadAnalog(SdlData* bd, ImGuiIO& io, ImGuiKey key, SDL_GamepadAxis axis_no,
                                 float v0, float v1) {
-    float merged_value = 0.0f;
-    for (SDL_Gamepad* gamepad : bd->gamepads) {
-        float vn = Saturate((float)(SDL_GetGamepadAxis(gamepad, axis_no) - v0) / (float)(v1 - v0));
-        if (merged_value < vn)
-            merged_value = vn;
-    }
+    // FIX-GT7-004: from the copy the event thread keeps.
+    const s16 value = g_pad_axes[axis_no].load(std::memory_order_relaxed);
+    const float merged_value = Saturate((float)(value - v0) / (float)(v1 - v0));
     io.AddKeyAnalogEvent(key, merged_value > 0.1f, merged_value);
 }
 
@@ -737,32 +815,14 @@ static void UpdateGamepads() {
     ImGuiIO& io = ImGui::GetIO();
     SdlData* bd = GetBackendData();
 
-    auto& controllers = *Common::Singleton<Input::GameControllers>::Instance();
-    SDL_Gamepad* SDLGamepad = controllers[0]->m_sdl_gamepad;
-    // Update list of gamepads to use
-    if (bd->want_update_gamepads_list && bd->gamepad_mode != ImGui_ImplSDL3_GamepadMode_Manual) {
-        if (SDLGamepad) {
-            bd->gamepads.push_back(SDLGamepad);
-            bd->want_update_gamepads_list = false;
-        } else {
-            CloseGamepads();
-            int sdl_gamepads_count = 0;
-            const SDL_JoystickID* sdl_gamepads = SDL_GetGamepads(&sdl_gamepads_count);
-            for (int n = 0; n < sdl_gamepads_count; n++)
-                if (SDL_Gamepad* gamepad = SDL_OpenGamepad(sdl_gamepads[n])) {
-                    bd->gamepads.push_back(gamepad);
-                    if (bd->gamepad_mode == ImGui_ImplSDL3_GamepadMode_AutoFirst)
-                        break;
-                }
-            bd->want_update_gamepads_list = false;
-        }
-    }
+    // FIX-GT7-004: no SDL call here (the present thread): the followed gamepad and its state come
+    // from the event thread (ProcessEvent).
 
     // FIXME: Technically feeding gamepad shouldn't depend on this now that they are regular inputs.
     if ((io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad) == 0)
         return;
     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
-    if (bd->gamepads.Size == 0)
+    if (g_pad_followed.load(std::memory_order_acquire) == 0)
         return;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 
@@ -849,11 +909,26 @@ void NewFrame(bool is_reusing_frame) {
         io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     }
 
+    // DIAG-GT7-009: these parts go through SDL's mouse and joystick state; one over 20 ms is
+    // logged.
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    const auto t0 = Clock::now();
     UpdateMouseData();
+    const auto t1 = Clock::now();
     UpdateMouseCursor();
+    const auto t2 = Clock::now();
 
     // Update game controllers (if enabled and available)
     UpdateGamepads();
+    const auto t3 = Clock::now();
+    if (ms(t0, t3) > 20.0) {
+        LOG_WARNING(ImGui, "DIAG-GT7-009: imgui SDL frame {:.1f} ms: mouse data {:.1f}, mouse "
+                           "cursor {:.1f}, gamepads {:.1f}",
+                    ms(t0, t3), ms(t0, t1), ms(t1, t2), ms(t2, t3));
+    }
 }
 
 void OnResize() {

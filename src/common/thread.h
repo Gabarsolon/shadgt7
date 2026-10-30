@@ -37,8 +37,42 @@ int CurrentCoreIsFast();
 /// SHADGT_BUILD_ON_SLOW_CORES=0 turns it off.
 void PreferEfficiencyCores();
 
+/// PERF-GT7-024: pipeline builds: on hybrid CPUs as PreferEfficiencyCores; on CPUs with one kind
+/// of core, the compile cores (the last third of the cores, both hardware threads of each).
+void PreferCompileCores();
+
 /// Undoes PreferPerformanceCores/PreferEfficiencyCores for the calling thread.
 void AllowAllCores();
+
+/// PERF-088: the CPU has fast and slow cores.
+bool HybridCpu();
+
+/// PERF-GT7-024: on a CPU with one kind of core, the threads of the driver's shader compiler are
+/// kept on the compile cores too: unnamed threads busy since the last call are sampled, and one
+/// found running in nvgpucomp64.dll is moved. Called every 2 s. RYGT_COMPILE_CORES=0 turns the
+/// compile cores off.
+void ConfineDriverCompileThreads();
+
+/// PERF-GT7-024: while a draw waits for its pipeline (the game is stopped anyway), compile work
+/// may use every core; calls nest (on, then off once per on).
+void SetCompileCoresWide(bool wide);
+/// PERF-GT7-024, PERF-GT7-032: compile work uses every core now.
+bool CompileCoresWide();
+
+/// PERF-GT7-032: during a catch-up (PERF-GT7-029: many draws skipped while their pipelines
+/// build), compile work uses every core below normal priority, taking the time the game's and the
+/// renderer's threads leave. Not while a draw waits for its pipeline. Calls nest.
+void SetCompileCatchUp(bool on);
+/// PERF-GT7-032: compile work runs below normal priority now.
+bool CompileThreadsLow();
+
+/// PERF-GT7-032: around a build the calling thread does while the GPU's commands wait for it (a
+/// new compute pipeline on the command thread). Meanwhile the other compile work stays on the
+/// compile cores below normal priority (unless a draw waits for its pipeline), and the calling
+/// thread runs above normal priority on the other cores. Calls nest; End once per Begin, on the
+/// same thread.
+void BeginForegroundCompile();
+void EndForegroundCompile();
 
 void SetThreadName(void* thread, const char* name);
 

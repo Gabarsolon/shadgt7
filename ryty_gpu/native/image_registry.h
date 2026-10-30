@@ -124,6 +124,8 @@ public:
     /// before that one it was written in (0: none).
     std::atomic<u64> written_frame{0};
     std::atomic<u64> written_frame_before{0};
+    /// DIAG-GT7-008 (diagnosis): the last frame a shader sampled it (kept with RYGT_DIAG=1).
+    std::atomic<u64> sampled_frame{0};
     std::atomic<bool> kept{false};
     std::atomic<bool> reused{false};
     std::atomic<u64> foreign_clock{0};

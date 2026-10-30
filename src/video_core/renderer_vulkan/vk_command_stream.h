@@ -21,8 +21,9 @@ namespace Vulkan {
 
 class Scheduler;
 
-/// PERF-084: which of a session's command buffers a command goes to.
-enum class CmdTarget : u8 { Primary, Upload };
+/// PERF-084: which of a session's command buffers a command goes to (PERF-GT7-018: Slot, the
+/// command buffer the command carries).
+enum class CmdTarget : u8 { Primary, Upload, Slot };
 
 /// PERF-084: the command buffer a replayed command goes to (the scheduler's command thread).
 vk::CommandBuffer ReplayCommandBuffer(Scheduler& scheduler, CmdTarget target);
@@ -154,7 +155,11 @@ private:
     template <typename F, CmdTarget target>
     static void ExecCommand(Scheduler& scheduler, void* fn) {
         F& f = *static_cast<F*>(fn);
-        f(ReplayCommandBuffer(scheduler, target));
+        if constexpr (target == CmdTarget::Slot) {
+            f(vk::CommandBuffer{});
+        } else {
+            f(ReplayCommandBuffer(scheduler, target));
+        }
         f.~F();
     }
 
@@ -224,12 +229,22 @@ private:
 /// copied when recorded.
 class CmdBuf {
 public:
+    CmdBuf() noexcept = default;
     explicit CmdBuf(vk::CommandBuffer direct_) noexcept : direct{direct_} {}
     CmdBuf(CommandRing* ring_, CmdTarget target_) noexcept : ring{ring_}, target{target_} {}
+    /// PERF-GT7-018: records into the ring for the command buffer at *slot_, which the thread
+    /// replaying the ring fills in (a list it makes itself) and reads when it replays.
+    CmdBuf(CommandRing* ring_, const vk::CommandBuffer* slot_) noexcept
+        : ring{ring_}, slot{slot_} {}
 
     /// The command buffer of a direct handle (nullptr handle when recording into a ring).
     vk::CommandBuffer Direct() const noexcept {
         return direct;
+    }
+
+    /// Whether anything is recorded through this (a direct handle or a ring).
+    explicit operator bool() const noexcept {
+        return ring != nullptr || direct;
     }
 
     void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
@@ -286,6 +301,32 @@ public:
     /// NAT-100: runs a recorded secondary command buffer here.
     void executeCommands(vk::CommandBuffer secondary) const {
         Call([=](vk::CommandBuffer cmd) { cmd.executeCommands(secondary); });
+    }
+
+    /// PERF-GT7-018: runs a secondary command buffer recorded through `secondary` here; one
+    /// recorded into the ring is read from its slot when replayed (the same ring: it was ended
+    /// before this is replayed).
+    void executeCommands(const CmdBuf& secondary) const {
+        if (!secondary.slot) {
+            executeCommands(secondary.direct);
+            return;
+        }
+        ASSERT_MSG(ring == secondary.ring, "PERF-GT7-018: a list run from another ring");
+        const vk::CommandBuffer* at = secondary.slot;
+        Call([at](vk::CommandBuffer cmd) { cmd.executeCommands(*at); });
+    }
+
+    /// PERF-GT7-018: ends the command buffer (the ring's lists end where they are replayed).
+    void end() const {
+        Call([](vk::CommandBuffer cmd) { static_cast<void>(cmd.end()); });
+    }
+
+    void resetQueryPool(vk::QueryPool pool, u32 first, u32 count) const {
+        Call([=](vk::CommandBuffer cmd) { cmd.resetQueryPool(pool, first, count); });
+    }
+
+    void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, u32 query) const {
+        Call([=](vk::CommandBuffer cmd) { cmd.writeTimestamp2(stage, pool, query); });
     }
 
     void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
@@ -518,6 +559,19 @@ public:
                       });
     }
 
+    void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
+                                const vk::ClearDepthStencilValue& value,
+                                vk::ArrayProxy<const vk::ImageSubresourceRange> const& ranges) const {
+        if (!ring) {
+            direct.clearDepthStencilImage(image, layout, value, ranges);
+            return;
+        }
+        RecordRegions(ranges,
+                      [=](vk::CommandBuffer cmd, u32 count, const vk::ImageSubresourceRange* r) {
+                          cmd.clearDepthStencilImage(image, layout, &value, count, r);
+                      });
+    }
+
     void fillBuffer(vk::Buffer dst, vk::DeviceSize offset, vk::DeviceSize size, u32 data) const {
         Call([=](vk::CommandBuffer cmd) { cmd.fillBuffer(dst, offset, size, data); });
     }
@@ -531,6 +585,26 @@ public:
         Record(CommandRing::Bytes<u8>(size) + 16, [&](CommandRing::Extra& extra) {
             const auto* copied = extra.Copy(static_cast<const u8*>(data), size);
             return [=](vk::CommandBuffer cmd) { cmd.updateBuffer(dst, offset, size, copied); };
+        });
+    }
+
+    void setViewport(u32 first, vk::ArrayProxy<const vk::Viewport> const& viewports) const {
+        if (!ring) {
+            direct.setViewport(first, viewports);
+            return;
+        }
+        RecordRegions(viewports, [=](vk::CommandBuffer cmd, u32 count, const vk::Viewport* v) {
+            cmd.setViewport(first, count, v);
+        });
+    }
+
+    void setScissor(u32 first, vk::ArrayProxy<const vk::Rect2D> const& scissors) const {
+        if (!ring) {
+            direct.setScissor(first, scissors);
+            return;
+        }
+        RecordRegions(scissors, [=](vk::CommandBuffer cmd, u32 count, const vk::Rect2D* s) {
+            cmd.setScissor(first, count, s);
         });
     }
 
@@ -660,6 +734,13 @@ private:
 
     template <typename Build>
     void Record(size_t extra_bytes, Build&& build) const {
+        if (slot) {
+            // PERF-GT7-018: the command goes to the list at the slot, not the session's.
+            ring->Record<CmdTarget::Slot>(extra_bytes, [&](CommandRing::Extra& extra) {
+                return [at = slot, fn = build(extra)](vk::CommandBuffer) mutable { fn(*at); };
+            });
+            return;
+        }
         if (target == CmdTarget::Primary) {
             ring->Record<CmdTarget::Primary>(extra_bytes, build);
         } else {
@@ -754,6 +835,7 @@ private:
     vk::CommandBuffer direct{};
     CommandRing* ring{};
     CmdTarget target{CmdTarget::Primary};
+    const vk::CommandBuffer* slot{}; ///< PERF-GT7-018
 };
 
 } // namespace Vulkan

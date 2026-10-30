@@ -241,12 +241,15 @@ void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTy
     }
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
+    const DrawIndirectParams* indirect) {
     // The command thread's registers are those of the draw it is decoding.
     const auto& regs = liverpool->DrawRegs();
     bool depth_copy;
     bool stencil_copy;
-    const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+    // An indirect draw's quads are always tessellated (its parameters say so): one pipeline.
+    const bool quad_list =
+        !indirect && regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
     // PERF-068: a quad list's pipeline depends on whether its indices are GPU-written, which
     // only the recorder's buffer cache knows: both are selected, the recorder takes its one.
     // -DisablePerf 75 leaves quad lists to the recorder.
@@ -261,12 +264,16 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
     selected.compute = nullptr;
     selected.is_quad_list = quad_list;
     selected.quad_tess_pipeline = nullptr;
+    selected.indirect = indirect != nullptr; // PERF-GT7-031
+    selected.vertex_sgpr_offset = indirect ? indirect->vertex_sgpr_offset : u16{0};
+    selected.instance_sgpr_offset = indirect ? indirect->instance_sgpr_offset : 0u;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
-    selected.pipeline = pipeline_cache.GetGraphicsPipeline({
-        .vertex_sgpr_offset = 0,
-        .instance_sgpr_offset = 0,
-        .tessellate_quads = false,
-    });
+    selected.pipeline = pipeline_cache.GetGraphicsPipeline(indirect ? *indirect
+                                                                    : DrawIndirectParams{
+                                                                          .vertex_sgpr_offset = 0,
+                                                                          .instance_sgpr_offset = 0,
+                                                                          .tessellate_quads = false,
+                                                                      });
     if (selected.pipeline) {
         CopySelectedStages(selected.stages);
     }
@@ -370,6 +377,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
     SelectedPipeline selected = selected_recycler.Take(); // PERF-056
     selected.pipeline = nullptr;
+    selected.indirect = false; // PERF-GT7-031
     selected.is_compute = true;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
     selected.compute = pipeline_cache.GetComputePipeline();
@@ -1052,7 +1060,16 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // PERF-065: moved, not copied; the selection is recycled after the draw and keeps
             // the shadow's old buffer (its capacity).
             std::swap(info.flattened_ud_buf, selected.flattened);
-            info.flattened_ud_src.assign(info.flattened_ud_buf.size(), 0);
+            // PERF-GT7-016 (C): in native mode only diagnostics read where the dwords came from
+            // (zeros here anyway), so the zero fill at every draw is left out while the size holds.
+            bool keep_sources = false;
+#ifdef RYTY_GPU
+            keep_sources = native && NativeRenderer::NextOn() &&
+                           info.flattened_ud_src.size() == info.flattened_ud_buf.size();
+#endif
+            if (!keep_sources) {
+                info.flattened_ud_src.assign(info.flattened_ud_buf.size(), 0);
+            }
         } else {
             // The sharps are read again from the memory as the recorder sees it now.
             info.RefreshFlatBuf();
@@ -1107,7 +1124,15 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     }
     // PERF-068: a quad list's selection holds both of its pipelines.
     const bool quad_selection = selected_pipeline && selected_pipeline->is_quad_list;
-    if ((selected_allowed || quad_selection) && selected_pipeline) {
+    // PERF-GT7-031: an indirect draw's selection, for the same base vertex and instance SGPRs.
+    const bool indirect_selection =
+        selected_pipeline && selected_pipeline->indirect && params.is_indirect &&
+        selected_pipeline->vertex_sgpr_offset == params.vertex_sgpr_offset &&
+        selected_pipeline->instance_sgpr_offset == params.instance_sgpr_offset;
+    if (selected_pipeline && selected_pipeline->indirect != params.is_indirect) {
+        selected_allowed = false; // a selection made for the other kind of draw
+    }
+    if ((selected_allowed || quad_selection || indirect_selection) && selected_pipeline) {
         const bool tess = quad_selection && params.tessellate_quads;
         const auto* pipeline =
             tess ? selected_pipeline->quad_tess_pipeline : selected_pipeline->pipeline;
@@ -1182,8 +1207,60 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
     const DrawIndirectParams& params) {
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
-    const GraphicsPipeline* pipeline;
-    {
+    const GraphicsPipeline* pipeline = nullptr;
+    // PERF-GT7-020: the draw's shaders are waited for under the lookup lock as before, its
+    // pipeline without it (built here when no worker took it yet), so the command thread goes
+    // on selecting the next draws' pipelines and their builds start meanwhile. With the lock
+    // held, a new track's first race built its one-off targets' pipelines one after the other
+    // (171 draws, ~390 ms each with a cold driver cache): a 68 s stop. RYGT_ONE_OFF_UNLOCKED=0
+    // waits as before.
+    static const bool unlocked = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_UNLOCKED");
+        return !(env && env[0] == '0');
+    }();
+    // PERF-GT7-036: its shaders too: waited for under the lock, the command thread could not
+    // select the next draws (nor queue their shaders and builds) meanwhile, so a new track's
+    // first corner waited for each draw's translations one after the other (45 draws, ~11 ms
+    // each: frames of 400-900 ms). A draw takes a round per stage it lacks, and one for its
+    // pipeline. RYGT_ONE_OFF_SHADERS_UNLOCKED=0: under the lock, as before.
+    static const bool shaders_unlocked = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_SHADERS_UNLOCKED");
+        return !(env && env[0] == '0');
+    }();
+    bool found = false;
+    for (u32 round = 0; unlocked && round < 8; ++round) {
+        decltype(pipeline_cache.TakeSkippedBuild()) build;
+        std::function<void()> shader_wait;
+        {
+            std::scoped_lock lk{pipeline_cache.LookupMutex()};
+            pipeline_cache.SetWaitForShaders(true);
+            pipeline_cache.SetShadersUnlocked(shaders_unlocked);
+            pipeline = pipeline_cache.GetGraphicsPipeline(params);
+            pipeline_cache.SetShadersUnlocked(false);
+            pipeline_cache.SetWaitForShaders(false);
+            if (pipeline) {
+                if (SelectsPipelinesAhead()) {
+                    CopySelectedStages(stages);
+                }
+                found = true;
+            } else {
+                build = pipeline_cache.TakeSkippedBuild();
+            }
+            shader_wait = pipeline_cache.TakeShaderWait();
+        }
+        if (found) {
+            break;
+        }
+        if (shader_wait) {
+            shader_wait();
+            continue;
+        }
+        if (!build) {
+            break;
+        }
+        pipeline_cache.FinishBuildUnlocked(build);
+    }
+    if (!found) {
         std::scoped_lock lk{pipeline_cache.LookupMutex()};
         pipeline_cache.SetForceWait(true);
         pipeline = pipeline_cache.GetGraphicsPipeline(params);
@@ -1192,6 +1269,8 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
             return pipeline;
         }
         CopySelectedStages(stages);
+    } else if (!SelectsPipelinesAhead()) {
+        return pipeline;
     }
     InstallDrawStages(pipeline, stages, false);
     return pipeline;
@@ -2771,6 +2850,14 @@ void Rasterizer::FlushDeferredFences() {
     if (deferred_unflushed.exchange(false, std::memory_order_acq_rel)) {
         scheduler.Flush();
     }
+}
+
+void Rasterizer::OnRecorderIdle() {
+#ifdef RYTY_GPU
+    if (native) {
+        native->BeginAhead(); // PERF-GT7-008
+    }
+#endif
 }
 
 bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,

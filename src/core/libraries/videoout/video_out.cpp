@@ -12,6 +12,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -353,6 +354,8 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     if (!port) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
+    // DIAG-GT7-007: the game asks for a flip at the end of the command buffers it submits next.
+    RyDiag::Timeline('E', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0, buf_id);
 
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {

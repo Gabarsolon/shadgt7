@@ -24,6 +24,7 @@
 #include "core/user_settings.h"
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
+#include "imgui/renderer/imgui_impl_sdl3.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
@@ -298,6 +299,7 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_CHANGE_CONTROLLER:
         // ryGT: the player ports changed in the in-game Controllers window.
         controllers.ReassignAll();
+        ImGui::Sdl::FollowReassignedGamepad(); // FIX-GT7-007
         break;
     case SDL_EVENT_TOGGLE_SIMPLE_FPS:
         Overlay::ToggleSimpleFps();

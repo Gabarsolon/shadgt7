@@ -10,6 +10,10 @@
 
 namespace Shader::Backend::SPIRV {
 
+/// FIX-226: float atomic min/max without VK_EXT_shader_atomic_float2 run only the integer atomic
+/// the value's sign picks (RYGT_FLOAT_ATOMIC_EXACT=0: both, as before).
+bool FloatAtomicExact();
+
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                                          const IR::Program& program, Bindings& binding);
 
