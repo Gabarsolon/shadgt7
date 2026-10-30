@@ -386,9 +386,44 @@ public:
         libraries.emplace(key, library);
     }
 
+    /// PERF-GT7-041 (RYGT_GPL=1): the library of the key, compiled by the first caller only; a
+    /// caller that needs one another build is compiling waits for it instead of compiling it again
+    /// (a race start queues many cars that share their pixel shaders). Second: it was reused.
+    template <typename Create>
+    std::pair<vk::Pipeline, bool> GetOrCreate(u64 key, Create&& create) {
+        std::shared_future<vk::Pipeline> wait_for;
+        std::promise<vk::Pipeline> promise;
+        {
+            std::scoped_lock lk{mutex};
+            if (const auto it = libraries.find(key); it != libraries.end()) {
+                return {it->second, true};
+            }
+            if (const auto it = pending.find(key); it != pending.end()) {
+                wait_for = it->second;
+            } else {
+                pending.emplace(key, promise.get_future().share());
+            }
+        }
+        if (wait_for.valid()) {
+            ++shared_waits;
+            return {wait_for.get(), true};
+        }
+        const vk::Pipeline library = create();
+        {
+            std::scoped_lock lk{mutex};
+            libraries.emplace(key, library);
+            pending.erase(key);
+        }
+        promise.set_value(library);
+        return {library, false};
+    }
+
+    std::atomic<u64> shared_waits{};
+
 private:
     std::mutex mutex;
     std::unordered_map<u64, vk::Pipeline> libraries;
+    std::unordered_map<u64, std::shared_future<vk::Pipeline>> pending;
 };
 
 class LibraryKey {
@@ -837,7 +872,15 @@ GraphicsPipeline::GraphicsPipeline(
     // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
     // summary their library compiles (with link-time optimization info kept) took the process
     // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
-    static const bool whole_tessellated = Common::PerfFeatureEnabled(80);
+    // PERF-GT7-040 (RYGT_GPL=1, off by default, also turns on PERF-GT7-041): tessellated
+    // pipelines are built from libraries too (still without optimization), so GT7's cars share compiled fragment and pre-raster
+    // libraries across their many state combinations and only fast-link. FIX-057's memory blow-up
+    // came with link-time optimization info kept in the libraries, which SHD-001 no longer does.
+    static const bool gpl_tessellated = [] {
+        const char* env = std::getenv("RYGT_GPL");
+        return env && env[0] == '1' && !LinkTimeOptimization();
+    }();
+    static const bool whole_tessellated = Common::PerfFeatureEnabled(80) && !gpl_tessellated;
     // DIAG-058 (SHADGT_NO_LIBRARIES=1): every pipeline is compiled whole, never fast-linked from
     // libraries (does the summary's driver figure render differently from fast-linked ones?).
     static const bool no_libraries = [] {
@@ -904,7 +947,9 @@ GraphicsPipeline::GraphicsPipeline(
             auto& part_info = part_infos[i];
             part_info = pipeline_info;
             part_info.pNext = &library_infos[i];
-            part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR;
+            // FIX-057: tessellated libraries keep the whole pipeline's disabled optimization.
+            part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR |
+                              (pipeline_info.flags & vk::PipelineCreateFlagBits::eDisableOptimization);
             if (LinkTimeOptimization()) { // SHD-001
                 part_info.flags |= vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
             }
@@ -981,6 +1026,50 @@ GraphicsPipeline::GraphicsPipeline(
         const u64 fragment_hash = fragment_key.Hash();
         // -DisablePerf 18 compiles every library for every pipeline, one after another.
         const bool share_libraries = Common::PerfFeatureEnabled(18);
+        std::array<vk::Pipeline, 4> library_handles{};
+        if (gpl_tessellated && share_libraries) {
+            // PERF-GT7-041: shared libraries compiled once even when builds overlap.
+            auto fragment_shared = std::async(std::launch::async, [&] {
+                return library_cache.GetOrCreate(fragment_hash, [&] { return create_library(2); });
+            });
+            library_handles[0] = create_library(0);
+            const auto [pre_raster, pre_raster_was_reused] =
+                library_cache.GetOrCreate(pre_raster_hash, [&] { return create_library(1); });
+            library_handles[3] = create_library(3);
+            const auto [fragment, fragment_was_reused] = fragment_shared.get();
+            library_handles[1] = pre_raster;
+            library_handles[2] = fragment;
+            library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
+            library_link->owned_libraries[1] = vk::UniquePipeline{library_handles[3], device};
+            const auto libraries_done = std::chrono::steady_clock::now();
+            const vk::PipelineLibraryCreateInfoKHR link_libraries = {
+                .libraryCount = static_cast<u32>(library_handles.size()),
+                .pLibraries = library_handles.data(),
+            };
+            const vk::GraphicsPipelineCreateInfo link_info = {
+                .pNext = &link_libraries,
+                .layout = *pipeline_layout,
+            };
+            auto [link_result, linked] =
+                device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+            ASSERT_MSG(link_result == vk::Result::eSuccess, "Failed to link graphics pipeline: {}",
+                       vk::to_string(link_result));
+            pipeline = std::move(linked);
+            SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+            LOG_WARNING(
+                Render_Vulkan,
+                "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
+                "link {:.1f} ms; PERF-GT7-041 shared waits {}",
+                debug_str,
+                std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
+                pre_raster_was_reused ? "reused" : "compiled",
+                fragment_was_reused ? "reused" : "compiled",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          libraries_done)
+                    .count(),
+                library_cache.shared_waits.load());
+            return; // LTO is off whenever RYGT_GPL is on
+        }
         vk::Pipeline pre_raster_library =
             share_libraries ? library_cache.Find(pre_raster_hash) : vk::Pipeline{};
         vk::Pipeline fragment_library =
@@ -993,7 +1082,6 @@ GraphicsPipeline::GraphicsPipeline(
         if (!fragment_library && share_libraries) {
             fragment_future = std::async(std::launch::async, create_library, size_t{2});
         }
-        std::array<vk::Pipeline, 4> library_handles{};
         library_handles[0] = create_library(0);
         if (!pre_raster_library) {
             pre_raster_library = create_library(1);
