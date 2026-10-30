@@ -343,6 +343,7 @@ public:
         return !queue.ForegroundIdle();
     }
     /// PERF-GT7-034: at most this many builds at once, unless a draw waits for its own.
+    /// FIX-GT7-022: read-ahead builds only.
     void SetPace(u32 limit) {
         std::scoped_lock lk{extra_mutex};
         pace = limit;
@@ -395,15 +396,23 @@ private:
     void ApplyExtra() {
         const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
                                       CompileConcurrency(), 12u);
-        u32 width = waiting > 0      ? widest
-                    : foreground > 0 ? CompileConcurrency()
-                    : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
-                                     : CompileConcurrency();
+        const u32 width = waiting > 0      ? widest
+                          : foreground > 0 ? CompileConcurrency()
+                          : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
+                                           : CompileConcurrency();
+        // FIX-GT7-022: the pace (PERF-GT7-034) holds back the read-ahead builds only, and they
+        // leave a worker free for the draws that went on without their pipeline. On a new GT7
+        // track (a city), 600 builds of draws on screen waited up to 27 s, one or two at a time,
+        // while the game ran at 35-38 ms a frame either way: buildings were missing or black for
+        // a while. In the race, a new building's build waited for a worker behind read-ahead
+        // ones of up to 1.7 s each.
+        u32 background = width;
         if (waiting == 0) {
-            width = std::clamp(pace, 1u, width); // PERF-GT7-034
+            background = std::min(std::clamp(pace, 1u, width), std::max(width - 1, 1u));
         }
         queue.SetMaxRunning(std::min(width, CompileConcurrency()));
         queue.SetExtraRunning(width > CompileConcurrency() ? width - CompileConcurrency() : 0);
+        queue.SetBackgroundLimit(background);
     }
     std::mutex extra_mutex;
     int waiting = 0;
@@ -3222,6 +3231,8 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     // heavy scenes (the pit straight, ~3,000 draws): every 5-10 frames one took 66 ms. A draw
     // waiting for its pipeline still widens the compiles; the draws on screen still build first
     // (FIX-GT7-009). In menus too (they run at 60 fps or wait for their pipelines).
+    // FIX-GT7-022: past the catch-up's step back, only the read-ahead builds step back: the
+    // builds of draws that went on without their pipeline keep the usual width.
     // RYGT_CATCH_UP_PACE=0: never.
     if (!paced) {
         return;
@@ -3271,8 +3282,9 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         } else if (c.pace_limit > 1 && build_workers->Busy()) {
             --c.pace_limit;
             build_workers->SetPace(c.pace_limit);
-            note(c.pace_limit == 1 ? "compiles one at a time"
-                                   : fmt::format("compiles {} at a time", c.pace_limit).c_str());
+            note(c.pace_limit == 1
+                     ? "read-ahead compiles one at a time"
+                     : fmt::format("read-ahead compiles {} at a time", c.pace_limit).c_str());
         }
         return;
     }
@@ -3284,7 +3296,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     if (c.pace_limit < usual) {
         ++c.pace_limit;
         build_workers->SetPace(c.pace_limit == usual ? 64 : c.pace_limit);
-        note(fmt::format("compiles {} at a time", c.pace_limit).c_str());
+        note(fmt::format("read-ahead compiles {} at a time", c.pace_limit).c_str());
     } else if (c.on && c.stepped_back) {
         c.stepped_back = false;
         c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
