@@ -46,6 +46,15 @@ struct BufferSpecialization {
                (!swizzle_enable ||
                 (index_stride == other.index_stride && element_size == other.element_size));
     }
+
+    /// FIX-GT7-024: equal but for addressing (stride, swizzling, thread-id addressing and
+    /// coherence), which reads of a buffer bound empty don't depend on.
+    bool SameButAddressing(const BufferSpecialization& other) const {
+        return is_formatted == other.is_formatted &&
+               (!is_formatted ||
+                (data_format == other.data_format && num_format == other.num_format &&
+                 dst_select == other.dst_select && num_conversion == other.num_conversion));
+    }
 };
 
 struct ImageSpecialization {
@@ -87,6 +96,9 @@ struct StageSpecialization {
     const Info* info{};
     RuntimeInfo runtime_info{};
     std::bitset<MaxStageResources> bitset{};
+    /// FIX-GT7-024: bound buffers the rasterizer binds empty (IsBoundEmpty). Not stored: only
+    /// a lookup's own (the right side of a comparison) is read.
+    std::bitset<MaxStageResources> bound_empty{};
     Gcn::FetchShaderData fetch_shader_data{};
     SmallVector<VsAttribSpecialization, 32> vs_attribs;
     SmallVector<BufferSpecialization, 16> buffers;
@@ -139,11 +151,16 @@ struct StageSpecialization {
         // V# translation saw instead of zeros. Thread-id addressing and coherence, which the
         // code also reads from the V#, are added to the key.
         const bool usage_known = info->resource_usage_known;
+        // FIX-GT7-024: -DisablePerf 172 compares buffers bound empty as any other.
+        static const bool empty_without_addressing = Common::PerfFeatureEnabled(172);
         u32 binding{};
         ForEachSharp(
             binding, buffers, info->buffers,
-            [this, usage_known](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+            [this, usage_known, &binding](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                 const size_t index = &desc - info->buffers.data();
+                if (empty_without_addressing && !desc.IsSpecial() && IsBoundEmpty(sharp)) {
+                    bound_empty[binding - 1] = true; // ForEachSharp counted it already
+                }
                 spec.stride =
                     !usage_known || info->buffer_stride_used[index] ? sharp.GetStride() : 0;
                 if (usage_known) {
@@ -236,6 +253,28 @@ struct StageSpecialization {
         return info != nullptr;
     }
 
+    /// FIX-GT7-024: a V# with records that the rasterizer still binds empty, so reads give 0
+    /// and writes are dropped: a base of 0, or a buffer ending past the GPU's 40-bit address
+    /// space (FIX-031). GT7's city shaders leave V#s made of float constants (strides like
+    /// 0x3e2a, terabytes long) in slots a draw doesn't read; their values changed from one run
+    /// to the next, and each one made a new translation and a pipeline compile of up to a second
+    /// (the building drawn black meanwhile). Such a buffer is compared without its addressing.
+    static bool IsBoundEmpty(const AmdGpu::Buffer& sharp) {
+        constexpr u64 GpuAddressLimit = 1ULL << 40;
+        const u64 base = sharp.base_address;
+        const u64 size = sharp.GetSize();
+        return sharp.num_records != 0 &&
+               (base == 0 || (sharp.num_records != UINT32_MAX &&
+                              (size >= GpuAddressLimit || base + size > GpuAddressLimit)));
+    }
+
+    /// The right side's buffer `i` at `binding` matches this one's (FIX-GT7-024: without the
+    /// addressing when the right side binds it empty).
+    bool BufferMatches(const StageSpecialization& other, u32 i, u32 binding) const {
+        return other.bound_empty[binding] ? buffers[i].SameButAddressing(other.buffers[i])
+                                          : buffers[i] == other.buffers[i];
+    }
+
     bool operator==(const StageSpecialization& other) const {
         if (!Valid() || !other.Valid()) {
             return false;
@@ -277,8 +316,8 @@ struct StageSpecialization {
         }
 
         u32 binding{};
-        for (u32 i = 0; i < buffers.size(); i++) {
-            if (other.bitset[binding++] && buffers[i] != other.buffers[i]) {
+        for (u32 i = 0; i < buffers.size(); i++, binding++) {
+            if (other.bitset[binding] && !BufferMatches(other, i, binding)) {
                 return false;
             }
         }
@@ -379,10 +418,10 @@ struct StageSpecialization {
             return "start bindings";
         }
         u32 binding{};
-        for (u32 i = 0; i < buffers.size(); i++) {
-            if (other.bitset[binding++] && buffers[i] != other.buffers[i]) {
+        for (u32 i = 0; i < buffers.size(); i++, binding++) {
+            if (other.bitset[binding] && !BufferMatches(other, i, binding)) {
                 index = i;
-                return "buffer";
+                return other.bound_empty[binding] ? "buffer bound empty" : "buffer";
             }
         }
         for (u32 i = 0; i < images.size(); i++) {

@@ -271,6 +271,10 @@ private:
     void DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage);
     void LogRepeatedPermutation(const Program& program, size_t perm_idx, Shader::HwStage hw_stage,
                                 u64 pgm_hash);
+    void LogNewPermutation(const Program& program, Shader::HwStage hw_stage,
+                           const Shader::ShaderParams& params,
+                           const Shader::RuntimeInfo& runtime_info,
+                           const Shader::Backend::Bindings& binding); // DIAG-GT7-013
     std::unordered_set<u64> failed_shaders;
     /// FIX-043 diagnostic: hash of the SPIR-V that CompileModule produced last.
     u64 last_spv_hash{};

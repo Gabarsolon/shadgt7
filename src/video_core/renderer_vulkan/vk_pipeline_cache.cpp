@@ -3982,8 +3982,9 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
+        // FIX-GT7-024: the lookup's on the right, as GetProgram compares (its bitsets decide).
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
-            Shader::StageSpecialization(info, runtime_info, profile, binding) != job->spec) {
+            job->spec != Shader::StageSpecialization(info, runtime_info, profile, binding)) {
             continue;
         }
         if (!insert) {
@@ -4571,7 +4572,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             if (!S().stage_deferred || skip_wait || unlocked ||
                 (read_ahead && RetryReadAhead())) {
                 S().stage_deferred = true;
-                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
+                if (QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding) &&
+                    !read_ahead) {
+                    LogNewPermutation(*program, hw_stage, params, runtime_info, binding);
+                }
             }
             if (unlocked) {
                 NoteUnlockedShaderWait(params.hash);
@@ -4647,6 +4651,49 @@ void PipelineCache::LogRepeatedPermutation(const Program& program, size_t perm_i
         }
         return;
     }
+}
+
+void PipelineCache::LogNewPermutation(const Program& program, Shader::HwStage hw_stage,
+                                      const Shader::ShaderParams& params,
+                                      const Shader::RuntimeInfo& runtime_info,
+                                      const Shader::Backend::Bindings& binding) {
+    // DIAG-GT7-013: why a draw of a known program needs a new translation (each one is a pipeline
+    // compile, up to a second, with the draw skipped meanwhile): how the lookup differs from each
+    // existing permutation, with the V# of a differing buffer.
+    static u64 events = 0;
+    const u64 event = ++events;
+    if (program.modules.empty() || (event > 60 && event % 200 != 0)) {
+        return;
+    }
+    std::string reasons;
+    u32 listed = 0;
+    for (size_t perm_idx = 0; perm_idx < program.modules.size() && listed < 8; ++perm_idx) {
+        const auto& permutation = program.modules[perm_idx];
+        if (!permutation.info) {
+            continue;
+        }
+        ++listed;
+        auto& info = *permutation.info;
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        info.RefreshFlatBuf();
+        const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+        u32 index{};
+        const char* reason = permutation.spec.FirstDifference(spec, index);
+        reasons += fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
+        if (reason && std::string_view{reason}.starts_with("buffer") &&
+            index < info.buffers.size()) {
+            const auto sharp = info.buffers[index].GetSharp(info);
+            std::array<u32, 4> words{};
+            std::memcpy(words.data(), &sharp, sizeof(words));
+            reasons += fmt::format("(V# {:08x} {:08x} {:08x} {:08x})", words[0], words[1],
+                                   words[2], words[3]);
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-GT7-013: new translation {} of {}_{:#x} for a draw; {}:{}",
+                event, hw_stage, params.hash,
+                listed ? "existing permutations differ in" : "no permutation translated yet",
+                reasons);
 }
 
 bool PipelineCache::IsTessEmulatedDraw() const {
