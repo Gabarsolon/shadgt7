@@ -2,6 +2,8 @@
 // states (keyboard bindings and SDL gamepads), and this thread forwards them to Ryty's libScePad,
 // which is what the game reads. The game's rumble and light bar requests travel back the same way.
 
+#include <filesystem>
+#include "common/ryty_config.h"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -205,23 +207,8 @@ std::atomic<bool> g_overlay_open{false};
 
 // The GT Sport config next to GTSport.exe (user/custom_configs/CUSA03220.json) as text.
 std::string ReadGameConfig() {
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-        return {};
-    }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("/\\") + 1) + "user/custom_configs/CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return {};
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
+    // FIX-230: Unicode and long-path safe.
+    std::string text = Common::RytyReadGameConfig();
     return text;
 }
 
@@ -581,11 +568,7 @@ void SetControllerPortChoice(int player, const std::string& key) {
     }
     LOG_INFO(Input, "Ryty: controller ports changed in game: {}", joined);
     // Kept for the next start and the launcher (Input.controller_ports).
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length != 0 && length < MAX_PATH) {
-        std::string file{path, length};
-        file = file.substr(0, file.find_last_of("/\\") + 1) + "user/custom_configs/CUSA03220.json";
+    if (const std::wstring file = Common::RytyGameConfigPathW(); !file.empty()) { // FIX-230
         auto config = nlohmann::json::parse(ReadGameConfig(), nullptr, false);
         if (config.is_discarded() || !config.is_object()) {
             config = nlohmann::json::object();
@@ -594,7 +577,7 @@ void SetControllerPortChoice(int player, const std::string& key) {
             config["Input"] = nlohmann::json::object();
         }
         config["Input"]["controller_ports"] = joined;
-        std::ofstream out{file, std::ios::binary | std::ios::trunc};
+        std::ofstream out{std::filesystem::path{file}, std::ios::binary | std::ios::trunc};
         out << config.dump();
     }
     // The window thread puts every gamepad in its new port.
