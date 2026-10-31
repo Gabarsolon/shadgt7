@@ -433,6 +433,10 @@ private:
     absl::flat_hash_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
+    u64 vram_evicted_images = 0; ///< NAT-VRAM-001
+    u64 vram_evicted_bytes = 0;
+    u64 vram_logged_images = 0;
+    std::chrono::steady_clock::time_point vram_log_time{};
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
     u64 total_used_samplers = 0;

@@ -525,6 +525,9 @@ public:
         return total_memory_budget;
     }
 
+    /// NAT-VRAM-001: the launcher's video memory setting in bytes, 0 for Auto.
+    [[nodiscard]] static u64 VideoMemorySettingBytes();
+
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
@@ -538,6 +541,7 @@ private:
     /// Collects various information from the device.
     void CollectDeviceParameters();
     void CollectPhysicalMemoryInfo();
+    void ApplyVideoMemorySetting(); ///< NAT-VRAM-001
     void CollectImageFormatInfo();
     void CollectToolingInfo() const;
 
