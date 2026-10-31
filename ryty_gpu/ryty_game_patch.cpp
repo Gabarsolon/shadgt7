@@ -721,73 +721,55 @@ void InstallScriptPatches(u8* base) {
     }
 }
 
-// DIAG-GT7-043: RYGT_DUMP_SCRIPTS=<folder> saves every Adhoc script GT7 reads, one file each, with
-// the time it was read in stderr. Its buffered streams refill 2 KB at a time from these calls of
-// the game's file read (eboot 0x316fbf0), with the same arguments as in GT Sport.
-constexpr u64 kGt7FileRead = 0x316fbf0;
-constexpr u64 kGt7StreamRefillCalls[] = {0x17b48e9, 0x2b708fe, 0x2b9f011, 0x2beb4c2,
-                                         0x2bf32bc, 0x2bf58f8, 0x2bf5d16, 0x2c23a04,
-                                         0x2cf0764, 0x2cf110c, 0x2cf15e5, 0x3170d14};
+// DIAG-GT7-043: RYGT_DUMP_SCRIPTS=<folder> saves every Adhoc script GT7 loads, one file each, with
+// the time it was loaded in stderr. Since version 15 a script's body is encrypted: the loader reads
+// the "ADCH015" header and 16 bytes, makes a decrypting stream from them and reads through it. What
+// that stream's read returns is saved, so this sees what the game itself gets.
+constexpr u64 kGt7MakeScriptStream = 0x2bec690;     // void make(Stream** out, Stream** in, u8* iv)
+constexpr u64 kGt7MakeScriptStreamCall = 0x2b7e712; // its call in the script loader
+constexpr u64 kGt7ScriptStreamRead = 0x2beb2f0;     // u64 read(Stream*, u8* to, u64 size)
+constexpr u8 kGt7ScriptStreamReadStart[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                            0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x78};
+using MakeScriptStreamFn = void(PS4_SYSV_ABI*)(void**, void*, void*);
+using ScriptStreamReadFn = u64(PS4_SYSV_ABI*)(void*, u8*, u64);
+MakeScriptStreamFn g_make_script_stream = nullptr;
+ScriptStreamReadFn g_script_stream_read = nullptr;
 std::string g_script_dump_folder;
 std::mutex g_script_dump_mutex;
 std::vector<std::pair<void*, FILE*>> g_script_dumps;
 int g_script_dump_count = 0;
 
-// The first path in the script's symbol table, the compiled unit, as a file name.
-std::string ScriptUnitName(const u8* data, s64 read) {
-    std::string best;
-    std::string run;
-    for (s64 i = 8; i <= read; ++i) {
-        if (i < read && data[i] >= 32 && data[i] < 127) {
-            run += static_cast<char>(data[i]);
-            continue;
-        }
-        if (run.find('/') != std::string::npos) {
-            best = run;
-            break;
-        }
-        run.clear();
+void PS4_SYSV_ABI MakeScriptStreamHook(void** out, void* in, void* iv) {
+    g_make_script_stream(out, in, iv);
+    std::scoped_lock lock{g_script_dump_mutex};
+    const auto entry = std::find_if(g_script_dumps.begin(), g_script_dumps.end(),
+                                    [out](const auto& dump) { return dump.first == *out; });
+    if (entry != g_script_dumps.end()) {
+        std::fclose(entry->second);
+        g_script_dumps.erase(entry);
     }
-    for (char& c : best) {
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
-            c == '>' || c == '|') {
-            c = '_';
-        }
+    const std::string path =
+        fmt::format("{}\\{:05}.adc", g_script_dump_folder, ++g_script_dump_count);
+    SYSTEMTIME now{};
+    GetSystemTime(&now);
+    std::fprintf(stderr, "[scripts] %02d:%02d:%02d.%03d UTC #%d\n", now.wHour, now.wMinute,
+                 now.wSecond, now.wMilliseconds, g_script_dump_count);
+    if (FILE* file = std::fopen(path.c_str(), "wb")) {
+        g_script_dumps.emplace_back(*out, file);
     }
-    return best.substr(best.size() > 100 ? best.size() - 100 : 0);
 }
 
-s64 PS4_SYSV_ABI Gt7StreamRefillHook(void* file, GuestIoVec* iov) {
-    const s64 read = g_file_read(file, iov);
-    if (read <= 0 || !iov || !iov->base) {
-        return read;
-    }
-    const u8* const data = iov->base;
-    std::scoped_lock lock{g_script_dump_mutex};
-    auto entry = std::find_if(g_script_dumps.begin(), g_script_dumps.end(),
-                              [file](const auto& dump) { return dump.first == file; });
-    if (read >= 16 && std::memcmp(data, "ADCH", 4) == 0) {
+u64 PS4_SYSV_ABI ScriptStreamReadHook(void* stream, u8* to, u64 size) {
+    const u64 read = g_script_stream_read(stream, to, size);
+    const s32 count = static_cast<s32>(read);
+    if (count > 0 && to) {
+        std::scoped_lock lock{g_script_dump_mutex};
+        const auto entry = std::find_if(g_script_dumps.begin(), g_script_dumps.end(),
+                                        [stream](const auto& dump) { return dump.first == stream; });
         if (entry != g_script_dumps.end()) {
-            std::fclose(entry->second);
-            g_script_dumps.erase(entry);
+            std::fwrite(to, 1, static_cast<size_t>(count), entry->second);
+            std::fflush(entry->second);
         }
-        const std::string unit = ScriptUnitName(data, read);
-        const std::string path =
-            fmt::format("{}\\{:05}_{}.adc", g_script_dump_folder, ++g_script_dump_count, unit);
-        SYSTEMTIME now{};
-        GetSystemTime(&now);
-        std::fprintf(stderr, "[scripts] %02d:%02d:%02d.%03d UTC #%d %s\n", now.wHour, now.wMinute,
-                     now.wSecond, now.wMilliseconds, g_script_dump_count, unit.c_str());
-        FILE* out = std::fopen(path.c_str(), "wb");
-        if (!out) {
-            return read;
-        }
-        g_script_dumps.emplace_back(file, out);
-        entry = std::prev(g_script_dumps.end());
-    }
-    if (entry != g_script_dumps.end()) {
-        std::fwrite(data, 1, static_cast<size_t>(read), entry->second);
-        std::fflush(entry->second);
     }
     return read;
 }
@@ -797,18 +779,46 @@ void InstallGt7ScriptDump(u8* base) {
     if (!folder || !folder[0]) {
         return;
     }
-    g_script_dump_folder = folder;
-    CreateDirectoryA(folder, nullptr);
+    u8* const read = base + kGt7ScriptStreamRead + kTextRvaShift;
+    constexpr size_t kMoved = sizeof(kGt7ScriptStreamReadStart);
+    if (std::memcmp(read, kGt7ScriptStreamReadStart, kMoved) != 0) {
+        std::fprintf(stderr, "[patch] DIAG-GT7-043: original bytes differ, not applied\n");
+        return;
+    }
     u8* stubs = AllocNear(base);
     if (!stubs) {
         std::fprintf(stderr, "[patch] DIAG-GT7-043: no memory near the game's code for the hooks\n");
         return;
     }
-    g_file_read = reinterpret_cast<FileReadFn>(base + kGt7FileRead + kTextRvaShift);
-    for (size_t i = 0; i < std::size(kGt7StreamRefillCalls); ++i) {
-        RedirectCall(base, stubs + i * 16, kGt7StreamRefillCalls[i], kGt7FileRead,
-                     reinterpret_cast<void*>(&Gt7StreamRefillHook), "DIAG-GT7-043 script reads");
+    g_script_dump_folder = folder;
+    CreateDirectoryA(folder, nullptr);
+    g_make_script_stream =
+        reinterpret_cast<MakeScriptStreamFn>(base + kGt7MakeScriptStream + kTextRvaShift);
+    if (!RedirectCall(base, stubs, kGt7MakeScriptStreamCall, kGt7MakeScriptStream,
+                      reinterpret_cast<void*>(&MakeScriptStreamHook), "DIAG-GT7-043 script loads")) {
+        return;
     }
+    // The read's first instructions move to a trampoline; they don't depend on where they run.
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    u8* const trampoline = stubs + 16;
+    std::memcpy(trampoline, read, kMoved);
+    std::memcpy(trampoline + kMoved, jump, 6);
+    const u8* const resume = read + kMoved;
+    std::memcpy(trampoline + kMoved + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, kMoved + 14);
+    g_script_stream_read = reinterpret_cast<ScriptStreamReadFn>(trampoline);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(read, kMoved, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    const void* const hook = reinterpret_cast<void*>(&ScriptStreamReadHook);
+    std::memcpy(read, jump, 6);
+    std::memcpy(read + 6, &hook, 8);
+    std::memset(read + 14, 0x90, kMoved - 14);
+    DWORD ignored = 0;
+    VirtualProtect(read, kMoved, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), read, kMoved);
+    std::fprintf(stderr, "[patch] DIAG-GT7-043 script reads applied\n");
 }
 
 void InstallMiscHooks(u8* base) {
