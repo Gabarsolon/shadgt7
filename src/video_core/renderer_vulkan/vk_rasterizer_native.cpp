@@ -9115,10 +9115,12 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     return slot.get();
 }
 
-bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows) {
+bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows,
+                               u32 first_layers) {
     // NAT-132/134: a picture filled with the pattern (two dwords, repeated), as memory holds it
     // after a fill: copied in from a buffer holding it (any format: every texel is the pattern's
-    // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124).
+    // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124), or of its first
+    // layers with `first_layers` (FIX-GT7-031).
     const auto& info = entry.info;
     const u32 texel = info.props.is_depth
                           ? (info.pixel_format == vk::Format::eD16Unorm ||
@@ -9135,7 +9137,8 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
-    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? 1u : layers * depth);
+    const u32 row_layers = std::clamp(first_layers, 1u, layers);
+    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? row_layers : layers * depth);
     if (info.props.is_bgr_packed_float) {
         const auto repack = [](u32 value) {
             return (value >> 21) | (((value >> 10) & 0x7ffu) << 11) |
@@ -9164,7 +9167,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
                                                                 : vk::ImageAspectFlagBits::eColor,
                               .mipLevel = m,
                               .baseArrayLayer = 0,
-                              .layerCount = rows ? 1u : layers},
+                              .layerCount = rows ? row_layers : layers},
             .imageOffset = {0, 0, 0},
             .imageExtent = {w, h, d},
         });
@@ -9234,7 +9237,11 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
         const u32 rows = u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) / row_bytes,
                                            info.size.height));
-        if (rows != 0 && FillImage(entry, lo, hi, rows)) {
+        // FIX-GT7-031: a fill of whole layers clears those layers. GT7 clears the layers of its
+        // headlight shadow maps that this frame uses, fewer than the picture has.
+        const u64 layer_bytes = info.guest_size / std::max<u32>(info.resources.layers, 1);
+        const u32 whole_layers = layer_bytes != 0 ? u32(entry.rewrite_bytes / layer_bytes) : 0;
+        if (rows != 0 && FillImage(entry, lo, hi, rows, whole_layers)) {
             ++stats.rewrite_partial;
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
@@ -9292,7 +9299,17 @@ void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
     // lo, hi... (count dwords) to its second: a memset of depth buffers, stencil planes and
     // pictures.
     constexpr u64 FillShader = 0x8aa6e00c;
-    if (cs.pgm_hash != FillShader || cs.buffers.size() < 2) {
+    // FIX-GT7-031: GT7's is the same shader. Without it, its fills of targets were lost: the
+    // headlight shadow maps were never cleared and kept the nearest depth of every frame since
+    // the race began, so the lights lit only what no object ever covered (the middle of the road).
+    // RYGT_NATIVE_GT7_FILLS=0: as before.
+    constexpr u64 FillShaderGt7 = 0xabe484108a360b66;
+    static const bool gt7_fills = [] {
+        const char* env = std::getenv("RYGT_NATIVE_GT7_FILLS");
+        return !(env && env[0] == '0');
+    }();
+    if ((cs.pgm_hash != FillShader && !(gt7_fills && cs.pgm_hash == FillShaderGt7)) ||
+        cs.buffers.size() < 2) {
         return;
     }
     const Shader::BufferResource* args = nullptr;
