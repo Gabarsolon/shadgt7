@@ -943,6 +943,13 @@ private:
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
+    /// PERF-GT7-044: the small pictures drawn this frame, written back when it ends.
+    std::vector<Native::ImageEntry*> frame_writebacks;
+    void QueueWriteback(const Native::ImageEntry* entry);
+    /// PERF-GT7-044: pictures waiting for the frame's end go back before work over their memory.
+    void WritebacksBefore(VAddr address, u64 size);
+    void WritebacksBefore(const DrawBindings& b);
+    bool writebacks_due = false; ///< some of them wait for the next global barrier
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
     /// NAT-123: GPU-written images the dumped frame sampled, by texture key.
     std::vector<std::pair<std::string, const Native::ImageEntry*>> dump_textures;
@@ -955,7 +962,7 @@ private:
     void ApplyRewrite(Native::ImageEntry& entry);
     /// NAT-132: fills the picture with a 32-bit pattern on the GPU (rows != 0: only those rows
     /// of the first mip and layer); false when it can't (compressed, multisampled).
-    bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows);
+    bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows, u32 first_layers = 0);
     /// NAT-134: a device buffer holding the pattern (lo, hi, lo, hi...), at least `bytes` long.
     const Native::Rhi::Buffer* PatternBuffer(u32 lo, u32 hi, u64 bytes);
     std::unordered_map<u64, std::unique_ptr<Native::Rhi::Buffer>> fill_patterns;

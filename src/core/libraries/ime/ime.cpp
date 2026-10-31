@@ -206,8 +206,10 @@ public:
             openEvent.param.rect.x = m_param.ime.posx;
             openEvent.param.rect.y = m_param.ime.posy;
         } else {
+            // FIX-GT7-032: no USB keyboard, as sceImeKeyboardGetResourceId says. Update delivers it.
             openEvent.param.resource_id_array.user_id = 1;
-            openEvent.param.resource_id_array.resource_id[0] = 1;
+            m_keyboard_open_event = openEvent;
+            m_keyboard_open_pending = true;
         }
 
         // Are we supposed to call the event handler on init with
@@ -230,7 +232,13 @@ public:
 
     Error Update(OrbisImeEventHandler handler) {
         if (!m_ime_mode) {
-            /* We don't handle any events for ImeKeyboard */
+            // FIX-GT7-032: the only ImeKeyboard event delivered is the one that says it opened. GT7
+            // waits for it: without it, each menu page it pushes or pops waits 5 s for the keyboard
+            // (its OSK close spins 300 times until the keyboard reports it is ready).
+            if (m_keyboard_open_pending) {
+                m_keyboard_open_pending = false;
+                Execute(handler, &m_keyboard_open_event, false);
+            }
             return Error::OK;
         }
         if (!g_ime_state) {
@@ -325,6 +333,8 @@ private:
         OrbisImeParamExtended ime_ext;
     } m_param{};
     bool m_ime_mode = false;
+    OrbisImeEvent m_keyboard_open_event{};
+    bool m_keyboard_open_pending = false;
 };
 
 static std::unique_ptr<ImeHandler> g_ime_handler;

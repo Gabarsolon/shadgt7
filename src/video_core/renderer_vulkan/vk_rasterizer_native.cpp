@@ -1545,6 +1545,54 @@ void NativeRenderer::PassBarrier() {
     ++stats.pass_barriers;
 }
 
+// PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame
+// ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
+// ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
+// copy, a tiling dispatch and their barriers each) took 17% of the GPU's time in a GPU Trace.
+// RYGT_NATIVE_WRITEBACK_EACH=1: after each draw, as before.
+void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
+    static const bool each = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_EACH");
+        return env && env[0] == '1';
+    }();
+    if (each) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+        }
+        return;
+    }
+    // Pictures of the same size at the same memory each write all of it: only the last one drawn
+    // counts, and goes last.
+    std::erase_if(frame_writebacks, [&](const Native::ImageEntry* other) {
+        return other->info.guest_address == entry->info.guest_address &&
+               other->info.guest_size == entry->info.guest_size;
+    });
+    frame_writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+}
+
+// PERF-GT7-044: work that writes memory a waiting picture covers comes after that picture, as the
+// game ordered them; written back at the frame's end, the picture would overwrite the newer bytes.
+// It goes at the next global barrier, before that work, and the bytes the work leaves stay right.
+void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
+    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+        const VAddr begin = entry->info.guest_address;
+        if (address + std::max<u64>(size, 1) <= begin || begin + entry->info.guest_size <= address) {
+            return false;
+        }
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+        writebacks_due = true;
+        return true;
+    });
+}
+
+void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
+    for (const auto& [address, size] : b.gpu_writes) {
+        WritebacksBefore(address, size);
+    }
+}
+
 void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
@@ -1603,6 +1651,7 @@ void NativeRenderer::FlushWritebacks() {
         s.keep.push_back(std::move(out));
     }
     writebacks.clear();
+    writebacks_due = false;
     s.pipeline = vk::Pipeline{}; // the re-tiling binds its own pipeline
     ForgetBindings(s);            // OPT-014: and its own bindings
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
@@ -3242,17 +3291,29 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // ranges meeting one of these stay in guest memory too.
     static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
         std::vector<std::pair<VAddr, VAddr>> list;
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
-        for (const char* at = env; at && *at;) {
-            char* end = nullptr;
-            const VAddr begin = std::strtoull(at, &end, 16);
-            if (end == at || *end != '+') {
-                break;
+        // FIX-GT7-029: GT7's per-frame memory ends at 0x208600000 or 0x208800000, past the range
+        // the launcher lists. A compute write there makes a small region; the unbounded reads,
+        // which all end at that limit, meet it and grow it over most of the per-frame memory
+        // (NAT-114): every CPU write then faults, ~100,000 protection calls in 2 s, and the frame
+        // rate drops for the rest of the session. With a list (GT7's launcher), the tail stays in
+        // guest memory too; RYGT_NATIVE_INPLACE_EXTRA, in the same form, replaces it (empty: none).
+        const char* const ranges = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        if (!extra && ranges) {
+            extra = "208000000+800000";
+        }
+        for (const char* source : {ranges, extra}) {
+            for (const char* at = source; at && *at;) {
+                char* end = nullptr;
+                const VAddr begin = std::strtoull(at, &end, 16);
+                if (end == at || *end != '+') {
+                    break;
+                }
+                at = end + 1;
+                const u64 length = std::strtoull(at, &end, 16);
+                list.emplace_back(begin, begin + std::max<u64>(length, 1));
+                at = *end == ',' ? end + 1 : end;
             }
-            at = end + 1;
-            const u64 length = std::strtoull(at, &end, 16);
-            list.emplace_back(begin, begin + std::max<u64>(length, 1));
-            at = *end == ',' ? end + 1 : end;
         }
         return list;
     }();
@@ -6413,7 +6474,7 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 
 bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
     const Stream& s = stream;
-    if (s.buffers_written) {
+    if (s.buffers_written || writebacks_due) {
         return true;
     }
     for (const auto* entry : b.sampled) {
@@ -7282,9 +7343,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             note(entry, &targets->color_ranges[cb]);
             // NAT-112: small pictures go back to guest memory.
             constexpr u64 WritebackSize = 64_KB;
-            if (entry && entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
-                std::ranges::find(writebacks, entry) == writebacks.end()) {
-                writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            if (entry && entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1) {
+                QueueWriteback(entry); // PERF-GT7-044
             }
         }
         note(targets->depth);
@@ -7293,9 +7353,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         note(entry);
         constexpr u64 WritebackSize = 64_KB; // NAT-112, as for render targets
         if (entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
-            !entry->info.props.is_depth &&
-            std::ranges::find(writebacks, entry) == writebacks.end()) {
-            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            !entry->info.props.is_depth) {
+            QueueWriteback(entry); // PERF-GT7-044
         }
     }
     s.buffers_written |= b.writes_buffers;
@@ -7636,6 +7695,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         b.Clear();
         b.push = UserData(regs);
         BindStages(pipeline->GetStages(), regs, false, b);
+        WritebacksBefore(b); // PERF-GT7-044
     }
     if (b.failed) {
         ++stats.skipped;
@@ -9115,10 +9175,12 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     return slot.get();
 }
 
-bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows) {
+bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows,
+                               u32 first_layers) {
     // NAT-132/134: a picture filled with the pattern (two dwords, repeated), as memory holds it
     // after a fill: copied in from a buffer holding it (any format: every texel is the pattern's
-    // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124).
+    // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124), or of its first
+    // layers with `first_layers` (FIX-GT7-031).
     const auto& info = entry.info;
     const u32 texel = info.props.is_depth
                           ? (info.pixel_format == vk::Format::eD16Unorm ||
@@ -9135,7 +9197,8 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
-    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? 1u : layers * depth);
+    const u32 row_layers = std::clamp(first_layers, 1u, layers);
+    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? row_layers : layers * depth);
     if (info.props.is_bgr_packed_float) {
         const auto repack = [](u32 value) {
             return (value >> 21) | (((value >> 10) & 0x7ffu) << 11) |
@@ -9164,7 +9227,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
                                                                 : vk::ImageAspectFlagBits::eColor,
                               .mipLevel = m,
                               .baseArrayLayer = 0,
-                              .layerCount = rows ? 1u : layers},
+                              .layerCount = rows ? row_layers : layers},
             .imageOffset = {0, 0, 0},
             .imageExtent = {w, h, d},
         });
@@ -9234,7 +9297,11 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
         const u32 rows = u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) / row_bytes,
                                            info.size.height));
-        if (rows != 0 && FillImage(entry, lo, hi, rows)) {
+        // FIX-GT7-031: a fill of whole layers clears those layers. GT7 clears the layers of its
+        // headlight shadow maps that this frame uses, fewer than the picture has.
+        const u64 layer_bytes = info.guest_size / std::max<u32>(info.resources.layers, 1);
+        const u32 whole_layers = layer_bytes != 0 ? u32(entry.rewrite_bytes / layer_bytes) : 0;
+        if (rows != 0 && FillImage(entry, lo, hi, rows, whole_layers)) {
             ++stats.rewrite_partial;
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
@@ -9292,7 +9359,17 @@ void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
     // lo, hi... (count dwords) to its second: a memset of depth buffers, stencil planes and
     // pictures.
     constexpr u64 FillShader = 0x8aa6e00c;
-    if (cs.pgm_hash != FillShader || cs.buffers.size() < 2) {
+    // FIX-GT7-031: GT7's is the same shader. Without it, its fills of targets were lost: the
+    // headlight shadow maps were never cleared and kept the nearest depth of every frame since
+    // the race began, so the lights lit only what no object ever covered (the middle of the road).
+    // RYGT_NATIVE_GT7_FILLS=0: as before.
+    constexpr u64 FillShaderGt7 = 0xabe484108a360b66;
+    static const bool gt7_fills = [] {
+        const char* env = std::getenv("RYGT_NATIVE_GT7_FILLS");
+        return !(env && env[0] == '0');
+    }();
+    if ((cs.pgm_hash != FillShader && !(gt7_fills && cs.pgm_hash == FillShaderGt7)) ||
+        cs.buffers.size() < 2) {
         return;
     }
     const Shader::BufferResource* args = nullptr;
@@ -9397,6 +9474,7 @@ void NativeRenderer::DispatchDirect() {
     b.Clear();
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
+    WritebacksBefore(b); // PERF-GT7-044
     if (b.failed) {
         ++stats.skipped;
         return;
@@ -9485,6 +9563,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     b.Clear();
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
+    WritebacksBefore(b); // PERF-GT7-044
     PrepareImages(b); // PERF-109
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
@@ -9613,6 +9692,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
                                      meta ? " (metadata clear)" : "")); // NAT-117
     }
     ++stats.fills;
+    WritebacksBefore(address, num_bytes); // PERF-GT7-044
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
         GlobalBarrier();
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
@@ -9649,6 +9729,13 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         r.FrameDumpEvent(fmt::format("copy {:#x}{} <- {:#x}{} ({:#x} bytes)", dst,
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
                                      num_bytes)); // NAT-117
+    }
+    // PERF-GT7-044: what it reads as well as what it overwrites.
+    if (!src_gds) {
+        WritebacksBefore(src, num_bytes);
+    }
+    if (!dst_gds) {
+        WritebacksBefore(dst, num_bytes);
     }
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
     const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
@@ -9699,6 +9786,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     Stream& s = Begin();
+    WritebacksBefore(address, data.size()); // PERF-GT7-044
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
@@ -10220,6 +10308,7 @@ void NativeRenderer::EvictImages() {
         held_versions.erase(&entry);
         std::erase(stream.written, &entry);
         std::erase(writebacks, &entry);
+        std::erase(frame_writebacks, &entry); // PERF-GT7-044
         std::erase(dump_entries, &entry);
         for (auto it = stencil_owners.begin(); it != stencil_owners.end();) {
             auto& owners = it->second;
@@ -10656,6 +10745,13 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
         ++in_place.frames;
     }
+    // PERF-GT7-044: this frame's pictures go back after the next global barrier.
+    for (auto* entry : frame_writebacks) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+    }
+    frame_writebacks.clear();
     ++frame;
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     if (RyDiag::Enabled() && !AbOn()) {
