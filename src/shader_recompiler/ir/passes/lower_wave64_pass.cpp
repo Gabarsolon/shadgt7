@@ -309,7 +309,11 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
 // with the depth of their occluder). Those ifs are GCN EXEC scopes around arithmetic: without the
 // branch every invocation runs the arithmetic, which nothing else sees, the ifs directly inside test
 // the removed condition as well, and the lane read is in uniform control flow. A branch whose own
-// blocks ask which invocations are active is kept: without it, more of them are.
+// blocks ask which invocations are active is kept: without it, more of them are. Only EXEC scopes
+// qualify, since V_READLANE ignores EXEC: a guard on anything else decides whether the guest reads the
+// lane at all. And only in a group of 64 invocations, the one wave the lowering can exchange: a guard
+// on a 64-lane boundary stays what it is (crowd fix, f35c61f8), and any if around the read that is not
+// an EXEC scope leaves the read as it was.
 // RYGT_LANE_READ_UNBRANCH=0: as before.
 static bool ReadsActiveLanes(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
@@ -329,12 +333,16 @@ static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runt
         const char* env = std::getenv("RYGT_LANE_READ_UNBRANCH");
         return !(env && env[0] == '0');
     }();
-    if (!enabled) {
+    const auto [size_x, size_y, size_z] = runtime.hw.cs.workgroup_size;
+    if (!enabled || size_x * size_y * size_z != 64) {
         return;
     }
     using Type = IR::AbstractSyntaxNode::Type;
     auto& list = program.syntax_list;
-    // The ifs that differ between invocations around a read of an upper lane.
+    const auto differs = [&](size_t scope) {
+        return IsDivergentLoopCondition(list[scope].data.if_node.cond, runtime);
+    };
+    // The EXEC scopes that differ between invocations around a read of an upper lane.
     std::vector<size_t> open;
     std::unordered_set<size_t> scopes;
     u32 loops = 0;
@@ -357,12 +365,11 @@ static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runt
                 std::ranges::any_of(list[i].data.block->Instructions(), [&](const IR::Inst& inst) {
                     return inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate() &&
                            inst.Arg(1).U32() >= profile.subgroup_size;
+                }) &&
+                std::ranges::none_of(open, [&](size_t scope) {
+                    return differs(scope) && !list[scope].data.if_node.exec_scope;
                 })) {
-                for (const size_t scope : open) {
-                    if (IsDivergentLoopCondition(list[scope].data.if_node.cond, runtime)) {
-                        scopes.insert(scope);
-                    }
-                }
+                std::ranges::copy_if(open, std::inserter(scopes, scopes.end()), differs);
             }
             break;
         default:

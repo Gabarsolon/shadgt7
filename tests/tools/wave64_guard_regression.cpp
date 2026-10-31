@@ -16,7 +16,9 @@ bool PerfFeatureEnabled(u32) { return true; }
 int main() {
     int tests = 0;
     int failures = 0;
-    for (u32 threads : {64u, 128u}) {
+    // 0: the guard is an invocation test. 1: it is a GCN EXEC scope, which a lane read ignores
+    // (FIX-GT7-028). 2: the same, but its block asks which lanes are active, so it must stay.
+    for (int guard : {0, 1, 2}) for (u32 threads : {64u, 128u}) {
         for (u32 subgroup : {32u, 64u}) {
             for (bool global : {false, true}) {
                 for (bool constant_left : {false, true}) {
@@ -39,6 +41,9 @@ int main() {
                                                   : ir.IGreaterThanEqual(lhs, rhs, false);
                             IR::IREmitter body_ir{body};
                             [[maybe_unused]] const auto read = body_ir.ReadLane(index, ir.Imm32(63));
+                            if (guard == 2) {
+                                [[maybe_unused]] const auto first = body_ir.ReadFirstLane(index);
+                            }
                             Info info{};
                             info.hw_stage = HwStage::Compute;
                             IR::Program program{info};
@@ -46,7 +51,8 @@ int main() {
                             using Node = IR::AbstractSyntaxNode;
                             program.syntax_list = {
                                 {.data = {.block = &header}, .type = Node::Type::Block},
-                                {.data = {.if_node = {condition, &body, &merge}}, .type = Node::Type::If},
+                                {.data = {.if_node = {condition, &body, &merge, guard != 0}},
+                                 .type = Node::Type::If},
                                 {.data = {.block = &body}, .type = Node::Type::Block},
                                 {.data = {.end_if = {&merge}}, .type = Node::Type::EndIf},
                                 {.data = {.block = &merge}, .type = Node::Type::Block},
@@ -76,13 +82,14 @@ int main() {
                                 (boundary % 64 == 63 &&
                                 ((!constant_left && (comparison == 1 || comparison == 2)) ||
                                  (constant_left && (comparison == 0 || comparison == 3))));
-                            const bool expected = uniform && aligned && threads == 64 && subgroup == 32;
+                            const bool expected = (guard == 1 || (uniform && aligned)) &&
+                                                  threads == 64 && subgroup == 32;
                             const bool lowered = info.shared_memory_scratch_size != 0;
                             ++tests;
                             if (lowered != expected) {
                                 ++failures;
-                                std::printf("FAIL threads=%u subgroup=%u global=%d left=%d cmp=%d boundary=%u\n",
-                                            threads, subgroup, global, constant_left, comparison, boundary);
+                                std::printf("FAIL guard=%d threads=%u subgroup=%u global=%d left=%d cmp=%d boundary=%u\n",
+                                            guard, threads, subgroup, global, constant_left, comparison, boundary);
                             }
                         }
                     }
