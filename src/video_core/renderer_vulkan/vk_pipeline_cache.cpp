@@ -1410,13 +1410,15 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
     return build;
 }
 
-void PipelineCache::FinishBuild(PipelineBuild& build) {
+void PipelineCache::FinishBuild(PipelineBuild& build, bool draw_waits) {
     // FIX-044: the GPU thread waiting for (or doing) a pipeline build holds the guest clocks.
     Common::GuestClock::CompilePause hold;
     if (!build.started.exchange(true)) {
+        g_pipeline_build_urgent = draw_waits || build.urgent; // FIX-GT7-030
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
             build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata);
+        g_pipeline_build_urgent = false;
         // The copies were only needed while building; draws use the cached infos.
         build.pipeline->SetStageInfos(build.canonical);
         build.info_copies = {};
@@ -2338,7 +2340,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 Common::Nvtx::Scope nvtx{"wait for pipeline build"}; // DIAG-056
                 WaitForBuild(*build, params);
             }
-            FinishBuild(*build);
+            FinishBuild(*build, true);
             const auto now = std::chrono::steady_clock::now();
             if (queued_states) {
                 ++queued_state_stats.waits;
@@ -2370,9 +2372,11 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         } else {
             Common::Nvtx::Scope nvtx{"build pipeline here"}; // DIAG-056
             RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
+            g_pipeline_build_urgent = true; // FIX-GT7-030
             it.value() = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, S().graphics_key, *pipeline_cache, S().infos,
                 S().runtime_infos, S().fetch_shader, S().modules, sdata);
+            g_pipeline_build_urgent = false;
         }
 
         if (S().key_uses_legacy) { // D10

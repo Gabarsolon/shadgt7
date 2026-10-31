@@ -21,6 +21,10 @@ class TextureCache;
 
 namespace Vulkan {
 
+/// FIX-GT7-030: this thread builds a pipeline a draw is waiting for: it does not wait for another
+/// build's shared libraries.
+inline thread_local bool g_pipeline_build_urgent = false;
+
 static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::SwStage::NumLogicalStages);
 static constexpr u32 MaxVertexBufferCount = 32;
 

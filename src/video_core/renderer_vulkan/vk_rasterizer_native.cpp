@@ -10151,7 +10151,14 @@ void NativeRenderer::EvictImages() {
     // at ~4 s into the next attempt 50-120 MB of them were made and uploaded again.
     static const u64 texture_budget = [] {
         const char* env = std::getenv("RYGT_NATIVE_KEEP_TEXTURES_MB");
-        return (env && *env ? std::strtoull(env, nullptr, 10) : u64{2048}) << 20;
+        if (env && *env) {
+            return u64{std::strtoull(env, nullptr, 10)} << 20;
+        }
+        // FIX-GT7-030 (NAT-VRAM-001): what the video memory setting can free here: idle textures
+        // take at most half of it (not below the budget's 1 GB floor).
+        const u64 vram = Instance::VideoMemorySettingBytes();
+        return vram != 0 ? std::min(u64{2048} << 20, std::max<u64>(vram, u64{1} << 30) / 2)
+                         : u64{2048} << 20;
     }();
     // PERF-GT7-011: only textures the game loaded and left alone: uploaded at most twice, never
     // rewritten by GPU work nor made of targets, and at most 4 at one address. Keeping every idle

@@ -25,6 +25,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/shared_build_map.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -368,62 +369,12 @@ private:
 // pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
 // pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse
 // both compiled shader libraries and only link. Libraries live until exit.
-class StageLibraryCache {
+class StageLibraryCache : public SharedBuildMap<vk::Pipeline> {
 public:
     static StageLibraryCache& Instance() {
         static StageLibraryCache cache;
         return cache;
     }
-
-    vk::Pipeline Find(u64 key) {
-        std::scoped_lock lk{mutex};
-        const auto it = libraries.find(key);
-        return it != libraries.end() ? it->second : vk::Pipeline{};
-    }
-
-    void Insert(u64 key, vk::Pipeline library) {
-        std::scoped_lock lk{mutex};
-        libraries.emplace(key, library);
-    }
-
-    /// PERF-GT7-041 (RYGT_GPL=1): the library of the key, compiled by the first caller only; a
-    /// caller that needs one another build is compiling waits for it instead of compiling it again
-    /// (a race start queues many cars that share their pixel shaders). Second: it was reused.
-    template <typename Create>
-    std::pair<vk::Pipeline, bool> GetOrCreate(u64 key, Create&& create) {
-        std::shared_future<vk::Pipeline> wait_for;
-        std::promise<vk::Pipeline> promise;
-        {
-            std::scoped_lock lk{mutex};
-            if (const auto it = libraries.find(key); it != libraries.end()) {
-                return {it->second, true};
-            }
-            if (const auto it = pending.find(key); it != pending.end()) {
-                wait_for = it->second;
-            } else {
-                pending.emplace(key, promise.get_future().share());
-            }
-        }
-        if (wait_for.valid()) {
-            ++shared_waits;
-            return {wait_for.get(), true};
-        }
-        const vk::Pipeline library = create();
-        {
-            std::scoped_lock lk{mutex};
-            libraries.emplace(key, library);
-            pending.erase(key);
-        }
-        promise.set_value(library);
-        return {library, false};
-    }
-
-    std::atomic<u64> shared_waits{};
-
-private:
-    std::mutex mutex;
-    std::unordered_map<u64, vk::Pipeline> libraries;
-    std::unordered_map<u64, std::shared_future<vk::Pipeline>> pending;
 };
 
 class LibraryKey {
@@ -1019,6 +970,10 @@ GraphicsPipeline::GraphicsPipeline(
             fragment_key.Add(sdata.multisampling.minSampleShading);
         }
         fragment_key.Add(pipeline_rendering_ci.viewMask);
+        // FIX-GT7-030: tessellated pipelines' libraries are not optimized (FIX-057): the others must
+        // not draw with them.
+        fragment_key.Add(static_cast<bool>(pipeline_info.flags &
+                                           vk::PipelineCreateFlagBits::eDisableOptimization));
         for (const auto state : dynamic_states) {
             fragment_key.Add(state);
         }
@@ -1029,74 +984,49 @@ GraphicsPipeline::GraphicsPipeline(
         // -DisablePerf 18 compiles every library for every pipeline, one after another.
         const bool share_libraries = Common::PerfFeatureEnabled(18);
         std::array<vk::Pipeline, 4> library_handles{};
+        vk::Pipeline pre_raster_library;
+        vk::Pipeline fragment_library;
+        bool pre_raster_reused = false;
+        bool fragment_reused = false;
         if (gpl_tessellated && share_libraries) {
             // PERF-GT7-041: shared libraries compiled once even when builds overlap.
+            const bool may_wait = !g_pipeline_build_urgent; // FIX-GT7-030
             auto fragment_shared = std::async(std::launch::async, [&] {
-                return library_cache.GetOrCreate(fragment_hash, [&] { return create_library(2); });
+                return library_cache.GetOrCreate(fragment_hash, may_wait,
+                                                 [&] { return create_library(2); });
             });
             library_handles[0] = create_library(0);
-            const auto [pre_raster, pre_raster_was_reused] =
-                library_cache.GetOrCreate(pre_raster_hash, [&] { return create_library(1); });
+            std::tie(pre_raster_library, pre_raster_reused) = library_cache.GetOrCreate(
+                pre_raster_hash, may_wait, [&] { return create_library(1); });
             library_handles[3] = create_library(3);
-            const auto [fragment, fragment_was_reused] = fragment_shared.get();
-            library_handles[1] = pre_raster;
-            library_handles[2] = fragment;
-            library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
-            library_link->owned_libraries[1] = vk::UniquePipeline{library_handles[3], device};
-            const auto libraries_done = std::chrono::steady_clock::now();
-            const vk::PipelineLibraryCreateInfoKHR link_libraries = {
-                .libraryCount = static_cast<u32>(library_handles.size()),
-                .pLibraries = library_handles.data(),
-            };
-            const vk::GraphicsPipelineCreateInfo link_info = {
-                .pNext = &link_libraries,
-                .layout = *pipeline_layout,
-            };
-            auto [link_result, linked] =
-                device.createGraphicsPipelineUnique(pipeline_cache, link_info);
-            ASSERT_MSG(link_result == vk::Result::eSuccess, "Failed to link graphics pipeline: {}",
-                       vk::to_string(link_result));
-            pipeline = std::move(linked);
-            SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-            LOG_WARNING(
-                Render_Vulkan,
-                "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-                "link {:.1f} ms; PERF-GT7-041 shared waits {}",
-                debug_str,
-                std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
-                pre_raster_was_reused ? "reused" : "compiled",
-                fragment_was_reused ? "reused" : "compiled",
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                          libraries_done)
-                    .count(),
-                library_cache.shared_waits.load());
-            return; // LTO is off whenever RYGT_GPL is on
-        }
-        vk::Pipeline pre_raster_library =
-            share_libraries ? library_cache.Find(pre_raster_hash) : vk::Pipeline{};
-        vk::Pipeline fragment_library =
-            share_libraries ? library_cache.Find(fragment_hash) : vk::Pipeline{};
-        const bool pre_raster_reused = bool(pre_raster_library);
-        const bool fragment_reused = bool(fragment_library);
-        // PERF-018: the two shader libraries are compiled at the same time, the fragment one
-        // on another thread.
-        std::future<vk::Pipeline> fragment_future;
-        if (!fragment_library && share_libraries) {
-            fragment_future = std::async(std::launch::async, create_library, size_t{2});
-        }
-        library_handles[0] = create_library(0);
-        if (!pre_raster_library) {
-            pre_raster_library = create_library(1);
-            library_cache.Insert(pre_raster_hash, pre_raster_library);
-        }
-        library_handles[3] = create_library(3);
-        if (fragment_future.valid()) {
-            fragment_library = fragment_future.get();
-        } else if (!fragment_library) {
-            fragment_library = create_library(2);
-        }
-        if (!fragment_reused) {
-            library_cache.Insert(fragment_hash, fragment_library);
+            std::tie(fragment_library, fragment_reused) = fragment_shared.get();
+        } else {
+            if (share_libraries) {
+                pre_raster_library = library_cache.Find(pre_raster_hash);
+                fragment_library = library_cache.Find(fragment_hash);
+            }
+            pre_raster_reused = bool(pre_raster_library);
+            fragment_reused = bool(fragment_library);
+            // PERF-018: the two shader libraries are compiled at the same time, the fragment one
+            // on another thread.
+            std::future<vk::Pipeline> fragment_future;
+            if (!fragment_library && share_libraries) {
+                fragment_future = std::async(std::launch::async, create_library, size_t{2});
+            }
+            library_handles[0] = create_library(0);
+            if (!pre_raster_library) {
+                pre_raster_library = create_library(1);
+                library_cache.Insert(pre_raster_hash, pre_raster_library);
+            }
+            library_handles[3] = create_library(3);
+            if (fragment_future.valid()) {
+                fragment_library = fragment_future.get();
+            } else if (!fragment_library) {
+                fragment_library = create_library(2);
+            }
+            if (!fragment_reused) {
+                library_cache.Insert(fragment_hash, fragment_library);
+            }
         }
         library_handles[1] = pre_raster_library;
         library_handles[2] = fragment_library;
@@ -1120,13 +1050,14 @@ GraphicsPipeline::GraphicsPipeline(
         LOG_WARNING(
             Render_Vulkan,
             "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-            "link {:.1f} ms",
+            "link {:.1f} ms; PERF-GT7-041 shared waits {}",
             debug_str,
             std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
             pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                       libraries_done)
-                .count());
+                .count(),
+            library_cache.shared_waits.load());
 
         if (!LinkTimeOptimization()) {
             return; // SHD-001: the fast-linked pipeline is the one drawn with

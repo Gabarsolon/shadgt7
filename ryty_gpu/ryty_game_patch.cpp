@@ -1097,9 +1097,19 @@ void InstallTriggerTelemetryGt7(u8* base) {
     auto* slot = reinterpret_cast<TelemetryUpdateFn*>(base + 0x53efcb0);
     auto original = reinterpret_cast<TelemetryUpdateFn>(base + 0x1d10f10);
     const u8 magic[] = {0xc7, 0x87, 0xdc, 0x01, 0, 0, 0x30, 0x53, 0x37, 0x47};
-    MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(base + 0x53efcb0, &info, sizeof(info)) || info.State != MEM_COMMIT ||
-        *slot != original || std::memcmp(base + 0x1d10f53, magic, sizeof(magic)) != 0) {
+    // FIX-GT7-030: this runs for every title: another executable may have no readable page there.
+    const auto readable = [](const u8* address, size_t size) {
+        MEMORY_BASIC_INFORMATION info{};
+        constexpr DWORD ReadAccess = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                     PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                     PAGE_EXECUTE_WRITECOPY;
+        return VirtualQuery(address, &info, sizeof(info)) != 0 && info.State == MEM_COMMIT &&
+               (info.Protect & ReadAccess) != 0 && (info.Protect & PAGE_GUARD) == 0 &&
+               address + size <= static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
+    };
+    if (!readable(base + 0x53efcb0, sizeof(*slot)) || *slot != original ||
+        !readable(base + 0x1d10f53, sizeof(magic)) ||
+        std::memcmp(base + 0x1d10f53, magic, sizeof(magic)) != 0) {
         return;
     }
     // On whenever the launcher's trigger strength slider is above 0% (the bridge scales the effects

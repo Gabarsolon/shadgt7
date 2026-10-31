@@ -232,9 +232,10 @@ u64 RecycleBudgetBytes() {
         if (const auto value = Common::RytyGameConfigValue("image_recycle_mb")) {
             bytes = std::strtoull(value->c_str(), nullptr, 10) << 20;
         }
-        // NAT-VRAM-001: freed images kept for reuse take at most 1/16 of the video memory setting.
+        // NAT-VRAM-001: freed images kept for reuse take at most 1/16 of the video memory setting
+        // (not below the budget's 1 GB floor).
         if (const u64 vram = Vulkan::Instance::VideoMemorySettingBytes(); vram != 0) {
-            bytes = std::min(bytes, vram / 16);
+            bytes = std::min(bytes, std::max<u64>(vram, u64{1} << 30) / 16);
         }
         return bytes;
     }();
