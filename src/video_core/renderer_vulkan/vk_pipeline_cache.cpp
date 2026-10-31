@@ -1038,7 +1038,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         warm_compute_thread =
             std::jthread([this](std::stop_token stop) { WarmComputePipelines(stop); });
     }
-    LoadElseScopeFixed();
     // PERF-032: the shader store: a program's stored translations are read when a draw first
     // uses it, and new translations are stored. -DisablePerf 47 leaves the store closed.
     // FIX-186 (RyGT): at any RAM setting. The launcher's 16 GB setting turns
@@ -1080,6 +1079,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
         }
     }
+    LoadElseScopeFixed(); // after the store's Open: SHD-010's clear removes them with it
     if (CompileMode() == 1 && AsyncPipelines()) {
         static std::jthread slow_motion{SlowMotionThread}; // PERF-103
     }
@@ -3535,9 +3535,7 @@ bool IsWatchedShader(u64 hash) {
 }
 
 void PipelineCache::LoadElseScopeFixed() {
-    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
-    else_scope_fixed_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-                            fmt::format("{}.else-scope-fix", serial);
+    else_scope_fixed_path = Storage::RetranslationMarksPath();
     std::ifstream file{else_scope_fixed_path};
     std::string line;
     while (std::getline(file, line)) {

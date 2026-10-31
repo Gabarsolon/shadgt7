@@ -133,6 +133,17 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
                     build, stored.empty() ? "unknown" : stored, files, bytes / 1048576.0,
                     store.string());
     }
+    // The marks count a program's permutations in the store as it was. New translations start
+    // at 0 again, and the next start would refuse those under the old marks. The stores of a
+    // game share the file: another store loses its marks too, and retranslates those programs
+    // once at worst.
+    std::error_code marks_ec;
+    std::filesystem::remove(RetranslationMarksPath(), marks_ec);
+    if (marks_ec) {
+        // The stamp stays as it was: the next start tries again.
+        LOG_ERROR(Render, "SHD-010: could not remove {}", RetranslationMarksPath().string());
+        return;
+    }
     if (is_folder) {
         std::filesystem::create_directories(store, ec);
     }
@@ -142,6 +153,11 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
 }
 
 } // namespace
+
+std::filesystem::path RetranslationMarksPath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           fmt::format("{}.else-scope-fix", Common::ElfInfo::Instance().GameSerial());
+}
 
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadGT:PipelineCacheIO");
