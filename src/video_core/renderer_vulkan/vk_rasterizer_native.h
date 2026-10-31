@@ -955,7 +955,7 @@ private:
     void ApplyRewrite(Native::ImageEntry& entry);
     /// NAT-132: fills the picture with a 32-bit pattern on the GPU (rows != 0: only those rows
     /// of the first mip and layer); false when it can't (compressed, multisampled).
-    bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows);
+    bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows, u32 first_layers = 0);
     /// NAT-134: a device buffer holding the pattern (lo, hi, lo, hi...), at least `bytes` long.
     const Native::Rhi::Buffer* PatternBuffer(u32 lo, u32 hi, u64 bytes);
     std::unordered_map<u64, std::unique_ptr<Native::Rhi::Buffer>> fill_patterns;
