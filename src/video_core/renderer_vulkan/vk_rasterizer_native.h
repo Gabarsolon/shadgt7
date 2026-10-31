@@ -251,7 +251,27 @@ private:
         u64 index_offset = 0;
         vk::IndexType index_type = vk::IndexType::eUint32;
         std::vector<const Native::ImageEntry*> written; ///< since the last barrier
-        bool buffers_written = false;                   ///< by shaders since the last barrier
+        /// PERF-GT7-043: `foreign` says something else than a dispatch wrote them.
+        struct WrittenFlag {
+            bool value = false;
+            bool foreign = false;
+            WrittenFlag& operator=(bool written) {
+                value = foreign = written;
+                return *this;
+            }
+            WrittenFlag& operator|=(bool written) {
+                value |= written;
+                foreign |= written;
+                return *this;
+            }
+            operator bool() const {
+                return value;
+            }
+        };
+        WrittenFlag buffers_written;                    ///< by shaders since the last barrier
+        /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
+        u64 run_program = 0;
+        u32 run_commands = 0;
         /// NAT-140: attachments drawn since the last pass or global barrier, and pictures
         /// sampled since the last global barrier: what a new pass has to wait for.
         std::vector<const Native::ImageEntry*> attach_dirty;
@@ -731,6 +751,8 @@ private:
     void RecordIndirect(const IndirectDraw& indirect, const IndirectBuffers& buffers,
                         bool is_indexed);
     bool NeedsBarrierFor(const DrawBindings& b) const;
+    // PERF-GT7-043
+    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded) const;
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
     void WatchPages(VAddr address, u64 size);

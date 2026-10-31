@@ -786,6 +786,7 @@ void NativeRenderer::BeginHudStream() {
     s.pipeline = vk::Pipeline{};
     s.vertex_state_known = false;
     s.commands = 0;
+    s.run_program = 0; // PERF-GT7-043
     ++s.serial;        // OPT-015
     ForgetBindings(s); // OPT-014
     // It runs after the main list: what that list wrote is finished first.
@@ -1253,6 +1254,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.pipeline = vk::Pipeline{};
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
+    s.run_program = 0; // PERF-GT7-043
     GpuTimeBegin(s); // DIAG-GT7-001: the first segment is the wait for earlier GPU work
     ++s.serial;        // OPT-015
     ForgetBindings(s); // OPT-014
@@ -6411,6 +6413,49 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
     }
 }
 
+// PERF-GT7-043: dispatches in a row of a listed program run without a barrier between them when
+// none of them writes buffers and none samples or stores a picture over memory another touched.
+// GT7's probe filter 0x490b6362 runs ~8 such dispatches at a time, each of a few groups: without
+// the barriers it takes 3.8 times less GPU time. A listed program must store into its images
+// without loading from them, and must not store the same texels twice in a run: their order is no
+// longer defined. RYGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
+bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program,
+                                     bool recorded) const {
+    static const std::vector<u64> listed = [] {
+        std::vector<u64> list;
+        const char* env = std::getenv("RYGT_NATIVE_OVERLAP_PROGRAMS");
+        for (const char* at = env ? env : "490b6362"; *at;) {
+            char* end = nullptr;
+            const u64 value = std::strtoull(at, &end, 16);
+            if (end == at) {
+                break;
+            }
+            list.push_back(value);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    if (std::ranges::find(listed, program) == listed.end() || s.run_program != program ||
+        s.run_commands != s.commands || s.buffers_written.foreign || recorded ||
+        !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
+        return true;
+    }
+    const auto meets = [](const std::vector<const Native::ImageEntry*>& pictures,
+                          const Native::ImageEntry* entry) {
+        return std::ranges::any_of(pictures, [&](const Native::ImageEntry* picture) {
+            return picture && entry->info.guest_address < picture->info.guest_address +
+                                                              picture->info.guest_size &&
+                   picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
+        });
+    };
+    return std::ranges::any_of(b.sampled, [&](const auto* entry) {
+               return entry && meets(s.written, entry);
+           }) ||
+           std::ranges::any_of(b.stored, [&](const auto* entry) {
+               return entry && meets(s.read, entry);
+           });
+}
+
 bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
     const Stream& s = stream;
     if (s.buffers_written) {
@@ -9389,6 +9434,10 @@ void NativeRenderer::DispatchDirect() {
                             false); // NAT-118
     }
     const u64 refresh_before = stats.region_refresh_ns; // DIAG-GT7-004
+    // PERF-GT7-043: what is recorded for this dispatch needs its barrier.
+    const u64 uploads_before = registry->GetStats().uploads.load(std::memory_order_relaxed);
+    const u64 barriers_before = stats.barriers;
+    const u64 copies_before = stats.source_copies;
     Stream& s = [&]() -> Stream& {
         PartClock part{&stats.dispatch_bind_ns[0]};
         return Begin();
@@ -9407,9 +9456,20 @@ void NativeRenderer::DispatchDirect() {
     }
     stats.dispatch_refresh_ns += stats.region_refresh_ns - refresh_before;
     split(1);
+    const bool image_init = device->PendingImageInit(); // PERF-GT7-043
     PrepareImages(b); // PERF-109
     split(2);
-    GlobalBarrier();
+    const u64 program = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+    const bool recorded = image_init || stats.barriers != barriers_before ||
+                          stats.source_copies != copies_before ||
+                          stats.region_refresh_ns != refresh_before ||
+                          registry->GetStats().uploads.load(std::memory_order_relaxed) !=
+                              uploads_before;
+    if (RunNeedsBarrier(s, b, program, recorded)) { // PERF-GT7-043
+        GlobalBarrier();
+    } else {
+        EndRendering();
+    }
     split(3);
     const CmdBuf cmdbuf{s.cmd};
     // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
@@ -9454,8 +9514,11 @@ void NativeRenderer::DispatchDirect() {
         r.StartFrameDumpNow(); // FIX-156 (diagnosis): a watched fill
     }
     s.buffers_written = true; // what the dispatch wrote is seen after the next barrier
+    s.buffers_written.foreign = false; // PERF-GT7-043: a barrier came first, or nothing else wrote
     ++stats.dispatches;
     ++s.commands;
+    s.run_program = program; // PERF-GT7-043
+    s.run_commands = s.commands;
     ChunkFlushCheck();
     Report();
 }
