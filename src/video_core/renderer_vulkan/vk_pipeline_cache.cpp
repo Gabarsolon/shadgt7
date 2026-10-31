@@ -4391,6 +4391,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             wg[0] * wg[1] * wg[2] == 64 && Common::PerfFeatureEnabled(31)) {
             // Wave-aligned guards can contain lane reads with or without a loop.
             needed_fixes |= 128u;
+            if (Shader::HasLaneReads(params.code)) {
+                needed_fixes |= 1024u; // FIX-GT7-028 (256, 512: its earlier forms)
+            }
         }
         if (Shader::HasWholeWaveRegions(params.code)) {
             needed_fixes |= 32u; // FIX-190

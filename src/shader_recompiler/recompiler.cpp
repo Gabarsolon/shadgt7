@@ -106,6 +106,22 @@ std::string ListGcnCode(std::span<const u32> code) {
     return out;
 }
 
+bool HasLaneReads(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Opcode::V_READLANE_B32) {
+            return true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
 bool HasLaneReadsAndLoop(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());

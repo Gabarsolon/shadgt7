@@ -605,6 +605,43 @@ public:
     }
 
 private:
+    // FIX-GT7-028: whether a condition only depends on EXEC. It must be read here: SSA turns the
+    // reads of EXEC into plain values. An EXEC scope without a branch of its own (divergence label)
+    // and a branch moved out of an if reach their if through a goto variable.
+    bool IsExecCondition(const Statement& expr) const {
+        switch (expr.type) {
+        case StatementType::Identity:
+            return expr.guest_cond == IR::Condition::Execz ||
+                   expr.guest_cond == IR::Condition::Execnz ||
+                   expr.guest_cond == IR::Condition::True ||
+                   expr.guest_cond == IR::Condition::False;
+        case StatementType::Not:
+            return IsExecCondition(*expr.op);
+        case StatementType::Or:
+            return IsExecCondition(*expr.op_a) && IsExecCondition(*expr.op_b);
+        case StatementType::Variable: {
+            const auto it = exec_variables.find(expr.id);
+            return it != exec_variables.end() && it->second;
+        }
+        default:
+            return false;
+        }
+    }
+
+    // A variable set under another condition depends on that one as well.
+    bool IsExecAssignment(const Statement& stmt) const {
+        if (!IsExecCondition(*stmt.op)) {
+            return false;
+        }
+        for (const Statement* up = stmt.up; up && up->type != StatementType::Function;
+             up = up->up) {
+            if (up->type != StatementType::If || !IsExecCondition(*up->cond)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void Visit(Statement& parent, IR::Block* break_block, IR::Block* fallthrough_block) {
         IR::Block* current_block{};
         IR::Block::iterator insert_point{};
@@ -643,6 +680,9 @@ private:
             case StatementType::SetVariable: {
                 IR::IREmitter ir{*current_block, insert_point};
                 ir.SetGotoVariable(stmt.id, VisitExpr(ir, *stmt.op));
+                const bool is_exec{IsExecAssignment(stmt)};
+                const auto [variable, added]{exec_variables.try_emplace(stmt.id, is_exec)};
+                variable->second = variable->second && is_exec;
                 break;
             }
             case StatementType::If: {
@@ -651,6 +691,7 @@ private:
                 // Implement if header block
                 IR::IREmitter ir{*current_block, insert_point};
                 const IR::U1 cond{ir.ConditionRef(VisitExpr(ir, *stmt.cond))};
+                const bool exec_scope{IsExecCondition(*stmt.cond)};
 
                 const size_t if_node_index{syntax_list.size()};
                 syntax_list.emplace_back();
@@ -670,6 +711,7 @@ private:
                 if_node.data.if_node.cond = cond;
                 if_node.data.if_node.body = then_block;
                 if_node.data.if_node.merge = merge_block;
+                if_node.data.if_node.exec_scope = exec_scope;
 
                 auto& endif_node{syntax_list.emplace_back()};
                 endif_node.type = IR::AbstractSyntaxNode::Type::EndIf;
@@ -796,6 +838,7 @@ private:
     Common::ObjectPool<IR::Inst>& inst_pool;
     Common::ObjectPool<IR::Block>& block_pool;
     IR::AbstractSyntaxList& syntax_list;
+    std::unordered_map<u32, bool> exec_variables;
 };
 
 } // Anonymous namespace

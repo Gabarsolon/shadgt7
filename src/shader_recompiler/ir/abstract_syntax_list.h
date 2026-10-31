@@ -28,6 +28,7 @@ struct AbstractSyntaxNode {
             U1 cond;
             Block* body;
             Block* merge;
+            bool exec_scope; // The condition only says which lanes EXEC holds (FIX-GT7-028).
         } if_node;
         struct {
             Block* merge;
