@@ -721,6 +721,96 @@ void InstallScriptPatches(u8* base) {
     }
 }
 
+// DIAG-GT7-043: RYGT_DUMP_SCRIPTS=<folder> saves every Adhoc script GT7 reads, one file each, with
+// the time it was read in stderr. Its buffered streams refill 2 KB at a time from these calls of
+// the game's file read (eboot 0x316fbf0), with the same arguments as in GT Sport.
+constexpr u64 kGt7FileRead = 0x316fbf0;
+constexpr u64 kGt7StreamRefillCalls[] = {0x17b48e9, 0x2b708fe, 0x2b9f011, 0x2beb4c2,
+                                         0x2bf32bc, 0x2bf58f8, 0x2bf5d16, 0x2c23a04,
+                                         0x2cf0764, 0x2cf110c, 0x2cf15e5, 0x3170d14};
+std::string g_script_dump_folder;
+std::mutex g_script_dump_mutex;
+std::vector<std::pair<void*, FILE*>> g_script_dumps;
+int g_script_dump_count = 0;
+
+// The first path in the script's symbol table, the compiled unit, as a file name.
+std::string ScriptUnitName(const u8* data, s64 read) {
+    std::string best;
+    std::string run;
+    for (s64 i = 8; i <= read; ++i) {
+        if (i < read && data[i] >= 32 && data[i] < 127) {
+            run += static_cast<char>(data[i]);
+            continue;
+        }
+        if (run.find('/') != std::string::npos) {
+            best = run;
+            break;
+        }
+        run.clear();
+    }
+    for (char& c : best) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+            c == '>' || c == '|') {
+            c = '_';
+        }
+    }
+    return best.substr(best.size() > 100 ? best.size() - 100 : 0);
+}
+
+s64 PS4_SYSV_ABI Gt7StreamRefillHook(void* file, GuestIoVec* iov) {
+    const s64 read = g_file_read(file, iov);
+    if (read <= 0 || !iov || !iov->base) {
+        return read;
+    }
+    const u8* const data = iov->base;
+    std::scoped_lock lock{g_script_dump_mutex};
+    auto entry = std::find_if(g_script_dumps.begin(), g_script_dumps.end(),
+                              [file](const auto& dump) { return dump.first == file; });
+    if (read >= 16 && std::memcmp(data, "ADCH", 4) == 0) {
+        if (entry != g_script_dumps.end()) {
+            std::fclose(entry->second);
+            g_script_dumps.erase(entry);
+        }
+        const std::string unit = ScriptUnitName(data, read);
+        const std::string path =
+            fmt::format("{}\\{:05}_{}.adc", g_script_dump_folder, ++g_script_dump_count, unit);
+        SYSTEMTIME now{};
+        GetSystemTime(&now);
+        std::fprintf(stderr, "[scripts] %02d:%02d:%02d.%03d UTC #%d %s\n", now.wHour, now.wMinute,
+                     now.wSecond, now.wMilliseconds, g_script_dump_count, unit.c_str());
+        FILE* out = std::fopen(path.c_str(), "wb");
+        if (!out) {
+            return read;
+        }
+        g_script_dumps.emplace_back(file, out);
+        entry = std::prev(g_script_dumps.end());
+    }
+    if (entry != g_script_dumps.end()) {
+        std::fwrite(data, 1, static_cast<size_t>(read), entry->second);
+        std::fflush(entry->second);
+    }
+    return read;
+}
+
+void InstallGt7ScriptDump(u8* base) {
+    const char* folder = std::getenv("RYGT_DUMP_SCRIPTS");
+    if (!folder || !folder[0]) {
+        return;
+    }
+    g_script_dump_folder = folder;
+    CreateDirectoryA(folder, nullptr);
+    u8* stubs = AllocNear(base);
+    if (!stubs) {
+        std::fprintf(stderr, "[patch] DIAG-GT7-043: no memory near the game's code for the hooks\n");
+        return;
+    }
+    g_file_read = reinterpret_cast<FileReadFn>(base + kGt7FileRead + kTextRvaShift);
+    for (size_t i = 0; i < std::size(kGt7StreamRefillCalls); ++i) {
+        RedirectCall(base, stubs + i * 16, kGt7StreamRefillCalls[i], kGt7FileRead,
+                     reinterpret_cast<void*>(&Gt7StreamRefillHook), "DIAG-GT7-043 script reads");
+    }
+}
+
 void InstallMiscHooks(u8* base) {
     const char* diag = std::getenv("RYGT_ENV_DIAG");
     const char* scale = std::getenv("RYGT_ENV_SCALE");
@@ -1224,6 +1314,7 @@ void RytyApplyGamePatches() {
     InstallMiscHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
