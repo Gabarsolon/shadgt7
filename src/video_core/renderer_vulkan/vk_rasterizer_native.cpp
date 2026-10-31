@@ -1545,6 +1545,31 @@ void NativeRenderer::PassBarrier() {
     ++stats.pass_barriers;
 }
 
+// PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame
+// ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
+// ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
+// copy, a tiling dispatch and their barriers each) took 17% of the GPU's time in a GPU Trace.
+// RYGT_NATIVE_WRITEBACK_EACH=1: after each draw, as before.
+void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
+    static const bool each = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_EACH");
+        return env && env[0] == '1';
+    }();
+    if (each) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+        }
+        return;
+    }
+    // Pictures of the same size at the same memory each write all of it: only the last one drawn
+    // counts, and goes last.
+    std::erase_if(frame_writebacks, [&](const Native::ImageEntry* other) {
+        return other->info.guest_address == entry->info.guest_address &&
+               other->info.guest_size == entry->info.guest_size;
+    });
+    frame_writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+}
+
 void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
@@ -7282,9 +7307,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             note(entry, &targets->color_ranges[cb]);
             // NAT-112: small pictures go back to guest memory.
             constexpr u64 WritebackSize = 64_KB;
-            if (entry && entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
-                std::ranges::find(writebacks, entry) == writebacks.end()) {
-                writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            if (entry && entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1) {
+                QueueWriteback(entry); // PERF-GT7-044
             }
         }
         note(targets->depth);
@@ -7293,9 +7317,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         note(entry);
         constexpr u64 WritebackSize = 64_KB; // NAT-112, as for render targets
         if (entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
-            !entry->info.props.is_depth &&
-            std::ranges::find(writebacks, entry) == writebacks.end()) {
-            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            !entry->info.props.is_depth) {
+            QueueWriteback(entry); // PERF-GT7-044
         }
     }
     s.buffers_written |= b.writes_buffers;
@@ -10220,6 +10243,7 @@ void NativeRenderer::EvictImages() {
         held_versions.erase(&entry);
         std::erase(stream.written, &entry);
         std::erase(writebacks, &entry);
+        std::erase(frame_writebacks, &entry); // PERF-GT7-044
         std::erase(dump_entries, &entry);
         for (auto it = stencil_owners.begin(); it != stencil_owners.end();) {
             auto& owners = it->second;
@@ -10656,6 +10680,13 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
         ++in_place.frames;
     }
+    // PERF-GT7-044: this frame's pictures go back after the next global barrier.
+    for (auto* entry : frame_writebacks) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+    }
+    frame_writebacks.clear();
     ++frame;
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     if (RyDiag::Enabled() && !AbOn()) {

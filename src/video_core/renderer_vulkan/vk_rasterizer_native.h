@@ -943,6 +943,9 @@ private:
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
+    /// PERF-GT7-044: the small pictures drawn this frame, written back when it ends.
+    std::vector<Native::ImageEntry*> frame_writebacks;
+    void QueueWriteback(const Native::ImageEntry* entry);
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
     /// NAT-123: GPU-written images the dumped frame sampled, by texture key.
     std::vector<std::pair<std::string, const Native::ImageEntry*>> dump_textures;
