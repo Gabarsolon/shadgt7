@@ -946,6 +946,10 @@ private:
     /// PERF-GT7-044: the small pictures drawn this frame, written back when it ends.
     std::vector<Native::ImageEntry*> frame_writebacks;
     void QueueWriteback(const Native::ImageEntry* entry);
+    /// PERF-GT7-044: pictures waiting for the frame's end go back before work over their memory.
+    void WritebacksBefore(VAddr address, u64 size);
+    void WritebacksBefore(const DrawBindings& b);
+    bool writebacks_due = false; ///< some of them wait for the next global barrier
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
     /// NAT-123: GPU-written images the dumped frame sampled, by texture key.
     std::vector<std::pair<std::string, const Native::ImageEntry*>> dump_textures;

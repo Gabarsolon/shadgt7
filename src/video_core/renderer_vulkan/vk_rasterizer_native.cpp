@@ -1570,6 +1570,29 @@ void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
     frame_writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
 }
 
+// PERF-GT7-044: work that writes memory a waiting picture covers comes after that picture, as the
+// game ordered them; written back at the frame's end, the picture would overwrite the newer bytes.
+// It goes at the next global barrier, before that work, and the bytes the work leaves stay right.
+void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
+    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+        const VAddr begin = entry->info.guest_address;
+        if (address + std::max<u64>(size, 1) <= begin || begin + entry->info.guest_size <= address) {
+            return false;
+        }
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+        writebacks_due = true;
+        return true;
+    });
+}
+
+void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
+    for (const auto& [address, size] : b.gpu_writes) {
+        WritebacksBefore(address, size);
+    }
+}
+
 void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
@@ -1628,6 +1651,7 @@ void NativeRenderer::FlushWritebacks() {
         s.keep.push_back(std::move(out));
     }
     writebacks.clear();
+    writebacks_due = false;
     s.pipeline = vk::Pipeline{}; // the re-tiling binds its own pipeline
     ForgetBindings(s);            // OPT-014: and its own bindings
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
@@ -6438,7 +6462,7 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 
 bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
     const Stream& s = stream;
-    if (s.buffers_written) {
+    if (s.buffers_written || writebacks_due) {
         return true;
     }
     for (const auto* entry : b.sampled) {
@@ -7659,6 +7683,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         b.Clear();
         b.push = UserData(regs);
         BindStages(pipeline->GetStages(), regs, false, b);
+        WritebacksBefore(b); // PERF-GT7-044
     }
     if (b.failed) {
         ++stats.skipped;
@@ -9420,6 +9445,7 @@ void NativeRenderer::DispatchDirect() {
     b.Clear();
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
+    WritebacksBefore(b); // PERF-GT7-044
     if (b.failed) {
         ++stats.skipped;
         return;
@@ -9508,6 +9534,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     b.Clear();
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
+    WritebacksBefore(b); // PERF-GT7-044
     PrepareImages(b); // PERF-109
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
@@ -9636,6 +9663,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
                                      meta ? " (metadata clear)" : "")); // NAT-117
     }
     ++stats.fills;
+    WritebacksBefore(address, num_bytes); // PERF-GT7-044
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
         GlobalBarrier();
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
@@ -9672,6 +9700,13 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         r.FrameDumpEvent(fmt::format("copy {:#x}{} <- {:#x}{} ({:#x} bytes)", dst,
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
                                      num_bytes)); // NAT-117
+    }
+    // PERF-GT7-044: what it reads as well as what it overwrites.
+    if (!src_gds) {
+        WritebacksBefore(src, num_bytes);
+    }
+    if (!dst_gds) {
+        WritebacksBefore(dst, num_bytes);
     }
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
     const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
@@ -9722,6 +9757,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     Stream& s = Begin();
+    WritebacksBefore(address, data.size()); // PERF-GT7-044
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
