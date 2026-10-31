@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -17,7 +18,8 @@ namespace Vulkan {
 /// one first; then FIX-GT7-009's screen ones (draws skipped again: each builds the one on screen
 /// skipped most) in order; then PERF-GT7-025's soon ones (draws that went on without their
 /// pipeline) in draw order; then PERF-171's tessellated read-ahead ones (the cars) in order; then
-/// normal ones (read-ahead) in order; on at most `max_running` workers at once.
+/// normal ones (read-ahead) in order; on at most `max_running` workers at once. FIX-GT7-022: the
+/// read-ahead ones (tessellated and normal) only while fewer than `background_limit` run.
 class BuildQueue {
 public:
     using Job = std::function<void()>;
@@ -47,10 +49,12 @@ public:
     /// Waits for the next job. False once stopped. A job must be followed by Finished.
     bool Pop(Job& job, std::stop_token stop) {
         std::unique_lock lk{mutex};
+        const auto drawn = [&] { return urgent != 0 || !screen.empty() || !soon.empty(); };
+        const auto read_ahead = [&] { return !tessellated.empty() || jobs.size() > urgent; };
         if (!cv.wait(lk, stop, [&] {
-                return (!jobs.empty() || !screen.empty() || !soon.empty() ||
-                        !tessellated.empty()) &&
-                       running < max_running + extra_running;
+                const u32 limit = max_running + extra_running;
+                return (drawn() && running < limit) ||
+                       (read_ahead() && running < std::min(limit, background_limit));
             })) {
             return false;
         }
@@ -116,8 +120,18 @@ public:
         cv.notify_all();
     }
 
+    /// FIX-GT7-022: a read-ahead job starts only while fewer than this many jobs run.
+    void SetBackgroundLimit(u32 limit) {
+        {
+            std::scoped_lock lk{mutex};
+            background_limit = limit;
+        }
+        cv.notify_all();
+    }
+
 private:
     u32 max_running;
+    u32 background_limit = ~0u; ///< FIX-GT7-022
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<Job> jobs;        ///< urgent ones at the front, normal ones after

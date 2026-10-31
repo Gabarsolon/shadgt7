@@ -113,6 +113,74 @@ TEST(BuildQueue, ExtraRunningWidens) {
     EXPECT_TRUE(queue.ForegroundIdle());
 }
 
+TEST(BuildQueue, BackgroundLimitHoldsReadAheadOnly) {
+    // FIX-GT7-022: read-ahead jobs (tessellated, normal) start only under the background limit;
+    // the jobs of draws (urgent, screen, soon) up to the full limit.
+    BuildQueue queue{4};
+    queue.SetBackgroundLimit(1);
+    std::vector<std::string> order;
+    queue.Push([&] { order.push_back("normal"); }, BuildQueue::Kind::Normal);
+    queue.Push([&] { order.push_back("tess"); }, BuildQueue::Kind::Tessellated);
+    queue.Push([&] { order.push_back("screen"); }, BuildQueue::Kind::Screen);
+    queue.Push([&] { order.push_back("soon"); }, BuildQueue::Kind::Soon);
+    queue.Push([&] { order.push_back("urgent"); }, BuildQueue::Kind::Urgent);
+    std::stop_source stop;
+    for (int i = 0; i < 3; ++i) {
+        BuildQueue::Job job;
+        ASSERT_TRUE(queue.Pop(job, stop.get_token()));
+        job();
+    }
+    EXPECT_EQ(order, (std::vector<std::string>{"urgent", "screen", "soon"}));
+    std::atomic<bool> got{};
+    std::thread worker{[&] {
+        BuildQueue::Job next;
+        if (queue.Pop(next, stop.get_token())) {
+            next();
+            got = true;
+            queue.Finished();
+        }
+    }};
+    std::this_thread::sleep_for(50ms);
+    EXPECT_FALSE(got.load()) << "no read-ahead job starts while three draw jobs run";
+    for (int i = 0; i < 3; ++i) {
+        queue.Finished();
+    }
+    worker.join();
+    EXPECT_TRUE(got.load());
+    EXPECT_EQ(order.back(), "tess");
+    EXPECT_EQ(queue.Pending(), 1u);
+}
+
+TEST(BuildQueue, DrawJobTakesTheFreeWorker) {
+    // FIX-GT7-022: with read-ahead jobs held at the background limit, a draw's job queued later
+    // starts at once on a free worker.
+    BuildQueue queue{2};
+    queue.SetBackgroundLimit(1);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    std::stop_source stop;
+    BuildQueue::Job first;
+    ASSERT_TRUE(queue.Pop(first, stop.get_token()));
+    std::atomic<bool> got{};
+    bool drawn = false;
+    std::thread worker{[&] {
+        BuildQueue::Job next;
+        if (queue.Pop(next, stop.get_token())) {
+            next();
+            got = true;
+        }
+    }};
+    std::this_thread::sleep_for(50ms);
+    EXPECT_FALSE(got.load()) << "the second read-ahead job waits";
+    queue.Push([&] { drawn = true; }, BuildQueue::Kind::Soon);
+    worker.join();
+    EXPECT_TRUE(got.load());
+    EXPECT_TRUE(drawn) << "the draw's job took the free worker";
+    queue.Finished();
+    queue.Finished();
+    EXPECT_EQ(queue.Pending(), 1u);
+}
+
 TEST(BuildQueue, MaxRunningNarrows) {
     BuildQueue queue{2};
     queue.SetMaxRunning(1);

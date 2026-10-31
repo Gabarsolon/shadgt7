@@ -265,6 +265,10 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
 // held, so the game's frame rate drops with it), so a long compile looks like slow motion.
 static std::atomic<s64> g_last_skip_ns{};
 
+// FIX-GT7-023: the live cache, saved before the window's close ends the process.
+static std::atomic<PipelineCache*> g_exit_save_cache{};
+static std::mutex g_exit_save_mutex; // FIX-GT7-025
+
 static u32 CompileMode() {
 #ifdef RYTY_GPU
     static const u32 mode = static_cast<u32>(std::clamp(EmulatorSettings.GetCompileMode(), 0, 2));
@@ -343,6 +347,7 @@ public:
         return !queue.ForegroundIdle();
     }
     /// PERF-GT7-034: at most this many builds at once, unless a draw waits for its own.
+    /// FIX-GT7-022: read-ahead builds only.
     void SetPace(u32 limit) {
         std::scoped_lock lk{extra_mutex};
         pace = limit;
@@ -395,15 +400,23 @@ private:
     void ApplyExtra() {
         const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
                                       CompileConcurrency(), 12u);
-        u32 width = waiting > 0      ? widest
-                    : foreground > 0 ? CompileConcurrency()
-                    : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
-                                     : CompileConcurrency();
+        const u32 width = waiting > 0      ? widest
+                          : foreground > 0 ? CompileConcurrency()
+                          : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
+                                           : CompileConcurrency();
+        // FIX-GT7-022: the pace (PERF-GT7-034) holds back the read-ahead builds only, and they
+        // leave a worker free for the draws that went on without their pipeline. On a new GT7
+        // track (a city), 600 builds of draws on screen waited up to 27 s, one or two at a time,
+        // while the game ran at 35-38 ms a frame either way: buildings were missing or black for
+        // a while. In the race, a new building's build waited for a worker behind read-ahead
+        // ones of up to 1.7 s each.
+        u32 background = width;
         if (waiting == 0) {
-            width = std::clamp(pace, 1u, width); // PERF-GT7-034
+            background = std::min(std::clamp(pace, 1u, width), std::max(width - 1, 1u));
         }
         queue.SetMaxRunning(std::min(width, CompileConcurrency()));
         queue.SetExtraRunning(width > CompileConcurrency() ? width - CompileConcurrency() : 0);
+        queue.SetBackgroundLimit(background);
     }
     std::mutex extra_mutex;
     int waiting = 0;
@@ -884,10 +897,19 @@ static bool WarmComputeOn() {
     return on;
 }
 
-std::filesystem::path PipelineCache::WarmComputeDir() {
+std::filesystem::path PipelineCache::WarmComputeDir() const {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    // FIX-GT7-026: a folder per GPU and driver (the pipeline cache UUID changes with the
+    // driver): recipes hold the subgroup size and push descriptors of the device that made them,
+    // so another GPU's are never built here. Those of the folder itself (before) are left there.
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    std::string uuid;
+    for (const u8 byte : props.pipelineCacheUUID) {
+        uuid += fmt::format("{:02x}", byte);
+    }
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           fmt::format("{}.warm_compute", serial);
+           fmt::format("{}.warm_compute", serial) /
+           fmt::format("{:04x}-{:04x}-{}", props.vendorID, props.deviceID, uuid);
 }
 
 void PipelineCache::WarmComputePipelines(std::stop_token stop) {
@@ -1011,6 +1033,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         SingleSampleBarycentricRequested()));
     CreateDriverCache();
+    g_exit_save_cache.store(this); // FIX-GT7-023
     if (WarmComputeOn()) { // PERF-GT7-037
         warm_compute_thread =
             std::jthread([this](std::stop_token stop) { WarmComputePipelines(stop); });
@@ -1072,6 +1095,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
+    {
+        std::scoped_lock lk{g_exit_save_mutex}; // FIX-GT7-025: after an exit save in progress
+        g_exit_save_cache.store(nullptr);       // FIX-GT7-023
+    }
     if (warm_compute_thread.joinable()) { // PERF-GT7-037: before the caches go
         warm_compute_thread.request_stop();
         warm_compute_thread.join();
@@ -1203,9 +1230,11 @@ void PipelineCache::SaveDriverCache(bool wait) {
     if (driver_cache_writer.joinable()) {
         driver_cache_writer.join();
     }
-    pipelines_at_driver_save = num_new_pipelines;
+    // FIX-GT7-025: the count this save holds at least (its data is read after).
+    const u32 count = num_new_pipelines.load();
+    pipelines_at_driver_save = count;
     driver_cache_saved_at = std::chrono::steady_clock::now();
-    const auto write = [path = driver_cache_path](std::vector<u8> data) {
+    const auto write = [this, path = driver_cache_path, count](std::vector<u8> data) {
         // PERF-164: a cache over 1 GB is not written (GT Sport's reached 3.7 GB and stalled);
         // the file from before stays.
         if (data.size() > DriverCacheMaxBytes()) {
@@ -1223,8 +1252,14 @@ void PipelineCache::SaveDriverCache(bool wait) {
                 return;
             }
         }
+        // FIX-GT7-025: only over an older save (the exit save may have written a newer one).
         std::error_code ec;
-        std::filesystem::rename(temp, path, ec);
+        if (!driver_cache_file.Commit(count, [&] {
+                std::filesystem::rename(temp, path, ec);
+                return !ec;
+            })) {
+            std::filesystem::remove(temp, ec);
+        }
     };
     const vk::Device device = instance.GetDevice();
     const vk::PipelineCache cache = *pipeline_cache;
@@ -1264,6 +1299,48 @@ void PipelineCache::SaveDriverCache(bool wait) {
     if (wait) {
         driver_cache_writer.join();
     }
+}
+
+int PipelineCache::SaveDriverCacheNow() {
+    // FIX-GT7-023: closing the window ends the game at once (TerminateProcess, ryty_entry.cpp),
+    // so the destructor's save never runs, and PERF-167 saves a 1.6 GB cache only every 5 min. A
+    // 5-minute session on a new GT7 track (a city) kept none of its pipelines: the next race
+    // there built them again, buildings missing or black meanwhile. Read and written on the
+    // closing thread, beside a save in progress (another temporary file).
+    // FIX-GT7-025: compared with the save the file holds, not the last one asked for: an
+    // automatic save still writing when the window closes is cut short by the process's end.
+    const u32 count = num_new_pipelines.load();
+    if (driver_cache_path.empty() || !pipeline_cache || count <= driver_cache_file.Kept()) {
+        return -1;
+    }
+    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess || data.empty() || data.size() > DriverCacheMaxBytes()) {
+        return -1;
+    }
+    auto temp = driver_cache_path;
+    temp += ".exit.tmp";
+    {
+        const Common::FS::IOFile file{temp, Common::FS::FileAccessMode::Create};
+        if (!file.IsOpen() || file.Write(data) != data.size()) {
+            return -1;
+        }
+    }
+    std::error_code ec;
+    if (!driver_cache_file.Commit(count, [&] {
+            std::filesystem::rename(temp, driver_cache_path, ec);
+            return !ec;
+        })) {
+        std::filesystem::remove(temp, ec); // a newer automatic save is in the file already
+        return -1;
+    }
+    return static_cast<int>(data.size() >> 20);
+}
+
+int SaveDriverCacheAtExit() {
+    // FIX-GT7-025: the cache isn't destroyed during the save (the destructor takes the lock).
+    std::scoped_lock lk{g_exit_save_mutex};
+    PipelineCache* const cache = g_exit_save_cache.load();
+    return cache ? cache->SaveDriverCacheNow() : -1;
 }
 
 void PipelineCache::MaybeSaveDriverCache() {
@@ -3222,6 +3299,8 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     // heavy scenes (the pit straight, ~3,000 draws): every 5-10 frames one took 66 ms. A draw
     // waiting for its pipeline still widens the compiles; the draws on screen still build first
     // (FIX-GT7-009). In menus too (they run at 60 fps or wait for their pipelines).
+    // FIX-GT7-022: past the catch-up's step back, only the read-ahead builds step back: the
+    // builds of draws that went on without their pipeline keep the usual width.
     // RYGT_CATCH_UP_PACE=0: never.
     if (!paced) {
         return;
@@ -3271,8 +3350,9 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         } else if (c.pace_limit > 1 && build_workers->Busy()) {
             --c.pace_limit;
             build_workers->SetPace(c.pace_limit);
-            note(c.pace_limit == 1 ? "compiles one at a time"
-                                   : fmt::format("compiles {} at a time", c.pace_limit).c_str());
+            note(c.pace_limit == 1
+                     ? "read-ahead compiles one at a time"
+                     : fmt::format("read-ahead compiles {} at a time", c.pace_limit).c_str());
         }
         return;
     }
@@ -3284,7 +3364,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     if (c.pace_limit < usual) {
         ++c.pace_limit;
         build_workers->SetPace(c.pace_limit == usual ? 64 : c.pace_limit);
-        note(fmt::format("compiles {} at a time", c.pace_limit).c_str());
+        note(fmt::format("read-ahead compiles {} at a time", c.pace_limit).c_str());
     } else if (c.on && c.stepped_back) {
         c.stepped_back = false;
         c.stepped_seconds += std::chrono::duration<double>(now - c.stepped_since).count();
@@ -3933,13 +4013,15 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
+        // FIX-GT7-024: the lookup's on the right, as GetProgram compares (its bitsets decide).
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
-            Shader::StageSpecialization(info, runtime_info, profile, binding) != job->spec) {
+            job->spec != Shader::StageSpecialization(info, runtime_info, profile, binding)) {
             continue;
         }
         if (!insert) {
             return true;
         }
+        LogNewPermutation(program, hw_stage, params, runtime_info, binding); // DIAG-GT7-013
         size_t perm_idx = program.modules.size();
         if (const auto end = stored_perm_end.find(hash); end != stored_perm_end.end()) {
             perm_idx = std::max(perm_idx, end->second);
@@ -4598,6 +4680,53 @@ void PipelineCache::LogRepeatedPermutation(const Program& program, size_t perm_i
         }
         return;
     }
+}
+
+void PipelineCache::LogNewPermutation(const Program& program, Shader::HwStage hw_stage,
+                                      const Shader::ShaderParams& params,
+                                      const Shader::RuntimeInfo& runtime_info,
+                                      const Shader::Backend::Bindings& binding) {
+    // DIAG-GT7-013: why a known program gets a new permutation (each one is a pipeline compile,
+    // up to a second, with its draws skipped meanwhile), when its translation is taken: for a
+    // draw or for a read-ahead state, how the lookup differs from each existing permutation,
+    // with the V# of a differing buffer.
+    if (std::ranges::none_of(program.modules, [](const auto& m) { return bool(m.info); })) {
+        return;
+    }
+    static u64 events = 0;
+    const u64 event = ++events;
+    if (event > 80 && event % 100 != 0) {
+        return;
+    }
+    std::string reasons;
+    u32 listed = 0;
+    for (size_t perm_idx = 0; perm_idx < program.modules.size() && listed < 8; ++perm_idx) {
+        const auto& permutation = program.modules[perm_idx];
+        if (!permutation.info) {
+            continue;
+        }
+        ++listed;
+        auto& info = *permutation.info;
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        info.RefreshFlatBuf();
+        const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+        u32 index{};
+        const char* reason = permutation.spec.FirstDifference(spec, index);
+        reasons += fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
+        if (reason && std::string_view{reason}.starts_with("buffer") &&
+            index < info.buffers.size()) {
+            const auto sharp = info.buffers[index].GetSharp(info);
+            std::array<u32, 4> words{};
+            std::memcpy(words.data(), &sharp, sizeof(words));
+            reasons += fmt::format("(V# {:08x} {:08x} {:08x} {:08x})", words[0], words[1],
+                                   words[2], words[3]);
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GT7-013: new permutation {} of {}_{:#x} for {}; existing ones differ in:{}",
+                event, hw_stage, params.hash, regs_override ? "a read-ahead state" : "a draw",
+                reasons);
 }
 
 bool PipelineCache::IsTessEmulatedDraw() const {
