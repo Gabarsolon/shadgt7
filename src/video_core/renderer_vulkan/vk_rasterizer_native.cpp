@@ -3242,17 +3242,29 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // ranges meeting one of these stay in guest memory too.
     static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
         std::vector<std::pair<VAddr, VAddr>> list;
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
-        for (const char* at = env; at && *at;) {
-            char* end = nullptr;
-            const VAddr begin = std::strtoull(at, &end, 16);
-            if (end == at || *end != '+') {
-                break;
+        // FIX-GT7-029: GT7's per-frame memory ends at 0x208600000 or 0x208800000, past the range
+        // the launcher lists. A compute write there makes a small region; the unbounded reads,
+        // which all end at that limit, meet it and grow it over most of the per-frame memory
+        // (NAT-114): every CPU write then faults, ~100,000 protection calls in 2 s, and the frame
+        // rate drops for the rest of the session. With a list (GT7's launcher), the tail stays in
+        // guest memory too; RYGT_NATIVE_INPLACE_EXTRA, in the same form, replaces it (empty: none).
+        const char* const ranges = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        if (!extra && ranges) {
+            extra = "208000000+800000";
+        }
+        for (const char* source : {ranges, extra}) {
+            for (const char* at = source; at && *at;) {
+                char* end = nullptr;
+                const VAddr begin = std::strtoull(at, &end, 16);
+                if (end == at || *end != '+') {
+                    break;
+                }
+                at = end + 1;
+                const u64 length = std::strtoull(at, &end, 16);
+                list.emplace_back(begin, begin + std::max<u64>(length, 1));
+                at = *end == ',' ? end + 1 : end;
             }
-            at = end + 1;
-            const u64 length = std::strtoull(at, &end, 16);
-            list.emplace_back(begin, begin + std::max<u64>(length, 1));
-            at = *end == ',' ? end + 1 : end;
         }
         return list;
     }();
