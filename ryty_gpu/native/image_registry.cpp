@@ -533,7 +533,45 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }();
         const bool zero_new = info.guest_address >= zero_range.first &&
                               info.guest_address < zero_range.second;
-        if (zero_new && info.num_samples == 1) {
+        // FIX-GT7-036: a target made just after a fill that covers it starts as that fill: the
+        // fill found no picture to clear, and its bytes are not in guest memory. GT7 fills its rain
+        // layer in the scratch pool, then draws it at a size the resolution scaling just changed:
+        // the new target read guest memory, where a small picture had gone back (NAT-112), and
+        // that 64 KB page showed as a block of huge values for a frame, under a large halo.
+        // RYGT_NATIVE_FILL_NEW_TARGETS=0: as before.
+        static const bool fill_new_targets = [] {
+            const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+            return !(env && env[0] == '0');
+        }();
+        const RecentFill* fill = nullptr;
+        RecentFill found_fill{};
+        if (fill_new_targets && info.num_samples == 1) {
+            std::scoped_lock lock{recent_fills_mutex};
+            for (const RecentFill& candidate : recent_fills) {
+                if (candidate.end != 0 && candidate.frame == frame &&
+                    candidate.begin <= info.guest_address &&
+                    candidate.end >= info.guest_address + info.guest_size &&
+                    (!fill || candidate.clock > found_fill.clock)) {
+                    found_fill = candidate;
+                    fill = &found_fill;
+                }
+            }
+        }
+        if (fill) {
+            result->rewrite = ImageEntry::Rewrite::Clear;
+            result->rewrite_pattern = fill->pattern;
+            result->rewrite_bytes = info.guest_size;
+            result->rewrite_clock = fill->clock;
+            static std::atomic<u32> logged{};
+            if (const u32 n = logged++; n < 200) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-036: new target {:#x} {}x{} {} starts as the fill {:#x}+{:#x} "
+                            "pattern {:#x} {:#x} ({} so far)",
+                            info.guest_address, info.size.width, info.size.height,
+                            vk::to_string(info.pixel_format), fill->begin, fill->end - fill->begin,
+                            fill->pattern[0], fill->pattern[1], n + 1);
+            }
+        } else if (zero_new && info.num_samples == 1) {
             result->rewrite = ImageEntry::Rewrite::Clear;
             result->rewrite_pattern = {0, 0};
             result->rewrite_bytes = info.guest_size;
@@ -1136,7 +1174,18 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
     }
 }
 
+void ImageRegistry::ForgetFills(VAddr address, u64 size) {
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::scoped_lock lock{recent_fills_mutex};
+    for (RecentFill& fill : recent_fills) {
+        if (fill.end != 0 && fill.begin < end && address < fill.end) {
+            fill.end = 0;
+        }
+    }
+}
+
 void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
+    ForgetFills(address, size); // FIX-GT7-036
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             MarkStale(entry, why);
@@ -1191,7 +1240,13 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
 }
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
-                             bool exact, u64 clock) {
+                             bool exact, u64 frame, u64 clock) {
+    ForgetFills(address, size); // FIX-GT7-036: a fill says what its bytes hold until this write
+    if (pattern) {
+        std::scoped_lock lock{recent_fills_mutex}; // FIX-GT7-036
+        recent_fills[recent_fill_next++ % recent_fills.size()] = {address, address + size, *pattern,
+                                                                  clock, frame};
+    }
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
         static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
         if (pattern && dump_on_fill) {
@@ -1340,6 +1395,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
 }
 
 void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+    ForgetFills(address, size); // FIX-GT7-036
     if (WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write {:#x}+{:#x} (exact {:#x})", address,
                     size, exact);

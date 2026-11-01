@@ -7409,6 +7409,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
         if (entry && std::ranges::find(s.written, entry) == s.written.end()) {
             s.written.push_back(entry);
+            // FIX-GT7-036: its bytes are no longer what a fill before it says.
+            registry->ForgetFills(entry->info.guest_address, entry->info.guest_size);
         }
     };
     for (const auto* entry : b.sampled) {
@@ -9188,7 +9190,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
 void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                               bool exact) {
     const u64 clock = ++write_clock; // NAT-148: when the memory was rewritten
-    registry->GpuWrote(address, size, pattern, exact, clock);
+    registry->GpuWrote(address, size, pattern, exact, frame, clock);
     // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
     const auto it = stencil_owners.find(address);
     if (it == stencil_owners.end() || !pattern) {
