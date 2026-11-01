@@ -131,6 +131,8 @@ public:
         push_tag = tag;
     }
 
+    /// PERF-GT7-046: whether every job pushed so far has finished.
+    bool QueueIdle();
     /// Returns once every job pushed so far has finished. A no-op on the recorder thread.
     /// PERF-050: the caller (the command thread) then owns the caches until its next Push or
     /// ReleaseExclusive; urgent work waits for it or is run by it (RunUrgentIfExclusive).

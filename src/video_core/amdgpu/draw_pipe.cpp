@@ -433,6 +433,11 @@ void DrawPipe::RunDispatcher(std::stop_token stop) {
     }
 }
 
+bool DrawPipe::QueueIdle() {
+    std::scoped_lock lk{mutex};
+    return finished == pushed && !urgent_running;
+}
+
 void DrawPipe::Drain() {
     if (OnRecorderThread()) {
         return;
