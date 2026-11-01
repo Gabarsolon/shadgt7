@@ -252,8 +252,9 @@ private:
     bool urgent_running{};
     u64 pushed{};
     u64 finished{};
-    std::atomic<u64> pushed_jobs{};
-    std::atomic<u64> finished_jobs{};
+    // The command thread writes the one per job, the recorder the other: each its own cache line.
+    alignas(64) std::atomic<u64> pushed_jobs{};
+    alignas(64) std::atomic<u64> finished_jobs{};
     bool recorder_waiting{};
     const size_t max_pending;
     std::atomic<std::thread::id> recorder_id{};

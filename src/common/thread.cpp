@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <algorithm>
 #include <atomic>
 #include <cwctype>
@@ -129,6 +130,7 @@ struct CoreClasses {
     bool hybrid = false;
     std::vector<ULONG> compile_ids; // PERF-GT7-024: one kind of core: the compile cores
     std::vector<ULONG> game_ids;    // PERF-GT7-032: and the other cores
+    std::vector<std::vector<ULONG>> game_cores; // PERF-GT7-048: the same, by physical core
 };
 
 bool CompileCoresOn() {
@@ -201,6 +203,7 @@ const CoreClasses& GetCoreClasses() {
                 for (auto other = cores.begin(); other != it; ++other) {
                     result.game_ids.insert(result.game_ids.end(), other->second.begin(),
                                            other->second.end());
+                    result.game_cores.push_back(other->second);
                 }
                 for (; it != cores.end(); ++it) {
                     result.compile_ids.insert(result.compile_ids.end(), it->second.begin(),
@@ -264,6 +267,57 @@ void PreferCompileCores() {
 
 void AllowAllCores() {
     CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+}
+
+// PERF-GT7-048 (RYGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none):
+// a renderer thread gets a physical core of its own, both hardware threads, from the last of the
+// cores that aren't the compile cores; the others' threads run on the rest (the first core takes
+// the interrupts). Threads ask from their own loops; `wanted` false gives the core back. By default
+// the recorder's: same screens of GT7's rain pre-race, one run, 35.6 against 36.9 ms a frame, the
+// slowest tenth 39.2 against 41.8. The recorder and the command processor each, or all three, were
+// worse: the game's job threads ran short of cores (2.4 to 2.8 ms more before the next frame).
+void UpdateCoreOwner(u32 slot, bool wanted) {
+    static const u32 mask = [] {
+        const char* env = std::getenv("RYGT_CORE_OWNERS");
+        return env && *env ? u32(std::strtoul(env, nullptr, 0)) : u32{2};
+    }();
+    if (((mask >> slot) & 1) == 0) {
+        return;
+    }
+    thread_local int applied = -1;
+    const int state = wanted ? 1 : 0;
+    if (applied == state) {
+        return;
+    }
+    applied = state;
+    const auto& classes = GetCoreClasses();
+    const size_t owners = std::popcount(mask);
+    if (classes.hybrid || classes.game_cores.size() < owners + 2) {
+        return;
+    }
+    size_t index = 0; // from the last core down, in slot order
+    for (u32 i = 0; i < slot; ++i) {
+        index += (mask >> i) & 1;
+    }
+    const auto& own = classes.game_cores[classes.game_cores.size() - 1 - index];
+    if (wanted) {
+        CallSetThreadSelectedCpuSets(GetCurrentThread(), own.data(), ULONG(own.size()));
+    } else {
+        CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+    }
+    using Fn = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+    static const auto set_default = KernelProc<Fn>("SetProcessDefaultCpuSets");
+    if (slot == std::countr_zero(mask) && set_default) {
+        std::vector<ULONG> rest;
+        for (size_t i = 0; i + owners < classes.game_cores.size(); ++i) {
+            rest.insert(rest.end(), classes.game_cores[i].begin(), classes.game_cores[i].end());
+        }
+        if (wanted) {
+            set_default(GetCurrentProcess(), rest.data(), ULONG(rest.size()));
+        } else {
+            set_default(GetCurrentProcess(), nullptr, 0);
+        }
+    }
 }
 
 bool HybridCpu() {
@@ -664,6 +718,7 @@ void PreferEfficiencyCores() {}
 void PreferCompileCores() {}
 
 void AllowAllCores() {}
+void UpdateCoreOwner(u32, bool) {}
 
 bool HybridCpu() {
     return false;
