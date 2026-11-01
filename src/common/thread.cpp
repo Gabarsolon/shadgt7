@@ -131,6 +131,7 @@ struct CoreClasses {
     std::vector<ULONG> compile_ids; // PERF-GT7-024: one kind of core: the compile cores
     std::vector<ULONG> game_ids;    // PERF-GT7-032: and the other cores
     std::vector<std::vector<ULONG>> game_cores; // PERF-GT7-048: the same, by physical core
+    std::vector<std::vector<ULONG>> all_cores;  // PERF-GT7-048: every core: RYGT_COMPILE_CORES=0
 };
 
 bool CompileCoresOn() {
@@ -197,6 +198,9 @@ const CoreClasses& GetCoreClasses() {
                 offset += entry.Size;
             }
             if (cores.size() >= 4) {
+                for (const auto& [core, ids] : cores) {
+                    result.all_cores.push_back(ids);
+                }
                 const size_t count = std::max<size_t>(2, (cores.size() + 2) / 3);
                 auto it = cores.begin();
                 std::advance(it, cores.size() - count);
@@ -292,14 +296,16 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
     applied = state;
     const auto& classes = GetCoreClasses();
     const size_t owners = std::popcount(mask);
-    if (classes.hybrid || classes.game_cores.size() < owners + 2) {
+    // Without compile cores, nothing is kept from the game's threads but the owners' cores.
+    const auto& usable = CompileCoresOn() ? classes.game_cores : classes.all_cores;
+    if (classes.hybrid || usable.size() < owners + 2) {
         return;
     }
     size_t index = 0; // from the last core down, in slot order
     for (u32 i = 0; i < slot; ++i) {
         index += (mask >> i) & 1;
     }
-    const auto& own = classes.game_cores[classes.game_cores.size() - 1 - index];
+    const auto& own = usable[usable.size() - 1 - index];
     if (wanted) {
         CallSetThreadSelectedCpuSets(GetCurrentThread(), own.data(), ULONG(own.size()));
     } else {
@@ -309,8 +315,8 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
     static const auto set_default = KernelProc<Fn>("SetProcessDefaultCpuSets");
     if (slot == std::countr_zero(mask) && set_default) {
         std::vector<ULONG> rest;
-        for (size_t i = 0; i + owners < classes.game_cores.size(); ++i) {
-            rest.insert(rest.end(), classes.game_cores[i].begin(), classes.game_cores[i].end());
+        for (size_t i = 0; i + owners < usable.size(); ++i) {
+            rest.insert(rest.end(), usable[i].begin(), usable[i].end());
         }
         if (wanted) {
             set_default(GetCurrentProcess(), rest.data(), ULONG(rest.size()));
