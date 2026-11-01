@@ -2886,6 +2886,40 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
 /// FIX-194: written ranges up to this size have their recently CPU-written pages written back.
 constexpr u64 MaxRegionWriteback = 4_MB;
 
+/// FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written ranges
+/// meeting one of these stay in guest memory too.
+static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
+    static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> list;
+        // FIX-GT7-029: GT7's per-frame memory ends at 0x208600000 or 0x208800000, past the range
+        // the launcher lists. A compute write there makes a small region; the unbounded reads,
+        // which all end at that limit, meet it and grow it over most of the per-frame memory
+        // (NAT-114): every CPU write then faults, ~100,000 protection calls in 2 s, and the frame
+        // rate drops for the rest of the session. With a list (GT7's launcher), the tail stays in
+        // guest memory too; RYGT_NATIVE_INPLACE_EXTRA, in the same form, replaces it (empty: none).
+        const char* const ranges = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        if (!extra && ranges) {
+            extra = "208000000+800000";
+        }
+        for (const char* source : {ranges, extra}) {
+            for (const char* at = source; at && *at;) {
+                char* end = nullptr;
+                const VAddr begin = std::strtoull(at, &end, 16);
+                if (end == at || *end != '+') {
+                    break;
+                }
+                at = end + 1;
+                const u64 length = std::strtoull(at, &end, 16);
+                list.emplace_back(begin, begin + std::max<u64>(length, 1));
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return list;
+    }();
+    return inplace_ranges;
+}
+
 void NativeRenderer::SnapshotBeforeWrite(VAddr address, u64 size) {
     // FIX-203: FIX-194 wrote back every page of a written range the CPU wrote lately, but a
     // shader's storage buffer covers more than it writes: GT7's compute passes bind 875 KB of
@@ -3037,11 +3071,50 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
     }
     for (auto it = first; it != regions.end() && it->second.begin < end; ++it) {
         Region& region = it->second;
-        if (region.end <= address || region.cpu_pages.empty()) {
+        if (region.end <= address) {
             continue;
         }
         const VAddr from = std::max(address, region.begin);
         const VAddr to = std::min(end, region.end);
+        // FIX-GT7-034: a listed range stays in guest memory because the game's CPU reads what the
+        // GPU writes there, but a neighbour's region can grow over it (FIX-172 only stops a write
+        // there making one). GT7's visibility states are such a range: its CPU only reads their
+        // pages, so only the 512 states in a page it also writes reached it, and the models past
+        // them in the frame's list were not drawn. The bytes written go to guest memory as they
+        // would have.
+        static const bool listed_writeback = [] {
+            const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
+            return !(env && env[0] == '0');
+        }();
+        if (listed_writeback && direct && to - from <= MaxWriteback) {
+            for (const auto& [listed_begin, listed_end] : InplaceRanges()) {
+                const VAddr copy_from = std::max(from, listed_begin);
+                const VAddr copy_to = std::min(to, listed_end);
+                if (copy_from >= copy_to ||
+                    !direct->EnsureImported(copy_from, copy_to - copy_from)) {
+                    continue;
+                }
+                Stream& s = Begin();
+                GlobalBarrier(); // behind the write
+                const vk::Buffer src{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
+                direct->ForEachPart(copy_from, copy_to - copy_from,
+                                    [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
+                                        u64 bytes) {
+                                        s.cmd.copyBuffer(
+                                            src, view.Handle(),
+                                            vk::BufferCopy{.srcOffset = copy_from - region.begin +
+                                                                        offset,
+                                                           .dstOffset = view_offset,
+                                                           .size = bytes});
+                                    });
+                s.buffers_written = true;
+                stats.region_writeback_bytes += copy_to - copy_from;
+                ++stats.region_writebacks;
+            }
+        }
+        if (region.cpu_pages.empty()) {
+            continue;
+        }
         // The pages the CPU wrote lately, in order.
         std::vector<VAddr> pages;
         const VAddr first_page = Common::AlignDown(from, 4096);
@@ -3287,37 +3360,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
         return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
     }();
-    // FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written
-    // ranges meeting one of these stay in guest memory too.
-    static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
-        std::vector<std::pair<VAddr, VAddr>> list;
-        // FIX-GT7-029: GT7's per-frame memory ends at 0x208600000 or 0x208800000, past the range
-        // the launcher lists. A compute write there makes a small region; the unbounded reads,
-        // which all end at that limit, meet it and grow it over most of the per-frame memory
-        // (NAT-114): every CPU write then faults, ~100,000 protection calls in 2 s, and the frame
-        // rate drops for the rest of the session. With a list (GT7's launcher), the tail stays in
-        // guest memory too; RYGT_NATIVE_INPLACE_EXTRA, in the same form, replaces it (empty: none).
-        const char* const ranges = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
-        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
-        if (!extra && ranges) {
-            extra = "208000000+800000";
-        }
-        for (const char* source : {ranges, extra}) {
-            for (const char* at = source; at && *at;) {
-                char* end = nullptr;
-                const VAddr begin = std::strtoull(at, &end, 16);
-                if (end == at || *end != '+') {
-                    break;
-                }
-                at = end + 1;
-                const u64 length = std::strtoull(at, &end, 16);
-                list.emplace_back(begin, begin + std::max<u64>(length, 1));
-                at = *end == ',' ? end + 1 : end;
-            }
-        }
-        return list;
-    }();
-    const bool listed_in_place = std::ranges::any_of(inplace_ranges, [&](const auto& range) {
+    const bool listed_in_place = std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
         return address < range.second && address + size > range.first;
     });
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
