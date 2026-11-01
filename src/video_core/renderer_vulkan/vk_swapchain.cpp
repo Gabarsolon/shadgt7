@@ -196,7 +196,7 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
-bool Swapchain::Present() {
+bool Swapchain::Present(u64 anti_lag_frame) {
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
@@ -205,7 +205,7 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
-    instance.AntiLagUpdate(true); // PERF-210
+    instance.AntiLagPresent(anti_lag_frame); // PERF-210
 #ifdef RYTY_GPU
     RytyDlssG::PresentStart();
     auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)

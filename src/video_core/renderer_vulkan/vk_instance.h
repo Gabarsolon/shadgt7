@@ -133,7 +133,10 @@ public:
         return vk12_features.shaderInt8;
     }
 
-    void AntiLagUpdate(bool present) const; // PERF-210
+    /// PERF-210: the frame index of a new frame's input stage, 0 without Anti-Lag.
+    u64 AntiLagInput() const;
+    /// PERF-210: closes the frame of that index; 0 sends nothing.
+    void AntiLagPresent(u64 frame) const;
 
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
@@ -639,7 +642,6 @@ private:
     bool maintenance_8{};
     bool anti_lag{};
     mutable u64 anti_lag_frame{};
-    mutable bool anti_lag_input_sent{};
     mutable std::mutex anti_lag_mutex;
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};

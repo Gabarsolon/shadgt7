@@ -78,8 +78,8 @@ public:
         return window;
     }
 
-    void AntiLagInput() {
-        instance.AntiLagUpdate(false); // PERF-210
+    u64 AntiLagInput() {
+        return instance.AntiLagInput(); // PERF-210
     }
 
     Rasterizer& GetRasterizer() const {
@@ -128,7 +128,8 @@ public:
                               VAddr cpu_address);
 #endif
 
-    void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
+    void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true,
+                 u64 anti_lag_frame = 0);
     Frame* PrepareLastFrame();
 
     /// FIX-193: in native mode, waits until the GPU has drawn the frame (a flip is only

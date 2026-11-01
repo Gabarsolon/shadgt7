@@ -1244,30 +1244,37 @@ void Instance::ReportDeviceLost() const {
     }
 }
 
-// PERF-210: the input stage runs on the game thread that submits the flip, so the driver can hold
-// the game there and start its next frame later; the present stage closes that frame.
-void Instance::AntiLagUpdate(bool present) const {
-    if (!anti_lag) {
-        return;
-    }
-    std::scoped_lock lock{anti_lag_mutex};
-    // A game that flips only at end of pipe has no input stage: no frame to close either.
-    if (present && !anti_lag_input_sent) {
-        return;
-    }
-    anti_lag_input_sent = !present;
-    if (!present) {
-        ++anti_lag_frame;
-    }
+static void SendAntiLagStage(vk::Device device, vk::AntiLagStageAMD stage, u64 frame) {
     const vk::AntiLagPresentationInfoAMD info{
-        .stage = present ? vk::AntiLagStageAMD::ePresent : vk::AntiLagStageAMD::eInput,
-        .frameIndex = anti_lag_frame,
+        .stage = stage,
+        .frameIndex = frame,
     };
-    device->antiLagUpdateAMD(vk::AntiLagDataAMD{
+    device.antiLagUpdateAMD(vk::AntiLagDataAMD{
         .mode = vk::AntiLagModeAMD::eOn,
         .maxFPS = 0,
         .pPresentationInfo = &info,
     });
+}
+
+// PERF-210: the input stage runs on the game thread that submits the flip, so the driver can hold
+// the game there and start its next frame later. The flip carries the frame's index to its
+// present, which closes that frame; repeats of a frame and flips at end of pipe carry 0.
+u64 Instance::AntiLagInput() const {
+    if (!anti_lag) {
+        return 0;
+    }
+    std::scoped_lock lock{anti_lag_mutex};
+    ++anti_lag_frame;
+    SendAntiLagStage(*device, vk::AntiLagStageAMD::eInput, anti_lag_frame);
+    return anti_lag_frame;
+}
+
+void Instance::AntiLagPresent(u64 frame) const {
+    if (!anti_lag || frame == 0) {
+        return;
+    }
+    std::scoped_lock lock{anti_lag_mutex};
+    SendAntiLagStage(*device, vk::AntiLagStageAMD::ePresent, frame);
 }
 
 } // namespace Vulkan

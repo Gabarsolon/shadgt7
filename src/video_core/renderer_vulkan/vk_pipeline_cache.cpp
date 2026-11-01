@@ -816,9 +816,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // AMD-307: the vertex order check takes locations 30/31. The stage feeding the
         // rasterizer exports NumExports() parameters, at most two locations further on (clip
         // distances, layer), so the pixel shader reads the check only when those stay below 30;
-        // the vertex side checks its own outputs the same way and then always writes it.
+        // the vertex side checks its own outputs the same way and then always writes it. The
+        // auxiliary tessellation stages of emulated rect and quad lists don't carry the copies.
         info.hw.fs.vertex_order_check =
-            profile.vertex_order_check &&
+            profile.vertex_order_check && !IsTessEmulatedDraw() &&
             regs.vs_output_config.NumExports() + 2 <= 30; // OrderCheckRefLocation
         break;
     }
