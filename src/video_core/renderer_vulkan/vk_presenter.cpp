@@ -1590,12 +1590,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 #endif
     // Recreate the swapchain if the window was resized.
+    // FIX-218: Recreate waits for the device to go idle and destroys the old swapchain and its
+    // semaphores, so it holds the submit lock, as Present's recreate does: Alt+Tab from a
+    // borderless window on an RX 6600 XT made the acquire report out of date, and the recreate
+    // ran while the command thread submitted ("Device lost during submit").
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
     if (!swapchain.AcquireNextImage()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        {
+            std::scoped_lock submit_lock{Scheduler::submit_mutex}; // FIX-218
+            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        }
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");

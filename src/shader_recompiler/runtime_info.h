@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
@@ -232,6 +233,9 @@ struct HwFragmentRuntimeInfo {
     bool quad_sample_mask{false};
     // Runtime specialization: AMD candidate, actual rasterization sample count is one.
     bool single_sample_barycentric{false};
+    // AMD-307: the pipeline's vertex exports leave locations 30/31 free for the vertex order
+    // check (set only where the device profile enables the check; formerly padding).
+    bool vertex_order_check{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -243,10 +247,14 @@ struct HwFragmentRuntimeInfo {
                clip_distance_emulation == other.clip_distance_emulation &&
                quad_sample_mask == other.quad_sample_mask &&
                single_sample_barycentric == other.single_sample_barycentric &&
+               vertex_order_check == other.vertex_order_check &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }
 };
+// AMD-307: vertex_order_check sits in former padding, so stored runtime infos keep their size.
+static_assert(offsetof(HwFragmentRuntimeInfo, vertex_order_check) + 1 ==
+              sizeof(HwFragmentRuntimeInfo));
 
 struct HwComputeRuntimeInfo {
     u32 shared_memory_size;

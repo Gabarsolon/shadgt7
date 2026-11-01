@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <array>
+#include <optional>
 #include <unordered_map>
 #include <sirit/sirit.h>
 
@@ -37,6 +38,11 @@ struct VectorIds {
     std::array<Id, 4> ids;
 };
 
+/// AMD-307: locations of the position copies for the vertex order check (Profile::
+/// vertex_order_check); parameters use the locations below them.
+inline constexpr u32 OrderCheckRefLocation = 30;
+inline constexpr u32 OrderCheckVertexLocation = 31;
+
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info, Info& info,
@@ -47,6 +53,8 @@ public:
 
     void DefineBufferProperties();
     void DefineAmdPerVertexAttribs();
+    /// AMD-307: the per-vertex index of each barycentric vertex, when the order is checked.
+    std::optional<std::array<Id, 3>> FindVertexOrder();
     void DefineWorkgroupIndex();
 
     [[nodiscard]] Id DefineInput(Id type, std::optional<u32> location = std::nullopt,
@@ -302,6 +310,12 @@ public:
     Id bary_coord_pull_model{};
     Id bary_coord_nopersp{};
     Id bary_coord_nopersp_sample{};
+    // AMD-307: the position copies for the per-triangle vertex order check.
+    u32 LastParamOutputLocation() const; ///< AMD-307
+    Id order_ref_out{};
+    Id order_vertex_out{};
+    Id order_ref_in{};
+    Id order_vertex_in{};
 
     struct TextureDefinition {
         const VectorIds* data_types;

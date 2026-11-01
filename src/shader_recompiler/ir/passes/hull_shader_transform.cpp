@@ -349,6 +349,11 @@ static IR::U32 TryOptimizeAddressModulo(IR::U32 addr, u32 stride, IR::IREmitter&
 // Read a TCS input (InputCP region) or TES input (OutputCP region)
 static IR::F32 ReadTessControlPointAttribute(IR::U32 addr, const u32 stride, IR::IREmitter& ir,
                                              u32 off_dw, bool is_output_read_in_tcs) {
+    // FIX-217: a stride of 0 declares no control point attributes (AlignUp(stride, 16) >> 4 is
+    // 0), so there is no storage to read; the read is 0 instead of a division by 0.
+    if (stride == 0) {
+        return ir.Imm32(0.0f);
+    }
     if (off_dw > 0) {
         addr = ir.IAdd(addr, ir.Imm32(off_dw));
     }
@@ -462,10 +467,15 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                     const IR::F32 data_component = ir.BitCast<IR::F32, IR::U32>(value);
 
                     if (output_kind == AttributeRegion::OutputCP) {
+                        const u32 stride = runtime_info.sw.tcs.hs_output_cp_stride;
+                        // FIX-217: a stride of 0 declares no output attributes, so the write
+                        // has no storage and is dropped.
+                        if (stride == 0) {
+                            return;
+                        }
                         if (off_dw > 0) {
                             addr = ir.IAdd(addr, ir.Imm32(off_dw));
                         }
-                        const u32 stride = runtime_info.sw.tcs.hs_output_cp_stride;
                         // Invocation ID array index is implicit, handled by SPIRV backend
                         const IR::U32 opt_addr = TryOptimizeAddressModulo(addr, stride, ir);
                         const IR::U32 offset = ir.IMod(opt_addr, ir.Imm32(stride));

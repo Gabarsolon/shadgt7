@@ -813,6 +813,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
               !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
              lowers_user_clip_planes) &&
             profile.needs_clip_distance_emulation;
+        // AMD-307: the vertex order check takes locations 30/31. The stage feeding the
+        // rasterizer exports NumExports() parameters, at most two locations further on (clip
+        // distances, layer), so the pixel shader reads the check only when those stay below 30;
+        // the vertex side checks its own outputs the same way and then always writes it.
+        info.hw.fs.vertex_order_check =
+            profile.vertex_order_check &&
+            regs.vs_output_config.NumExports() + 2 <= 30; // OrderCheckRefLocation
         break;
     }
     case HwStage::Compute: {
@@ -985,6 +992,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_fp16_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat16),
         .support_fp16_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat16),
         .support_fp32_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat32),
+        // FIX-223 (RYGT_DISCARD_KILL=0 or 1 overrides): AMD ends discarded pixels at once.
+        .discard_kills = [&] {
+            const char* env = std::getenv("RYGT_DISCARD_KILL");
+            return env && *env ? *env == '1' : instance.GetVendorID() == 0x1002;
+        }(),
         .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
         .support_fp64_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat64),
@@ -1011,9 +1023,34 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
         // DIAG-230 (diagnosis): RYGT_DIAG_NO_MANUAL_INTERP turns off per-vertex interpolation.
+        .amd_vertex_order = instance_.GetAmdVertexOrder(), // AMD-311
+        // AMD-313: FIX-215/216 drew the purple car again on an RX 7600 (fresh store), so RX 7000
+        // cards leave them out; SHADGT_AMD_NAN_RULES=0/1 overrides for any GPU.
+        .amd_nan_rules = [] {
+            if (const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); env && *env) {
+                return env[0] != '0';
+            }
+            return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
+        }(),
+        .supports_quad_derivatives = instance_.IsQuadDerivativesSupported(), // AMD-306
+        .vertex_order_check = instance_.IsVertexOrderCheckEnabled(),        // AMD-307
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
                                       !std::getenv("RYGT_DIAG_NO_MANUAL_INTERP"),
+        // AMD-315: on AMD's explicit vertex path a V_INTERP_MOV makes the whole attribute
+        // per-vertex, and the other components' V_INTERP_P2 reads then return vertex 0: flat,
+        // single-colour triangles (hills at Fuji on an RX 6600 XT). AMD's older compiler keeps
+        // that path (AMD-314), so it does GCN's P1/P2 arithmetic by hand, as 217d4011 does for
+        // the KHR path. SHADGT_MANUAL_INTERP=0/1 overrides.
+        .needs_manual_interpolation = [&] {
+            if (const char* env = std::getenv("SHADGT_MANUAL_INTERP"); env && *env) {
+                return env[0] != '0';
+            }
+            return (instance.IsFragmentShaderBarycentricSupported() &&
+                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) ||
+                   (instance.IsAmdShaderExplicitVertexParameterSupported() &&
+                    instance.IsAmdLegacyShaderCompiler());
+        }(),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .intel_arc_workarounds = instance.IsIntel(),
@@ -1029,6 +1066,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample interpolation on; KHR {}",
                     profile.supports_fragment_shader_barycentric);
     }
+    SetVertexOrderCheckCacheEnabled(profile.vertex_order_check); // AMD-307
     SetSingleSampleBarycentricCacheEnabled(UseSingleSampleBarycentric(
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         SingleSampleBarycentricRequested()));
@@ -2614,6 +2652,9 @@ bool PipelineCache::RefreshGraphicsKey() {
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
+    // FIX-220: DB_ALPHA_TO_MASK. GT Sport draws the track-edge overlays (grass and kerb paint over
+    // the asphalt) with alpha to coverage; without it their noise-masked alpha showed as dots.
+    key.alpha_to_coverage = regs.db_alpha_to_mask & 1;
     key.clip_space = regs.clipper_control.clip_space;
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
     key.prim_type =

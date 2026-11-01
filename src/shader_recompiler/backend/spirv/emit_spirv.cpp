@@ -429,6 +429,18 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         if (info.has_discard) {
             ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
         }
+        // AMD-306: GCN computes a texture's mip level from all four pixels of a quad, also inside
+        // branches. In SPIR-V implicit derivatives in a branch some quad pixels skip are
+        // undefined; AMD's RX 6000 (and older) compiler then picked wrong mip levels and smeared
+        // wall and kerb textures (RX 6600 XT), where the RX 7000 compiler kept the quads whole.
+        if (ctx.profile.supports_quad_derivatives) {
+            ctx.AddExtension("SPV_KHR_maximal_reconvergence");
+            ctx.AddExtension("SPV_KHR_quad_control");
+            ctx.AddCapability(spv::Capability::QuadControlKHR);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::MaximallyReconvergesKHR);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::QuadDerivativesKHR);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::RequireFullQuadsKHR);
+        }
         if (info.stores.GetAny(IR::Attribute::Depth)) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }

@@ -323,8 +323,13 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     }
     switch (attr) {
     case IR::Attribute::Position0:
-        return op_store(
-            ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.ConstU32(element)));
+        op_store(ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.ConstU32(element)));
+        if (Sirit::ValidId(ctx.order_ref_out)) { // AMD-307
+            op_store(ctx.OpAccessChain(ctx.output_f32, ctx.order_ref_out, ctx.ConstU32(element)));
+            op_store(
+                ctx.OpAccessChain(ctx.output_f32, ctx.order_vertex_out, ctx.ConstU32(element)));
+        }
+        return;
     case IR::Attribute::ClipDistance:
         return op_store(
             ctx.OpAccessChain(ctx.output_f32, ctx.clip_distances, ctx.ConstU32(element)));

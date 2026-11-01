@@ -940,6 +940,8 @@ static_assert(REG_DWORD(index_base_address) == ReadAheadStates::PerDrawRegisters
               REG_DWORD(max_index_size) == ReadAheadStates::PerDrawRegisters[3] &&
               REG_DWORD(num_indices) == ReadAheadStates::PerDrawRegisters[4] &&
               sizeof(Regs::index_base_address) == 2 * sizeof(u32));
+// FIX-220: DB_ALPHA_TO_MASK is context register 0x2DC, DB_DEPTH_CONTROL 0x200.
+static_assert(REG_DWORD(db_alpha_to_mask) - REG_DWORD(depth_control) == 0x2DC - 0x200);
 #undef REG_DWORD
 
 // FIX-014: draws the rasterizer filters out (Rasterizer::FilterDraw) never get a pipeline.

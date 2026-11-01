@@ -187,7 +187,19 @@ void EmitEpilogue(EmitContext& ctx) {
     }
 }
 
+// FIX-223: on AMD, pixels demoted to helpers left junk colours on discard edges
+// (magenta HUD and cockpit lights, green and purple dots on thin geometry).
 void EmitDiscard(EmitContext& ctx) {
+    if (ctx.profile.discard_kills) {
+        const Id kill_label{ctx.OpLabel()};
+        const Id merge_label{ctx.OpLabel()};
+        ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(ctx.true_value, kill_label, merge_label);
+        ctx.AddLabel(kill_label);
+        ctx.OpKill();
+        ctx.AddLabel(merge_label);
+        return;
+    }
     ctx.OpDemoteToHelperInvocationEXT();
 }
 
@@ -197,8 +209,12 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     ctx.OpBranchConditional(condition, kill_label, merge_label);
     ctx.AddLabel(kill_label);
-    ctx.OpDemoteToHelperInvocationEXT();
-    ctx.OpBranch(merge_label);
+    if (ctx.profile.discard_kills) {
+        ctx.OpKill();
+    } else {
+        ctx.OpDemoteToHelperInvocationEXT();
+        ctx.OpBranch(merge_label);
+    }
     ctx.AddLabel(merge_label);
 }
 

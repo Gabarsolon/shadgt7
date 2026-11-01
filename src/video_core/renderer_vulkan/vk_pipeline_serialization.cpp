@@ -56,6 +56,14 @@ static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
 
 namespace Vulkan {
 std::atomic<bool> single_sample_barycentric_cache_enabled{false};
+
+// AMD-307: hw.fs.vertex_order_check was padding before. Where the check is off (every device
+// except AMD's older compiler) it is cleared on load, so old stores keep matching; where it is on,
+// the shader store has its own version (cache_storage.cpp) and holds no older entries.
+static std::atomic<bool> vertex_order_check_cache_enabled{false};
+void SetVertexOrderCheckCacheEnabled(bool enabled) {
+    vertex_order_check_cache_enabled.store(enabled, std::memory_order_relaxed);
+}
 void SetSingleSampleBarycentricCacheEnabled(bool enabled) {
     single_sample_barycentric_cache_enabled.store(enabled, std::memory_order_relaxed);
 }
@@ -257,6 +265,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     if (stored_version - binary_version !=
         Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage)) {
         return false; // FIX-228
+    }
+    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+        !vertex_order_check_cache_enabled.load(std::memory_order_relaxed)) {
+        spec.runtime_info.hw.fs.vertex_order_check = false; // AMD-307
     }
     if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment && !single_sample_binary) {
         // This byte was padding in every older metadata revision.
