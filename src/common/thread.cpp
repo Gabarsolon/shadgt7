@@ -93,6 +93,34 @@ void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
 #ifdef _WIN32
 
 namespace {
+// FIX-GT7-022: the CPU set functions looked up at run time. Wine and Proton don't export all of
+// them, and a direct import kept the whole library from loading there (the game crashed at start).
+template <typename Fn>
+Fn KernelProc(const char* name) {
+    for (const wchar_t* library : {L"kernelbase.dll", L"kernel32.dll"}) {
+        if (const HMODULE module = GetModuleHandleW(library)) {
+            if (const auto found =
+                    reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(module, name)))) {
+                return found;
+            }
+        }
+    }
+    return Fn{};
+}
+
+BOOL CallGetSystemCpuSetInformation(PSYSTEM_CPU_SET_INFORMATION info, ULONG length,
+                                    PULONG returned) {
+    using Fn = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    static const auto proc = KernelProc<Fn>("GetSystemCpuSetInformation");
+    return proc && proc(info, length, returned, GetCurrentProcess(), 0);
+}
+
+BOOL CallSetThreadSelectedCpuSets(HANDLE thread, const ULONG* ids, ULONG count) {
+    using Fn = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+    static const auto proc = KernelProc<Fn>("SetThreadSelectedCpuSets");
+    return proc && proc(thread, ids, count);
+}
+
 // PERF-088: the CPU sets and their efficiency classes (the highest class is the fast cores).
 struct CoreClasses {
     std::vector<ULONG> fast_ids;
@@ -114,11 +142,11 @@ const CoreClasses& GetCoreClasses() {
     static const CoreClasses classes = [] {
         CoreClasses result;
         ULONG length = 0;
-        GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+        CallGetSystemCpuSetInformation(nullptr, 0, &length);
         std::vector<u8> buffer(length);
         auto* info = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
         if (length == 0 ||
-            !GetSystemCpuSetInformation(info, length, &length, GetCurrentProcess(), 0)) {
+            !CallGetSystemCpuSetInformation(info, length, &length)) {
             return result;
         }
         BYTE lowest = 255, highest = 0;
@@ -205,7 +233,7 @@ void PreferPerformanceCores() {
     throttling.StateMask = 0;
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling,
                          sizeof(throttling));
-    SetThreadSelectedCpuSets(GetCurrentThread(), classes.fast_ids.data(),
+    CallSetThreadSelectedCpuSets(GetCurrentThread(), classes.fast_ids.data(),
                              static_cast<ULONG>(classes.fast_ids.size()));
 }
 
@@ -218,7 +246,7 @@ void PreferEfficiencyCores() {
     if (!enabled || !classes.hybrid || classes.slow_ids.empty()) {
         return;
     }
-    SetThreadSelectedCpuSets(GetCurrentThread(), classes.slow_ids.data(),
+    CallSetThreadSelectedCpuSets(GetCurrentThread(), classes.slow_ids.data(),
                              static_cast<ULONG>(classes.slow_ids.size()));
 }
 
@@ -229,13 +257,13 @@ void PreferCompileCores() {
         return;
     }
     if (CompileCoresOn() && !classes.compile_ids.empty()) {
-        SetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
+        CallSetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
                                  static_cast<ULONG>(classes.compile_ids.size()));
     }
 }
 
 void AllowAllCores() {
-    SetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+    CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
 }
 
 bool HybridCpu() {
@@ -279,9 +307,9 @@ DriverCompileThreads& DriverThreads() {
 void ApplyCompileCores(HANDLE thread, bool wide) {
     const auto& ids = GetCoreClasses().compile_ids;
     if (wide) {
-        SetThreadSelectedCpuSets(thread, nullptr, 0);
+        CallSetThreadSelectedCpuSets(thread, nullptr, 0);
     } else {
-        SetThreadSelectedCpuSets(thread, ids.data(), static_cast<ULONG>(ids.size()));
+        CallSetThreadSelectedCpuSets(thread, ids.data(), static_cast<ULONG>(ids.size()));
     }
 }
 
@@ -505,20 +533,16 @@ struct ForegroundSelf {
 };
 thread_local ForegroundSelf foreground_self;
 
-// FIX-GT7-022: GetThreadSelectedCpuSets looked up at run time. Wine and Proton don't export it,
-// and a direct import kept the whole library from loading there (the game crashed at start).
 using GetThreadSelectedCpuSetsFn = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
 GetThreadSelectedCpuSetsFn GetThreadSelectedCpuSetsProc() {
     static const auto proc = [] {
-        for (const wchar_t* name : {L"kernelbase.dll", L"kernel32.dll"}) {
-            if (const HMODULE module = GetModuleHandleW(name)) {
-                if (const auto found = reinterpret_cast<GetThreadSelectedCpuSetsFn>(
-                        reinterpret_cast<void*>(GetProcAddress(module, "GetThreadSelectedCpuSets")))) {
-                    return found;
-                }
-            }
+        const auto found = KernelProc<GetThreadSelectedCpuSetsFn>("GetThreadSelectedCpuSets");
+        if (!found) {
+            // FIX-GT7-030: says why foreground compiles stay on the compile cores here.
+            LOG_WARNING(Common, "FIX-GT7-022: no GetThreadSelectedCpuSets (Wine, Proton): "
+                                "foreground compiles stay on the compile cores");
         }
-        return GetThreadSelectedCpuSetsFn{};
+        return found;
     }();
     return proc;
 }
@@ -543,7 +567,7 @@ void BeginForegroundCompile() {
             self.sets.resize(count);
             if (count == 0 || get_sets(current, self.sets.data(), count, &count)) {
                 self.sets.resize(count);
-                self.moved = SetThreadSelectedCpuSets(current, classes.game_ids.data(),
+                self.moved = CallSetThreadSelectedCpuSets(current, classes.game_ids.data(),
                                                       ULONG(classes.game_ids.size())) != FALSE;
             }
         }
@@ -565,7 +589,7 @@ void EndForegroundCompile() {
     if (--self.depth == 0) {
         const HANDLE current = GetCurrentThread();
         if (self.moved) {
-            SetThreadSelectedCpuSets(current, self.sets.empty() ? nullptr : self.sets.data(),
+            CallSetThreadSelectedCpuSets(current, self.sets.empty() ? nullptr : self.sets.data(),
                                      ULONG(self.sets.size()));
         }
         if (self.priority != THREAD_PRIORITY_ERROR_RETURN) {

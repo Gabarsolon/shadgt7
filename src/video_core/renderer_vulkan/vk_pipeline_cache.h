@@ -225,7 +225,7 @@ private:
     std::shared_ptr<PipelineBuild> MakePipelineBuild();
     void QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind);
     /// Builds the pipeline unless a worker already started; returns when it is built.
-    void FinishBuild(PipelineBuild& build);
+    void FinishBuild(PipelineBuild& build, bool draw_waits = false);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.
     void ReadAhead(const DrawIndirectParams params, bool restore = true);
     /// PERF-020: while new pipelines keep appearing, reads each command buffer ahead as soon as

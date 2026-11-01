@@ -1577,6 +1577,19 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
+    // NAT-VRAM-001: how many cached images the budget evicted, every 10 s while it does.
+    if (const auto now = std::chrono::steady_clock::now();
+        vram_evicted_images != vram_logged_images && now - vram_log_time >= std::chrono::seconds{10}) {
+        LOG_WARNING(Render_Vulkan,
+                    "NAT-VRAM-001: {} images evicted ({} MB) so far; used {} MB, budget {} MB, "
+                    "pressure at {} MB, critical at {} MB",
+                    vram_evicted_images, vram_evicted_bytes >> 20, total_used_memory >> 20,
+                    instance.GetTotalMemoryBudget() >> 20, pressure_gc_memory >> 20,
+                    critical_gc_memory >> 20);
+        vram_logged_images = vram_evicted_images;
+        vram_log_time = now;
+    }
+
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -1610,8 +1623,10 @@ void TextureCache::GarbageCollectImages() {
         if (download) {
             DownloadImageMemory(image_id);
         }
-        ++vram_evicted_images; // NAT-VRAM-001
-        vram_evicted_bytes += image.info.guest_size;
+        if (pressured) { // NAT-VRAM-001: not the age-based cleanup; sized as total_used_memory is
+            ++vram_evicted_images;
+            vram_evicted_bytes += Common::AlignUp(image.info.guest_size, 1024);
+        }
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -1626,19 +1641,6 @@ void TextureCache::GarbageCollectImages() {
         }
         return false;
     };
-
-    // NAT-VRAM-001: how many cached images the budget evicted, every 10 s while it does.
-    if (const auto now = std::chrono::steady_clock::now();
-        vram_evicted_images != vram_logged_images && now - vram_log_time >= std::chrono::seconds{10}) {
-        LOG_WARNING(Render_Vulkan,
-                    "NAT-VRAM-001: {} images evicted ({} MB) so far; used {} MB, budget {} MB, "
-                    "pressure at {} MB, critical at {} MB",
-                    vram_evicted_images, vram_evicted_bytes >> 20, total_used_memory >> 20,
-                    instance.GetTotalMemoryBudget() >> 20, pressure_gc_memory >> 20,
-                    critical_gc_memory >> 20);
-        vram_logged_images = vram_evicted_images;
-        vram_log_time = now;
-    }
 
     // Try to remove anything old enough and not high priority.
     configure(false);
