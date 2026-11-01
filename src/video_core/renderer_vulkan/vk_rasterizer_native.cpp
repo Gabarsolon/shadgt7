@@ -1896,6 +1896,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
         region.dirty_pages.insert(region.dirty_pages.end(), old.dirty_pages.begin(),
                                   old.dirty_pages.end());
         region.cpu_pages.merge(old.cpu_pages); // FIX-194
+        region.gpu_pages.merge(old.gpu_pages); // FIX-GT7-033
     }
     s.buffers_written = true;
     // CPU writes to it from now on are copied in before its next use.
@@ -2384,8 +2385,21 @@ void NativeRenderer::RefreshRegion(Region& region) {
             ++stats.region_partial_pages;
             continue;
         }
+        // FIX-GT7-033: a page the CPU wrote lately is compared only if the GPU wrote it since its
+        // last copy. Otherwise the compare only risks the page: a piece the region got wrong stays
+        // wrong for as long as the CPU writes the same value. GT7 builds its constants in a heap
+        // of such pages: the flag of its sky table's blit stayed 0 in the region at some addresses
+        // while guest memory held 1, the table lost 3 of its 4 rows whenever a frame's constants
+        // landed there, and the sky lost its clouds and the scene its light for that frame.
+        // RYGT_NATIVE_REGION_COMPARE=1: as before.
+        static const bool compare_all = [] {
+            const char* env = std::getenv("RYGT_NATIVE_REGION_COMPARE");
+            return env && env[0] == '1';
+        }();
+        const bool gpu_wrote = region.gpu_pages.erase(page) != 0;
         const bool compare =
-            !always_whole && (!region_writeback || recent || opened_ahead[k]);
+            !always_whole &&
+            (!region_writeback || (recent ? gpu_wrote || compare_all : opened_ahead[k]));
         // FIX-GT7-018: a page opened ahead counts as written lately only once the CPU changed it
         // (below). Counted at each refresh, every page of a chunk with one write stayed "written
         // lately" for good: opened ahead again and again, and its GPU writes written back.
@@ -3147,6 +3161,7 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
             stats.region_pages_forgotten += pages.size();
             continue;
         }
+        region.gpu_pages.insert(pages.begin(), pages.end()); // FIX-GT7-033
         Stream& s = Begin();
         GlobalBarrier(); // behind the write
         const vk::Buffer src{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
