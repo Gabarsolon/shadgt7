@@ -171,6 +171,27 @@ extern std::atomic<bool> g_watch_window;
 /// FIX-153 (diagnosis): the first 16 bytes there, as text ("unreadable" when they are not).
 std::string WatchedBytes(VAddr address);
 
+/// PERF-GT7-045: downloads recorded together: first their copies out of the images and of what
+/// their buffers hold, then one barrier, their tiling in scratch memory, one barrier and their
+/// copies to the buffers. Their ranges in the buffers must not overlap.
+struct DownloadBatch {
+    struct Tiling {
+        const Rhi::Pipeline* pipeline;
+        std::unique_ptr<Rhi::Buffer> params;
+        const Rhi::Buffer* out;
+        u64 out_offset;
+        u64 size;
+        u64 linear_offset;
+        u64 tiled_offset;
+        u32 groups;
+    };
+    std::unique_ptr<Rhi::Buffer> scratch;
+    u64 used = 0;
+    u64 alignment = 256;
+    std::vector<Tiling> tilings;
+    bool copied = false; ///< a copy went straight to its buffer
+};
+
 class ImageRegistry {
 public:
     explicit ImageRegistry(Rhi::Device& device);
@@ -299,7 +320,11 @@ public:
     /// Records copying an image back into a buffer in its guest layout (tiled again), for
     /// guest memory the CPU reads after the GPU wrote it.
     bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
-                        u64 out_offset = 0);
+                        u64 out_offset = 0, struct DownloadBatch* batch = nullptr);
+    /// PERF-GT7-045: scratch memory for downloads of up to `bytes` recorded into `batch`.
+    bool BeginDownloads(DownloadBatch& batch, u64 bytes, u64 alignment);
+    /// PERF-GT7-045: tiles the downloads recorded into `batch` and copies them to their buffers.
+    void FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch);
 
     struct Stats {
         std::atomic<u64> lookups, hits, created_textures, created_targets, uploads, upload_bytes;

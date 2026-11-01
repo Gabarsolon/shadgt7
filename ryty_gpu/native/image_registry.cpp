@@ -1813,8 +1813,56 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     return uploaded;
 }
 
+bool ImageRegistry::BeginDownloads(DownloadBatch& batch, u64 bytes, u64 alignment) {
+    batch.alignment = std::max<u64>(alignment, 256);
+    batch.used = 0;
+    batch.scratch = device.CreateBuffer({.size = bytes,
+                                         .usage = Rhi::BufferUsageStorage |
+                                                  Rhi::BufferUsageTransferSrc |
+                                                  Rhi::BufferUsageTransferDst,
+                                         .memory = Rhi::MemoryKind::DeviceLocal,
+                                         .name = "native write-back scratch"});
+    return batch.scratch != nullptr;
+}
+
+void ImageRegistry::FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch) {
+    if (batch.tilings.empty()) {
+        if (batch.copied) {
+            list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+            batch.copied = false;
+        }
+        return;
+    }
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
+    const Rhi::Pipeline* bound = nullptr;
+    for (const auto& tiling : batch.tilings) {
+        if (tiling.pipeline != bound) {
+            list.BindPipeline(tiling.pipeline);
+            bound = tiling.pipeline;
+        }
+        const std::array<Rhi::Binding, 3> bindings{{
+            {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
+             .offset = tiling.tiled_offset, .size = tiling.size},
+            {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
+             .offset = tiling.linear_offset, .size = tiling.size},
+            {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = tiling.params.get(),
+             .size = sizeof(TilingParams)},
+        }};
+        list.PushBindings(bindings);
+        list.Dispatch(tiling.groups, 1, 1);
+    }
+    list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    for (const auto& tiling : batch.tilings) {
+        list.CopyBuffer(batch.scratch.get(), tiling.tiled_offset, tiling.out, tiling.out_offset,
+                        tiling.size);
+    }
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer | Rhi::ScopeHost);
+    batch.tilings.clear(); // the device frees the temporary buffers after the GPU used them
+    batch.copied = false;
+}
+
 bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
-                                   u64 out_offset) {
+                                   u64 out_offset, DownloadBatch* batch) {
     const VideoCore::ImageInfo& info = entry.info;
     const u64 size = info.guest_size;
     if (size == 0 || out.Size() < out_offset + size) {
@@ -1826,10 +1874,35 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
             copy.buffer_offset += out_offset;
         }
         list.CopyImageToBuffer(entry.image.get(), &out, copies);
+        if (batch) {
+            batch->copied = true;
+        }
         return true;
     }
     const Rhi::Pipeline* tile = TilingPipeline(info, true);
     auto params_buffer = TilingParamsBuffer(info);
+    if (batch && tile && params_buffer) {
+        // The tiling leaves padding unwritten: the copy back keeps what guest memory holds there.
+        const u64 step = Common::AlignUp(size, batch->alignment);
+        const u64 linear_offset = batch->used;
+        const u64 tiled_offset = linear_offset + step;
+        batch->used = tiled_offset + step;
+        auto copies = MipCopies(info);
+        for (auto& copy : copies) {
+            copy.buffer_offset += linear_offset;
+        }
+        list.CopyImageToBuffer(entry.image.get(), batch->scratch.get(), copies);
+        list.CopyBuffer(&out, out_offset, batch->scratch.get(), tiled_offset, size);
+        batch->tilings.push_back({.pipeline = tile,
+                                  .params = std::move(params_buffer),
+                                  .out = &out,
+                                  .out_offset = out_offset,
+                                  .size = size,
+                                  .linear_offset = linear_offset,
+                                  .tiled_offset = tiled_offset,
+                                  .groups = static_cast<u32>((size / (info.num_bits / 8)) / 64)});
+        return true;
+    }
     auto linear = device.CreateBuffer({.size = size,
                                        .usage = Rhi::BufferUsageStorage |
                                                 Rhi::BufferUsageTransferDst,

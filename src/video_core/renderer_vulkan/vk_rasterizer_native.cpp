@@ -1612,11 +1612,38 @@ void NativeRenderer::FlushWritebacks() {
     Stream& s = stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
+    // PERF-GT7-045: a frame's ~190 pictures took 6 to 8 ms of GPU in a row at each frame's end, a
+    // tiling dispatch writing guest memory a word at a time over PCIe, and the game's next compute
+    // work waited behind them (with none, the time from the GPU's end to the next frame fell from
+    // 11.5 to 7.8 ms). Now they are tiled in video memory, then copied to guest memory together.
+    // A picture over the memory of one before it starts a new batch, so they land in the same
+    // order. RYGT_NATIVE_WRITEBACK_BATCH=0: each in turn, as before.
+    static const bool batched = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    Native::DownloadBatch batch;
+    std::vector<std::pair<VAddr, VAddr>> batch_ranges;
+    bool use_batch = false;
+    if (batched) {
+        const u64 step_alignment = std::max<u64>(alignment, 256);
+        u64 bytes = 0;
+        for (const auto* entry : writebacks) {
+            bytes += 2 * Common::AlignUp(u64(entry->info.guest_size), step_alignment);
+        }
+        use_batch = bytes != 0 && registry->BeginDownloads(batch, bytes, alignment);
+    }
     for (auto* entry : writebacks) {
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
         if (!direct || !direct->EnsureImported(address, size)) {
             continue;
+        }
+        if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
+                return address < range.second && range.first < address + size;
+            })) {
+            registry->FinishDownloads(*s.list, batch);
+            batch_ranges.clear();
         }
         const auto found = direct->FindBuffer(address, size);
         if (!found || found->second % alignment != 0) {
@@ -1625,7 +1652,9 @@ void NativeRenderer::FlushWritebacks() {
         auto out = device->WrapBuffer(
             reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
             found->first->SizeBytes());
-        if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
+        if (registry->RecordDownload(*s.list, *entry, *out, found->second,
+                                     use_batch ? &batch : nullptr)) {
+            batch_ranges.emplace_back(address, address + size);
             ++stats.writebacks;
             NoteHistory(address, size, 8, 0); // DIAG-187 (diagnosis)
             // NAT-146: regions over the picture's memory copy it in before their next use.
@@ -1651,6 +1680,9 @@ void NativeRenderer::FlushWritebacks() {
             }
         }
         s.keep.push_back(std::move(out));
+    }
+    if (use_batch) {
+        registry->FinishDownloads(*s.list, batch);
     }
     writebacks.clear();
     writebacks_due = false;
