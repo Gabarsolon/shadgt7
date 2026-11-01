@@ -392,7 +392,11 @@ private:
     std::unique_ptr<Native::Rhi::Pipeline> writeback_pipeline;
     void SnapshotBeforeWrite(VAddr address, u64 size);
     void DropWrittenBefores();
-    void NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before = nullptr);
+    void NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before = nullptr,
+                         bool shader_write = false);
+    /// FIX-203: writes back the words of a run that differ from before the work.
+    bool WriteBackChangedWords(Stream& s, const Region& region, const WrittenBefore& before,
+                               VAddr run_from, VAddr run_to);
     /// FIX-198: whether a draw whose pipeline is still building must wait for it: it draws
     /// into a picture no recent frame drew into.
     bool DrawMustNotSkip(const AmdGpu::Regs& regs);
