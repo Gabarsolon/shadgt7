@@ -9716,6 +9716,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     // resolved picture at its first read: GT Sport's minimaps, resolved into the scratch pool).
     ApplyRewrite(*src);
     ApplyRewrite(*dst);
+    registry->ForgetFills(dst->info.guest_address, dst->info.guest_size); // FIX-GT7-036
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("resolve {:#x} {}x{} x{} -> {:#x} {}x{} x{}",
                                      src->info.guest_address, src->info.size.width,
@@ -9897,6 +9898,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     WritebacksBefore(address, data.size()); // PERF-GT7-044
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
+    registry->ForgetFills(address, data.size()); // FIX-GT7-036: the bytes are no longer the fill
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
     for (auto& [base, region] : regions) {
         const VAddr begin = std::max<VAddr>(address, region.begin);
