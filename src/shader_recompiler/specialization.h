@@ -396,6 +396,9 @@ struct StageSpecialization {
                 if (fa.clip_distance_emulation != fb.clip_distance_emulation) {
                     return "fs clip distance";
                 }
+                if (fa.vertex_order_check != fb.vertex_order_check) {
+                    return "fs vertex order check";
+                }
                 for (u32 i = 0; i < fa.num_inputs; ++i) {
                     if (!(fa.inputs[i] == fb.inputs[i])) {
                         index = i;

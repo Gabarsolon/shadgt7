@@ -58,23 +58,39 @@ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
     return ctx.OpNMin(ctx.F64[1], a, b);
 }
 
+// FIX-216: MIN3 and MAX3 use NMin/NMax on every GPU: a NaN operand is ignored, as on GCN.
+// FMin3AMD/FMax3AMD (AMD GPUs) leave a NaN operand undefined; a tester's Radeon showed red and
+// yellow glows and banded skies, as NaNs in GT Sport's bloom and exposure do. The driver still
+// compiles the pair into one min3/max3 instruction.
 Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
-    if (ctx.profile.supports_trinary_minmax) {
+    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
         return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
     }
     return ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c));
 }
 
 Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
-    if (ctx.profile.supports_trinary_minmax) {
+    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
         return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
     }
     return ctx.OpNMax(ctx.F32[1], a, ctx.OpNMax(ctx.F32[1], b, c));
 }
 
 Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
-    if (ctx.profile.supports_trinary_minmax) {
+    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
         return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
+    }
+    if (ctx.profile.supports_trinary_minmax) {
+        // FIX-215: GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
+        // SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined; GT Sport's
+        // (65000, NaN, 0) HDR clamp then drew white car materials and too much bloom on Radeons,
+        // so the NaN case is selected explicitly.
+        const Id any_nan{ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
+            ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
+        const Id nan_result{
+            ctx.OpNMin(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), c)};
+        return ctx.OpSelect(ctx.F32[1], any_nan, nan_result,
+                            ctx.OpFMid3AMD(ctx.F32[1], a, b, c));
     }
     const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
     return ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx);

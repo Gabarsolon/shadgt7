@@ -116,6 +116,9 @@ private:
     /// Selects the best available present mode
     void FindPresentMode();
 
+    /// FIX-218: replaces a lost surface and queries its formats and present modes again.
+    void RecreateSurface();
+
     /// Sets the surface properties according to device capabilities
     void SetSurfaceProperties();
 
@@ -149,6 +152,7 @@ private:
     u32 image_index = 0;
     u32 frame_index = 0;
     bool needs_recreation = true;
+    bool surface_lost = false; ///< FIX-218: the next Create() makes a new surface.
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
 #ifdef RYTY_GPU

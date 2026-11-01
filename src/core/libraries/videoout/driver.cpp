@@ -435,6 +435,9 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
     RyDiag::Timeline('R', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
                      u64(u32(index)) | (u64(is_eop) << 32)); // DIAG-GT7-007
+    if (!is_eop) {
+        presenter->AntiLagInput(); // PERF-210: on the game's thread, never the command thread
+    }
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {

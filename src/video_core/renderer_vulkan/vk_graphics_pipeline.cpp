@@ -556,6 +556,7 @@ GraphicsPipeline::GraphicsPipeline(
             key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
         .sampleShadingEnable =
             fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
+        .alphaToCoverageEnable = key.alpha_to_coverage,
     };
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
@@ -672,8 +673,13 @@ GraphicsPipeline::GraphicsPipeline(
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };
+    // AMD-301: only stages the driver lists in requiredSubgroupSizeStages take the requirement
+    // (fragment from RDNA 3 on; compute only on GCN, RDNA 1 and 2, where vertex never did).
+    const vk::ShaderStageFlags sized_stages = instance.RequiredSubgroupSizeStages();
     for (auto& stage : shader_stages) {
-        stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
+        stage.pNext = instance.IsSubgroupSize64Supported() && (sized_stages & stage.stage)
+                          ? &subgroup_size_ci
+                          : nullptr;
     }
 
     const auto depth_format =

@@ -27,6 +27,7 @@ struct Profile {
     bool support_fp16_denorm_flush{};
     bool support_fp16_round_to_zero{};
     bool support_fp32_denorm_preserve{};
+    bool discard_kills{}; ///< FIX-223
     bool support_fp32_denorm_flush{};
     bool support_fp32_round_to_zero{};
     bool support_fp64_denorm_preserve{};
@@ -46,6 +47,20 @@ struct Profile {
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
     bool supports_shader_subgroup_clock{};
+    /// AMD-311: which of the six vertex orders per-vertex reads use with AMD's explicit vertex
+    /// parameter extension (index into AmdVertexOrders in spirv_emit_context.cpp; 0 as before).
+    u32 amd_vertex_order{};
+    /// AMD-313: FIX-215/216's NaN rules for MED3/MIN3/MAX3 on AMD's trinary path (default on).
+    bool amd_nan_rules{true};
+    /// AMD-306: pixel shaders keep whole quads and reconverge at the end of branches
+    /// (VK_KHR_shader_quad_control, VK_KHR_shader_maximal_reconvergence), so texture samples in
+    /// branches get their derivatives from all four pixels as on the PS4.
+    bool supports_quad_derivatives{};
+    /// AMD-307: with AMD's explicit vertex parameter extension, per-vertex reads find the vertex
+    /// order matching the barycentrics per triangle. Stages that write the position also write it
+    /// to OrderCheckRefLocation (interpolated) and OrderCheckVertexLocation (per vertex); the
+    /// pixel shader keeps the order whose blend of the per-vertex copy equals the interpolated one.
+    bool vertex_order_check{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
