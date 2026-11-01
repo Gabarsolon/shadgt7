@@ -3282,6 +3282,25 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     const u64 slot = NextOn() ? MemoHash(memo_key.data(), memo_key.size(), 0)
                               : XXH3_64bits(memo_key.data(), sizeof(memo_key));
     BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
+    // PERF-GT7-047: a region or mirror made or dropped elsewhere leaves this range's as it was
+    // (the generation moves ~9 times a frame on GT7's pre-race screens). Not for what is read in
+    // place: a later lookup may give it a mirror (NAT-150).
+    // RYGT_NATIVE_BUFFER_REVALIDATE=0: any change drops every memo, as before.
+    if (memo.address == address && memo.size == size && memo.flags == flags &&
+        memo.generation != buffer_generation) {
+        static const bool revalidate = [] {
+            const char* env = std::getenv("RYGT_NATIVE_BUFFER_REVALIDATE");
+            return !(env && env[0] == '0');
+        }();
+        const std::pair<VAddr, VAddr> range{address, address + size};
+        if (revalidate && (memo.region || memo.mirror) &&
+            memo.hard_generation == buffer_hard_generation &&
+            buffer_log.Seq() - memo.log_seq <= 64 &&
+            buffer_log.Untouched(memo.log_seq, {&range, 1})) {
+            memo.generation = buffer_generation;
+            memo.log_seq = buffer_log.Seq();
+        }
+    }
     if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
         memo.flags == flags) {
         if (memo.region || memo.mirror) {
@@ -3317,6 +3336,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             .size = size,
             .flags = flags,
             .generation = buffer_generation,
+            .hard_generation = buffer_hard_generation,
+            .log_seq = buffer_log.Seq(),
             .buffer = result->first,
             .offset = result->second,
             .region = memo_region,
@@ -5811,6 +5832,25 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         if (num_bindings <= TextureMemoViews && stage.pgm_hash != 0xaa3822a3 &&
             !r.FrameDumpCollecting()) {
             memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
+            // PERF-GT7-047: a picture made or dropped elsewhere leaves this one as it was:
+            // ~400,000 lookups per 10 s on GT7's pre-race screens went through Find again.
+            // RYGT_NATIVE_TEXTURE_REVALIDATE=0: any change drops every memo, as before.
+            if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
+                memo->generation != registry->Generation() + unmap_generation) {
+                static const bool revalidate = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_TEXTURE_REVALIDATE");
+                    return !(env && env[0] == '0');
+                }();
+                const u64 registry_now = registry->Generation();
+                const u64 unmap_now = unmap_generation.load(std::memory_order_acquire);
+                const std::pair<VAddr, VAddr> range{memo->range_begin, memo->range_end};
+                if (revalidate && memo->unmap_generation == unmap_now &&
+                    registry_now - memo->registry_generation <= 256 &&
+                    registry->Untouched(memo->registry_generation, {&range, 1})) {
+                    memo->generation = registry_now + unmap_now;
+                    memo->registry_generation = registry_now;
+                }
+            }
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
@@ -5947,7 +5987,14 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             for (u32 i = 0; i < num_bindings; ++i) {
                 memo->views[i] = b.images[first + i].imageView;
             }
-            memo->generation = registry->Generation() + unmap_generation;
+            memo->registry_generation = registry->Generation();
+            memo->unmap_generation = unmap_generation.load(std::memory_order_acquire);
+            memo->generation = memo->registry_generation + memo->unmap_generation;
+            // PERF-GT7-047: what Find looked at, and the picture it answered with.
+            memo->range_begin = std::min(desc.info.guest_address, entry->info.guest_address);
+            memo->range_end =
+                std::max(desc.info.guest_address + std::max<u64>(desc.info.guest_size, 1),
+                         entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
         (storage ? b.stored : b.sampled).push_back(entry);
         slot_text([&] {
@@ -9964,6 +10011,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         });
     }
     ++buffer_generation;        // OPT-003
+    ++buffer_hard_generation;   // PERF-GT7-047
     ++unmap_generation;         // OPT-002
 }
 
@@ -11067,6 +11115,7 @@ void NativeRenderer::VerifyMirrors() {
     }
     if (changed != 0) {
         ++buffer_generation; // OPT-003: memos see the dirty pages
+        ++buffer_hard_generation; // PERF-GT7-047
     }
 }
 

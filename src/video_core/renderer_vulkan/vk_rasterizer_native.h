@@ -591,6 +591,8 @@ private:
         u64 size = 0;
         u32 flags = 0;
         u64 generation = ~u64{0};
+        u64 hard_generation = 0; ///< PERF-GT7-047
+        u64 log_seq = 0;
         vk::Buffer buffer{};
         u64 offset = 0;
         Region* region = nullptr;
@@ -599,6 +601,7 @@ private:
     };
     std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
+    u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
     MemoKind memo_kind = MemoKind::None;
@@ -626,6 +629,10 @@ private:
         u64 generation = ~u64{0};
         Native::ImageEntry* entry = nullptr;
         std::array<vk::ImageView, Views> views{};
+        u64 registry_generation = 0; ///< PERF-GT7-047
+        u64 unmap_generation = 0;
+        VAddr range_begin = 0;
+        VAddr range_end = 0;
     };
     using TextureMemo = TextureMemoOf<TextureMemoViews>;
     using JobTextureMemo = TextureMemoOf<4>; ///< OPT-010's, per job thread (thread-local)
