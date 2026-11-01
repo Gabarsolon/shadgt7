@@ -270,6 +270,15 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 ++stats.hits;
                 if (largest != exact) {
                     ++stats.reused_larger;
+                    // FIX-GT7-035: the target of this size made before the larger one gets no
+                    // more draws, but a texture of its layout would still find it and read its
+                    // last picture. GT7's bloom draws 480x270 at 0x100a2f0000, also a 960x540
+                    // target: the next blur read a 480x270 picture from long ago, and its bright
+                    // spots stayed on the screen as white circles. Without it, the texture is a
+                    // crop of the larger target (NAT-104), as the smaller blurs there are.
+                    if (exact) {
+                        MarkReused(*exact);
+                    }
                 }
                 largest->last_use.store(frame, std::memory_order_relaxed);
                 return largest;
