@@ -150,11 +150,7 @@ void Swapchain::RecreateSurface() {
     FindPresentMode();
     // FindPresentFormat() rechecked HDR10 support; the new surface may not advertise it, so the
     // swapchain must not keep requesting it.
-#ifdef RYTY_GPU
-    needs_hdr = supports_hdr;
-#else
     needs_hdr = needs_hdr && supports_hdr;
-#endif
     const vk::Format new_format = needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format;
     LOG_WARNING(Render_Vulkan, "FIX-218: surface lost; created a new surface (HDR={})", needs_hdr);
     if (new_format != previous_format) {

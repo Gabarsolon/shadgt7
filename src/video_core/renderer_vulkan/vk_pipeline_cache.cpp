@@ -995,7 +995,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // FIX-223 (RYGT_DISCARD_KILL=0 or 1 overrides): AMD ends discarded pixels at once.
         .discard_kills = [&] {
             const char* env = std::getenv("RYGT_DISCARD_KILL");
-            return env && *env ? *env == '1' : instance.GetVendorID() == 0x1002;
+            return env && *env ? *env == '1'
+                               : instance.GetDriverID() == vk::DriverId::eAmdProprietary;
         }(),
         .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
@@ -1022,32 +1023,30 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             instance_.IsAmdShaderExplicitVertexParameterSupported(),
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
-        // DIAG-230 (diagnosis): RYGT_DIAG_NO_MANUAL_INTERP turns off per-vertex interpolation.
         .amd_vertex_order = instance_.GetAmdVertexOrder(), // AMD-311
         // AMD-313: FIX-215/216 drew the purple car again on an RX 7600 (fresh store), so RX 7000
         // cards leave them out; SHADGT_AMD_NAN_RULES=0/1 overrides for any GPU.
-        .amd_nan_rules = [] {
+        .amd_nan_rules = [&] {
             if (const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); env && *env) {
                 return env[0] != '0';
             }
-            return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
+            return !instance.IsAmdRx7000();
         }(),
         .supports_quad_derivatives = instance_.IsQuadDerivativesSupported(), // AMD-306
         .vertex_order_check = instance_.IsVertexOrderCheckEnabled(),        // AMD-307
-        .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
-                                      instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
-                                      !std::getenv("RYGT_DIAG_NO_MANUAL_INTERP"),
         // AMD-315: on AMD's explicit vertex path a V_INTERP_MOV makes the whole attribute
         // per-vertex, and the other components' V_INTERP_P2 reads then return vertex 0: flat,
         // single-colour triangles (hills at Fuji on an RX 6600 XT). AMD's older compiler keeps
         // that path (AMD-314), so it does GCN's P1/P2 arithmetic by hand, as 217d4011 does for
         // the KHR path. SHADGT_MANUAL_INTERP=0/1 overrides.
+        // DIAG-230 (diagnosis): RYGT_DIAG_NO_MANUAL_INTERP turns off per-vertex interpolation.
         .needs_manual_interpolation = [&] {
             if (const char* env = std::getenv("SHADGT_MANUAL_INTERP"); env && *env) {
                 return env[0] != '0';
             }
             return (instance.IsFragmentShaderBarycentricSupported() &&
-                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) ||
+                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
+                    !std::getenv("RYGT_DIAG_NO_MANUAL_INTERP")) ||
                    (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                     instance.IsAmdLegacyShaderCompiler());
         }(),
@@ -2229,6 +2228,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 if (a.mrt_mask != b.mrt_mask) add("mrt");
                 if (a.z_format != b.z_format || a.stencil_format != b.stencil_format ||
                     a.depth_clamp_enable != b.depth_clamp_enable) add("depth");
+                if (a.alpha_to_coverage != b.alpha_to_coverage) add("alpha to coverage");
                 if (a.prim_type != b.prim_type || a.polygon_mode != b.polygon_mode ||
                     a.clip_space != b.clip_space || a.provoking_vtx_last != b.provoking_vtx_last ||
                     a.depth_clip_enable != b.depth_clip_enable) add("raster");

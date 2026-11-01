@@ -350,11 +350,9 @@ std::optional<std::array<Id, 3>> EmitContext::FindVertexOrder() {
         OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(2U))};
     const Id reference = OpLoad(F32[4], order_ref_in);
     const Id ones = ConstF32(1.0f, 1.0f, 1.0f, 1.0f);
-    constexpr std::array<std::array<u32, 3>, 6> orders{{
-        {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
     Id best_error{};
     std::array<Id, 3> best{};
-    for (const auto& order : orders) {
+    for (const auto& order : AmdVertexOrders) {
         Id blend = OpVectorTimesScalar(F32[4], corners[order[0]], weights[0]);
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[1]], weights[1]));
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[2]], weights[2]));
