@@ -5833,7 +5833,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             !r.FrameDumpCollecting()) {
             memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
             // PERF-GT7-047: a picture made or dropped elsewhere leaves this one as it was:
-            // ~400,000 lookups per 10 s on GT7's pre-race screens went through Find again.
+            // up to ~300,000 lookups per 10 s on GT7's rain race went through Find again.
             // RYGT_NATIVE_TEXTURE_REVALIDATE=0: any change drops every memo, as before.
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
                 memo->generation != registry->Generation() + unmap_generation) {
