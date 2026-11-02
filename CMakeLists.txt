@@ -94,6 +94,14 @@ execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files
 if(GIT_CHANGES)
     string(APPEND GIT_DESC "-dirty")
 endif()
+# Each commit runs CMake again, so the description stays true: the module above doesn't see the HEAD
+# of a git worktree, and "ninja: no work to do" left the last commit's description in the build.
+execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --path-format=absolute --git-path logs/HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" OUTPUT_VARIABLE GIT_HEAD_LOG
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(EXISTS "${GIT_HEAD_LOG}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GIT_HEAD_LOG}")
+endif()
 git_branch_name(GIT_BRANCH)
 string(TIMESTAMP BUILD_DATE "%Y-%m-%d %H:%M:%S")
 
