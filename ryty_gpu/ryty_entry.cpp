@@ -235,9 +235,9 @@ void DrawWatermark() {
     const ImVec2 size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, g_watermark.c_str());
     const ImVec2 at{viewport->Pos.x + viewport->Size.x - size.x - 8.0f,
                     viewport->Pos.y + viewport->Size.y - size.y - 6.0f};
-    draw->AddText(font, font_size, {at.x + 1.0f, at.y + 1.0f}, IM_COL32(0, 0, 0, 110),
+    draw->AddText(font, font_size, {at.x + 1.0f, at.y + 1.0f}, IM_COL32(0, 0, 0, 70),
                   g_watermark.c_str());
-    draw->AddText(font, font_size, at, IM_COL32(235, 235, 235, 130), g_watermark.c_str());
+    draw->AddText(font, font_size, at, IM_COL32(235, 235, 235, 80), g_watermark.c_str());
 }
 
 // The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
