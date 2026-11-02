@@ -319,8 +319,15 @@ struct PartClock {
 
 // FIX-GT7-047: a list takes a chunk for itself even for a few KB, and keeps it until the GPU ran the
 // list. GT7's race loading has about 350 lists waiting: at 8 MB a chunk, 2.8 GB of RAM the driver
-// zeroes, for under 32 MB of data a frame.
-constexpr u64 ChunkSize = 1_MB;
+// zeroes, for under 32 MB of data a frame. RYGT_NATIVE_CHUNK_MB=8: as before.
+u64 ChunkSize() {
+    static const u64 size = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CHUNK_MB");
+        const long long mb = env ? std::strtoll(env, nullptr, 10) : 0;
+        return mb > 0 ? u64(mb) << 20 : u64{1_MB};
+    }();
+    return size;
+}
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
 
 } // namespace
@@ -1726,8 +1733,8 @@ void NativeRenderer::TrimChunks() {
         return !(env && env[0] == '0');
     }();
     constexpr u64 PeriodFrames = 150;
-    constexpr size_t KeptChunks = 128_MB / ChunkSize;
-    constexpr size_t AtMostChunks = 256_MB / ChunkSize;
+    const size_t KeptChunks = 128_MB / ChunkSize();
+    const size_t AtMostChunks = 256_MB / ChunkSize();
     if (!trim || frame % PeriodFrames != 0) {
         return;
     }
@@ -1761,23 +1768,23 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     }();
     while (!no_reuse && !retiring_chunks.empty() &&
            retiring_chunks.front().retire_tick + margin <= known) {
-        if (retiring_chunks.front().buffer->Size() == ChunkSize) {
+        if (retiring_chunks.front().buffer->Size() == ChunkSize()) {
             free_chunks.push_back(std::move(retiring_chunks.front()));
         }
         retiring_chunks.pop_front(); // larger ones are freed (after the GPU, by the device)
     }
-    if (size <= ChunkSize && !free_chunks.empty()) {
+    if (size <= ChunkSize() && !free_chunks.empty()) {
         Chunk chunk = std::move(free_chunks.back());
         free_chunks.pop_back();
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
     }
-    if (size <= ChunkSize) {
+    if (size <= ChunkSize()) {
         free_chunks_low = 0;
     }
     Chunk chunk;
     chunk.buffer = device->CreateBuffer({
-        .size = std::max(size, ChunkSize),
+        .size = std::max(size, ChunkSize()),
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
@@ -1911,9 +1918,10 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
                         });
     } else {
         // Preserve readable CPU contents and initialize holes consistently with sparse guest
-        // reads. Bound the staging allocation rather than snapshotting a whole large region.
+        // reads. Bound the staging allocation rather than snapshotting a whole large region,
+        // and to a chunk: a larger allocation has a buffer of its own, not used again (FIX-GT7-051).
         for (u64 offset = 0; offset < end - begin;) {
-            const u64 bytes = std::min<u64>(4_MB, end - begin - offset);
+            const u64 bytes = std::min<u64>({4_MB, ChunkSize(), end - begin - offset});
             const auto [upload, upload_offset, data] = Allocate(bytes, 4);
             r.memory->CopySparseMemory(begin + offset, data, bytes);
             s.cmd.copyBuffer(upload, dst, vk::BufferCopy{.srcOffset = upload_offset,
