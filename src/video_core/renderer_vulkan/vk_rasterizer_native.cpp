@@ -317,7 +317,10 @@ struct PartClock {
     }
 };
 
-constexpr u64 ChunkSize = 8_MB;
+// FIX-GT7-047: a list takes a chunk for itself even for a few KB, and keeps it until the GPU ran the
+// list. GT7's race loading has about 350 lists waiting: at 8 MB a chunk, 2.8 GB of RAM the driver
+// zeroes, for under 32 MB of data a frame.
+constexpr u64 ChunkSize = 1_MB;
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
 
 } // namespace
@@ -1713,9 +1716,9 @@ void NativeRenderer::ChunkFlushCheck() {
 }
 
 void NativeRenderer::TrimChunks() {
-    // FIX-GT7-046: free chunks were kept for good. One frame of GT7's race loading takes 350 of
-    // them, 2.8 GB of RAM the driver zeroes, and they stayed free for the rest of the session while
-    // a frame uses far fewer. What stayed free over the whole period goes back, a little at a time:
+    // FIX-GT7-046: free chunks were kept for good. GT7's race loading takes many of them at once,
+    // and they stayed free for the rest of the session while a frame uses far fewer. What stayed
+    // free over the whole period goes back, a little at a time:
     // the newest are reused first, so the oldest are the ones not needed.
     // RYGT_NATIVE_CHUNK_TRIM=0: as before.
     static const bool trim = [] {
@@ -1723,8 +1726,8 @@ void NativeRenderer::TrimChunks() {
         return !(env && env[0] == '0');
     }();
     constexpr u64 PeriodFrames = 150;
-    constexpr size_t KeptChunks = 16;
-    constexpr size_t AtMostChunks = 32;
+    constexpr size_t KeptChunks = 128_MB / ChunkSize;
+    constexpr size_t AtMostChunks = 256_MB / ChunkSize;
     if (!trim || frame % PeriodFrames != 0) {
         return;
     }
