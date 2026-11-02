@@ -38,6 +38,7 @@ struct Profile {
     bool support_fp64_signed_zero_inf_nan_preserve{};
     bool supports_image_load_store_lod{};
     bool supports_native_cube_calc{};
+    bool native_cube_sampling{};
     bool supports_trinary_minmax{};
     bool supports_buffer_fp32_atomic_min_max{};
     bool supports_image_fp32_atomic_min_max{};

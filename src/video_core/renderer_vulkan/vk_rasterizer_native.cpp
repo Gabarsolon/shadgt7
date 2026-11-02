@@ -879,6 +879,13 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     const Instance& instance = r.instance;
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
+    // Port of xacidr4inx's reflection fix (RyGT 0066): square colour images of six layers or
+    // more can be viewed as cube arrays. Not depth images (GT7's shadow cascades).
+    if (instance.IsImageCubeArraySupported() && !info.props.is_volume && !info.props.is_depth &&
+        info.size.width == info.size.height && info.resources.layers >= 6 &&
+        info.num_samples == 1) {
+        flags |= vk::ImageCreateFlagBits::eCubeCompatible;
+    }
     if (info.props.is_volume) {
         flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
         if (instance.Is2dViewOf3dSupported()) {
@@ -1037,6 +1044,9 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
         format = r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{entry.backend_features});
     }
     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
+    if (use == ViewUse::CubeSampled) {
+        view_type = vk::ImageViewType::eCubeArray;
+    }
     if (volume) {
         view_type = vk::ImageViewType::e3D;
     } else if (view_type == vk::ImageViewType::e3D) {
@@ -5734,6 +5744,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 }
             }
         }
+        const bool cube_sampling =
+            image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
@@ -5807,7 +5819,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                (u32(image_desc.is_depth) << 2) |
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
-                               (num_bindings << 16);
+                               (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings <= TextureMemoViews && stage.pgm_hash != 0xaa3822a3 &&
             !r.FrameDumpCollecting()) {
             memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
@@ -5936,7 +5948,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 view_info.range.extent.levels = 1;
             }
             const vk::ImageView view =
-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+                View(*entry, view_info, storage        ? ViewUse::Storage
+                                        : cube_sampling ? ViewUse::CubeSampled
+                                                        : ViewUse::Sampled);
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         if (memo) {
@@ -8811,6 +8825,8 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     static thread_local std::array<JobTextureMemo, 4096> memos{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
+        const bool cube_sampling =
+            image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
@@ -8841,7 +8857,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                (u32(image_desc.is_depth) << 2) |
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
-                               (num_bindings << 16);
+                               (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings > 4 || stage.pgm_hash == 0xaa3822a3) {
             return false; // the recorder (FIX-081's grass shader, long arrays)
         }
@@ -8893,7 +8909,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                 view_info.range.extent.levels = 1;
             }
             const vk::ImageView view =
-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+                View(*entry, view_info, storage        ? ViewUse::Storage
+                                        : cube_sampling ? ViewUse::CubeSampled
+                                                        : ViewUse::Sampled);
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         memo.sharp = raw_sharp;
