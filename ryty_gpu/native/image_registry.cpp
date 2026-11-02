@@ -258,7 +258,14 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
                     c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
                     c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
-                    c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
+                    c.pixel_format == info.pixel_format &&
+                    // FIX-GT7-048: 11_11_10 and 10_11_11 are one Vulkan format but not one memory
+                    // layout, and a texture is no crop of a target of the other (PlaceOf). GT7's
+                    // bloom, 480x270 in 10_11_11 at an address some screens draw 960x540 in
+                    // 11_11_10, went into that target: its 480x270 and 240x135 textures then
+                    // came from memory, the picture written back and uploaded each frame.
+                    c.props.is_bgr_packed_float == info.props.is_bgr_packed_float &&
+                    c.resources.levels == 1 &&
                     c.resources.layers == 1 && c.size.width >= info.size.width &&
                     c.size.height >= info.size.height &&
                     (!largest || u64(c.size.width) * c.size.height >
