@@ -1672,27 +1672,47 @@ void NativeRenderer::FlushWritebacks() {
                                                  Native::Rhi::BufferUsageTransferDst,
                                         .memory = Native::Rhi::MemoryKind::DeviceLocal,
                                         .name = "native write-back across views"});
-            downloaded = out && registry->RecordDownload(*s.list, *entry, *out);
-            if (downloaded) {
-                const vk::MemoryBarrier2 ready{
+            const auto ready = [&] {
+                const vk::MemoryBarrier2 barrier{
                     .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                     .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
                     .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                    .dstAccessMask =
+                        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
                 };
                 s.cmd.pipelineBarrier2(vk::DependencyInfo{
                     .memoryBarrierCount = 1,
-                    .pMemoryBarriers = &ready,
+                    .pMemoryBarriers = &barrier,
                 });
-                const vk::Buffer from{Handle<VkBuffer_T>(out->NativeHandle())};
+            };
+            if (out) {
+                const vk::Buffer buffer{Handle<VkBuffer_T>(out->NativeHandle())};
+                // The tiling leaves padding unwritten: the buffer starts with what guest memory
+                // holds there, or the copy back would put uninitialized bytes in it.
                 downloaded = direct->ForEachPart(
                     address, size,
                     [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
-                        s.cmd.copyBuffer(from, view.Handle(),
-                                         vk::BufferCopy{.srcOffset = offset,
-                                                        .dstOffset = view_offset,
+                        s.cmd.copyBuffer(view.Handle(), buffer,
+                                         vk::BufferCopy{.srcOffset = view_offset,
+                                                        .dstOffset = offset,
                                                         .size = bytes});
                     });
+                if (downloaded) {
+                    ready();
+                    downloaded = registry->RecordDownload(*s.list, *entry, *out);
+                }
+                if (downloaded) {
+                    ready();
+                    downloaded = direct->ForEachPart(
+                        address, size,
+                        [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
+                            s.cmd.copyBuffer(buffer, view.Handle(),
+                                             vk::BufferCopy{.srcOffset = offset,
+                                                            .dstOffset = view_offset,
+                                                            .size = bytes});
+                        });
+                    ready(); // a later picture over this memory starts from these bytes
+                }
             }
         }
         if (downloaded) {
