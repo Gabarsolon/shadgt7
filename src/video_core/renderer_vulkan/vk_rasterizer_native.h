@@ -968,6 +968,7 @@ private:
     /// PERF-GT7-044: the small pictures drawn this frame, written back when it ends.
     std::vector<Native::ImageEntry*> frame_writebacks;
     void QueueWriteback(const Native::ImageEntry* entry);
+    void WritebackForCpu(const Native::ImageEntry* entry); ///< FIX-GT7-041
     /// PERF-GT7-044: pictures waiting for the frame's end go back before work over their memory.
     void WritebacksBefore(VAddr address, u64 size);
     void WritebacksBefore(const DrawBindings& b);

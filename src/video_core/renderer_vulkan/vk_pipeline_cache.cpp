@@ -3166,7 +3166,18 @@ bool PipelineCache::StoredListingReady(u64 pgm_hash, bool may_skip) {
     return ready;
 }
 
+// FIX-GT7-041: GT7 draws a car's saved thumbnail once, with shaders it uses for nothing else: skipped
+// while they translate or build, the file stays without the car's colours for good.
+static bool DrawnOnce(u64 hash) {
+    constexpr std::array<u64, 2> OneShot{0x9b9bf2a4, 0x40327433};
+    return std::ranges::find(OneShot, hash) != OneShot.end();
+}
+
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
+        fragment && DrawnOnce(fragment->pgm_hash)) {
+        return true;
+    }
     // Keep going: rendering must not wait for a cosmetic pipeline.
     if (CompileMode() == 2) return false;
     // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
@@ -3947,7 +3958,8 @@ bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderPa
     // work reads what it writes). -DisablePerf 171 waits as before.
     static const bool enabled = Common::PerfFeatureEnabled(171);
     if (!enabled || force_wait || wait_for_shaders || regs_override != nullptr ||
-        sw_stage == SwStage::Compute || !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
+        sw_stage == SwStage::Compute || !AsyncTranslation() || !AsyncPipelines() || MenusWait() ||
+        DrawnOnce(params.hash)) {
         return false;
     }
     auto [it, inserted] = code_writes_memory.try_emplace(params.hash, false);

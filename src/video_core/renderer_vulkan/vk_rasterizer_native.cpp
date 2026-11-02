@@ -1547,6 +1547,40 @@ void NativeRenderer::PassBarrier() {
     ++stats.pass_barriers;
 }
 
+// FIX-150: GT Sport's small buffers from 0xf000000000 up are ones the GPU writes for the CPU
+// to read back. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
+// (ffffffffffffffff: every written range gets a region, as before).
+static VAddr InplaceFrom() {
+    static const VAddr from = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
+    }();
+    return from;
+}
+
+// FIX-GT7-041: a picture larger than NAT-112's drawn in the memory the CPU reads goes back in this
+// submission, before the fence the CPU waits for. GT7 saves a car's thumbnail this way: it copies
+// the finished 1920x1080 picture into two 1920x540 targets there, waits for the GPU and encodes
+// them to PNG, so the saved thumbnail held what that memory held before: black. GT7 draws few such
+// pictures: ten in a session with one customization. RYGT_NATIVE_WRITEBACK_CPU=0: as before.
+void NativeRenderer::WritebackForCpu(const Native::ImageEntry* entry) {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_CPU");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || entry->info.guest_address < InplaceFrom() ||
+        std::ranges::find(writebacks, entry) != writebacks.end()) {
+        return;
+    }
+    writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged++; n < 64) {
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-041: picture {:#x} {}x{} goes back for the CPU ({} so far)",
+                    entry->info.guest_address, entry->info.size.width, entry->info.size.height,
+                    n + 1);
+    }
+}
+
 // PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame
 // ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
 // ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
@@ -1619,13 +1653,49 @@ void NativeRenderer::FlushWritebacks() {
             continue;
         }
         const auto found = direct->FindBuffer(address, size);
-        if (!found || found->second % alignment != 0) {
+        if (found && found->second % alignment != 0) {
             continue;
         }
-        auto out = device->WrapBuffer(
-            reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
-            found->first->SizeBytes());
-        if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
+        // FIX-GT7-041: guest memory is imported in pieces (2 MB there), and a 4 MB picture spans
+        // three. It goes to a buffer first, then to each piece.
+        std::unique_ptr<Native::Rhi::Buffer> out;
+        bool downloaded = false;
+        if (found) {
+            out = device->WrapBuffer(
+                reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
+                found->first->SizeBytes());
+            downloaded = registry->RecordDownload(*s.list, *entry, *out, found->second);
+        } else {
+            out = device->CreateBuffer({.size = size,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferSrc |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                        .name = "native write-back across views"});
+            downloaded = out && registry->RecordDownload(*s.list, *entry, *out);
+            if (downloaded) {
+                const vk::MemoryBarrier2 ready{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                };
+                s.cmd.pipelineBarrier2(vk::DependencyInfo{
+                    .memoryBarrierCount = 1,
+                    .pMemoryBarriers = &ready,
+                });
+                const vk::Buffer from{Handle<VkBuffer_T>(out->NativeHandle())};
+                downloaded = direct->ForEachPart(
+                    address, size,
+                    [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
+                        s.cmd.copyBuffer(from, view.Handle(),
+                                         vk::BufferCopy{.srcOffset = offset,
+                                                        .dstOffset = view_offset,
+                                                        .size = bytes});
+                    });
+            }
+        }
+        if (downloaded) {
             ++stats.writebacks;
             NoteHistory(address, size, 8, 0); // DIAG-187 (diagnosis)
             // NAT-146: regions over the picture's memory copy it in before their next use.
@@ -1650,7 +1720,9 @@ void NativeRenderer::FlushWritebacks() {
                 }
             }
         }
-        s.keep.push_back(std::move(out));
+        if (out) {
+            s.keep.push_back(std::move(out));
+        }
     }
     writebacks.clear();
     writebacks_due = false;
@@ -3354,14 +3426,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         const char* env = std::getenv("RYGT_NATIVE_WRITE_REGIONS");
         return !(env && env[0] == '0');
     }();
-    // FIX-150: GT Sport's small buffers from 0xf000000000 up are ones the GPU writes for the CPU
-    // to read back (in a region the CPU never saw them: no rain drops on the windshield); written
-    // ranges there stay in guest memory. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
-    // (ffffffffffffffff: every written range gets a region, as before).
-    static const VAddr inplace_from = [] {
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
-        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
-    }();
+    // FIX-150: in a region the CPU never saw them (no rain drops on the windshield); written ranges
+    // there stay in guest memory.
+    const VAddr inplace_from = InplaceFrom();
     const bool listed_in_place = std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
         return address < range.second && address + size > range.first;
     });
@@ -7431,8 +7498,12 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             note(entry, &targets->color_ranges[cb]);
             // NAT-112: small pictures go back to guest memory.
             constexpr u64 WritebackSize = 64_KB;
-            if (entry && entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1) {
-                QueueWriteback(entry); // PERF-GT7-044
+            if (entry && entry->info.num_samples == 1) {
+                if (entry->info.guest_size <= WritebackSize) {
+                    QueueWriteback(entry); // PERF-GT7-044
+                } else {
+                    WritebackForCpu(entry); // FIX-GT7-041
+                }
             }
         }
         note(targets->depth);
