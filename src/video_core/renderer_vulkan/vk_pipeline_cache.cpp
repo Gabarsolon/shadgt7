@@ -213,7 +213,8 @@ private:
         // DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1): what each translation made.
         if (TranslateJobsDiag()) {
             LOG_WARNING(Render_Vulkan,
-                        "DIAG-GT7-073: translated #{} age {:.0f} ms ahead {} {:#x} stage {} start {}/{} {:.1f} ms, {} code "
+                        "DIAG-GT7-073: translated #{} age {:.0f} ms ahead {} {:#x} stage {} start "
+                        "{}/{} {:.1f} ms, {} code "
                         "words, spv {} words {:#x}, runtime {:#x}, user data {:#x}",
                         job.diag_id,
                         std::chrono::duration<double, std::milli>(start - job.queued_at).count(),
@@ -4260,6 +4261,9 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
         }
         if (job->too_old) {
             ++translate_stats.too_old; // FIX-GT7-052
+            if (TranslateJobsDiag()) {
+                LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} too old", job->diag_id);
+            }
             return true;
         }
         if (!job->info || !job->module) {
