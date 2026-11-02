@@ -45,13 +45,11 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
 // Version 13: stored SRT walker code also records flattened source addresses.
 // Version 14: stored specializations no longer include compile-time runtime-info changes.
-// 15: shader attribute loads/stores are stored (FIX-012). Version 14 entries still load, with
-// their flags recovered on first use by a rect/quad-list pipeline.
-// 16: the resource usage FIX-043 keys permutations by follows the Info. Versions 14 and 15
-// still load, as translations of unknown usage (keyed on every resource property, as stored).
-static constexpr u32 ShaderMetaVersion = 16u;
-static constexpr u32 ShaderMetaVersionWithoutResourceUsage = 15u;
-static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
+// 15: shader attribute loads/stores are stored (FIX-012).
+// 16: the resource usage FIX-043 keys permutations by follows the Info.
+// 17 (FIX-GT7-043): the Info's FMask list has another layout, holds every read as an FMask and
+// their key another meaning. Older entries are not read: their Info can't be read at this layout.
+static constexpr u32 ShaderMetaVersion = 17u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -233,9 +231,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion &&
-        meta_version != Serialization::ShaderMetaVersionWithoutResourceUsage &&
-        meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags) {
+    if (meta_version != Serialization::ShaderMetaVersion) {
         return false;
     }
 
@@ -278,12 +274,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
         spec.runtime_info.hw.fs.quad_sample_mask = false;
     }
-    info.Deserialize(ar, perm_hash_ar,
-                     meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
-    info.resource_usage_known = false;
-    if (meta_version >= Serialization::ShaderMetaVersion) {
-        ReadResourceUsage(meta, info);
-    }
+    info.Deserialize(ar, perm_hash_ar);
+    ReadResourceUsage(meta, info);
     return true;
 }
 
