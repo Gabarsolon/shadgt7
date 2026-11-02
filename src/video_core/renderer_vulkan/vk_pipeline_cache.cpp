@@ -1171,12 +1171,12 @@ PipelineCache::~PipelineCache() {
 // read in 68 ms and written in 0.5 s off the GPU thread, and it is saved during play (GT7 never
 // reaches the exit-time save): each session adds the pipelines of the cars and tracks it met.
 // PERF-167: the driver cache file's size limit, from the launcher's Graphics page
-// (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; 5 GB by default.
+// (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; 2 GB by default.
 static u64 DriverCacheMaxBytes() {
     static const u64 limit = [] {
         const char* env = std::getenv("RYGT_DRIVER_CACHE_MAX_MB");
         if (!env || !*env) {
-            return u64{5} << 30;
+            return u64{2} << 30; // FIX-GT7-049
         }
         const long long mb = std::strtoll(env, nullptr, 10);
         return mb < 0 ? ~u64{0} : u64(mb) << 20;
@@ -1217,7 +1217,16 @@ void PipelineCache::CreateDriverCache() {
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
                             fmt::format("{}.vkpipelinecache", serial);
         const Common::FS::IOFile file{driver_cache_path, Common::FS::FileAccessMode::Read};
-        if (file.IsOpen()) {
+        // FIX-GT7-049: the driver keeps what it is given in RAM, about 7 GB for GT7's 5.2 GB file
+        // (23 GB in a pre-race against 16 GB without it), and reading it takes as much again for a
+        // moment. A file over the limit could only stay as it is, so the cache starts empty and
+        // its next save replaces it.
+        if (file.IsOpen() && file.GetSize() > DriverCacheMaxBytes()) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-049: driver pipeline cache of {} MB is over the {} MB limit, "
+                        "starting empty",
+                        file.GetSize() >> 20, DriverCacheMaxBytes() >> 20);
+        } else if (file.IsOpen()) {
             data.resize(file.GetSize());
             if (file.Read(data) != data.size()) {
                 data.clear();
