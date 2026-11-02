@@ -566,6 +566,9 @@ private:
         std::vector<u32> spv;
         vk::ShaderModule module{};
         double translate_ms{};
+        u32 diag_id{};        ///< DIAG-GT7-073
+        bool diag_ahead{};    ///< DIAG-GT7-073: queued by a read-ahead state
+        std::chrono::steady_clock::time_point queued_at{};
         /// Set when harvested: its specialization, and when it became ready.
         Shader::StageSpecialization spec;
         std::chrono::steady_clock::time_point ready_since{};

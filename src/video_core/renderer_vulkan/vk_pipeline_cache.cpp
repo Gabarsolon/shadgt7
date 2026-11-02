@@ -92,6 +92,15 @@ bool CompilationInProgress() {
            g_shader_translations_running.load(std::memory_order_relaxed) != 0;
 }
 
+// DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1).
+static bool TranslateJobsDiag() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_DIAG_TRANSLATE_JOBS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 class PipelineCache::TranslateWorkers {
 public:
     TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
@@ -170,6 +179,19 @@ private:
         job.translate_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
+        // DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1): what each translation made.
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-073: translated #{} age {:.0f} ms ahead {} {:#x} stage {} start {}/{} {:.1f} ms, {} code "
+                        "words, spv {} words {:#x}, runtime {:#x}, user data {:#x}",
+                        job.diag_id,
+                        std::chrono::duration<double, std::milli>(start - job.queued_at).count(),
+                        job.diag_ahead, job.hash, u32(job.hw_stage), job.start.unified, job.start.buffer,
+                        job.translate_ms, job.code.size(), job.spv.size(),
+                        XXH3_64bits(job.spv.data(), job.spv.size() * sizeof(u32)),
+                        XXH3_64bits(&job.runtime_info, sizeof(job.runtime_info)),
+                        XXH3_64bits(job.user_data.data(), sizeof(job.user_data)));
+        }
     }
 
     const Shader::Profile& profile;
@@ -4047,6 +4069,10 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         return false; // as above
     }
     job->start = start;
+    static std::atomic<u32> diag_next_id{};
+    job->diag_id = ++diag_next_id;
+    job->diag_ahead = regs_override != nullptr;
+    job->queued_at = std::chrono::steady_clock::now();
     jobs.push_back(job);
     ++translate_stats.queued;
     translate_workers->Queue(std::move(job));
@@ -4073,10 +4099,38 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         // FIX-GT7-024: the lookup's on the right, as GetProgram compares (its bitsets decide).
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
             job->spec != Shader::StageSpecialization(info, runtime_info, profile, binding)) {
+            if (TranslateJobsDiag()) {
+                static std::atomic<u32> logged{};
+                if (job->hw_stage == hw_stage && job->sw_stage == sw_stage && ++logged <= 3000) {
+                    u32 index{};
+                    const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+                    const char* reason = job->spec.FirstDifference(spec, index);
+                    std::string fields;
+                    if (reason && std::string_view{reason} == "buffer" && index < spec.buffers.size() &&
+                        index < job->spec.buffers.size() && index < info.buffers.size()) {
+                        const auto& a = job->spec.buffers[index];
+                        const auto& c = spec.buffers[index];
+                        const auto& desc = info.buffers[index];
+                        fields = fmt::format(
+                            " program {:#x} base {:#x} type {} stride used {}: job stride {} fmt {} {}/{} swz {} tid {} coh {} ; this stride {} fmt {} {}/{} swz {} tid {} coh {}",
+                            hash, u64(desc.GetSharp(info).base_address), u32(desc.buffer_type), bool(info.buffer_stride_used[index]),
+                            u32(a.stride), u32(a.is_formatted), u32(a.data_format), u32(a.num_format), u32(a.swizzle_enable), u32(a.add_tid_enable), u32(a.coherent),
+                            u32(c.stride), u32(c.is_formatted), u32(c.data_format), u32(c.num_format), u32(c.swizzle_enable), u32(c.add_tid_enable), u32(c.coherent));
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-GT7-073: #{} not for this {}: {}[{}]{}", job->diag_id,
+                                regs_override != nullptr ? "read-ahead" : "draw",
+                                reason ? reason : "none", index, fields);
+                }
+            }
             continue;
         }
         if (!insert) {
             return true;
+        }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} taken by a {}", job->diag_id,
+                        regs_override != nullptr ? "read-ahead" : "draw");
         }
         LogNewPermutation(program, hw_stage, params, runtime_info, binding); // DIAG-GT7-013
         size_t perm_idx = program.modules.size();
@@ -4190,6 +4244,9 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
     std::erase_if(ready, [&](const std::shared_ptr<TranslateJob>& job) {
         if (now - job->ready_since < std::chrono::seconds{30} && ready.size() <= 32) {
             return false;
+        }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} expired", job->diag_id);
         }
         instance.GetDevice().destroyShaderModule(job->module);
         ++translate_stats.expired;
