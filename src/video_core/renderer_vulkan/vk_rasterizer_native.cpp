@@ -1589,24 +1589,32 @@ void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
     });
 }
 
-void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
-    for (const auto& [address, size] : b.gpu_writes) {
-        WritebacksBefore(address, size);
-    }
-    // FIX-GT7-040: what a shader writes in a region stays there, so a picture going back to guest
-    // memory first must reach the region first too. Left for the region's next use, it was copied
-    // in over the shader's bytes: GT7 fills its rain layer, whose memory also holds its reflection's
-    // small mips, and with no rain to draw it samples the fill right away. Those mips showed as a
-    // 64 KB block of huge values at every frame of a pre-race screen, under a large halo.
-    // RYGT_NATIVE_WRITEBACK_REFRESH=0: as before.
+// FIX-GT7-040: what work writes in a region stays there, so a picture going back to guest memory
+// first must reach the region first too. Left for the region's next use, it was copied in over the
+// shader's bytes: GT7 fills its rain layer, whose memory also holds its reflection's small mips, and
+// with no rain to draw it samples the fill right away. Those mips showed as a 64 KB block of huge
+// values at every frame of a pre-race screen, under a large halo. A fill or a copy gets its region
+// after this; a draw or dispatch has it already, and refreshes it again when this returns true.
+// RYGT_NATIVE_WRITEBACK_REFRESH=0: as before.
+bool NativeRenderer::SendWritebacksDue() {
     static const bool refresh = [] {
         const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_REFRESH");
         return !(env && env[0] == '0');
     }();
     if (!refresh || !writebacks_due) {
-        return;
+        return false;
     }
     GlobalBarrier(); // the pictures go back here
+    return true;
+}
+
+void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
+    for (const auto& [address, size] : b.gpu_writes) {
+        WritebacksBefore(address, size);
+    }
+    if (!SendWritebacksDue()) {
+        return;
+    }
     for (const auto& [address, size] : b.gpu_writes) {
         if (Region* region = RegionOver(address, size)) {
             RefreshRegion(*region);
@@ -9818,6 +9826,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     }
     ++stats.fills;
     WritebacksBefore(address, num_bytes); // PERF-GT7-044
+    SendWritebacksDue();                  // FIX-GT7-040
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
         GlobalBarrier();
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
@@ -9862,6 +9871,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     if (!dst_gds) {
         WritebacksBefore(dst, num_bytes);
     }
+    SendWritebacksDue(); // FIX-GT7-040
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
     const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
                                 : GuestBuffer(src, num_bytes, false);
