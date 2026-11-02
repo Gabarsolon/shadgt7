@@ -25,10 +25,12 @@
 #include <sstream>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <tuple>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 #include "common/alignment.h"
@@ -9769,18 +9771,26 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
                         dst->info.guest_address, vk::to_string(dst->info.pixel_format),
                         vk::to_string(dst_desc.info.pixel_format));
         }
-        const auto* src_view = src->View(*device, {.format = src_format,
-                                                   .base_layer = u16(region.srcSubresource.baseArrayLayer)});
-        const auto* dst_view = dst->View(*device, {.format = src_format,
-                                                   .base_layer = u16(region.dstSubresource.baseArrayLayer)});
+        // Views made for attachments: ImageEntry::View's are for sampling or storage only. The mode
+        // follows the views' format, which can differ from the one the guest names.
+        const vk::Format view_format = static_cast<vk::Format>(src_format);
+        const auto attachment_view = [&](const Native::ImageEntry& entry, u32 layer) {
+            VideoCore::ImageViewInfo view_info{};
+            view_info.format = view_format;
+            view_info.range.base.layer = u16(layer);
+            return View(entry, view_info, ViewUse::Attachment);
+        };
+        const vk::ImageView src_view = attachment_view(*src, region.srcSubresource.baseArrayLayer);
+        const vk::ImageView dst_view = attachment_view(*dst, region.dstSubresource.baseArrayLayer);
         if (src_view && dst_view) {
+            const std::string_view numeric = vk::componentNumericFormat(view_format, 0);
             const vk::RenderingAttachmentInfo attachment{
-                .imageView = vk::ImageView{Handle<VkImageView_T>(src_view->NativeHandle())},
+                .imageView = src_view,
                 .imageLayout = vk::ImageLayout::eGeneral,
-                .resolveMode = AmdGpu::IsInteger(regs.color_buffers[0].GetNumberFmt())
+                .resolveMode = numeric == "UINT" || numeric == "SINT"
                                    ? vk::ResolveModeFlagBits::eSampleZero
                                    : vk::ResolveModeFlagBits::eAverage,
-                .resolveImageView = vk::ImageView{Handle<VkImageView_T>(dst_view->NativeHandle())},
+                .resolveImageView = dst_view,
                 .resolveImageLayout = vk::ImageLayout::eGeneral,
                 .loadOp = vk::AttachmentLoadOp::eLoad,
                 .storeOp = vk::AttachmentStoreOp::eStore,
