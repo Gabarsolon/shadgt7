@@ -373,7 +373,7 @@ private:
     std::atomic<u32> logged_partial{};
     void SortRegionWrites();
     Region* RegionOver(VAddr address, u64 size);
-    Region* MakeRegion(VAddr address, u64 size);
+    Region* MakeRegion(VAddr address, u64 size, bool write);
     void RefreshRegion(Region& region);
     /// FIX-194: the GPU wrote [address, address + size) (in GPU order, just recorded): where a
     /// region holds it over pages the CPU writes too, guest memory gets the bytes as well.
