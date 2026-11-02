@@ -1576,9 +1576,17 @@ void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
 // game ordered them; written back at the frame's end, the picture would overwrite the newer bytes.
 // It goes at the next global barrier, before that work, and the bytes the work leaves stay right.
 void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
-    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+    const auto meets = [&](const Native::ImageEntry* entry) {
         const VAddr begin = entry->info.guest_address;
-        if (address + std::max<u64>(size, 1) <= begin || begin + entry->info.guest_size <= address) {
+        return address + std::max<u64>(size, 1) > begin && begin + entry->info.guest_size > address;
+    };
+    // FIX-GT7-040: a picture moved here when its frame ended counts too: unnoticed, it reached the
+    // region only at the region's next use, over what this work writes.
+    if (std::ranges::any_of(writebacks, meets)) {
+        writebacks_due = true;
+    }
+    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+        if (!meets(entry)) {
             return false;
         }
         if (std::ranges::find(writebacks, entry) == writebacks.end()) {
