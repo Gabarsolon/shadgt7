@@ -193,16 +193,17 @@ void TidyStores(std::stop_token stop, const std::filesystem::path& store) {
 
 /// The store at `store` (a folder, or an archive with its stamp at `stamp`) as this build's:
 /// cleared first when another build filled it, or when it went over its size limit. The stamp is
-/// written only after the clear.
-void ClaimStore(const std::filesystem::path& store, const std::filesystem::path& stamp,
+/// written only after the clear. False when it couldn't be cleared: what it holds isn't this build's
+/// (FIX-GT7-055 counts on that), so it stays closed for this session.
+bool ClaimStore(const std::filesystem::path& store, const std::filesystem::path& stamp,
                 bool is_folder) {
     const std::string build = RendererBuild();
     if (build.empty()) {
-        return; // a build without its commit: nothing to compare
+        return true; // a build without its commit: nothing to compare
     }
     const std::string stored = ReadStamp(stamp);
     if (stored == build) {
-        return;
+        return true;
     }
     const std::string from = stored.empty()             ? "from an unknown build"
                              : stored == OverLimitStamp ? "over its size limit"
@@ -222,7 +223,7 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
         LOG_WARNING(Render, "SHD-010: shader store {} is {} (this is {}); kept "
                             "(RYGT_KEEP_SHADER_CACHE=1)",
                     store.string(), from, build);
-        return;
+        return true;
     }
     if (has_files) {
         // FIX-GT7-057: a rename, whatever the store's size; TidyStores removes the files.
@@ -247,9 +248,10 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
         }
         if (!cleared) {
             // The stamp stays as it was: the next start tries again.
-            LOG_ERROR(Render, "SHD-010: could not clear the shader store {} ({})", store.string(),
-                      from);
-            return;
+            LOG_ERROR(Render, "SHD-010: could not clear the shader store {} ({}); closed for this "
+                              "session, translations are made each time",
+                      store.string(), from);
+            return false;
         }
         LOG_WARNING(Render, "SHD-010: renderer build {}, store {}: {} {} in {:.1f} ms; shaders are "
                             "translated again as they are needed",
@@ -266,8 +268,10 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
     std::filesystem::remove(RetranslationMarksPath(), marks_ec);
     if (marks_ec) {
         // The stamp stays as it was: the next start tries again.
-        LOG_ERROR(Render, "SHD-010: could not remove {}", RetranslationMarksPath().string());
-        return;
+        LOG_ERROR(Render, "SHD-010: could not remove {}; the shader store is closed for this "
+                          "session",
+                  RetranslationMarksPath().string());
+        return false;
     }
     if (is_folder) {
         std::filesystem::create_directories(store, ec);
@@ -275,6 +279,7 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
     if (!WriteStamp(stamp, build)) {
         LOG_ERROR(Render, "SHD-010: could not write {}", stamp.string());
     }
+    return true;
 }
 
 } // namespace
@@ -357,7 +362,9 @@ void DataBase::Open() {
         {
             auto stamp = cache_path;
             stamp.replace_extension(".build.txt");
-            ClaimStore(cache_path, stamp, false); // SHD-010
+            if (!ClaimStore(cache_path, stamp, false)) { // SHD-010
+                return;
+            }
         }
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
@@ -379,7 +386,9 @@ void DataBase::Open() {
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
-        ClaimStore(cache_path, cache_path / StampName, true); // SHD-010
+        if (!ClaimStore(cache_path, cache_path / StampName, true)) { // SHD-010
+            return;
+        }
         tidy_worker = std::jthread{
             [store = cache_path](std::stop_token stop) { TidyStores(stop, store); }};
     }

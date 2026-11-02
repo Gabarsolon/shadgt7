@@ -1162,7 +1162,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                        "pipeline cache (pipeline_cache_archived)");
         } else {
             Storage::DataBase::Instance().Open();
-            use_stored_shaders = true;
+            use_stored_shaders = Storage::DataBase::Instance().IsOpened();
             // D10: the old renderer's translations stand in while the new renderer's are built.
             // SHADGT_LEGACY_FALLBACK=0 turns it off.
             // SHD-002: not with stage descriptor sets: the old translations bind everything
@@ -1177,11 +1177,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                 legacy_fallback ? "on" : "off (no old shader store)");
                 }
             }
-            LOG_WARNING(Render_Vulkan,
-                        "PERF-032: shader translations are loaded from the store on first use");
+            if (use_stored_shaders) {
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-032: shader translations are loaded from the store on first use");
+            }
             // PERF-GT7-019 (RYGT_STORE_READERS=0: read on the GPU threads as before).
             const char* readers_env = std::getenv("RYGT_STORE_READERS");
-            if (!(readers_env && readers_env[0] == '0')) {
+            if (use_stored_shaders && !(readers_env && readers_env[0] == '0')) {
                 store_readers = std::make_unique<StoreReaders>(8);
                 store_stats.since = std::chrono::steady_clock::now();
             }
