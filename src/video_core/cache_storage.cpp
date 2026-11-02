@@ -47,6 +47,12 @@ namespace {
 // RYGT_KEEP_SHADER_CACHE=1 keeps it (tests across builds).
 constexpr const char* StampName = "renderer_build.txt";
 
+// FIX-GT7-053: CMake can't read the commit in a git worktree, so such a build has only its
+// description (which holds its commit), and its store was never cleared.
+std::string RendererBuild() {
+    return Common::g_scm_rev[0] != '\0' ? Common::g_scm_rev : Common::g_scm_desc;
+}
+
 bool KeepShaderCache() {
     const char* env = std::getenv("RYGT_KEEP_SHADER_CACHE");
     return env && env[0] == '1';
@@ -71,7 +77,7 @@ bool WriteStamp(const std::filesystem::path& stamp) {
     if (!file.IsOpen()) {
         return false;
     }
-    const std::string text = std::string{Common::g_scm_rev} + "\n";
+    const std::string text = RendererBuild() + "\n";
     return file.WriteRaw<char>(text.data(), text.size()) == text.size();
 }
 
@@ -79,7 +85,7 @@ bool WriteStamp(const std::filesystem::path& stamp) {
 /// cleared first when another build filled it. The stamp is written only after the clear.
 void ClaimStore(const std::filesystem::path& store, const std::filesystem::path& stamp,
                 bool is_folder) {
-    const std::string build = Common::g_scm_rev;
+    const std::string build = RendererBuild();
     if (build.empty()) {
         return; // a build without its commit: nothing to compare
     }
@@ -265,7 +271,7 @@ void DataBase::OpenLegacy() {
     std::error_code ec;
     opened = std::filesystem::is_directory(cache_path, ec);
     // SHD-010: another build's store is not read (the old renderer clears it when it opens it).
-    if (opened && ReadStamp(cache_path / StampName) != Common::g_scm_rev && !KeepShaderCache()) {
+    if (opened && ReadStamp(cache_path / StampName) != RendererBuild() && !KeepShaderCache()) {
         LOG_INFO(Render, "SHD-010: old renderer's shader store at {} is from another build; not "
                          "read",
                  cache_path.string());
