@@ -1593,6 +1593,25 @@ void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
     for (const auto& [address, size] : b.gpu_writes) {
         WritebacksBefore(address, size);
     }
+    // FIX-GT7-040: what a shader writes in a region stays there, so a picture going back to guest
+    // memory first must reach the region first too. Left for the region's next use, it was copied
+    // in over the shader's bytes: GT7 fills its rain layer, whose memory also holds its reflection's
+    // small mips, and with no rain to draw it samples the fill right away. Those mips showed as a
+    // 64 KB block of huge values at every frame of a pre-race screen, under a large halo.
+    // RYGT_NATIVE_WRITEBACK_REFRESH=0: as before.
+    static const bool refresh = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_REFRESH");
+        return !(env && env[0] == '0');
+    }();
+    if (!refresh || !writebacks_due) {
+        return;
+    }
+    GlobalBarrier(); // the pictures go back here
+    for (const auto& [address, size] : b.gpu_writes) {
+        if (Region* region = RegionOver(address, size)) {
+            RefreshRegion(*region);
+        }
+    }
 }
 
 void NativeRenderer::FlushWritebacks() {
