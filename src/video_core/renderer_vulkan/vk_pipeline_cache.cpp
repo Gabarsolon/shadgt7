@@ -4502,7 +4502,17 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     std::string mismatch_reasons;
     // PERF-044: replay the last search when its inputs are the same. -DisablePerf 56.
     static const bool memo_enabled = Common::PerfFeatureEnabled(56);
-    auto& memo = program->match_memo;
+    // FIX-GT7-045: a read-ahead state searches on its own. Found by the shared search, a permutation
+    // that also matched the draw being processed took its place when its key was made again, and
+    // "Read-ahead changed the current pipeline key" ended the game. RYGT_READ_AHEAD_OWN_MATCH=0: as
+    // before.
+    static const bool own_match = [] {
+        const char* env = std::getenv("RYGT_READ_AHEAD_OWN_MATCH");
+        return !(env && env[0] == '0');
+    }();
+    const bool ahead = own_match && regs_override != nullptr;
+    auto& memo = ahead ? program->ahead_memo : program->match_memo;
+    size_t& last_match = ahead ? program->ahead_last_match : program->last_match;
     const bool memo_stage = memo_enabled && (hw_stage == HwStage::Fragment ||
                                              hw_stage == HwStage::Compute);
     bool memo_usable = memo_stage && memo.valid &&
@@ -4524,8 +4534,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // -DisablePerf 133 searches from the first every time.
     static const bool last_first = Common::PerfFeatureEnabled(133);
     if (last_first && !memo_usable && hw_stage != HwStage::Hull &&
-        program->last_match < program->modules.size()) {
-        auto& permutation = program->modules[program->last_match];
+        last_match < program->modules.size()) {
+        auto& permutation = program->modules[last_match];
         if (permutation.info && !permutation.stored) {
             auto& info = *permutation.info;
             info.pgm_base = params.Base();
@@ -4536,15 +4546,14 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                     return Shader::StageSpecialization(info, runtime_info, profile, binding);
                 }()) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
-                    RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
-                                          program->last_match);
+                    RecoverAttributeFlags(info, permutation.spec, params, runtime_info, last_match);
                 }
                 info.AddBindings(binding);
                 if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
                     S().fetch_shader = &fetch;
                 }
                 return std::make_tuple(&info, permutation.module,
-                                       HashCombine(params.hash, program->last_match));
+                                       HashCombine(params.hash, last_match));
             }
         }
     }
@@ -4618,7 +4627,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             memo.user_data.assign(params.user_data.begin(), params.user_data.end());
             memo.flats.assign(flats.begin(), flats.end());
         }
-        program->last_match = perm_idx; // R7
+        last_match = perm_idx; // R7
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
         }
