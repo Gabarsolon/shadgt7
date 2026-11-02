@@ -4580,7 +4580,11 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const bool has_stored = !it_pgm.value()->modules.empty() ||
                             stored_perm_end.find(params.hash) != stored_perm_end.end();
     u32 needed_fixes = 0;
-    if (first_use && has_stored) {
+    // FIX-GT7-055: SHD-010 clears a store another build filled, so what this one holds was made by
+    // this translator: without this, the second launch of a new store translated again every
+    // program needing a fix (32 on the main menu) and left the first translation unused on disk.
+    static const bool other_builds_stored = Storage::StoreMayHoldOtherBuilds();
+    if (first_use && has_stored && other_builds_stored) {
         needed_fixes |= Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
         if (Shader::HasLegacyMad(params.code)) {
             needed_fixes |= 16u; // FIX-101

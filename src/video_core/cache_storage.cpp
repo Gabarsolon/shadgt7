@@ -165,6 +165,10 @@ std::filesystem::path RetranslationMarksPath() {
            fmt::format("{}.else-scope-fix", Common::ElfInfo::Instance().GameSerial());
 }
 
+bool StoreMayHoldOtherBuilds() {
+    return KeepShaderCache() || RendererBuild().empty();
+}
+
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadGT:PipelineCacheIO");
 
