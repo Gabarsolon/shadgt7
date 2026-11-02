@@ -188,6 +188,7 @@ private:
             .hash = job.hash,
         };
         auto info = std::make_unique<Shader::Info>(job.hw_stage, job.sw_stage, params);
+        info->pinned_fetch_sharps = std::move(job.fetch_sharps); // FIX-GT7-054
         auto runtime_info = job.runtime_info;
         auto binding = job.start;
         const auto start = std::chrono::steady_clock::now();
@@ -4067,6 +4068,40 @@ static bool CopyFetchShader(std::span<u32, Shader::ShaderParams::NumShaderUserDa
     return false;
 }
 
+// FIX-GT7-054: a vertex shader's attribute V#s, as the draw has them when its translation is
+// queued. They were read through the user data three times: for the code, for its SPIR-V, and for
+// its key when the job was harvested, by when the game had written that memory again. GT7's map
+// markers got code made from an empty V# (every attribute 0) under the key of real ones
+// (R, G, B, A), so every car's triangle landed on one point; the translation store then kept it for
+// every later start. RYGT_PIN_FETCH_SHARPS=0: as before.
+static std::vector<Shader::Info::PinnedFetchSharp> PinFetchSharps(
+    HwStage hw_stage, SwStage sw_stage, std::span<const u32> code,
+    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data, u64 hash) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_PIN_FETCH_SHARPS");
+        return !(env && env[0] == '0');
+    }();
+    const auto base = Shader::FetchShaderSgprBase(code);
+    if (!enabled || !base) {
+        return {};
+    }
+    const Shader::ShaderParams params{.user_data = user_data, .code = code, .hash = hash};
+    const auto reader = std::make_unique<Shader::Info>(hw_stage, sw_stage, params);
+    reader->has_fetch_shader = true;
+    reader->fetch_shader_sgpr_base = *base;
+    Shader::Gcn::FetchShaderData fetch;
+    if (!Shader::Gcn::ParseFetchShader(*reader, fetch)) {
+        return {};
+    }
+    std::vector<Shader::Info::PinnedFetchSharp> sharps;
+    sharps.reserve(fetch.attributes.size());
+    for (const auto& attrib : fetch.attributes) {
+        sharps.push_back({attrib.sgpr_base, attrib.dword_offset,
+                          reader->ReadUdReg<AmdGpu::Buffer>(attrib.sgpr_base, attrib.dword_offset)});
+    }
+    return sharps;
+}
+
 bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
@@ -4100,6 +4135,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
          hw_stage == HwStage::Local) &&
         !CopyFetchShader(job->user_data, job->code, job->fetch_copy)) {
         return false; // as above
+    }
+    if (!job->fetch_copy.empty()) {
+        job->fetch_sharps = PinFetchSharps(hw_stage, sw_stage, job->code, job->user_data, job->hash);
     }
     job->start = start;
     static std::atomic<u32> diag_next_id{};
@@ -4273,6 +4311,17 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
         }
         translate_stats.translate_ms += job->translate_ms;
         job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start);
+        // FIX-GT7-054: the key is made; from here this Info is matched against other draws.
+        const bool pinned = !job->info->pinned_fetch_sharps.empty();
+        job->info->pinned_fetch_sharps.clear();
+        if (TranslateJobsDiag() && pinned &&
+            Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start)
+                    .vs_attribs != job->spec.vs_attribs) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-073: #{} {:#x}: its attribute V#s changed after its draw, its "
+                        "code would have had another key without FIX-GT7-054",
+                        job->diag_id, job->hash);
+        }
         job->ready_since = now;
         ready.push_back(job);
         return true;

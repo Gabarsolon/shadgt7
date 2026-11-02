@@ -560,6 +560,7 @@ private:
         std::span<const u32> code; // FIX-160: over code_copy, not guest memory
         std::vector<u32> code_copy;
         std::vector<u32> fetch_copy; // FIX-189: the fetch shader user_data points at
+        std::vector<Shader::Info::PinnedFetchSharp> fetch_sharps; // FIX-GT7-054
         Shader::RuntimeInfo runtime_info;
         Shader::Backend::Bindings start;
         std::unique_ptr<Shader::Info> info;

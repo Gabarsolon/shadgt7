@@ -422,7 +422,7 @@ void EmitContext::DefineInputs() {
         ASSERT(fetch_shader.attributes.size() <= IR::NumParams);
         for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
             const auto& attrib = fetch_shader.attributes[semantic];
-            const auto sharp = attrib.GetSharp(info);
+            const auto sharp = attrib.GetSharpForCode(info);
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
             Id id{DefineInput(type, semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
