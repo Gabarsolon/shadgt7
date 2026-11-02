@@ -296,11 +296,16 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
             const char* env = std::getenv("RYGT_FMASK_KEY");
             return !(env && env[0] == '0');
         }();
-        if (const auto& first = resource.sharps[0].dwords[0]; fmask_key && !first.IsImmediate()) {
-            descriptors.Add(FMaskResource{.sharp_idx = SharpLocationFromSource(first.Inst())});
+        const bool size_read = inst.GetOpcode() == IR::Opcode::ImageQueryDimensions;
+        if (const auto& first = resource.sharps[0].dwords[0];
+            (fmask_key || size_read) && !first.IsImmediate()) {
+            const u32 index =
+                descriptors.Add(FMaskResource{.sharp_idx = SharpLocationFromSource(first.Inst())});
+            info.fmasks[index].size_read |= size_read;
             LOG_WARNING(Render_Recompiler,
-                        "FIX-GT7-043: program {:#x}: the T# at {} is an FMask, its reads are constants",
-                        info.pgm_hash, SharpLocationFromSource(first.Inst()));
+                        "FIX-GT7-043: program {:#x}: the T# at {} ({:#x}) is an FMask, its reads are "
+                        "constants",
+                        info.pgm_hash, SharpLocationFromSource(first.Inst()), image.Address());
         }
 
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};

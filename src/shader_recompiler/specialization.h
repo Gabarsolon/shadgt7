@@ -184,7 +184,12 @@ struct StageSpecialization {
             usage_known);
         ForEachSharp(
             binding, images, info->images, [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                spec.type = sharp.GetViewType(desc.is_array);
+                // FIX-GT7-043: translation has no image for an FMask, so code with one isn't for
+                // this T#. Two translations matching one state would let the read-ahead change the
+                // current draw's key, as the last match decides between them.
+                spec.type = sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())
+                                ? AmdGpu::ImageType::Invalid
+                                : sharp.GetViewType(desc.is_array);
                 spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                 spec.is_storage = desc.is_written;
                 if (spec.is_storage) {
@@ -202,10 +207,11 @@ struct StageSpecialization {
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          // FIX-GT7-043: zero for a T# that isn't an FMask, which this code
-                         // can't read: the fields count from zero, so an FMask's never are.
+                         // can't read. The size counts only where the code reads it: GT7 leaves
+                         // float data in many slots, which would make a variant per value.
                          if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
-                             spec.width = sharp.width + 1;
-                             spec.height = sharp.height + 1;
+                             spec.width = desc.size_read ? sharp.width + 1 : 1;
+                             spec.height = desc.size_read ? sharp.height + 1 : 1;
                          }
                      });
         ForEachSharp(samplers, info->samplers,

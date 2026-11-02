@@ -278,6 +278,7 @@ using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM
 
 struct FMaskResource {
     SharpLocation sharp_idx;
+    bool size_read{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         return info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
