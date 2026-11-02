@@ -418,6 +418,8 @@ private:
     void CreateDriverCache();
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
+    bool DriverCacheOutgrown(vk::Device device, vk::PipelineCache cache, u32 count);
+    std::atomic<bool> driver_cache_full{}; // FIX-GT7-050: this session saves no more
     std::filesystem::path driver_cache_path;
     /// PERF-GT7-037: the recipes of compute pipelines that took the driver long to build, and
     /// the thread that builds them again in the background at start.

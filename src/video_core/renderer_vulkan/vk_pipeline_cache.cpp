@@ -1275,8 +1275,36 @@ void PipelineCache::CreateDriverCache() {
     LOG_INFO(Render_Vulkan, "Driver pipeline cache: loaded {} bytes", data.size());
 }
 
+bool PipelineCache::DriverCacheOutgrown(vk::Device device, vk::PipelineCache cache, u32 count) {
+    // FIX-GT7-050: the driver can only hand the cache back whole, so one over the limit could never
+    // be saved again: the file stayed as it was and each new car or track was built again every
+    // session (FIX-GT7-023), while every save still copied the whole cache out to refuse it. Its
+    // size is now asked first, the file goes, and the next launch starts a new cache, as with a file
+    // over the limit (FIX-GT7-049). RYGT_DRIVER_CACHE_RESTART=0: as before.
+    static const bool restart = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE_RESTART");
+        return !(env && env[0] == '0');
+    }();
+    size_t size = 0;
+    if (!restart || device.getPipelineCacheData(cache, &size, nullptr) != vk::Result::eSuccess ||
+        size <= DriverCacheMaxBytes()) {
+        return false;
+    }
+    driver_cache_full = true;
+    std::error_code ec;
+    const bool removed = driver_cache_file.Commit(count, [&] {
+        std::filesystem::remove(driver_cache_path, ec);
+        return !ec;
+    });
+    LOG_WARNING(Render_Vulkan,
+                "FIX-GT7-050: driver pipeline cache of {} MB is over the {} MB limit: file {}, "
+                "the next launch starts a new cache",
+                size >> 20, DriverCacheMaxBytes() >> 20, removed ? "removed" : "kept");
+    return true;
+}
+
 void PipelineCache::SaveDriverCache(bool wait) {
-    if (driver_cache_path.empty() || !pipeline_cache) {
+    if (driver_cache_path.empty() || !pipeline_cache || driver_cache_full) {
         return;
     }
     // PERF-036: GT Sport's driver cache grows to several GB (3.4 GB on October 9). Reading it out
@@ -1296,13 +1324,13 @@ void PipelineCache::SaveDriverCache(bool wait) {
     pipelines_at_driver_save = count;
     driver_cache_saved_at = std::chrono::steady_clock::now();
     const auto write = [this, path = driver_cache_path, count](std::vector<u8> data) {
-        // PERF-164: a cache over 1 GB is not written (GT Sport's reached 3.7 GB and stalled);
+        // PERF-164: a cache over the limit is not written (GT Sport's reached 3.7 GB and stalled);
         // the file from before stays.
         if (data.size() > DriverCacheMaxBytes()) {
             LOG_WARNING(Render_Vulkan,
                         "PERF-164: driver pipeline cache not saved: {} MB is over the {} MB limit",
                         data.size() >> 20, DriverCacheMaxBytes() >> 20);
-            return;
+            return false;
         }
         // Write beside the file and rename, so an interrupted write never leaves a broken cache.
         auto temp = path;
@@ -1310,7 +1338,7 @@ void PipelineCache::SaveDriverCache(bool wait) {
         {
             const Common::FS::IOFile file{temp, Common::FS::FileAccessMode::Create};
             if (!file.IsOpen() || file.Write(data) != data.size()) {
-                return;
+                return false;
             }
         }
         // FIX-GT7-025: only over an older save (the exit save may have written a newer one).
@@ -1320,33 +1348,43 @@ void PipelineCache::SaveDriverCache(bool wait) {
                 return !ec;
             })) {
             std::filesystem::remove(temp, ec);
+            return false;
         }
+        return true;
     };
     const vk::Device device = instance.GetDevice();
     const vk::PipelineCache cache = *pipeline_cache;
     if (off_thread) {
         driver_cache_writing = true;
-        driver_cache_writer = std::jthread([this, device, cache, write] {
+        driver_cache_writer = std::jthread([this, device, cache, count, write] {
             Common::SetCurrentThreadName("shadGT:DriverCacheSave");
+            if (DriverCacheOutgrown(device, cache, count)) {
+                driver_cache_writing = false;
+                return;
+            }
             const auto start = std::chrono::steady_clock::now();
             auto [result, data] = device.getPipelineCacheData(cache);
             const auto read_end = std::chrono::steady_clock::now();
             if (result == vk::Result::eSuccess && !data.empty()) {
                 const size_t size = data.size();
                 driver_cache_bytes.store(size, std::memory_order_relaxed); // PERF-167
-                write(std::move(data));
-                LOG_WARNING(Render_Vulkan,
-                            "PERF-036: driver pipeline cache saved off the GPU thread: {} MB, "
-                            "read {:.0f} ms, written {:.0f} ms",
-                            size >> 20,
-                            std::chrono::duration<double, std::milli>(read_end - start).count(),
-                            std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - read_end)
-                                .count());
+                if (write(std::move(data))) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-036: driver pipeline cache saved off the GPU thread: {} MB, "
+                                "read {:.0f} ms, written {:.0f} ms",
+                                size >> 20,
+                                std::chrono::duration<double, std::milli>(read_end - start).count(),
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - read_end)
+                                    .count());
+                }
             }
             driver_cache_writing = false;
         });
     } else {
+        if (DriverCacheOutgrown(device, cache, count)) {
+            return;
+        }
         auto [result, data] = device.getPipelineCacheData(cache);
         if (result != vk::Result::eSuccess || data.empty()) {
             return;
@@ -1371,7 +1409,9 @@ int PipelineCache::SaveDriverCacheNow() {
     // FIX-GT7-025: compared with the save the file holds, not the last one asked for: an
     // automatic save still writing when the window closes is cut short by the process's end.
     const u32 count = num_new_pipelines.load();
-    if (driver_cache_path.empty() || !pipeline_cache || count <= driver_cache_file.Kept()) {
+    if (driver_cache_path.empty() || !pipeline_cache || driver_cache_full ||
+        count <= driver_cache_file.Kept() ||
+        DriverCacheOutgrown(instance.GetDevice(), *pipeline_cache, count)) { // FIX-GT7-050
         return -1;
     }
     auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
