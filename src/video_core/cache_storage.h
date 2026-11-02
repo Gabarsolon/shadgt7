@@ -59,6 +59,7 @@ public:
 
 private:
     std::jthread io_worker{};
+    std::jthread tidy_worker{}; // FIX-GT7-056, FIX-GT7-057
     std::filesystem::path cache_path{};
     bool opened{};
 };
