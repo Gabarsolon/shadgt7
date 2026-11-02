@@ -291,14 +291,10 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         // lamp halos (vs 0x59b5b0b6) leave float data in their cube's slot on draws that don't read
         // it; the rare time it looked like an FMask, the cube's read became these constants, and
         // the draws with a real cube took that code for the rest of the session: light of 1e33,
-        // the long pink rays. RYGT_FMASK_KEY=0: as before.
-        static const bool fmask_key = [] {
-            const char* env = std::getenv("RYGT_FMASK_KEY");
-            return !(env && env[0] == '0');
-        }();
+        // the long pink rays.
         const bool size_read = inst.GetOpcode() == IR::Opcode::ImageQueryDimensions;
         if (const auto& first = resource.sharps[0].dwords[0];
-            (fmask_key || size_read) && !first.IsImmediate()) {
+            (FMaskKeyEnabled() || size_read) && !first.IsImmediate()) {
             const u32 index =
                 descriptors.Add(FMaskResource{.sharp_idx = SharpLocationFromSource(first.Inst())});
             info.fmasks[index].size_read |= size_read;

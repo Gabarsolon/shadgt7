@@ -92,6 +92,7 @@ struct SamplerSpecialization {
  */
 struct StageSpecialization {
     static constexpr size_t MaxStageResources = 128;
+    static_assert(NUM_BUFFERS + NUM_IMAGES + NUM_FMASKS <= MaxStageResources);
 
     const Info* info{};
     RuntimeInfo runtime_info{};
@@ -187,7 +188,7 @@ struct StageSpecialization {
                 // FIX-GT7-043: translation has no image for an FMask, so code with one isn't for
                 // this T#. Two translations matching one state would let the read-ahead change the
                 // current draw's key, as the last match decides between them.
-                spec.type = sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())
+                spec.type = FMaskKeyEnabled() && sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())
                                 ? AmdGpu::ImageType::Invalid
                                 : sharp.GetViewType(desc.is_array);
                 spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
@@ -205,7 +206,12 @@ struct StageSpecialization {
             // getting a new translation (one in 16 pixel shader translations was such a copy).
             true);
         ForEachSharp(binding, fmasks, info->fmasks,
-                     [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
+                     [this](auto& spec, const auto& desc, AmdGpu::Image sharp) {
+                         if (!FMaskKeyEnabled()) {
+                             spec.width = sharp.width;
+                             spec.height = sharp.height;
+                             return;
+                         }
                          // FIX-GT7-043: zero for a T# that isn't an FMask, which this code
                          // can't read. The size counts only where the code reads it: GT7 leaves
                          // float data in many slots, which would make a variant per value.

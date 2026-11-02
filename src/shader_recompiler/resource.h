@@ -17,7 +17,9 @@ static constexpr u32 NUM_USER_DATA_REGS = 16;
 static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
-static constexpr u32 NUM_FMASKS = 8;
+// FIX-GT7-043: every read of a T# that looks like an FMask takes a place, not only size queries: one
+// race launch had up to 6 in a program, and a list that overflows ends the process.
+static constexpr u32 NUM_FMASKS = 24;
 
 using SharpLocation = u16;
 
@@ -155,6 +157,15 @@ struct BufferResource {
 };
 using BufferResourceList = boost::container::static_vector<BufferResource, NUM_BUFFERS>;
 
+/// FIX-GT7-043: whether the key tells an FMask from anything else. RYGT_FMASK_KEY=0: as before.
+inline bool FMaskKeyEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_FMASK_KEY");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
 enum class MipStorageFallbackMode : u16 {
     None,
     DynamicIndex,
@@ -189,6 +200,11 @@ struct ImageResource {
             image.depth = (image.depth + 1) * 6 - 1;
         }
         if (!image.Valid()) {
+            image = AmdGpu::Image::Null(is_depth);
+        } else if (!image && AmdGpu::IsFmask(image.GetDataFmt()) && FMaskKeyEnabled()) {
+            // FIX-GT7-043: float data GT7 leaves in a slot, not an FMask: an empty slot. As an
+            // FMask, its code would have no address to tell it from a T# that isn't one, and each
+            // such slot would make a variant (27 on one launch instead of 2).
             image = AmdGpu::Image::Null(is_depth);
         } else if (is_depth) {
             const auto data_fmt = image.GetDataFmt();
