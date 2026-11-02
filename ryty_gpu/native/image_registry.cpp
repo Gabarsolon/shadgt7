@@ -619,8 +619,17 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
     // 512) with one dispatch per face, those writes go into the 512x512 cube made earlier, and the
     // sky shader's read of the 256x256 cube found nothing of its layout, read zeros and drew the
     // sky black.
-    if (target.guest_address == texture.guest_address && target.resources.levels == 1 &&
-        texture.resources.levels == 1 &&
+    // FIX-GT7-058: of a target's first level too, as its other levels don't move that one. GT7's
+    // championship course maps resolve into the scratch pool's target at 0x100a0b0000, and when
+    // that was a 256x256 pyramid left by another pass, their 200x180 texture found no place and
+    // read guest memory: whatever colours it held, then a black square, with the map in the target.
+    // RYGT_NATIVE_CROP_OF_MIPS=0: as before.
+    static const bool crop_of_mips = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CROP_OF_MIPS");
+        return !(env && env[0] == '0');
+    }();
+    if (target.guest_address == texture.guest_address &&
+        (target.resources.levels == 1 || crop_of_mips) && texture.resources.levels == 1 &&
         texture.resources.layers <= target.resources.layers && target.pitch == texture.pitch &&
         target.tile_mode == texture.tile_mode && target.bank_swizzle == texture.bank_swizzle &&
         target.alt_tile == texture.alt_tile &&
@@ -629,6 +638,18 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
         (texture.size.width < target.size.width || texture.size.height < target.size.height) &&
         target.size.depth == 1 && texture.size.depth == 1 &&
         target.type == AmdGpu::ImageType::Color2D && texture.type == target.type) {
+        if (target.resources.levels != 1) {
+            static std::atomic<u32> logged{};
+            if (const u32 n = logged++; n < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-058: texture {:#x} {}x{} {} is a corner of target {}x{} {}, "
+                            "{} levels",
+                            texture.guest_address, texture.size.width, texture.size.height,
+                            vk::to_string(texture.pixel_format), target.size.width,
+                            target.size.height, vk::to_string(target.pixel_format),
+                            target.resources.levels);
+            }
+        }
         return {0, 0, texture.size.width, texture.size.height};
     }
     // A mip or layer of the texture drawn on its own.
