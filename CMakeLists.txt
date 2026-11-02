@@ -86,7 +86,14 @@ endif()
 # generate git revision information
 include("${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules/GetGitRevisionDescription.cmake")
 get_git_head_revision(GIT_REF_SPEC GIT_REV)
-git_describe(GIT_DESC --always --long --dirty)
+git_describe(GIT_DESC --always --long)
+# --dirty would count the patches externals/CMakeLists.txt applies to VMA, so every build but the
+# first one of a clone would say dirty. A submodule on another commit still counts.
+execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no --ignore-submodules=dirty
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" OUTPUT_VARIABLE GIT_CHANGES ERROR_QUIET)
+if(GIT_CHANGES)
+    string(APPEND GIT_DESC "-dirty")
+endif()
 git_branch_name(GIT_BRANCH)
 string(TIMESTAMP BUILD_DATE "%Y-%m-%d %H:%M:%S")
 
