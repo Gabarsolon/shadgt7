@@ -347,6 +347,7 @@ private:
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
     std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align);
+    void TrimChunks();
     Chunk TakeChunk(u64 size);
     vk::DescriptorPool TakeDescriptorPool();
 
@@ -1206,6 +1207,7 @@ private:
 
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
+    size_t free_chunks_low = 0; // FIX-GT7-046: the fewest free since the last trim
     std::deque<Chunk> retiring_chunks;
     /// PERF-GT7-007 (B): the device buffers of FIX-203's copies before the work (~2,000 a
     /// second in GT7, each made and destroyed), kept by size class and used again once the GPU

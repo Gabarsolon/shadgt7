@@ -1712,6 +1712,35 @@ void NativeRenderer::ChunkFlushCheck() {
     }
 }
 
+void NativeRenderer::TrimChunks() {
+    // FIX-GT7-046: free chunks were kept for good. One frame of GT7's race loading takes 350 of
+    // them, 2.8 GB of RAM the driver zeroes, and they stayed free for the rest of the session while
+    // a frame uses far fewer. What stayed free over the whole period goes back, a little at a time:
+    // the newest are reused first, so the oldest are the ones not needed.
+    // RYGT_NATIVE_CHUNK_TRIM=0: as before.
+    static const bool trim = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CHUNK_TRIM");
+        return !(env && env[0] == '0');
+    }();
+    constexpr u64 PeriodFrames = 150;
+    constexpr size_t KeptChunks = 16;
+    constexpr size_t AtMostChunks = 32;
+    if (!trim || frame % PeriodFrames != 0) {
+        return;
+    }
+    std::vector<Chunk> dropped;
+    {
+        std::scoped_lock lock{chunk_mutex};
+        if (free_chunks_low > KeptChunks) {
+            const auto count = std::min(free_chunks_low - KeptChunks, AtMostChunks);
+            const auto first = free_chunks.begin();
+            dropped.assign(std::make_move_iterator(first), std::make_move_iterator(first + count));
+            free_chunks.erase(first, first + count);
+        }
+        free_chunks_low = free_chunks.size();
+    }
+}
+
 NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     auto* semaphore = r.scheduler.GetWorkSemaphore();
     std::scoped_lock lock{chunk_mutex};
@@ -1737,7 +1766,11 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     if (size <= ChunkSize && !free_chunks.empty()) {
         Chunk chunk = std::move(free_chunks.back());
         free_chunks.pop_back();
+        free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
+    }
+    if (size <= ChunkSize) {
+        free_chunks_low = 0;
     }
     Chunk chunk;
     chunk.buffer = device->CreateBuffer({
@@ -10866,6 +10899,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    TrimChunks();
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     if (RyDiag::Enabled() && !AbOn()) {
         // DIAG-GT7-011: the recorder's stack samples of heavy frames (over 3,300 draws, as GT7's
