@@ -307,9 +307,9 @@ static bool LinkTimeOptimization() {
     return lto;
 }
 // AMD-320: fast-linked pipelines without the optimizer cost AMD far more GPU time than NVIDIA.
-// On AMD tessellated pipelines keep the optimizer, and the others are linked again with
-// link-time optimization on the workers (tessellated libraries still keep no link-time data:
-// FIX-057). RYGT_AMD_PIPELINE_POLICY=0 keeps the shared policy.
+// On AMD tessellated pipelines keep the optimizer. AMD-322: no link-time data and no second,
+// optimized link on AMD: on an RX 7600 (GT Sport) they made each menu pipeline take 0.4-0.7 s and
+// filled pipeline memory. RYGT_AMD_PIPELINE_POLICY=0 keeps the shared policy.
 static bool AmdPipelinePolicy(u32 vendor_id) {
     static const bool allowed = [] {
         const char* env = std::getenv("RYGT_AMD_PIPELINE_POLICY");
@@ -819,7 +819,7 @@ GraphicsPipeline::GraphicsPipeline(
     static const bool plain_tessellated_feature = Common::PerfFeatureEnabled(81);
     const bool amd_policy = AmdPipelinePolicy(instance.GetVendorID()); // AMD-320
     const bool plain_tessellated = plain_tessellated_feature && !amd_policy;
-    const bool lto_relink = amd_policy ? !tessellated : LinkTimeOptimization();
+    const bool lto_relink = !amd_policy && LinkTimeOptimization(); // AMD-322
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .flags = tessellated && plain_tessellated ? vk::PipelineCreateFlagBits::eDisableOptimization
