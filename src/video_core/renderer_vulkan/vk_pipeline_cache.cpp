@@ -1140,19 +1140,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #else
     const bool store_wanted = EmulatorSettings.IsPipelineCacheEnabled();
 #endif
-    // FIX-GT7-029: the translation store is off unless RYGT_SHADER_STORE=1. A stored
-    // translation's resource description is trusted as stored, and one recorded wrongly (Lance's
-    // GT7 shader 0xfb02f94a: the same SPIR-V, other buffer sources) made every later start feed
-    // that shader the wrong buffers; GT7 waited on it and the World Map ran at 13-16 fps. Without
-    // the store a warm start runs the same (30 fps, the driver's cache still has the pipelines),
-    // with a few hundred more draws skipped while the first translations are made.
+    // FIX-GT7-029 turned the translation store off: a stored translation's resource description is
+    // trusted as stored, and one recorded wrongly (Lance's GT7 shader 0xfb02f94a: the same SPIR-V,
+    // other buffer sources) made every later start feed that shader the wrong buffers; GT7 waited
+    // on it and the World Map ran at 13-16 fps. FIX-GT7-053: on again. Without it nothing compiled
+    // before was there at the next start: the main menu's buildings were missing for seconds at
+    // each one (7300 draws skipped on a launch that had to translate, 177 reading the store).
+    // RYGT_SHADER_STORE=0: translations are made each start.
     static const bool store_on = [] {
         const char* env = std::getenv("RYGT_SHADER_STORE");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     if (!store_on) {
-        LOG_WARNING(Render_Vulkan, "FIX-GT7-029: shader translations are made each start "
-                                   "(RYGT_SHADER_STORE=1 loads and stores them)");
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-053: shader translations are made each start "
+                                   "(RYGT_SHADER_STORE=0)");
     }
     if (store_on && store_wanted && Common::PerfFeatureEnabled(47)) {
         if (EmulatorSettings.IsPipelineCacheArchived()) {
