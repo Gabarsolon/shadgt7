@@ -569,6 +569,7 @@ private:
         u32 diag_id{};        ///< DIAG-GT7-073
         bool diag_ahead{};    ///< DIAG-GT7-073: queued by a read-ahead state
         std::chrono::steady_clock::time_point queued_at{};
+        bool too_old{}; ///< FIX-GT7-052: dropped before a worker translated it
         /// Set when harvested: its specialization, and when it became ready.
         Shader::StageSpecialization spec;
         std::chrono::steady_clock::time_point ready_since{};
@@ -606,6 +607,7 @@ private:
         u64 expired{};
         u64 duplicate{};
         u64 failed{};
+        u64 too_old{}; ///< FIX-GT7-052
         u64 waited{};
         double wait_ms{};
         double translate_ms{};

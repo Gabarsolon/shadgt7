@@ -129,16 +129,47 @@ private:
         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
         Common::PreferEfficiencyCores(); // PERF-097
         Shader::Pools pools;
+        // FIX-GT7-052: a translation reads the draw's V#s and T#s through its user data when it
+        // runs, and by then the game has written that memory again. On GT7's main menu 5100 of 6400
+        // translations started 200-500 ms after their draw (2% of those were ever used, against 93%
+        // under 10 ms): they described another draw, which queued another, for 25 s of missing
+        // buildings at every launch. So the newest job goes first, and one older than a frame is
+        // dropped: its draw asks again with what it reads then. RYGT_TRANSLATE_MAX_AGE_MS=0: as before.
+        static const auto max_age = [] {
+            const char* env = std::getenv("RYGT_TRANSLATE_MAX_AGE_MS");
+            return std::chrono::milliseconds{env && *env ? std::strtol(env, nullptr, 0) : 33};
+        }();
         while (!stop.stop_requested()) {
             std::shared_ptr<TranslateJob> job;
+            std::vector<std::shared_ptr<TranslateJob>> too_old;
             {
                 std::unique_lock lk{mutex};
                 cv.wait(lk, stop, [this] { return !queue.empty(); });
-                if (queue.empty()) {
-                    continue;
+                if (max_age.count() > 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    while (!queue.empty() && now - queue.front()->queued_at > max_age) {
+                        too_old.push_back(std::move(queue.front()));
+                        queue.pop_front();
+                    }
+                    if (!queue.empty()) {
+                        job = std::move(queue.back());
+                        queue.pop_back();
+                    }
+                } else if (!queue.empty()) {
+                    job = std::move(queue.front());
+                    queue.pop_front();
                 }
-                job = std::move(queue.front());
-                queue.pop_front();
+            }
+            for (const auto& old : too_old) {
+                {
+                    std::scoped_lock lk{old->mutex};
+                    old->too_old = true;
+                    old->done = true;
+                }
+                old->cv.notify_all();
+            }
+            if (!job) {
+                continue;
             }
             Translate(*job, pools);
             {
@@ -4227,6 +4258,10 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
         if (!job->done) {
             return false;
         }
+        if (job->too_old) {
+            ++translate_stats.too_old; // FIX-GT7-052
+            return true;
+        }
         if (!job->info || !job->module) {
             ++translate_stats.failed;
             return true;
@@ -4258,10 +4293,11 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
             LOG_WARNING(Render_Vulkan,
                         "FIX-078 shader translation in {:.1f} s: {} queued, {} used by draws "
                         "({:.1f} ms of translation done off this thread), {} never drawn, {} "
-                        "duplicates, {} failed; {} draws waited for one ({:.1f} ms)",
+                        "duplicates, {} failed, FIX-GT7-052: {} too old; {} draws waited for "
+                        "one ({:.1f} ms)",
                         std::chrono::duration<double>(now - stats.since).count(), stats.queued,
                         stats.used, stats.translate_ms, stats.expired, stats.duplicate,
-                        stats.failed, stats.waited, stats.wait_ms);
+                        stats.failed, stats.too_old, stats.waited, stats.wait_ms);
         }
         stats = {};
         stats.since = now;
