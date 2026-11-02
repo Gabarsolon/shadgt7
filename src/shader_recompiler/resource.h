@@ -293,11 +293,17 @@ struct SamplerResource {
 using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
 
 struct FMaskResource {
-    SharpLocation sharp_idx;
+    // FIX-GT7-043: as the image's own fetch. Eight dwords read in a row from the first one's place
+    // went past the buffer's end for a T# of four, and were another T# for one with scattered dwords.
+    SharpFetch<AmdGpu::Image> sharp_fetch{};
+    bool is_r128{};
     bool size_read{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
-        return info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
+        AmdGpu::Image image{};
+        const bool fetched = is_r128 ? sharp_fetch.Fetch<4>(info.flattened_ud_buf.data(), &image)
+                                     : sharp_fetch.Fetch(info.flattened_ud_buf.data(), &image);
+        return fetched ? image : AmdGpu::Image::Null(false);
     }
 };
 using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;

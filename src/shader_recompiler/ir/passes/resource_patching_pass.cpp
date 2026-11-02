@@ -133,7 +133,7 @@ public:
 
     u32 Add(const FMaskResource& desc) {
         u32 index = Add(fmask_resources, desc, [&desc](const auto& existing) {
-            return desc.sharp_idx == existing.sharp_idx;
+            return desc.sharp_fetch == existing.sharp_fetch && desc.is_r128 == existing.is_r128;
         });
         return index;
     }
@@ -283,6 +283,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     }
 
     // Patch image instruction if image is FMask.
+    const FMaskResource fmask_res{.sharp_fetch = image_res.sharp_fetch, .is_r128 = image_res.is_r128};
     if (AmdGpu::IsFmask(image.GetDataFmt())) {
         ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
 
@@ -293,15 +294,13 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         // the draws with a real cube took that code for the rest of the session: light of 1e33,
         // the long pink rays.
         const bool size_read = inst.GetOpcode() == IR::Opcode::ImageQueryDimensions;
-        if (const auto& first = resource.sharps[0].dwords[0];
-            (FMaskKeyEnabled() || size_read) && !first.IsImmediate()) {
-            const u32 index =
-                descriptors.Add(FMaskResource{.sharp_idx = SharpLocationFromSource(first.Inst())});
+        if (FMaskKeyEnabled() || size_read) {
+            const u32 index = descriptors.Add(fmask_res);
             info.fmasks[index].size_read |= size_read;
             LOG_WARNING(Render_Recompiler,
                         "FIX-GT7-043: program {:#x}: the T# at {} ({:#x}) is an FMask, its reads are "
                         "constants",
-                        info.pgm_hash, SharpLocationFromSource(first.Inst()), image.Address());
+                        info.pgm_hash, image_res.sharp_fetch.offsets[0], image.Address());
         }
 
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};

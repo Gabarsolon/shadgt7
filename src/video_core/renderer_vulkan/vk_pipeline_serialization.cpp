@@ -49,7 +49,8 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // 16: the resource usage FIX-043 keys permutations by follows the Info.
 // 17 (FIX-GT7-043): the Info's FMask list has another layout, holds every read as an FMask and
 // their key another meaning. Older entries are not read: their Info can't be read at this layout.
-static constexpr u32 ShaderMetaVersion = 17u;
+// 18 (FIX-GT7-043): an FMask's T# is kept as the way to fetch it.
+static constexpr u32 ShaderMetaVersion = 18u;
 } // namespace Serialization
 
 namespace Vulkan {
