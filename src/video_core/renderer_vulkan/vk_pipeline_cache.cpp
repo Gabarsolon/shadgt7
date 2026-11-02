@@ -1304,7 +1304,16 @@ bool PipelineCache::DriverCacheOutgrown(vk::Device device, vk::PipelineCache cac
 }
 
 void PipelineCache::SaveDriverCache(bool wait) {
-    if (driver_cache_path.empty() || !pipeline_cache || driver_cache_full) {
+    if (driver_cache_path.empty() || !pipeline_cache) {
+        return;
+    }
+    if (driver_cache_full) {
+        // FIX-GT7-050: no more saves, but the thread that found it full may still be removing the
+        // file, and the destructor comes here to wait for it: the members it uses go before the
+        // jthread's own join.
+        if (wait && driver_cache_writer.joinable()) {
+            driver_cache_writer.join();
+        }
         return;
     }
     // PERF-036: GT Sport's driver cache grows to several GB (3.4 GB on October 9). Reading it out
