@@ -201,8 +201,12 @@ struct StageSpecialization {
             true);
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.width = sharp.width;
-                         spec.height = sharp.height;
+                         // FIX-GT7-043: zero for a T# that isn't an FMask, which this code
+                         // can't read: the fields count from zero, so an FMask's never are.
+                         if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
+                             spec.width = sharp.width + 1;
+                             spec.height = sharp.height + 1;
+                         }
                      });
         ForEachSharp(samplers, info->samplers,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {

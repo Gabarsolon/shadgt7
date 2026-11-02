@@ -286,6 +286,23 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     if (AmdGpu::IsFmask(image.GetDataFmt())) {
         ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
 
+        // FIX-GT7-043: every instruction below leaves no image for this T#, so without a record
+        // here the key doesn't look at it again and this code matches any T# in that slot. GT7's
+        // lamp halos (vs 0x59b5b0b6) leave float data in their cube's slot on draws that don't read
+        // it; the rare time it looked like an FMask, the cube's read became these constants, and
+        // the draws with a real cube took that code for the rest of the session: light of 1e33,
+        // the long pink rays. RYGT_FMASK_KEY=0: as before.
+        static const bool fmask_key = [] {
+            const char* env = std::getenv("RYGT_FMASK_KEY");
+            return !(env && env[0] == '0');
+        }();
+        if (const auto& first = resource.sharps[0].dwords[0]; fmask_key && !first.IsImmediate()) {
+            descriptors.Add(FMaskResource{.sharp_idx = SharpLocationFromSource(first.Inst())});
+            LOG_WARNING(Render_Recompiler,
+                        "FIX-GT7-043: program {:#x}: the T# at {} is an FMask, its reads are constants",
+                        info.pgm_hash, SharpLocationFromSource(first.Inst()));
+        }
+
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
         switch (inst.GetOpcode()) {
         case IR::Opcode::ImageRead:
@@ -307,11 +324,6 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
                                                    ir.Imm32(static_cast<u32>(image.height)), // y
                                                    ir.Imm32(1), ir.Imm32(1)); // depth, mip
             inst.ReplaceUsesWith(dims);
-
-            // Track FMask resource to do specialization.
-            descriptors.Add(FMaskResource{
-                .sharp_idx = SharpLocationFromSource(resource.sharps[0].dwords[0].Inst()),
-            });
             return;
         }
         default:
