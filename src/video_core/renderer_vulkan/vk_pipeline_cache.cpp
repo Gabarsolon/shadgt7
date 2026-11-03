@@ -93,6 +93,15 @@ bool CompilationInProgress() {
            g_shader_translations_running.load(std::memory_order_relaxed) != 0;
 }
 
+// DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1).
+static bool TranslateJobsDiag() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_DIAG_TRANSLATE_JOBS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 class PipelineCache::TranslateWorkers {
 public:
     TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
@@ -121,16 +130,47 @@ private:
         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
         Common::PreferEfficiencyCores(); // PERF-097
         Shader::Pools pools;
+        // FIX-GT7-052: a translation reads the draw's V#s and T#s through its user data when it
+        // runs, and by then the game has written that memory again. On GT7's main menu 5100 of 6400
+        // translations started 200-500 ms after their draw (2% of those were ever used, against 93%
+        // under 10 ms): they described another draw, which queued another, for 25 s of missing
+        // buildings at every launch. So the newest job goes first, and one older than a frame is
+        // dropped: its draw asks again with what it reads then. RYGT_TRANSLATE_MAX_AGE_MS=0: as before.
+        static const auto max_age = [] {
+            const char* env = std::getenv("RYGT_TRANSLATE_MAX_AGE_MS");
+            return std::chrono::milliseconds{env && *env ? std::strtol(env, nullptr, 0) : 33};
+        }();
         while (!stop.stop_requested()) {
             std::shared_ptr<TranslateJob> job;
+            std::vector<std::shared_ptr<TranslateJob>> too_old;
             {
                 std::unique_lock lk{mutex};
                 cv.wait(lk, stop, [this] { return !queue.empty(); });
-                if (queue.empty()) {
-                    continue;
+                if (max_age.count() > 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    while (!queue.empty() && now - queue.front()->queued_at > max_age) {
+                        too_old.push_back(std::move(queue.front()));
+                        queue.pop_front();
+                    }
+                    if (!queue.empty()) {
+                        job = std::move(queue.back());
+                        queue.pop_back();
+                    }
+                } else if (!queue.empty()) {
+                    job = std::move(queue.front());
+                    queue.pop_front();
                 }
-                job = std::move(queue.front());
-                queue.pop_front();
+            }
+            for (const auto& old : too_old) {
+                {
+                    std::scoped_lock lk{old->mutex};
+                    old->too_old = true;
+                    old->done = true;
+                }
+                old->cv.notify_all();
+            }
+            if (!job) {
+                continue;
             }
             Translate(*job, pools);
             {
@@ -149,6 +189,7 @@ private:
             .hash = job.hash,
         };
         auto info = std::make_unique<Shader::Info>(job.hw_stage, job.sw_stage, params);
+        info->pinned_fetch_sharps = std::move(job.fetch_sharps); // FIX-GT7-054
         auto runtime_info = job.runtime_info;
         auto binding = job.start;
         const auto start = std::chrono::steady_clock::now();
@@ -171,6 +212,20 @@ private:
         job.translate_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
+        // DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1): what each translation made.
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-073: translated #{} age {:.0f} ms ahead {} {:#x} stage {} start "
+                        "{}/{} {:.1f} ms, {} code "
+                        "words, spv {} words {:#x}, runtime {:#x}, user data {:#x}",
+                        job.diag_id,
+                        std::chrono::duration<double, std::milli>(start - job.queued_at).count(),
+                        job.diag_ahead, job.hash, u32(job.hw_stage), job.start.unified, job.start.buffer,
+                        job.translate_ms, job.code.size(), job.spv.size(),
+                        XXH3_64bits(job.spv.data(), job.spv.size() * sizeof(u32)),
+                        XXH3_64bits(&job.runtime_info, sizeof(job.runtime_info)),
+                        XXH3_64bits(job.user_data.data(), sizeof(job.user_data)));
+        }
     }
 
     const Shader::Profile& profile;
@@ -1089,19 +1144,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #else
     const bool store_wanted = EmulatorSettings.IsPipelineCacheEnabled();
 #endif
-    // FIX-GT7-029: the translation store is off unless RYGT_SHADER_STORE=1. A stored
-    // translation's resource description is trusted as stored, and one recorded wrongly (Lance's
-    // GT7 shader 0xfb02f94a: the same SPIR-V, other buffer sources) made every later start feed
-    // that shader the wrong buffers; GT7 waited on it and the World Map ran at 13-16 fps. Without
-    // the store a warm start runs the same (30 fps, the driver's cache still has the pipelines),
-    // with a few hundred more draws skipped while the first translations are made.
+    // FIX-GT7-029 turned the translation store off: a stored translation's resource description is
+    // trusted as stored, and one recorded wrongly (Lance's GT7 shader 0xfb02f94a: the same SPIR-V,
+    // other buffer sources) made every later start feed that shader the wrong buffers; GT7 waited
+    // on it and the World Map ran at 13-16 fps. FIX-GT7-053: on again. Without it nothing compiled
+    // before was there at the next start: the main menu's buildings were missing for seconds at
+    // each one (7300 draws skipped on a launch that had to translate, 177 reading the store).
+    // RYGT_SHADER_STORE=0: translations are made each start.
     static const bool store_on = [] {
         const char* env = std::getenv("RYGT_SHADER_STORE");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     if (!store_on) {
-        LOG_WARNING(Render_Vulkan, "FIX-GT7-029: shader translations are made each start "
-                                   "(RYGT_SHADER_STORE=1 loads and stores them)");
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-053: shader translations are made each start "
+                                   "(RYGT_SHADER_STORE=0)");
     }
     if (store_on && store_wanted && Common::PerfFeatureEnabled(47)) {
         if (EmulatorSettings.IsPipelineCacheArchived()) {
@@ -1109,7 +1165,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                        "pipeline cache (pipeline_cache_archived)");
         } else {
             Storage::DataBase::Instance().Open();
-            use_stored_shaders = true;
+            use_stored_shaders = Storage::DataBase::Instance().IsOpened();
             // D10: the old renderer's translations stand in while the new renderer's are built.
             // SHADGT_LEGACY_FALLBACK=0 turns it off.
             // SHD-002: not with stage descriptor sets: the old translations bind everything
@@ -1124,11 +1180,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                 legacy_fallback ? "on" : "off (no old shader store)");
                 }
             }
-            LOG_WARNING(Render_Vulkan,
-                        "PERF-032: shader translations are loaded from the store on first use");
+            if (use_stored_shaders) {
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-032: shader translations are loaded from the store on first use");
+            }
             // PERF-GT7-019 (RYGT_STORE_READERS=0: read on the GPU threads as before).
             const char* readers_env = std::getenv("RYGT_STORE_READERS");
-            if (!(readers_env && readers_env[0] == '0')) {
+            if (use_stored_shaders && !(readers_env && readers_env[0] == '0')) {
                 store_readers = std::make_unique<StoreReaders>(8);
                 store_stats.since = std::chrono::steady_clock::now();
             }
@@ -4074,6 +4132,40 @@ static bool CopyFetchShader(std::span<u32, Shader::ShaderParams::NumShaderUserDa
     return false;
 }
 
+// FIX-GT7-054: a vertex shader's attribute V#s, as the draw has them when its translation is
+// queued. They were read through the user data three times: for the code, for its SPIR-V, and for
+// its key when the job was harvested, by when the game had written that memory again. GT7's map
+// markers got code made from an empty V# (every attribute 0) under the key of real ones
+// (R, G, B, A), so every car's triangle landed on one point; the translation store then kept it for
+// every later start. RYGT_PIN_FETCH_SHARPS=0: as before.
+static std::vector<Shader::Info::PinnedFetchSharp> PinFetchSharps(
+    HwStage hw_stage, SwStage sw_stage, std::span<const u32> code,
+    std::span<const u32, Shader::ShaderParams::NumShaderUserData> user_data, u64 hash) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_PIN_FETCH_SHARPS");
+        return !(env && env[0] == '0');
+    }();
+    const auto base = Shader::FetchShaderSgprBase(code);
+    if (!enabled || !base) {
+        return {};
+    }
+    const Shader::ShaderParams params{.user_data = user_data, .code = code, .hash = hash};
+    const auto reader = std::make_unique<Shader::Info>(hw_stage, sw_stage, params);
+    reader->has_fetch_shader = true;
+    reader->fetch_shader_sgpr_base = *base;
+    Shader::Gcn::FetchShaderData fetch;
+    if (!Shader::Gcn::ParseFetchShader(*reader, fetch)) {
+        return {};
+    }
+    std::vector<Shader::Info::PinnedFetchSharp> sharps;
+    sharps.reserve(fetch.attributes.size());
+    for (const auto& attrib : fetch.attributes) {
+        sharps.push_back({attrib.sgpr_base, attrib.dword_offset,
+                          reader->ReadUdReg<AmdGpu::Buffer>(attrib.sgpr_base, attrib.dword_offset)});
+    }
+    return sharps;
+}
+
 bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
@@ -4108,7 +4200,14 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         !CopyFetchShader(job->user_data, job->code, job->fetch_copy)) {
         return false; // as above
     }
+    if (!job->fetch_copy.empty()) {
+        job->fetch_sharps = PinFetchSharps(hw_stage, sw_stage, job->code, job->user_data, job->hash);
+    }
     job->start = start;
+    static std::atomic<u32> diag_next_id{};
+    job->diag_id = ++diag_next_id;
+    job->diag_ahead = regs_override != nullptr;
+    job->queued_at = std::chrono::steady_clock::now();
     jobs.push_back(job);
     ++translate_stats.queued;
     translate_workers->Queue(std::move(job));
@@ -4135,10 +4234,38 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         // FIX-GT7-024: the lookup's on the right, as GetProgram compares (its bitsets decide).
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
             job->spec != Shader::StageSpecialization(info, runtime_info, profile, binding)) {
+            if (TranslateJobsDiag()) {
+                static std::atomic<u32> logged{};
+                if (job->hw_stage == hw_stage && job->sw_stage == sw_stage && ++logged <= 3000) {
+                    u32 index{};
+                    const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+                    const char* reason = job->spec.FirstDifference(spec, index);
+                    std::string fields;
+                    if (reason && std::string_view{reason} == "buffer" && index < spec.buffers.size() &&
+                        index < job->spec.buffers.size() && index < info.buffers.size()) {
+                        const auto& a = job->spec.buffers[index];
+                        const auto& c = spec.buffers[index];
+                        const auto& desc = info.buffers[index];
+                        fields = fmt::format(
+                            " program {:#x} base {:#x} type {} stride used {}: job stride {} fmt {} {}/{} swz {} tid {} coh {} ; this stride {} fmt {} {}/{} swz {} tid {} coh {}",
+                            hash, u64(desc.GetSharp(info).base_address), u32(desc.buffer_type), bool(info.buffer_stride_used[index]),
+                            u32(a.stride), u32(a.is_formatted), u32(a.data_format), u32(a.num_format), u32(a.swizzle_enable), u32(a.add_tid_enable), u32(a.coherent),
+                            u32(c.stride), u32(c.is_formatted), u32(c.data_format), u32(c.num_format), u32(c.swizzle_enable), u32(c.add_tid_enable), u32(c.coherent));
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-GT7-073: #{} not for this {}: {}[{}]{}", job->diag_id,
+                                regs_override != nullptr ? "read-ahead" : "draw",
+                                reason ? reason : "none", index, fields);
+                }
+            }
             continue;
         }
         if (!insert) {
             return true;
+        }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} taken by a {}", job->diag_id,
+                        regs_override != nullptr ? "read-ahead" : "draw");
         }
         LogNewPermutation(program, hw_stage, params, runtime_info, binding); // DIAG-GT7-013
         size_t perm_idx = program.modules.size();
@@ -4235,12 +4362,30 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
         if (!job->done) {
             return false;
         }
+        if (job->too_old) {
+            ++translate_stats.too_old; // FIX-GT7-052
+            if (TranslateJobsDiag()) {
+                LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} too old", job->diag_id);
+            }
+            return true;
+        }
         if (!job->info || !job->module) {
             ++translate_stats.failed;
             return true;
         }
         translate_stats.translate_ms += job->translate_ms;
         job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start);
+        // FIX-GT7-054: the key is made; from here this Info is matched against other draws.
+        const bool pinned = !job->info->pinned_fetch_sharps.empty();
+        job->info->pinned_fetch_sharps.clear();
+        if (TranslateJobsDiag() && pinned &&
+            Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start)
+                    .vs_attribs != job->spec.vs_attribs) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-073: #{} {:#x}: its attribute V#s changed after its draw, its "
+                        "code would have had another key without FIX-GT7-054",
+                        job->diag_id, job->hash);
+        }
         job->ready_since = now;
         ready.push_back(job);
         return true;
@@ -4253,6 +4398,9 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
         if (now - job->ready_since < std::chrono::seconds{30} && ready.size() <= 32) {
             return false;
         }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} expired", job->diag_id);
+        }
         instance.GetDevice().destroyShaderModule(job->module);
         ++translate_stats.expired;
         return true;
@@ -4263,10 +4411,11 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
             LOG_WARNING(Render_Vulkan,
                         "FIX-078 shader translation in {:.1f} s: {} queued, {} used by draws "
                         "({:.1f} ms of translation done off this thread), {} never drawn, {} "
-                        "duplicates, {} failed; {} draws waited for one ({:.1f} ms)",
+                        "duplicates, {} failed, FIX-GT7-052: {} too old; {} draws waited for "
+                        "one ({:.1f} ms)",
                         std::chrono::duration<double>(now - stats.since).count(), stats.queued,
                         stats.used, stats.translate_ms, stats.expired, stats.duplicate,
-                        stats.failed, stats.waited, stats.wait_ms);
+                        stats.failed, stats.too_old, stats.waited, stats.wait_ms);
         }
         stats = {};
         stats.since = now;
@@ -4495,7 +4644,11 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const bool has_stored = !it_pgm.value()->modules.empty() ||
                             stored_perm_end.find(params.hash) != stored_perm_end.end();
     u32 needed_fixes = 0;
-    if (first_use && has_stored) {
+    // FIX-GT7-055: SHD-010 clears a store another build filled, so what this one holds was made by
+    // this translator: without this, the second launch of a new store translated again every
+    // program needing a fix (32 on the main menu) and left the first translation unused on disk.
+    static const bool other_builds_stored = Storage::StoreMayHoldOtherBuilds();
+    if (first_use && has_stored && other_builds_stored) {
         needed_fixes |= Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
         if (Shader::HasLegacyMad(params.code)) {
             needed_fixes |= 16u; // FIX-101

@@ -186,6 +186,24 @@ struct Info : InfoPersistent {
         return data;
     }
 
+    /// FIX-GT7-054: a translation on a worker reads its vertex attributes' V#s here: as the draw
+    /// had them, whenever translation, SPIR-V emission and the key get to them. Empty otherwise.
+    struct PinnedFetchSharp {
+        u32 sgpr_base;
+        u32 dword_offset;
+        AmdGpu::Buffer sharp;
+    };
+    std::vector<PinnedFetchSharp> pinned_fetch_sharps;
+
+    AmdGpu::Buffer ReadFetchSharp(u32 sgpr_base, u32 dword_offset) const noexcept {
+        for (const auto& pinned : pinned_fetch_sharps) {
+            if (pinned.sgpr_base == sgpr_base && pinned.dword_offset == dword_offset) {
+                return pinned.sharp;
+            }
+        }
+        return ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+    }
+
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
         bnd.unified += buffers.size() + samplers.size();
