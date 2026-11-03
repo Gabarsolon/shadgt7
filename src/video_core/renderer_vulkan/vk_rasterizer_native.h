@@ -362,6 +362,8 @@ private:
         /// guest memory are what the region holds except for the CPU's new writes (what
         /// FIX-173's compare needs). Pages not here are copied in whole at the next write.
         std::unordered_map<VAddr, u64> cpu_pages;
+        /// FIX-GT7-033: of those, the pages the GPU wrote since their last copy.
+        std::unordered_set<VAddr> gpu_pages;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
