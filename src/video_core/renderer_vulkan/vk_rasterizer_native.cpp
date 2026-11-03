@@ -1940,19 +1940,34 @@ NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
     return nullptr;
 }
 
-NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
-    ++buffer_generation; // OPT-003: regions are taken in or made
+NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool write) {
     auto* direct = r.buffer_cache.GetDirectMemory();
     // The new region takes in every region it overlaps (their GPU-written contents kept).
     VAddr begin = Common::AlignDown(address, 4096);
     VAddr end = Common::AlignUp(address + size, 4096);
     std::vector<Region> merged;
+    bool refused;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+        for (const auto& [base, region] : regions) {
+            if (region.begin < end && region.end > begin) {
+                begin = std::min(begin, region.begin);
+                end = std::max(end, region.end);
+            }
+        }
+        // FIX-GT7-039: a range that can't be a region leaves the regions it reaches alone. In GT7's
+        // rain a shader reads 2.17 GB up to the end of a pool, once a frame: that read used to erase
+        // the ~26 regions under it, and with them what the GPU wrote there. They were made again
+        // from guest memory each frame, 143 MB of copies a frame. A write of a size a region can
+        // have still goes to guest memory in place, or to a smaller region: regions left over it
+        // would keep their old bytes, so those are taken out.
+        refused = !direct || end - begin > 1_GB || !r.IsMappedStart(begin) ||
+                  !r.memory->IsValidGpuMapping(begin, end - begin);
+        if (refused && !(write && size <= 1_GB)) {
+            return nullptr;
+        }
         for (auto it = regions.begin(); it != regions.end();) {
             if (it->second.begin < end && it->second.end > begin) {
-                begin = std::min(begin, it->second.begin);
-                end = std::max(end, it->second.end);
                 merged.push_back(std::move(it->second));
                 it = regions.erase(it);
             } else {
@@ -1960,9 +1975,9 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
             }
         }
     }
+    ++buffer_generation; // OPT-003: regions are taken in or made
     buffer_log.Note(begin, end); // OPT-010
-    if (!direct || end - begin > 1_GB || !r.IsMappedStart(begin) ||
-        !r.memory->IsValidGpuMapping(begin, end - begin)) {
+    if (refused) {
         return nullptr;
     }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
@@ -3553,7 +3568,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
         if (address < region->begin || address + size > region->end) {
-            region = MakeRegion(address, size);
+            region = MakeRegion(address, size, write);
         }
         if (region) {
             RefreshRegion(*region);
@@ -3585,7 +3600,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         return address < range.second && address + size > range.first;
     });
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
-        if (Region* region = MakeRegion(address, size)) {
+        if (Region* region = MakeRegion(address, size, true)) {
             ++stats.region_binds;
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
@@ -3624,7 +3639,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
     }
     if (write) {
-        if (Region* region = MakeRegion(address, size)) {
+        if (Region* region = MakeRegion(address, size, true)) {
             ++stats.region_binds;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
