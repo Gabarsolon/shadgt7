@@ -94,6 +94,8 @@ enum class SharpFetchPostOp : u8 {
     ClearAnisoRatioAndThreshold,
     // A scalar-memory base pointer, rather than a guest V# descriptor.
     ReadConstPointer,
+    // Sample a cube through a native cube-array view, retaining cross-face filtering.
+    NativeCubeSampling,
 };
 
 enum class BufferType : u8 {

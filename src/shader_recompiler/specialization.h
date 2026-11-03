@@ -131,8 +131,7 @@ struct StageSpecialization {
                              // nearly every frame, and those draws were skipped while each built
                              // (the flickering driver figure). Such an attribute counts as plain
                              // floats. -DisablePerf 83 specializes on it.
-                             static const bool plain_garbage = Common::PerfFeatureEnabled(83);
-                             if (plain_garbage && sharp.GetSize() >= (u64{1} << 30)) {
+                             if (Gcn::VertexAttribute::IsGarbage(sharp)) {
                                  spec.num_class = AmdGpu::NumberClass::Float;
                                  spec.dst_select = AmdGpu::CompMapping{
                                      .r = AmdGpu::CompSwizzle::Red,

@@ -16,6 +16,7 @@
 
 #include <miniz.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -47,9 +48,22 @@ namespace {
 // RYGT_KEEP_SHADER_CACHE=1 keeps it (tests across builds).
 constexpr const char* StampName = "renderer_build.txt";
 
+// FIX-GT7-053: CMake can't read the commit in a git worktree, so such a build has only its
+// description (which holds its commit), and its store was never cleared.
+std::string RendererBuild() {
+    return Common::g_scm_rev[0] != '\0' ? Common::g_scm_rev : Common::g_scm_desc;
+}
+
 bool KeepShaderCache() {
     const char* env = std::getenv("RYGT_KEEP_SHADER_CACHE");
     return env && env[0] == '1';
+}
+
+// Tests: a store of its own for this tag. The stamp knows neither the environment's switches nor
+// changes made since the build was configured, so a test keeps one store per renderer and switches.
+std::string StoreTag() {
+    const char* env = std::getenv("RYGT_SHADER_STORE_TAG");
+    return env && *env ? std::string{"-"} + env : std::string{};
 }
 
 std::string ReadStamp(const std::filesystem::path& stamp) {
@@ -66,49 +80,159 @@ std::string ReadStamp(const std::filesystem::path& stamp) {
     return text;
 }
 
-bool WriteStamp(const std::filesystem::path& stamp) {
+bool WriteStamp(const std::filesystem::path& stamp, const std::string& build) {
     Common::FS::IOFile file{stamp, Common::FS::FileAccessMode::Create};
     if (!file.IsOpen()) {
         return false;
     }
-    const std::string text = std::string{Common::g_scm_rev} + "\n";
+    const std::string text = build + "\n";
     return file.WriteRaw<char>(text.data(), text.size()) == text.size();
 }
 
+/// FIX-GT7-057: where a folder to clear waits for TidyStores: <store>.clearing<n>.
+constexpr const char* ClearingSuffix = ".clearing";
+
+/// FIX-GT7-057: the folder set aside at once. False if it can't be renamed (a file held open).
+bool SetAside(const std::filesystem::path& store) {
+    std::error_code ec;
+    for (u32 n = 0; n < 100; ++n) {
+        auto aside = store;
+        aside += fmt::format("{}{}", ClearingSuffix, n);
+        if (std::filesystem::exists(aside, ec)) {
+            continue;
+        }
+        std::filesystem::rename(store, aside, ec);
+        return !ec;
+    }
+    return false;
+}
+
+/// FIX-GT7-056: this stamp sends the store to SHD-010's clear at the next start.
+constexpr const char* OverLimitStamp = "over-size-limit";
+
+/// RYGT_SHADER_STORE_MAX_MB=0: no limit.
+u64 StoreMaxBytes() {
+    static const u64 max = [] {
+        const char* env = std::getenv("RYGT_SHADER_STORE_MAX_MB");
+        return u64{env && *env ? std::strtoull(env, nullptr, 0) : 4096} * 1048576;
+    }();
+    return max;
+}
+
+/// Removes what a folder holds, one entry at a time, until asked to stop. True when it's empty.
+bool EmptyFolder(std::stop_token stop, const std::filesystem::path& folder, u64& files,
+                 u64& bytes) {
+    std::error_code ec;
+    std::filesystem::directory_iterator it{folder, ec};
+    const std::filesystem::directory_iterator end;
+    bool emptied = true;
+    while (!ec && it != end) {
+        if (stop.stop_requested()) {
+            return false;
+        }
+        const auto path = it->path();
+        std::error_code entry_ec;
+        const u64 size = it->is_regular_file(entry_ec) ? it->file_size(entry_ec) : 0;
+        it.increment(ec);
+        std::filesystem::remove_all(path, entry_ec);
+        emptied &= !entry_ec;
+        if (!entry_ec) {
+            ++files;
+            bytes += size;
+        }
+    }
+    return emptied && !ec;
+}
+
+/// FIX-GT7-056 and FIX-GT7-057, off the start's thread (GT7's old store: 238,000 files, 15 GB).
+/// Removes the folders set aside, also those a closed game left, then looks at the store's size:
+/// over the limit, the next start begins a new one, as FIX-GT7-050 does with the driver's cache.
+void TidyStores(std::stop_token stop, const std::filesystem::path& store) {
+    Common::SetCurrentThreadName("shadGT:ShaderStoreTidy");
+    Common::PreferEfficiencyCores();
+    std::error_code ec;
+    const std::string prefix = store.filename().string() + ClearingSuffix;
+    std::vector<std::filesystem::path> aside;
+    for (std::filesystem::directory_iterator it{store.parent_path(), ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        if (it->path().filename().string().starts_with(prefix)) {
+            aside.push_back(it->path());
+        }
+    }
+    for (const auto& folder : aside) {
+        const auto start = std::chrono::steady_clock::now();
+        u64 files = 0, bytes = 0;
+        const bool emptied = EmptyFolder(stop, folder, files, bytes);
+        if (emptied) {
+            std::filesystem::remove(folder, ec);
+        }
+        LOG_WARNING(Render, "FIX-GT7-057: removed {}{} files ({:.1f} MB) of {} in {:.1f} s",
+                    emptied ? "" : "only ", files, bytes / 1048576.0, folder.string(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    }
+    if (StoreMaxBytes() == 0 || KeepShaderCache()) {
+        return;
+    }
+    u64 bytes = 0;
+    ec.clear();
+    for (std::filesystem::directory_iterator it{store, ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        if (stop.stop_requested()) {
+            return;
+        }
+        std::error_code entry_ec;
+        bytes += it->is_regular_file(entry_ec) ? it->file_size(entry_ec) : 0;
+    }
+    if (!ec && bytes > StoreMaxBytes()) {
+        const bool stamped = WriteStamp(store / StampName, OverLimitStamp);
+        LOG_WARNING(Render, "FIX-GT7-056: shader store of {} MB is over the {} MB limit: {}",
+                    bytes / 1048576, StoreMaxBytes() / 1048576,
+                    stamped ? "the next start begins a new one" : "its stamp can't be written");
+    }
+}
+
 /// The store at `store` (a folder, or an archive with its stamp at `stamp`) as this build's:
-/// cleared first when another build filled it. The stamp is written only after the clear.
-void ClaimStore(const std::filesystem::path& store, const std::filesystem::path& stamp,
+/// cleared first when another build filled it, or when it went over its size limit. The stamp is
+/// written only after the clear. False when it couldn't be cleared: what it holds isn't this build's
+/// (FIX-GT7-055 counts on that), so it stays closed for this session.
+bool ClaimStore(const std::filesystem::path& store, const std::filesystem::path& stamp,
                 bool is_folder) {
-    const std::string build = Common::g_scm_rev;
+    const std::string build = RendererBuild();
     if (build.empty()) {
-        return; // a build without its commit: nothing to compare
+        return true; // a build without its commit: nothing to compare
     }
     const std::string stored = ReadStamp(stamp);
     if (stored == build) {
-        return;
+        return true;
     }
+    const std::string from = stored.empty()             ? "from an unknown build"
+                             : stored == OverLimitStamp ? "over its size limit"
+                                                        : "from " + stored;
     std::error_code ec;
-    u64 files = 0, bytes = 0;
-    if (is_folder && std::filesystem::is_directory(store, ec)) {
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(store, ec)) {
-            if (entry.is_regular_file(ec) && entry.path().filename() != StampName) {
-                ++files;
-                bytes += entry.file_size(ec);
-            }
+    bool has_files = false;
+    if (is_folder) {
+        std::filesystem::directory_iterator it{store, ec};
+        const std::filesystem::directory_iterator end;
+        for (; !ec && it != end && !has_files; it.increment(ec)) {
+            has_files = it->path().filename() != StampName;
         }
-    } else if (!is_folder && std::filesystem::is_regular_file(store, ec)) {
-        files = 1;
-        bytes = std::filesystem::file_size(store, ec);
+    } else {
+        has_files = std::filesystem::is_regular_file(store, ec);
     }
-    if (files != 0 && KeepShaderCache()) {
-        LOG_WARNING(Render, "SHD-010: shader store {} is from build {} (this is {}); kept "
+    if (has_files && KeepShaderCache()) {
+        LOG_WARNING(Render, "SHD-010: shader store {} is {} (this is {}); kept "
                             "(RYGT_KEEP_SHADER_CACHE=1)",
-                    store.string(), stored.empty() ? "unknown" : stored, build);
-        return;
+                    store.string(), from, build);
+        return true;
     }
-    if (files != 0) {
+    if (has_files) {
+        // FIX-GT7-057: a rename, whatever the store's size; TidyStores removes the files.
+        const auto start = std::chrono::steady_clock::now();
+        const bool aside = is_folder && SetAside(store);
         bool cleared = true;
-        if (is_folder) {
+        if (aside) {
+            std::filesystem::create_directories(store, ec);
+        } else if (is_folder) {
             for (const auto& entry : std::filesystem::directory_iterator(store, ec)) {
                 if (entry.path().filename() == StampName) {
                     continue;
@@ -124,14 +248,17 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
         }
         if (!cleared) {
             // The stamp stays as it was: the next start tries again.
-            LOG_ERROR(Render, "SHD-010: could not clear the shader store {} of build {}",
-                      store.string(), stored.empty() ? "unknown" : stored);
-            return;
+            LOG_ERROR(Render, "SHD-010: could not clear the shader store {} ({}); closed for this "
+                              "session, translations are made each time",
+                      store.string(), from);
+            return false;
         }
-        LOG_WARNING(Render, "SHD-010: new renderer build {} (store from {}): cleared {} files "
-                            "({:.1f} MB) from {}; shaders are translated again as they are needed",
-                    build, stored.empty() ? "unknown" : stored, files, bytes / 1048576.0,
-                    store.string());
+        LOG_WARNING(Render, "SHD-010: renderer build {}, store {}: {} {} in {:.1f} ms; shaders are "
+                            "translated again as they are needed",
+                    build, from, aside ? "set aside" : "cleared", store.string(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              start)
+                        .count());
     }
     // The marks count a program's permutations in the store as it was. New translations start
     // at 0 again, and the next start would refuse those under the old marks. The stores of a
@@ -141,22 +268,29 @@ void ClaimStore(const std::filesystem::path& store, const std::filesystem::path&
     std::filesystem::remove(RetranslationMarksPath(), marks_ec);
     if (marks_ec) {
         // The stamp stays as it was: the next start tries again.
-        LOG_ERROR(Render, "SHD-010: could not remove {}", RetranslationMarksPath().string());
-        return;
+        LOG_ERROR(Render, "SHD-010: could not remove {}; the shader store is closed for this "
+                          "session",
+                  RetranslationMarksPath().string());
+        return false;
     }
     if (is_folder) {
         std::filesystem::create_directories(store, ec);
     }
-    if (!WriteStamp(stamp)) {
+    if (!WriteStamp(stamp, build)) {
         LOG_ERROR(Render, "SHD-010: could not write {}", stamp.string());
     }
+    return true;
 }
 
 } // namespace
 
 std::filesystem::path RetranslationMarksPath() {
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           fmt::format("{}.else-scope-fix", Common::ElfInfo::Instance().GameSerial());
+           fmt::format("{}{}.else-scope-fix", Common::ElfInfo::Instance().GameSerial(), StoreTag());
+}
+
+bool StoreMayHoldOtherBuilds() {
+    return KeepShaderCache() || RendererBuild().empty();
 }
 
 void ProcessIO(const std::stop_token& stoken) {
@@ -228,7 +362,9 @@ void DataBase::Open() {
         {
             auto stamp = cache_path;
             stamp.replace_extension(".build.txt");
-            ClaimStore(cache_path, stamp, false); // SHD-010
+            if (!ClaimStore(cache_path, stamp, false)) { // SHD-010
+                return;
+            }
         }
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
@@ -246,10 +382,15 @@ void DataBase::Open() {
             // SHD-002: stage descriptor sets: translations of their own.
             cache_path += "-direct-sets";
         }
+        cache_path += StoreTag();
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
-        ClaimStore(cache_path, cache_path / StampName, true); // SHD-010
+        if (!ClaimStore(cache_path, cache_path / StampName, true)) { // SHD-010
+            return;
+        }
+        tidy_worker = std::jthread{
+            [store = cache_path](std::stop_token stop) { TidyStores(stop, store); }};
     }
 
     io_worker = std::jthread{ProcessIO};
@@ -265,7 +406,7 @@ void DataBase::OpenLegacy() {
     std::error_code ec;
     opened = std::filesystem::is_directory(cache_path, ec);
     // SHD-010: another build's store is not read (the old renderer clears it when it opens it).
-    if (opened && ReadStamp(cache_path / StampName) != Common::g_scm_rev && !KeepShaderCache()) {
+    if (opened && ReadStamp(cache_path / StampName) != RendererBuild() && !KeepShaderCache()) {
         LOG_INFO(Render, "SHD-010: old renderer's shader store at {} is from another build; not "
                          "read",
                  cache_path.string());
@@ -283,6 +424,10 @@ void DataBase::Close() {
 
     io_worker.request_stop();
     io_worker.join();
+    if (tidy_worker.joinable()) {
+        tidy_worker.request_stop();
+        tidy_worker.join();
+    }
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_finalize_archive(&zip_ar);

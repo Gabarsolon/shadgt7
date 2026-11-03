@@ -248,6 +248,21 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     auto image = image_res.GetSharp(info);
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
+    // Port of xacidr4inx's reflection fix (RyGT 0066): keep integer accesses,
+    // comparison/gather operations, and face-space offsets or gradients on their existing
+    // array path. Ordinary fragment cube samples use the host cube sampler; the post-op
+    // separates their descriptor from any array access.
+    if (profile.native_cube_sampling && info.hw_stage == HwStage::Fragment &&
+        image.GetType() == AmdGpu::ImageType::Cube &&
+        inst.GetOpcode() == IR::Opcode::ImageSampleRaw && !inst_info.is_depth &&
+        !inst_info.is_gather && !inst_info.has_offset && !inst_info.has_derivatives &&
+        !inst_info.is_unnormalized) {
+        AmdGpu::Sampler sampler{};
+        const auto fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]);
+        if (fetch.Fetch(info.flattened_ud_buf.data(), &sampler) && !sampler.force_unnormalized) {
+            image_res.post_op = SharpFetchPostOp::NativeCubeSampling;
+        }
+    }
 
     if (needs_mip_storage_fallback) {
         // If the mip level to IMAGE_(LOAD/STORE)_MIP is a constant, set up ImageResource

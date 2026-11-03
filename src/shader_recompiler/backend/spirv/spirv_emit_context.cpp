@@ -350,11 +350,9 @@ std::optional<std::array<Id, 3>> EmitContext::FindVertexOrder() {
         OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(2U))};
     const Id reference = OpLoad(F32[4], order_ref_in);
     const Id ones = ConstF32(1.0f, 1.0f, 1.0f, 1.0f);
-    constexpr std::array<std::array<u32, 3>, 6> orders{{
-        {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
     Id best_error{};
     std::array<Id, 3> best{};
-    for (const auto& order : orders) {
+    for (const auto& order : AmdVertexOrders) {
         Id blend = OpVectorTimesScalar(F32[4], corners[order[0]], weights[0]);
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[1]], weights[1]));
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[2]], weights[2]));
@@ -422,7 +420,7 @@ void EmitContext::DefineInputs() {
         ASSERT(fetch_shader.attributes.size() <= IR::NumParams);
         for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
             const auto& attrib = fetch_shader.attributes[semantic];
-            const auto sharp = attrib.GetSharp(info);
+            const auto sharp = attrib.GetSharpForCode(info);
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
             Id id{DefineInput(type, semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
@@ -1131,6 +1129,10 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
     const auto type = image.GetViewType(desc.is_array);
     const u32 sampled = desc.is_written ? 2 : 1;
+    if (desc.post_op == SharpFetchPostOp::NativeCubeSampling) {
+        ctx.AddCapability(spv::Capability::SampledCubeArray);
+        return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
+    }
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color2D:
@@ -1180,6 +1182,7 @@ void EmitContext::DefineImagesAndSamplers() {
             .view_type = sharp.GetViewType(image_desc.is_array),
             .is_integer = is_integer,
             .is_storage = is_storage,
+            .native_cube = image_desc.post_op == SharpFetchPostOp::NativeCubeSampling,
             .mip_fallback_mode = mip_fallback_mode,
         });
         interfaces.push_back(id);
