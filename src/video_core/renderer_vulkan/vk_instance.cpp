@@ -27,12 +27,6 @@
 
 namespace Vulkan {
 
-static StoreGpuFamily g_store_gpu_family{StoreGpuFamily::Other}; // AMD-312
-
-StoreGpuFamily GetStoreGpuFamily() {
-    return g_store_gpu_family;
-}
-
 namespace {
 
 std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
@@ -567,7 +561,8 @@ bool Instance::CreateDevice() {
             feature_chain.get<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>()
                 .shaderMaximalReconvergence &&
             feature_chain.get<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>().shaderQuadControl &&
-            !Simulates(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME) &&
+            (GetSimulatedGpu() == SimulatedGpu::None ||
+             !Simulates(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME)) &&
             add_extension(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) &&
             add_extension(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
         LOG_INFO(Render_Vulkan, "AMD-306: whole quads in pixel shader branches: {} (driver {})",
@@ -975,19 +970,6 @@ void Instance::CollectDeviceParameters() {
 
     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
-    // AMD-312: Radeon RX 9000 cards (RDNA4) and RX 7000 cards (RDNA3) get shader stores of
-    // their own versions; RX 7000 cards also leave FIX-215/216 out (AMD-313).
-    if (driver_id == vk::DriverId::eAmdProprietary) {
-        if (model_name.find("Radeon RX 9") != std::string::npos) {
-            g_store_gpu_family = StoreGpuFamily::AmdRdna4;
-        } else if (model_name.find("Radeon RX 7") != std::string::npos) {
-            g_store_gpu_family = StoreGpuFamily::AmdRdna3;
-        } else if (IsAmdLegacyShaderCompiler()) {
-            // AMD's older shader compiler (RX 6000, RX 5000, RX 400/500): AMD-306/307/308 change
-            // its translations, so these cards keep a store of their own.
-            g_store_gpu_family = StoreGpuFamily::AmdLegacy;
-        }
-    }
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);
@@ -1262,25 +1244,37 @@ void Instance::ReportDeviceLost() const {
     }
 }
 
-// PERF-210: the input stage runs on the game thread that submits the flip, so the driver can hold
-// the game there and start its next frame later; the present stage closes that frame.
-void Instance::AntiLagUpdate(bool present) const {
-    if (!anti_lag) {
-        return;
-    }
-    std::scoped_lock lock{anti_lag_mutex};
-    if (!present) {
-        ++anti_lag_frame;
-    }
+static void SendAntiLagStage(vk::Device device, vk::AntiLagStageAMD stage, u64 frame) {
     const vk::AntiLagPresentationInfoAMD info{
-        .stage = present ? vk::AntiLagStageAMD::ePresent : vk::AntiLagStageAMD::eInput,
-        .frameIndex = anti_lag_frame,
+        .stage = stage,
+        .frameIndex = frame,
     };
-    device->antiLagUpdateAMD(vk::AntiLagDataAMD{
+    device.antiLagUpdateAMD(vk::AntiLagDataAMD{
         .mode = vk::AntiLagModeAMD::eOn,
         .maxFPS = 0,
         .pPresentationInfo = &info,
     });
+}
+
+// PERF-210: the input stage runs on the game thread that submits the flip, so the driver can hold
+// the game there and start its next frame later. The flip carries the frame's index to its
+// present, which closes that frame; repeats of a frame and flips at end of pipe carry 0.
+u64 Instance::AntiLagInput() const {
+    if (!anti_lag) {
+        return 0;
+    }
+    std::scoped_lock lock{anti_lag_mutex};
+    ++anti_lag_frame;
+    SendAntiLagStage(*device, vk::AntiLagStageAMD::eInput, anti_lag_frame);
+    return anti_lag_frame;
+}
+
+void Instance::AntiLagPresent(u64 frame) const {
+    if (!anti_lag || frame == 0) {
+        return;
+    }
+    std::scoped_lock lock{anti_lag_mutex};
+    SendAntiLagStage(*device, vk::AntiLagStageAMD::ePresent, frame);
 }
 
 } // namespace Vulkan

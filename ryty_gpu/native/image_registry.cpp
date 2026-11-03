@@ -533,7 +533,45 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }();
         const bool zero_new = info.guest_address >= zero_range.first &&
                               info.guest_address < zero_range.second;
-        if (zero_new && info.num_samples == 1) {
+        // FIX-GT7-036: a target made just after a fill that covers it starts as that fill: the
+        // fill found no picture to clear, and its bytes are not in guest memory. GT7 fills its rain
+        // layer in the scratch pool, then draws it at a size the resolution scaling just changed:
+        // the new target read guest memory, where a small picture had gone back (NAT-112), and
+        // that 64 KB page showed as a block of huge values for a frame, under a large halo.
+        // RYGT_NATIVE_FILL_NEW_TARGETS=0: as before.
+        static const bool fill_new_targets = [] {
+            const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+            return !(env && env[0] == '0');
+        }();
+        const RecentFill* fill = nullptr;
+        RecentFill found_fill{};
+        if (fill_new_targets && info.num_samples == 1) {
+            std::scoped_lock lock{recent_fills_mutex};
+            for (const RecentFill& candidate : recent_fills) {
+                if (candidate.end != 0 && candidate.frame == frame &&
+                    candidate.begin <= info.guest_address &&
+                    candidate.end >= info.guest_address + info.guest_size &&
+                    (!fill || candidate.clock > found_fill.clock)) {
+                    found_fill = candidate;
+                    fill = &found_fill;
+                }
+            }
+        }
+        if (fill) {
+            result->rewrite = ImageEntry::Rewrite::Clear;
+            result->rewrite_pattern = fill->pattern;
+            result->rewrite_bytes = info.guest_size;
+            result->rewrite_clock = fill->clock;
+            static std::atomic<u32> logged{};
+            if (const u32 n = logged++; n < 200) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-036: new target {:#x} {}x{} {} starts as the fill {:#x}+{:#x} "
+                            "pattern {:#x} {:#x} ({} so far)",
+                            info.guest_address, info.size.width, info.size.height,
+                            vk::to_string(info.pixel_format), fill->begin, fill->end - fill->begin,
+                            fill->pattern[0], fill->pattern[1], n + 1);
+            }
+        } else if (zero_new && info.num_samples == 1) {
             result->rewrite = ImageEntry::Rewrite::Clear;
             result->rewrite_pattern = {0, 0};
             result->rewrite_bytes = info.guest_size;
@@ -1157,7 +1195,18 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
     }
 }
 
+void ImageRegistry::ForgetFills(VAddr address, u64 size) {
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::scoped_lock lock{recent_fills_mutex};
+    for (RecentFill& fill : recent_fills) {
+        if (fill.end != 0 && fill.begin < end && address < fill.end) {
+            fill.end = 0;
+        }
+    }
+}
+
 void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
+    ForgetFills(address, size); // FIX-GT7-036
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             MarkStale(entry, why);
@@ -1212,7 +1261,13 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
 }
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
-                             bool exact, u64 clock) {
+                             bool exact, u64 frame, u64 clock) {
+    ForgetFills(address, size); // FIX-GT7-036: a fill says what its bytes hold until this write
+    if (pattern) {
+        std::scoped_lock lock{recent_fills_mutex}; // FIX-GT7-036
+        recent_fills[recent_fill_next++ % recent_fills.size()] = {address, address + size, *pattern,
+                                                                  clock, frame};
+    }
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
         static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
         if (pattern && dump_on_fill) {
@@ -1361,6 +1416,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
 }
 
 void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+    ForgetFills(address, size); // FIX-GT7-036
     if (WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write {:#x}+{:#x} (exact {:#x})", address,
                     size, exact);
@@ -1834,8 +1890,56 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     return uploaded;
 }
 
+bool ImageRegistry::BeginDownloads(DownloadBatch& batch, u64 bytes, u64 alignment) {
+    batch.alignment = std::max<u64>(alignment, 256);
+    batch.used = 0;
+    batch.scratch = device.CreateBuffer({.size = bytes,
+                                         .usage = Rhi::BufferUsageStorage |
+                                                  Rhi::BufferUsageTransferSrc |
+                                                  Rhi::BufferUsageTransferDst,
+                                         .memory = Rhi::MemoryKind::DeviceLocal,
+                                         .name = "native write-back scratch"});
+    return batch.scratch != nullptr;
+}
+
+void ImageRegistry::FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch) {
+    if (batch.tilings.empty()) {
+        if (batch.copied) {
+            list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+            batch.copied = false;
+        }
+        return;
+    }
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
+    const Rhi::Pipeline* bound = nullptr;
+    for (const auto& tiling : batch.tilings) {
+        if (tiling.pipeline != bound) {
+            list.BindPipeline(tiling.pipeline);
+            bound = tiling.pipeline;
+        }
+        const std::array<Rhi::Binding, 3> bindings{{
+            {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
+             .offset = tiling.tiled_offset, .size = tiling.size},
+            {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
+             .offset = tiling.linear_offset, .size = tiling.size},
+            {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = tiling.params.get(),
+             .size = sizeof(TilingParams)},
+        }};
+        list.PushBindings(bindings);
+        list.Dispatch(tiling.groups, 1, 1);
+    }
+    list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    for (const auto& tiling : batch.tilings) {
+        list.CopyBuffer(batch.scratch.get(), tiling.tiled_offset, tiling.out, tiling.out_offset,
+                        tiling.size);
+    }
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer | Rhi::ScopeHost);
+    batch.tilings.clear(); // the device frees the temporary buffers after the GPU used them
+    batch.copied = false;
+}
+
 bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
-                                   u64 out_offset) {
+                                   u64 out_offset, DownloadBatch* batch) {
     const VideoCore::ImageInfo& info = entry.info;
     const u64 size = info.guest_size;
     if (size == 0 || out.Size() < out_offset + size) {
@@ -1847,10 +1951,35 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
             copy.buffer_offset += out_offset;
         }
         list.CopyImageToBuffer(entry.image.get(), &out, copies);
+        if (batch) {
+            batch->copied = true;
+        }
         return true;
     }
     const Rhi::Pipeline* tile = TilingPipeline(info, true);
     auto params_buffer = TilingParamsBuffer(info);
+    if (batch && tile && params_buffer) {
+        // The tiling leaves padding unwritten: the copy back keeps what guest memory holds there.
+        const u64 step = Common::AlignUp(size, batch->alignment);
+        const u64 linear_offset = batch->used;
+        const u64 tiled_offset = linear_offset + step;
+        batch->used = tiled_offset + step;
+        auto copies = MipCopies(info);
+        for (auto& copy : copies) {
+            copy.buffer_offset += linear_offset;
+        }
+        list.CopyImageToBuffer(entry.image.get(), batch->scratch.get(), copies);
+        list.CopyBuffer(&out, out_offset, batch->scratch.get(), tiled_offset, size);
+        batch->tilings.push_back({.pipeline = tile,
+                                  .params = std::move(params_buffer),
+                                  .out = &out,
+                                  .out_offset = out_offset,
+                                  .size = size,
+                                  .linear_offset = linear_offset,
+                                  .tiled_offset = tiled_offset,
+                                  .groups = static_cast<u32>((size / (info.num_bits / 8)) / 64)});
+        return true;
+    }
     auto linear = device.CreateBuffer({.size = size,
                                        .usage = Rhi::BufferUsageStorage |
                                                 Rhi::BufferUsageTransferDst,
