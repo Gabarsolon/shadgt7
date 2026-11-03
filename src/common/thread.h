@@ -42,6 +42,8 @@ void PreferEfficiencyCores();
 void PreferCompileCores();
 
 /// Undoes PreferPerformanceCores/PreferEfficiencyCores for the calling thread.
+void UpdateCoreOwner(u32 slot, bool wanted); ///< PERF-GT7-048
+
 void AllowAllCores();
 
 /// PERF-088: the CPU has fast and slow cores.
