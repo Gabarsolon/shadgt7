@@ -25,10 +25,12 @@
 #include <sstream>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <tuple>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 #include "common/alignment.h"
@@ -10000,6 +10002,65 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     };
     const vk::Image src_image{Handle<VkImage_T>(src->image->NativeHandle())};
     const vk::Image dst_image{Handle<VkImage_T>(dst->image->NativeHandle())};
+    // FIX-GT7-044: the scratch pool's targets keep the format they were made with, whatever is drawn
+    // into them later (NAT-113). vkCmdResolveImage wants one format on both sides: GT7's menu course
+    // map, drawn in R8G8B8A8, came out converted to 10-bit fields once a 512x512 A2B10G10R10 target
+    // was left at 0x100a0b0000 (the rewards screen draws one), and the map's texture read those bits
+    // as R8G8B8A8: an orange line and a rainbow shadow instead of white and grey. A view of the
+    // source's format writes the bits a guest resolve would. RYGT_NATIVE_RESOLVE_VIEW=0: as before.
+    static const bool resolve_view = [] {
+        const char* env = std::getenv("RYGT_NATIVE_RESOLVE_VIEW");
+        return !(env && env[0] == '0');
+    }();
+    const auto src_format = src->image->Desc().format;
+    if (resolve_view && layers == 1 && src->image->Desc().samples > 1 &&
+        dst->image->Desc().samples == 1 && src_format != dst->image->Desc().format &&
+        src->info.num_bits == dst->info.num_bits) {
+        static std::atomic<u32> logged{};
+        if (const u32 n = logged++; n < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-044: resolve {:#x} {} into {:#x}, a {} target, the guest's {}",
+                        src->info.guest_address, vk::to_string(src->info.pixel_format),
+                        dst->info.guest_address, vk::to_string(dst->info.pixel_format),
+                        vk::to_string(dst_desc.info.pixel_format));
+        }
+        // Views made for attachments: ImageEntry::View's are for sampling or storage only. The mode
+        // follows the views' format, which can differ from the one the guest names.
+        const vk::Format view_format = static_cast<vk::Format>(src_format);
+        const auto attachment_view = [&](const Native::ImageEntry& entry, u32 layer) {
+            VideoCore::ImageViewInfo view_info{};
+            view_info.format = view_format;
+            view_info.range.base.layer = u16(layer);
+            return View(entry, view_info, ViewUse::Attachment);
+        };
+        const vk::ImageView src_view = attachment_view(*src, region.srcSubresource.baseArrayLayer);
+        const vk::ImageView dst_view = attachment_view(*dst, region.dstSubresource.baseArrayLayer);
+        if (src_view && dst_view) {
+            const std::string_view numeric = vk::componentNumericFormat(view_format, 0);
+            const vk::RenderingAttachmentInfo attachment{
+                .imageView = src_view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+                .resolveMode = numeric == "UINT" || numeric == "SINT"
+                                   ? vk::ResolveModeFlagBits::eSampleZero
+                                   : vk::ResolveModeFlagBits::eAverage,
+                .resolveImageView = dst_view,
+                .resolveImageLayout = vk::ImageLayout::eGeneral,
+                .loadOp = vk::AttachmentLoadOp::eLoad,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+            };
+            s.cmd.beginRendering(vk::RenderingInfo{
+                .renderArea{.extent = {region.extent.width, region.extent.height}},
+                .layerCount = 1,
+                .colorAttachmentCount = 1,
+                .pColorAttachments = &attachment,
+            });
+            s.cmd.endRendering();
+            Written(dst);
+            s.buffers_written = true;
+            ++s.commands;
+            return;
+        }
+    }
     if (src->image->Desc().samples > 1 && dst->image->Desc().samples == 1) {
         CmdBuf{s.cmd}.resolveImage(src_image, vk::ImageLayout::eGeneral, dst_image,
                                    vk::ImageLayout::eGeneral, region);
