@@ -435,7 +435,7 @@ void DrawPipe::RunDispatcher(std::stop_token stop) {
 
 bool DrawPipe::QueueIdle() {
     std::scoped_lock lk{mutex};
-    return finished == pushed && !urgent_running;
+    return finished == pushed && !recorder_callback_running;
 }
 
 void DrawPipe::Drain() {
@@ -444,14 +444,14 @@ void DrawPipe::Drain() {
     }
     std::unique_lock lk{mutex};
     ++stats.drains;
-    if (finished == pushed && !urgent_running) {
+    if (finished == pushed && !recorder_callback_running) {
         exclusive = true;
         return;
     }
     ++stats.drains_that_waited;
     const auto start = std::chrono::steady_clock::now();
     const u64 target = pushed;
-    done_cv.wait(lk, [this, target] { return finished >= target && !urgent_running; });
+    done_cv.wait(lk, [this, target] { return finished >= target && !recorder_callback_running; });
     exclusive = true;
     stats.drain_wait_us += MicrosecondsSince(start);
 }
@@ -475,13 +475,13 @@ void DrawPipe::RunUrgent() {
         }
         jobs.swap(urgent);
         has_urgent.store(false, std::memory_order_relaxed);
-        urgent_running = true;
+        recorder_callback_running = true;
     }
     for (auto& job : jobs) {
         job();
     }
     std::scoped_lock lk{mutex};
-    urgent_running = false;
+    recorder_callback_running = false;
     done_cv.notify_all();
 }
 
@@ -505,9 +505,8 @@ void DrawPipe::RunUrgentIfExclusive() {
 
 void DrawPipe::ReleaseExclusive() {
     std::scoped_lock lk{mutex};
-    exclusive = false;
-    if (!urgent.empty()) {
-        work_cv.notify_all();
+    if (std::exchange(exclusive, false) && recorder_waiting) {
+        work_cv.notify_one();
     }
 }
 
@@ -541,19 +540,28 @@ void DrawPipe::Run(std::stop_token stop) {
             RecorderParts::Running running; // DIAG-GT7-005
             RunUrgent();
         }
-        if (has_idle_hook.load(std::memory_order_acquire)) {
-            bool empty;
-            {
-                std::scoped_lock lk{mutex};
-                empty = queue.empty();
-            }
-            if (empty) {
-                RecorderParts::Running running; // DIAG-GT7-005
-                idle_hook(); // D5, PERF-GT7-008
-            }
-        }
         {
             std::unique_lock lk{mutex};
+            if (idle_hook && queue.empty()) {
+                // The hook can submit to the same scheduler as a caller that drained the pipe.
+                // If the caller got the caches first, it may release them without pushing a job.
+                if (exclusive) {
+                    recorder_waiting = true;
+                    work_cv.wait(lk, [&] { return !exclusive || stop.stop_requested(); });
+                    recorder_waiting = false;
+                }
+                if (queue.empty() && !stop.stop_requested()) {
+                    recorder_callback_running = true;
+                    lk.unlock();
+                    {
+                        RecorderParts::Running running; // DIAG-GT7-005
+                        idle_hook(); // D5, PERF-GT7-008
+                    }
+                    lk.lock();
+                    recorder_callback_running = false;
+                    done_cv.notify_all();
+                }
+            }
             if (queue.empty()) {
                 recorder_waiting = true;
                 const auto idle_from = std::chrono::steady_clock::now();
