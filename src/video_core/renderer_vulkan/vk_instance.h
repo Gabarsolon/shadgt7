@@ -133,9 +133,12 @@ public:
         return vk12_features.shaderInt8;
     }
 
-    /// Returns true if VK_KHR_maintenance8 is supported
-    void AntiLagUpdate(bool present) const; // PERF-210
+    /// PERF-210: the frame index of a new frame's input stage, 0 without Anti-Lag.
+    u64 AntiLagInput() const;
+    /// PERF-210: closes the frame of that index; 0 sends nothing.
+    void AntiLagPresent(u64 frame) const;
 
+    /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
     }
@@ -332,6 +335,12 @@ public:
     bool IsAmdLegacyShaderCompiler() const {
         return driver_id == vk::DriverId::eAmdProprietary &&
                driver_info.find("LLPC") == std::string::npos;
+    }
+
+    /// AMD-313: a Radeon RX 7000 on AMD's driver.
+    bool IsAmdRx7000() const {
+        return driver_id == vk::DriverId::eAmdProprietary &&
+               GetModelName().find("Radeon RX 7") != std::string_view::npos;
     }
 
     /// AMD-306: pixel shaders can ask for whole quads and maximal reconvergence
@@ -650,9 +659,5 @@ private:
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };
-
-/// AMD-312: which shader store version the selected GPU uses (see cache_storage.cpp).
-enum class StoreGpuFamily { Other, AmdRdna3, AmdRdna4, AmdLegacy };
-StoreGpuFamily GetStoreGpuFamily();
 
 } // namespace Vulkan

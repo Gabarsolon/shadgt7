@@ -502,12 +502,17 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+    // FIX-220: alpha to coverage needs an alpha at location 0; a pixel shader that writes none
+    // draws as without it.
+    const Shader::Info* const fragment_stage = stages[u32(Shader::SwStage::Fragment)];
+    const bool writes_coverage_alpha =
+        fragment_stage && fragment_stage->stores.Get(Shader::IR::Attribute::RenderTarget0, 3);
     sdata.multisampling = {
         .rasterizationSamples = LiverpoolToVK::NumSamples(
             key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
         .sampleShadingEnable =
             fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
-        .alphaToCoverageEnable = key.alpha_to_coverage,
+        .alphaToCoverageEnable = key.alpha_to_coverage && writes_coverage_alpha,
     };
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {

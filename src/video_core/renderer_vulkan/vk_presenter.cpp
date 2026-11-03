@@ -1561,7 +1561,8 @@ struct PresentSteps {
 };
 } // namespace
 
-void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
+                        u64 anti_lag_frame) {
     PresentSteps steps; // DIAG-GT7-009
     // Free the frame for reuse
     const auto free_frame = [&] {
@@ -1845,7 +1846,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         RYDIAG_SCOPE(Present);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
         steps.Lap(5);
-        if (!swapchain.Present()) {
+        if (!swapchain.Present(anti_lag_frame)) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
         steps.Lap(6);

@@ -61,7 +61,9 @@ std::atomic<bool> single_sample_barycentric_cache_enabled{false};
 
 // AMD-307: hw.fs.vertex_order_check was padding before. Where the check is off (every device
 // except AMD's older compiler) it is cleared on load, so old stores keep matching; where it is on,
-// the shader store has its own version (cache_storage.cpp) and holds no older entries.
+// entries carry VertexOrderCheckVersion and older ones are not read: their vertex shaders do not
+// write the position copies.
+static constexpr u32 VertexOrderCheckVersion = 100u;
 static std::atomic<bool> vertex_order_check_cache_enabled{false};
 void SetVertexOrderCheckCacheEnabled(bool enabled) {
     vertex_order_check_cache_enabled.store(enabled, std::memory_order_relaxed);
@@ -206,7 +208,10 @@ void RegisterShaderMeta(const Shader::Info& info,
     meta.Write((single_sample_barycentric ? Serialization::ShaderBinaryVersionSingleSampleBarycentric
                 : masked_fragment         ? Serialization::ShaderBinaryVersionQuadSampleMask
                                           : Serialization::ShaderBinaryVersion) +
-               Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage));
+               Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage) +
+               (vertex_order_check_cache_enabled.load(std::memory_order_relaxed)
+                    ? VertexOrderCheckVersion
+                    : 0u));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -243,6 +248,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
+    if (vertex_order_check_cache_enabled.load(std::memory_order_relaxed)) { // AMD-307
+        if (binary_version < VertexOrderCheckVersion) {
+            return false;
+        }
+        binary_version -= VertexOrderCheckVersion;
+    }
     // FIX-228: hull shader translations made with the other normalization are not read (the
     // stage is checked once the specialization is read).
     const u32 stored_version = binary_version;
