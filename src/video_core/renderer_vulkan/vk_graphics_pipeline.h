@@ -173,7 +173,8 @@ private:
                              const SerializationSupport& sdata,
                              std::span<const vk::PipelineColorBlendAttachmentState> attachments,
                              bool fragment);
-    std::array<vk::ShaderEXT, 2> shader_objects{};
+    /// Vertex, tessellation control, tessellation evaluation and fragment shader objects.
+    std::array<vk::ShaderEXT, 4> shader_objects{};
     struct {
         vk::PrimitiveTopology topology{};
         vk::PolygonMode polygon_mode{};
@@ -186,6 +187,7 @@ private:
         bool logic_op_enable{};
         vk::LogicOp logic_op{};
         u32 attachments{};
+        u32 patch_control_points{}; ///< SO-003: 0 without tessellation
         std::array<vk::Bool32, AmdGpu::NUM_COLOR_BUFFERS> blend_enable{};
         std::array<vk::ColorBlendEquationEXT, AmdGpu::NUM_COLOR_BUFFERS> equations{};
     } so_state;

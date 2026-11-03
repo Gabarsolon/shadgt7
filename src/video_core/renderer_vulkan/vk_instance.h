@@ -177,6 +177,10 @@ public:
     bool IsShaderObjectEnabled() const {
         return shader_object;
     }
+    /// SO-003: tessellated pipelines are drawn with shader objects too.
+    bool IsShaderObjectTessellationEnabled() const {
+        return shader_object_tessellation;
+    }
 
     /// Returns true when VK_EXT_extended_dynamic_state3 is supported
     bool IsExtendedDynamicState3Supported() const {
@@ -641,6 +645,7 @@ private:
     bool depth_clip_enable{};
     bool dynamic_state_3{};
     bool shader_object{}; ///< SO-001
+    bool shader_object_tessellation{}; ///< SO-003
     bool graphics_pipeline_library{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};

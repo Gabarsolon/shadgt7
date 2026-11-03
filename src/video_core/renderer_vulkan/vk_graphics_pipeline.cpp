@@ -443,10 +443,13 @@ GraphicsPipeline::GraphicsPipeline(
     // is made with its own stages' sets only.
     // SO-001: a pipeline drawn with shader objects gets a layout without independent sets: the
     // shaders are made with its set layouts and bound sets must match them exactly.
+    // SO-003: tessellated ones too (also the rect/quad list emulation) where the device has
+    // dynamic patch control points and domain origin.
+    const bool so_tessellation = instance.IsShaderObjectTessellationEnabled();
     const bool so_candidate =
-        instance.IsShaderObjectEnabled() && !tessellated &&
-        key.prim_type != AmdGpu::PrimitiveType::RectList &&
-        key.prim_type != AmdGpu::PrimitiveType::QuadList &&
+        instance.IsShaderObjectEnabled() &&
+        (so_tessellation || (!tessellated && key.prim_type != AmdGpu::PrimitiveType::RectList &&
+                             key.prim_type != AmdGpu::PrimitiveType::QuadList)) &&
         !infos[u32(Shader::SwStage::Geometry)] &&
         !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena &&
         !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena &&
@@ -857,6 +860,10 @@ GraphicsPipeline::GraphicsPipeline(
         so_state.logic_op_enable = color_blending.logicOpEnable != VK_FALSE;
         so_state.logic_op = color_blending.logicOp;
         so_state.attachments = key.num_color_attachments;
+        so_state.patch_control_points =
+            tessellated || is_rect_list || is_quad_list
+                ? tessellation_state.patchControlPoints
+                : 0;
         if (CreateShaderObjects(modules, sdata, attachments,
                                 infos[u32(Shader::SwStage::Fragment)] != nullptr)) {
             return;
@@ -1206,15 +1213,27 @@ GraphicsPipeline::GraphicsPipeline(
 bool GraphicsPipeline::CreateShaderObjects(
     std::span<const vk::ShaderModule> modules, const SerializationSupport& sdata,
     std::span<const vk::PipelineColorBlendAttachmentState> attachments, bool fragment) {
-    const std::vector<u32> vertex_code = ModuleCode(modules[u32(Shader::SwStage::Vertex)]);
-    std::vector<u32> fragment_code;
-    if (fragment) {
-        fragment_code = ModuleCode(modules[u32(Shader::SwStage::Fragment)]);
-    } else if (!sdata.fragment.empty()) {
-        fragment_code = sdata.fragment; // clip distance emulation's discard shader
+    // SO-001/SO-003: the stages in draw order; the rect/quad list emulation's control and
+    // evaluation shaders and the clip distance emulation's discard shader are generated code.
+    const bool tessellation = so_state.patch_control_points != 0;
+    const auto code_of = [&](Shader::SwStage stage, const std::vector<u32>& generated) {
+        const auto module = modules[u32(stage)];
+        return module ? ModuleCode(module) : generated;
+    };
+    std::array<std::vector<u32>, 4> code;
+    code[0] = ModuleCode(modules[u32(Shader::SwStage::Vertex)]);
+    if (tessellation) {
+        code[1] = code_of(Shader::SwStage::TessellationControl, sdata.tcs);
+        code[2] = code_of(Shader::SwStage::TessellationEval, sdata.tes);
     }
-    if (vertex_code.empty() || ((fragment || !sdata.fragment.empty()) && fragment_code.empty())) {
-        return false; // the module's code wasn't kept: a pipeline as before
+    if (fragment) {
+        code[3] = ModuleCode(modules[u32(Shader::SwStage::Fragment)]);
+    } else if (!sdata.fragment.empty()) {
+        code[3] = sdata.fragment; // clip distance emulation's discard shader
+    }
+    if (code[0].empty() || (tessellation && (code[1].empty() || code[2].empty())) ||
+        ((fragment || !sdata.fragment.empty()) && code[3].empty())) {
+        return false; // a module's code wasn't kept: a pipeline as before
     }
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
@@ -1226,31 +1245,35 @@ bool GraphicsPipeline::CreateShaderObjects(
         .requiredSubgroupSize = 64,
     };
     const vk::ShaderStageFlags sized_stages = instance.RequiredSubgroupSizeStages();
-    const auto sized = [&](vk::ShaderStageFlagBits stage) -> const void* {
-        return instance.IsSubgroupSize64Supported() && (sized_stages & stage) ? &subgroup_size
-                                                                               : nullptr;
-    };
-    boost::container::static_vector<vk::ShaderCreateInfoEXT, 2> create_infos;
-    create_infos.push_back(vk::ShaderCreateInfoEXT{
-        .pNext = sized(vk::ShaderStageFlagBits::eVertex),
-        .stage = vk::ShaderStageFlagBits::eVertex,
-        .nextStage = vk::ShaderStageFlagBits::eFragment,
-        .codeType = vk::ShaderCodeTypeEXT::eSpirv,
-        .codeSize = vertex_code.size() * sizeof(u32),
-        .pCode = vertex_code.data(),
-        .pName = "main",
-        .setLayoutCount = num_sets,
-        .pSetLayouts = set_layouts.data(),
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &push_constants,
-    });
-    if (!fragment_code.empty()) {
+    constexpr std::array<vk::ShaderStageFlagBits, 4> stage_bits{
+        vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eTessellationControl,
+        vk::ShaderStageFlagBits::eTessellationEvaluation, vk::ShaderStageFlagBits::eFragment};
+    boost::container::static_vector<vk::ShaderCreateInfoEXT, 4> create_infos;
+    std::array<u32, 4> slot{};
+    for (u32 i = 0; i < 4; ++i) {
+        if (code[i].empty()) {
+            continue;
+        }
+        vk::ShaderStageFlags next{};
+        for (u32 j = i + 1; j < 4; ++j) {
+            if (!code[j].empty()) {
+                next = stage_bits[j];
+                break;
+            }
+        }
+        if (i == 0 && !tessellation) {
+            next = vk::ShaderStageFlagBits::eFragment;
+        }
+        slot[i] = static_cast<u32>(create_infos.size());
         create_infos.push_back(vk::ShaderCreateInfoEXT{
-            .pNext = sized(vk::ShaderStageFlagBits::eFragment),
-            .stage = vk::ShaderStageFlagBits::eFragment,
+            .pNext = instance.IsSubgroupSize64Supported() && (sized_stages & stage_bits[i])
+                         ? &subgroup_size
+                         : nullptr,
+            .stage = stage_bits[i],
+            .nextStage = next,
             .codeType = vk::ShaderCodeTypeEXT::eSpirv,
-            .codeSize = fragment_code.size() * sizeof(u32),
-            .pCode = fragment_code.data(),
+            .codeSize = code[i].size() * sizeof(u32),
+            .pCode = code[i].data(),
             .pName = "main",
             .setLayoutCount = num_sets,
             .pSetLayouts = set_layouts.data(),
@@ -1258,7 +1281,7 @@ bool GraphicsPipeline::CreateShaderObjects(
             .pPushConstantRanges = &push_constants,
         });
     }
-    std::array<VkShaderEXT, 2> created{};
+    std::array<VkShaderEXT, 4> created{};
     const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
         instance.GetDevice(), static_cast<u32>(create_infos.size()),
         reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
@@ -1277,7 +1300,11 @@ bool GraphicsPipeline::CreateShaderObjects(
         }
         return false;
     }
-    shader_objects = {vk::ShaderEXT{created[0]}, vk::ShaderEXT{created[1]}};
+    for (u32 i = 0; i < 4; ++i) {
+        if (!code[i].empty()) {
+            shader_objects[i] = vk::ShaderEXT{created[slot[i]]};
+        }
+    }
     for (u32 i = 0; i < so_state.attachments; ++i) {
         const auto& attachment = attachments[i];
         so_state.blend_enable[i] = attachment.blendEnable;
@@ -1291,9 +1318,13 @@ bool GraphicsPipeline::CreateShaderObjects(
         };
     }
     static std::atomic<u32> made{};
-    if (const u32 n = ++made; n <= 3 || n % 500 == 0) {
-        LOG_WARNING(Render_Vulkan, "SO-001: {} drawn with shader objects ({} so far)",
-                    GetDebugString(), n);
+    static std::atomic<u32> made_tessellated{};
+    const u32 n = ++made;
+    const u32 t = tessellation ? ++made_tessellated : made_tessellated.load();
+    if (n <= 3 || n % 500 == 0 || (tessellation && (t <= 3 || t % 100 == 0))) {
+        LOG_WARNING(Render_Vulkan,
+                    "SO-001: {} drawn with shader objects ({} so far, {} tessellated, SO-003)",
+                    GetDebugString(), n, t);
     }
     return true;
 }
@@ -1301,11 +1332,13 @@ bool GraphicsPipeline::CreateShaderObjects(
 void GraphicsPipeline::BindShaderObjects(vk::CommandBuffer cmd) const {
     std::array<vk::ShaderStageFlagBits, 5> stages{vk::ShaderStageFlagBits::eVertex,
                                                   vk::ShaderStageFlagBits::eFragment};
-    std::array<vk::ShaderEXT, 5> shaders{shader_objects[0], shader_objects[1]};
+    std::array<vk::ShaderEXT, 5> shaders{shader_objects[0], shader_objects[3]};
     u32 count = 2;
     if (instance.IsTessellationShaderEnabled()) {
-        stages[count++] = vk::ShaderStageFlagBits::eTessellationControl;
-        stages[count++] = vk::ShaderStageFlagBits::eTessellationEvaluation;
+        stages[count] = vk::ShaderStageFlagBits::eTessellationControl;
+        shaders[count++] = shader_objects[1];
+        stages[count] = vk::ShaderStageFlagBits::eTessellationEvaluation;
+        shaders[count++] = shader_objects[2];
     }
     if (instance.IsGeometryShaderEnabled()) {
         stages[count++] = vk::ShaderStageFlagBits::eGeometry;
@@ -1313,6 +1346,11 @@ void GraphicsPipeline::BindShaderObjects(vk::CommandBuffer cmd) const {
     cmd.bindShadersEXT(count, stages.data(), shaders.data());
     const auto& s = so_state;
     cmd.setPrimitiveTopology(s.topology);
+    if (s.patch_control_points != 0) {
+        // SO-003: as the pipeline's tessellation state (no domain origin state: upper left).
+        cmd.setPatchControlPointsEXT(s.patch_control_points);
+        cmd.setTessellationDomainOriginEXT(vk::TessellationDomainOrigin::eUpperLeft);
+    }
     cmd.setPolygonModeEXT(s.polygon_mode);
     cmd.setRasterizationSamplesEXT(s.samples);
     const vk::SampleMask mask = ~vk::SampleMask{0};

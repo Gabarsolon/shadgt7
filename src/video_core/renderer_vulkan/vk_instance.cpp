@@ -292,7 +292,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
         vk::PhysicalDeviceShaderQuadControlFeaturesKHR,
-        vk::PhysicalDeviceShaderObjectFeaturesEXT>();
+        vk::PhysicalDeviceShaderObjectFeaturesEXT,
+        vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>();
     features = feature_chain.get().features;
     // AMD-300: the features an older Radeon's driver turns off.
     if (const auto simulated = GetSimulatedGpu(); simulated != SimulatedGpu::None) {
@@ -452,8 +453,16 @@ bool Instance::CreateDevice() {
             vertex_input_dynamic_state) {
             shader_object = add_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
         }
-        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}",
-                    shader_object ? "on" : "not available (driver lacks a needed feature)");
+        // SO-003: tessellated pipelines too, with dynamic patch control points and domain origin.
+        if (shader_object && d3.extendedDynamicState3TessellationDomainOrigin &&
+            feature_chain.get<vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>()
+                .extendedDynamicState2PatchControlPoints) {
+            shader_object_tessellation =
+                add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+        }
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
+                    shader_object ? "on" : "not available (driver lacks a needed feature)",
+                    shader_object_tessellation ? "too (SO-003)" : "as pipelines");
     }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
     // slows down KosmicKrisp due to unrolling. Revisit if KosmicKrisp moves this to mesh shaders.
@@ -760,6 +769,10 @@ bool Instance::CreateDevice() {
             .extendedDynamicState3DepthClipEnable = shader_object,
             .extendedDynamicState3DepthClipNegativeOneToOne = shader_object,
             .extendedDynamicState3ProvokingVertexMode = shader_object,
+            .extendedDynamicState3TessellationDomainOrigin = shader_object_tessellation,
+        },
+        vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT{
+            .extendedDynamicState2PatchControlPoints = true, // SO-003
         },
         vk::PhysicalDeviceShaderObjectFeaturesEXT{
             .shaderObject = true, // SO-001
@@ -858,6 +871,9 @@ bool Instance::CreateDevice() {
     }
     if (!shader_object) {
         device_chain.unlink<vk::PhysicalDeviceShaderObjectFeaturesEXT>();
+    }
+    if (!shader_object_tessellation) {
+        device_chain.unlink<vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>();
     }
     if (!dynamic_state_3) {
         device_chain.unlink<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>();
