@@ -1694,14 +1694,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     while (!dcb.empty()) {
         ProcessCommands();
 
-        // PERF-GT7-052 (test, RYGT_GFX_YIELD_PACKETS=<n>): every n packets, while a compute
-        // queue has a submission waiting, this queue yields so that one is decoded now. The
-        // graphics decode otherwise yields only at a wait or at its submission's end: a label
-        // GT7's job threads spin on waited 1.2 ms on average between the game's compute submit
-        // and its decode (DIAG-GT7-028, fencegpu-1), a quarter of its round trip.
+        // PERF-GT7-052 (RYGT_GFX_YIELD_PACKETS=<n>, 32 by default, 0 off): every n packets,
+        // while a compute queue has a submission waiting, this queue yields so that one is
+        // decoded now. The graphics decode otherwise yields only at a wait or at its
+        // submission's end: a label GT7's job threads spin on waited 1.2 ms on average between
+        // the game's compute submit and its decode (DIAG-GT7-028, fencegpu-1), a quarter of its
+        // round trip. On by default after two A/B runs in one run each: pre-race frames within
+        // 33.4 ms 46% -> 57% at 2820 MHz (fencegpu-3), 4% -> 13% at 1290 MHz (yield-db1).
         static const u32 yield_packets = [] {
             const char* env = std::getenv("RYGT_GFX_YIELD_PACKETS");
-            return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+            return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u;
         }();
         if (yield_packets != 0 && ++gfx_packets_since_yield >= yield_packets) {
             gfx_packets_since_yield = 0;
