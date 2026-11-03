@@ -641,13 +641,16 @@ private:
         u32 parked{}; ///< PERF-GT7-052: its front task waits at a label, semaphore or rewind
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
-    u32 num_mapped_queues{1u}; // GFX is always available
+    /// GFX is always available. FIX-GT7-071: written under submit_mutex by the game's submitting
+    /// thread, read without it by the command thread's queue loop and ComputeQueueRunnable.
+    std::atomic<u32> num_mapped_queues{1u};
 
     /// PERF-GT7-052: a compute queue has a submission to decode and its task is not parked at
     /// a wait. Resuming a parked one syncs the recorder for nothing: with every pending queue
     /// counted (fencegpu-2) the recorder was drained 11,000 times in 2 s and the GPU ran dry.
     bool ComputeQueueRunnable() const {
-        for (u32 q = 1; q < num_mapped_queues; ++q) {
+        const u32 queues = num_mapped_queues.load(std::memory_order_acquire);
+        for (u32 q = 1; q < queues; ++q) {
             const auto& queue = mapped_queues[q];
             if (queue.parked == 0 && queue.pending.load(std::memory_order_relaxed) != 0) {
                 return true;

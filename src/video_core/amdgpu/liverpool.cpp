@@ -1387,7 +1387,7 @@ void Liverpool::Process(std::stop_token stoken) {
         while (num_tasks || num_commands) {
             ProcessCommands();
 
-            curr_qid = (curr_qid + 1) % num_mapped_queues;
+            curr_qid = (curr_qid + 1) % num_mapped_queues.load(std::memory_order_acquire);
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -3949,7 +3949,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     }
 
     std::scoped_lock lk{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
+    num_mapped_queues.store(
+        std::max(num_mapped_queues.load(std::memory_order_relaxed), gnm_vqid + 1),
+        std::memory_order_release); // FIX-GT7-071
     ++num_submits;
     ++num_tasks;
     queue.pending.fetch_add(1, std::memory_order_relaxed); // PERF-GT7-052
