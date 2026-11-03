@@ -453,12 +453,13 @@ bool Instance::CreateDevice() {
             vertex_input_dynamic_state) {
             shader_object = add_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
         }
-        // SO-003: tessellated pipelines too, with dynamic patch control points and domain origin.
-        if (shader_object && d3.extendedDynamicState3TessellationDomainOrigin &&
-            feature_chain.get<vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>()
-                .extendedDynamicState2PatchControlPoints) {
-            shader_object_tessellation =
-                add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+        // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
+        // control point and domain origin commands its shaders need (AMD's driver reports no
+        // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
+        if (const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS")) {
+            shader_object_tessellation = shader_object && tess[0] != '0';
+        } else {
+            shader_object_tessellation = shader_object;
         }
         LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
@@ -769,10 +770,6 @@ bool Instance::CreateDevice() {
             .extendedDynamicState3DepthClipEnable = shader_object,
             .extendedDynamicState3DepthClipNegativeOneToOne = shader_object,
             .extendedDynamicState3ProvokingVertexMode = shader_object,
-            .extendedDynamicState3TessellationDomainOrigin = shader_object_tessellation,
-        },
-        vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT{
-            .extendedDynamicState2PatchControlPoints = true, // SO-003
         },
         vk::PhysicalDeviceShaderObjectFeaturesEXT{
             .shaderObject = true, // SO-001
@@ -871,9 +868,6 @@ bool Instance::CreateDevice() {
     }
     if (!shader_object) {
         device_chain.unlink<vk::PhysicalDeviceShaderObjectFeaturesEXT>();
-    }
-    if (!shader_object_tessellation) {
-        device_chain.unlink<vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>();
     }
     if (!dynamic_state_3) {
         device_chain.unlink<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>();
