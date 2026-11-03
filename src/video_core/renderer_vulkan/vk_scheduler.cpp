@@ -598,7 +598,13 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     // PERF-DIAG-007: every 2 s, how busy the GPU was (sampled: submitted work not yet complete)
     // and which threads used the CPU, to tell GPU-bound, CPU-bound and serialized frames apart.
     Common::SetCurrentThreadName("shadGT:PerfMonitor");
+    // PERF-GT7-054: the thread sampling (a Toolhelp snapshot of every thread on the system,
+    // twice) ran 61 ms in a 65 ms frame at normal priority, every 2 s, in play too: 6 of 70
+    // pre-race spikes in two runs. Low priority, so the game's and the renderer's threads come
+    // first, and the snapshots every 10 s.
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
     Common::SampleThreadCpuUsage(0);
+    u32 windows = 0;
     auto window_start = std::chrono::steady_clock::now();
     u64 samples = 0;
     u64 busy_samples = 0;
@@ -614,11 +620,15 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
             continue;
         }
         const u64 tick = work_semaphore.CurrentTick();
-        Common::ConfineDriverCompileThreads(); // PERF-GT7-024
+        const bool sample_threads = ++windows % 5 == 0; // PERF-GT7-054: every 10 s
+        if (sample_threads) {
+            Common::ConfineDriverCompileThreads(); // PERF-GT7-024
+        }
         LOG_WARNING(Render_Vulkan, "Perf monitor {:.1f} s: GPU busy {:.0f}%, {} submits; CPU {}",
                     std::chrono::duration<double>(now - window_start).count(),
                     samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick,
-                    Common::SampleThreadCpuUsage(10));
+                    sample_threads ? Common::SampleThreadCpuUsage(10)
+                                   : std::string{"(threads sampled every 10 s)"});
         LOG_WARNING(Render_Vulkan, "Frontend work in {:.1f} s: {}",
                     std::chrono::duration<double>(now - window_start).count(),
                     Common::TakeWorkCounters());

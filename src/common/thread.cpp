@@ -134,6 +134,20 @@ struct CoreClasses {
     std::vector<std::vector<ULONG>> all_cores;  // PERF-GT7-048: every core: RYGT_COMPILE_CORES=0
 };
 
+// PERF-GT7-055 (test, RYGT_COMPILE_LOW=1): the driver's compile threads and the translators stay
+// below normal priority whenever no draw waits for its pipeline, not only during a catch-up
+// (PERF-GT7-032). In the pre-race the random grid brings ~47 driver compiles over 100 ms a race
+// at normal priority beside the game's job threads: a fifth of the 66 ms frames of two runs had
+// a compile or translate thread busy. Not switched by RYGT_AB: the driver's threads get their
+// priority when they are found, every 10 s.
+static bool CompileAlwaysLow() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_COMPILE_LOW");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 bool CompileCoresOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_COMPILE_CORES");
@@ -385,7 +399,7 @@ void ApplyCompilePriority(const DriverCompileThreads::Thread& thread, bool low) 
 // catch-up: every core, below normal (the time the game's and the renderer's threads leave).
 void ApplyCompileState(DriverCompileThreads& d) {
     const bool wide = d.waits > 0 || (d.catch_up > 0 && d.foreground == 0);
-    const bool low = d.waits == 0 && (d.foreground > 0 || d.catch_up > 0);
+    const bool low = d.waits == 0 && (d.foreground > 0 || d.catch_up > 0 || CompileAlwaysLow());
     d.wide_now.store(wide, std::memory_order_relaxed);
     d.low_now.store(low, std::memory_order_relaxed);
     const bool cores = wide != d.applied_wide;
@@ -433,6 +447,38 @@ bool Unnamed(HANDLE thread) {
 }
 } // namespace
 
+// PERF-GT7-054: NtGetNextThread (ntdll, stable since Vista) walks one process's threads; it
+// takes the previous thread's handle to continue, so that handle is closed only after the call.
+using NtGetNextThreadFn = LONG(NTAPI*)(HANDLE process, HANDLE thread, ACCESS_MASK access,
+                                       ULONG attributes, ULONG flags, PHANDLE next);
+
+bool ForEachProcessThread(unsigned long access,
+                          const std::function<bool(void*, unsigned long)>& fn) {
+    static const NtGetNextThreadFn next_thread = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll ? reinterpret_cast<NtGetNextThreadFn>(GetProcAddress(ntdll, "NtGetNextThread"))
+                     : nullptr;
+    }();
+    if (!next_thread) {
+        return false;
+    }
+    HANDLE previous = nullptr;
+    bool previous_kept = false;
+    for (;;) {
+        HANDLE next = nullptr;
+        const LONG status = next_thread(GetCurrentProcess(), previous, access, 0, 0, &next);
+        if (previous && !previous_kept) {
+            CloseHandle(previous);
+        }
+        if (status < 0 || !next) {
+            break;
+        }
+        previous = next;
+        previous_kept = fn(next, GetThreadId(next));
+    }
+    return true;
+}
+
 void ConfineDriverCompileThreads() {
     const auto& classes = GetCoreClasses();
     if (classes.hybrid || classes.compile_ids.empty() || !CompileCoresOn()) {
@@ -443,19 +489,29 @@ void ConfineDriverCompileThreads() {
         return;
     }
     std::vector<DWORD> tids;
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    const DWORD pid = GetCurrentProcessId();
     const DWORD self = GetCurrentThreadId();
-    THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
-    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
-        if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != self) {
-            tids.push_back(entry.th32ThreadID);
+    // PERF-GT7-054: this process's threads only; the machine-wide snapshot as a fallback.
+    const bool walked = ForEachProcessThread(THREAD_QUERY_LIMITED_INFORMATION,
+                                             [&](void*, unsigned long tid) {
+                                                 if (tid != self) {
+                                                     tids.push_back(tid);
+                                                 }
+                                                 return false;
+                                             });
+    if (!walked) {
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return;
         }
+        const DWORD pid = GetCurrentProcessId();
+        THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
+        for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != self) {
+                tids.push_back(entry.th32ThreadID);
+            }
+        }
+        CloseHandle(snapshot);
     }
-    CloseHandle(snapshot);
     std::ranges::sort(tids);
 
     auto& d = DriverThreads();
@@ -524,7 +580,7 @@ void ConfineDriverCompileThreads() {
                 thread.priority = own;
             }
             ApplyCompileCores(thread.handle, d.applied_wide);
-            if (d.applied_low) {
+            if (d.applied_low || (d.waits == 0 && CompileAlwaysLow())) { // PERF-GT7-055
                 ApplyCompilePriority(thread, true);
             }
             ++found;
@@ -580,7 +636,8 @@ void SetCompileCatchUp(bool on) {
 }
 
 bool CompileThreadsLow() {
-    return DriverThreads().low_now.load(std::memory_order_relaxed);
+    return DriverThreads().low_now.load(std::memory_order_relaxed) ||
+           (CompileAlwaysLow() && DriverThreads().waits == 0); // PERF-GT7-055
 }
 
 namespace {
@@ -731,6 +788,9 @@ bool HybridCpu() {
 }
 
 void ConfineDriverCompileThreads() {}
+bool ForEachProcessThread(unsigned long, const std::function<bool(void*, unsigned long)>&) {
+    return false; // PERF-GT7-054: Windows only
+}
 
 void SetCompileCoresWide(bool) {}
 
