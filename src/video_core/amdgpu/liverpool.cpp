@@ -988,6 +988,18 @@ void Liverpool::PipeReadAhead() {
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+// PERF-GT7-046: a queue's wait for a label no queued work writes stopped the command thread until
+// the recorder had finished all it was given, ~4 ms a frame on GT7's pre-race screens, and nothing
+// else decoded meanwhile. The queue now yields until the recorder has run dry, and only then asks
+// for it. RYGT_NATIVE_WAIT_NO_DRAIN=0: the wait drains the recorder at once.
+bool Liverpool::WaitsYieldToRecorder() const {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WAIT_NO_DRAIN");
+        return !(env && env[0] == '0');
+    }();
+    return enabled && draw_pipe;
+}
+
 void Liverpool::SyncRecorder(std::string_view reason) {
     if (!draw_pipe) {
         return;
@@ -2694,6 +2706,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         });
                         break;
                     }
+                    // PERF-GT7-046: until the recorder has run dry, other queues decode.
+                    while (WaitsYieldToRecorder() && !wait_reg_mem->Test(regs.reg_array) &&
+                           !draw_pipe->QueueIdle()) {
+                        YIELD_GFX();
+                    }
                     if (!wait_reg_mem->Test(regs.reg_array)) {
                         SyncRecorder("wait reg mem");
                     }
@@ -3357,6 +3374,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 waits_moved_after_turns += yielded;
                 RecordSafe([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
                 break;
+            }
+            // PERF-GT7-046: until the recorder has run dry, other queues decode.
+            while (WaitsYieldToRecorder() && !wait_reg_mem->Test(regs.reg_array) &&
+                   !draw_pipe->QueueIdle()) {
+                YIELD_ASC(vqid);
             }
             // PERF-031: what is waited on may be written by recorded work; the pending-fence
             // check reads the rasterizer, which only the drained recorder lets the command use.
