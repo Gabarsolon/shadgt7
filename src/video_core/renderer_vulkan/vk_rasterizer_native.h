@@ -151,7 +151,7 @@ public:
                         u32 index_offset);
 
 private:
-    enum class ViewUse : u8 { Sampled, Storage, Attachment };
+    enum class ViewUse : u8 { Sampled, Storage, Attachment, CubeSampled };
 
     struct Chunk {
         std::unique_ptr<Native::Rhi::Buffer> buffer;

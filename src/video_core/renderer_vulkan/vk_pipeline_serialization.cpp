@@ -25,11 +25,13 @@ namespace Serialization {
 // 19/20 (FIX-199): cube samples with an implicit level take their gradients from the direction.
 // The 96-byte buffer-offset table moves the quad sample mask and stage offset ranges.
 // 23/24 (FIX-215): samplers record whether they sample a cube map.
-static constexpr u32 ShaderBinaryVersion = 23u;
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 24u;
+// 33/34/35: fragment cube samples use native cube-array views (port of RyGT 0066); stored
+// translations made before sampled cubes as 2D arrays of faces.
+static constexpr u32 ShaderBinaryVersion = 33u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 34u;
 // 25: AMD single-sample KHR barycentrics (on for AMD GPUs) change the
 // fragment interface and interpolation; read only while that option is on.
-static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 25u;
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 35u;
 // 29/30/31 (FIX-227/228): hull shaders, whose unnormalized samples at an explicit LOD are normalized
 // by that mip's dimensions. Other stages keep their versions. RYGT_UNNORMALIZED_MIP=0: hull
 // shaders as before too.

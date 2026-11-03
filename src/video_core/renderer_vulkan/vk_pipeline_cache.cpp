@@ -50,6 +50,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "ryty_gpu/ryty_diag.h"
 
 namespace Shader::Optimization {
@@ -1062,6 +1063,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // D2: read-only guest buffers are read in place through the direct-memory page table.
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
+    // Port of xacidr4inx's reflection fix (RyGT 0066): fragment cube samples filter across faces.
+    profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
     if (SingleSampleBarycentricRequested() && instance.GetVendorID() == 0x1002) {
         LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample interpolation on; KHR {}",
                     profile.supports_fragment_shader_barycentric);

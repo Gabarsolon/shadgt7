@@ -523,6 +523,10 @@ public:
     }
 
     /// Returns whether VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT is supported on 3D images
+    bool IsImageCubeArraySupported() const {
+        return features.imageCubeArray;
+    }
+
     bool Is2dViewOf3dSupported() const {
         return image_2d_view_of_3d && image_2d_view_of_3d_features.image2DViewOf3D &&
                image_2d_view_of_3d_features.sampler2DViewOf3D;
