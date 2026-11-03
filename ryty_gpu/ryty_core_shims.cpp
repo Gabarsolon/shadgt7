@@ -674,6 +674,11 @@ bool IsWritableTarget(VAddr virtual_addr, u64 size) {
     if (virtual_addr == 0 || size == 0) {
         return false;
     }
+    // FIX-GT7-037: GT7's race once asked for occlusion results at -8. The end of that range wraps
+    // to 8, so the checks below saw an empty range and said yes, and the write crashed the recorder.
+    if (virtual_addr + size < virtual_addr) {
+        return false;
+    }
     if (IsGuestReadable(virtual_addr, size)) {
         return true; // Guest memory: tracking protections fault and are handled.
     }

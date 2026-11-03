@@ -16,6 +16,10 @@ namespace Storage {
 /// FIX-018/020's marks: up to which stored permutation each program was translated before a fix.
 [[nodiscard]] std::filesystem::path RetranslationMarksPath();
 
+/// SHD-010 leaves another build's translations in the store (RYGT_KEEP_SHADER_CACHE=1, or a build
+/// that knows neither its commit nor its description).
+[[nodiscard]] bool StoreMayHoldOtherBuilds();
+
 enum class BlobType : u32 {
     ShaderMeta,
     ShaderBinary,
@@ -55,6 +59,7 @@ public:
 
 private:
     std::jthread io_worker{};
+    std::jthread tidy_worker{}; // FIX-GT7-056, FIX-GT7-057
     std::filesystem::path cache_path{};
     bool opened{};
 };

@@ -112,6 +112,7 @@ private:
         s32 index;
         bool eop;
         std::chrono::steady_clock::time_point submitted{}; // PERF-DIAG-002
+        u64 anti_lag_frame{};                              // PERF-210
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -121,7 +122,8 @@ private:
     void Flip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     bool DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
+                            u64 anti_lag_frame = 0);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;

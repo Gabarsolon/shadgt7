@@ -306,6 +306,17 @@ static bool LinkTimeOptimization() {
     }();
     return lto;
 }
+// AMD-320: fast-linked pipelines without the optimizer cost AMD far more GPU time than NVIDIA.
+// On AMD tessellated pipelines keep the optimizer. AMD-322: no link-time data and no second,
+// optimized link on AMD: on an RX 7600 (GT Sport) they made each menu pipeline take 0.4-0.7 s and
+// filled pipeline memory. RYGT_AMD_PIPELINE_POLICY=0 keeps the shared policy.
+static bool AmdPipelinePolicy(u32 vendor_id) {
+    static const bool allowed = [] {
+        const char* env = std::getenv("RYGT_AMD_PIPELINE_POLICY");
+        return !(env && env[0] == '0');
+    }();
+    return allowed && vendor_id == 0x1002;
+}
 static std::atomic<u64> lto_links{};
 static std::atomic<u64> lto_us{};
 
@@ -502,12 +513,17 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+    // FIX-220: alpha to coverage needs an alpha at location 0; a pixel shader that writes none
+    // draws as without it.
+    const Shader::Info* const fragment_stage = stages[u32(Shader::SwStage::Fragment)];
+    const bool writes_coverage_alpha =
+        fragment_stage && fragment_stage->stores.Get(Shader::IR::Attribute::RenderTarget0, 3);
     sdata.multisampling = {
         .rasterizationSamples = LiverpoolToVK::NumSamples(
             key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
         .sampleShadingEnable =
             fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
-        .alphaToCoverageEnable = key.alpha_to_coverage,
+        .alphaToCoverageEnable = key.alpha_to_coverage && writes_coverage_alpha,
     };
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
@@ -805,7 +821,10 @@ GraphicsPipeline::GraphicsPipeline(
     // FIX-057: the driver's optimizer is what ran out of memory on GT Sport's tessellated
     // pipelines (also whole, two at a time); they are compiled without optimization.
     // -DisablePerf 81 optimizes them.
-    static const bool plain_tessellated = Common::PerfFeatureEnabled(81);
+    static const bool plain_tessellated_feature = Common::PerfFeatureEnabled(81);
+    const bool amd_policy = AmdPipelinePolicy(instance.GetVendorID()); // AMD-320
+    const bool plain_tessellated = plain_tessellated_feature && !amd_policy;
+    const bool lto_relink = !amd_policy && LinkTimeOptimization(); // AMD-322
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .flags = tessellated && plain_tessellated ? vk::PipelineCreateFlagBits::eDisableOptimization
@@ -909,7 +928,7 @@ GraphicsPipeline::GraphicsPipeline(
             // FIX-057: tessellated libraries keep the whole pipeline's disabled optimization.
             part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR |
                               (pipeline_info.flags & vk::PipelineCreateFlagBits::eDisableOptimization);
-            if (LinkTimeOptimization()) { // SHD-001
+            if (lto_relink) { // SHD-001, AMD-320
                 part_info.flags |= vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
             }
             part_info.stageCount = 0;
@@ -960,6 +979,8 @@ GraphicsPipeline::GraphicsPipeline(
             pre_raster_key.Add(state);
         }
 
+        // AMD-320: libraries with and without link-time data are different libraries.
+        pre_raster_key.Add(lto_relink);
         LibraryKey fragment_key{2};
         // SHD-002: the fragment stage's set only.
         fragment_key.Add(set_layout_hashes[Shader::Backend::StageSet(u32(Shader::SwStage::Fragment))]);
@@ -978,6 +999,7 @@ GraphicsPipeline::GraphicsPipeline(
         fragment_key.Add(pipeline_rendering_ci.viewMask);
         // FIX-GT7-030: tessellated pipelines' libraries are not optimized (FIX-057): the others must
         // not draw with them.
+        fragment_key.Add(lto_relink);
         fragment_key.Add(static_cast<bool>(pipeline_info.flags &
                                            vk::PipelineCreateFlagBits::eDisableOptimization));
         for (const auto state : dynamic_states) {
@@ -1065,7 +1087,7 @@ GraphicsPipeline::GraphicsPipeline(
                 .count(),
             library_cache.shared_waits.load());
 
-        if (!LinkTimeOptimization()) {
+        if (!lto_relink) {
             return; // SHD-001: the fast-linked pipeline is the one drawn with
         }
         auto promise = std::make_shared<std::promise<void>>();

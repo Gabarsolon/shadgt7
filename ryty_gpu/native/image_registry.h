@@ -171,6 +171,27 @@ extern std::atomic<bool> g_watch_window;
 /// FIX-153 (diagnosis): the first 16 bytes there, as text ("unreadable" when they are not).
 std::string WatchedBytes(VAddr address);
 
+/// PERF-GT7-045: downloads recorded together: first their copies out of the images and of what
+/// their buffers hold, then one barrier, their tiling in scratch memory, one barrier and their
+/// copies to the buffers. Their ranges in the buffers must not overlap.
+struct DownloadBatch {
+    struct Tiling {
+        const Rhi::Pipeline* pipeline;
+        std::unique_ptr<Rhi::Buffer> params;
+        const Rhi::Buffer* out;
+        u64 out_offset;
+        u64 size;
+        u64 linear_offset;
+        u64 tiled_offset;
+        u32 groups;
+    };
+    std::unique_ptr<Rhi::Buffer> scratch;
+    u64 used = 0;
+    u64 alignment = 256;
+    std::vector<Tiling> tilings;
+    bool copied = false; ///< a copy went straight to its buffer
+};
+
 class ImageRegistry {
 public:
     explicit ImageRegistry(Rhi::Device& device);
@@ -256,7 +277,7 @@ public:
     /// size is only what the shader may write (GT Sport binds its whole scratch pool), so such a
     /// write uploads a target again only when the buffer is about the target's size.
     void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact,
-                  u64 clock);
+                  u64 frame, u64 clock);
     /// NAT-120: uploads the image from guest memory before its next use.
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);
@@ -274,6 +295,8 @@ public:
     /// watched); `exact` is the bytes the instruction wrote there (0: unknown). Small textures
     /// on the page are checked by hash before their next use; large ones only when written.
     void CpuWrite(VAddr address, u64 size, u64 exact);
+    /// FIX-GT7-036: what wrote over these bytes ends the fills remembered there.
+    void ForgetFills(VAddr address, u64 size);
     /// NAT-109: the addresses holding the most images (address, count), for reports.
     std::vector<std::pair<VAddr, u32>> Crowded(u32 count);
 
@@ -299,7 +322,11 @@ public:
     /// Records copying an image back into a buffer in its guest layout (tiled again), for
     /// guest memory the CPU reads after the GPU wrote it.
     bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
-                        u64 out_offset = 0);
+                        u64 out_offset = 0, struct DownloadBatch* batch = nullptr);
+    /// PERF-GT7-045: scratch memory for downloads of up to `bytes` recorded into `batch`.
+    bool BeginDownloads(DownloadBatch& batch, u64 bytes, u64 alignment);
+    /// PERF-GT7-045: tiles the downloads recorded into `batch` and copies them to their buffers.
+    void FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch);
 
     struct Stats {
         std::atomic<u64> lookups, hits, created_textures, created_targets, uploads, upload_bytes;
@@ -358,6 +385,17 @@ private:
     std::unordered_map<const ImageEntry*, UploadTally> upload_tally; ///< DIAG-197
     std::array<Shard, NumShards> shards;
     std::mutex upload_mutex;
+    /// FIX-GT7-036: the last fills, for targets made just after one that covers them.
+    struct RecentFill {
+        VAddr begin = 0;
+        VAddr end = 0;
+        std::array<u32, 2> pattern{};
+        u64 clock = 0;
+        u64 frame = 0;
+    };
+    std::array<RecentFill, 16> recent_fills{};
+    u32 recent_fill_next = 0;
+    std::mutex recent_fills_mutex;
     std::vector<ImageEntry*> pending_uploads;
     std::atomic<u64> generation{0}; ///< OPT-002
     /// OPT-010: the ranges of the pictures made or dropped, by the generation they made.
