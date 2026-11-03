@@ -441,7 +441,28 @@ GraphicsPipeline::GraphicsPipeline(
 
     // SHD-002: one set per stage; with libraries, sets are independent so each shader library
     // is made with its own stages' sets only.
-    const bool independent_sets = instance.IsGraphicsPipelineLibrarySupported();
+    // SO-001: a pipeline drawn with shader objects gets a layout without independent sets: the
+    // shaders are made with its set layouts and bound sets must match them exactly.
+    const bool so_candidate =
+        instance.IsShaderObjectEnabled() && !tessellated &&
+        key.prim_type != AmdGpu::PrimitiveType::RectList &&
+        key.prim_type != AmdGpu::PrimitiveType::QuadList &&
+        !infos[u32(Shader::SwStage::Geometry)] &&
+        !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena &&
+        !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena &&
+        key.depth_samples <= key.num_samples &&
+        std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
+                            [&](u8 samples) { return samples == 0 || samples == key.num_samples; });
+    // SO-002: shader object pipelines keep the independent sets layout. The validation layer
+    // asks for VK_SHADER_CREATE_INDEPENDENT_SETS (not in these headers) to match it; a layout
+    // without independent sets lost the GPU device within 35 s on an RX 7600 (three runs), with
+    // it two minutes ran clean. RYGT_SO_INDEPENDENT=0 (diagnosis): the strict layout.
+    static const bool so_independent = [] {
+        const char* env = std::getenv("RYGT_SO_INDEPENDENT");
+        return !(env && env[0] == '0');
+    }();
+    const bool independent_sets =
+        instance.IsGraphicsPipelineLibrarySupported() && (!so_candidate || so_independent);
     const vk::PipelineLayoutCreateInfo layout_info = {
         .flags = independent_sets ? vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT
                                   : vk::PipelineLayoutCreateFlags{},
@@ -821,11 +842,7 @@ GraphicsPipeline::GraphicsPipeline(
     // SO-001: a plain pipeline is drawn with shader objects: no pipeline is compiled. Not with
     // tessellation (also the rect/quad list emulation), a geometry shader, sample shading or
     // AMD's mixed sample counts, which shader objects can't express.
-    if (instance.IsShaderObjectEnabled() && !tessellated && !is_rect_list && !is_quad_list &&
-        !infos[u32(Shader::SwStage::Geometry)] && !sdata.multisampling.sampleShadingEnable &&
-        key.depth_samples <= key.num_samples &&
-        std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
-                            [&](u8 samples) { return samples == 0 || samples == key.num_samples; })) {
+    if (so_candidate && !sdata.multisampling.sampleShadingEnable) {
         const auto& raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
         so_state.topology = topology;
         so_state.polygon_mode = raster.polygonMode;
@@ -844,6 +861,15 @@ GraphicsPipeline::GraphicsPipeline(
                                 infos[u32(Shader::SwStage::Fragment)] != nullptr)) {
             return;
         }
+    }
+    if (so_candidate && instance.IsGraphicsPipelineLibrarySupported()) {
+        // SO-001: no shader objects after all: the layout libraries need (independent sets).
+        auto layout_ci = layout_info;
+        layout_ci.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
+        auto [result, independent] = instance.GetDevice().createPipelineLayoutUnique(layout_ci);
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create graphics pipeline layout: {}",
+                   vk::to_string(result));
+        pipeline_layout = std::move(independent);
     }
 
     // FIX-057: the driver's optimizer is what ran out of memory on GT Sport's tessellated
