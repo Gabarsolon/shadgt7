@@ -5883,38 +5883,55 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                  (sharp_size >= 1_GB && base != 0 && !r.memory->IsValidMapping(base)));
             const bool unmapped =
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
-            if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
-                u64 size = r.memory->ClampRangeSize(base, sharp_size);
-                // FIX-GT7-067: a read-only V# whose records run past the memory the game committed
-                // is cut where that memory stops being readable. At a race load GT7 binds its
-                // per-frame ring at 0x200800000 from each draw's start to the end of a ~110 MB
-                // reservation, 48 MB of it committed. Not importable whole, each such range was
-                // copied into upload memory at every bind, zeros past the committed part (up to
-                // 64 MB each, 78 GB in 10 s, until "NAT-100: no upload memory" ended the game),
-                // or bound empty past 64 MB. The console can't read past the cut either. Only from
-                // 4 MB (those were 33-106 MB), so that other bindings don't pay the lookups.
-                // RYGT_NATIVE_READABLE_CUT=0: as before.
-                static const bool readable_cut = [] {
-                    const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
-                    return !(env && env[0] == '0');
-                }();
-                if (readable_cut && !desc.is_written && size >= 4_MB) {
-                    if (auto* const memory = r.buffer_cache.GetDirectMemory();
-                        memory && !RegionOver(base, size) && !memory->EnsureImported(base, size)) {
-                        const u64 readable =
-                            Native::ReadablePrefix(reinterpret_cast<const void*>(base), size);
-                        if (readable != 0 && readable < size) {
-                            static std::atomic<u32> cut_logged{};
-                            if (Sample(cut_logged)) {
-                                LOG_WARNING(Render_Vulkan,
-                                            "FIX-GT7-067: read range {:#x}+{:#x} cut to its "
-                                            "readable {:#x}",
-                                            base, size, readable);
-                            }
-                            size = readable;
+            const bool bindable = base != 0 && sharp_size != 0 && !impossible && !unmapped;
+            u64 size = bindable ? r.memory->ClampRangeSize(base, sharp_size) : 0;
+            // FIX-GT7-067: a read-only V# whose records run past the memory the game committed
+            // is cut where that memory stops being readable. At a race load GT7 binds its
+            // per-frame ring at 0x200800000 from each draw's start to the end of a ~110 MB
+            // reservation, 48 MB of it committed. Not importable whole, each such range was
+            // copied into upload memory at every bind, zeros past the committed part (up to
+            // 64 MB each, 78 GB in 10 s, until "NAT-100: no upload memory" ended the game),
+            // or bound empty past 64 MB. The console can't read past the cut either. Only from
+            // 4 MB (those were 33-106 MB), so that other bindings don't pay the lookups.
+            // RYGT_NATIVE_READABLE_CUT=0: as before.
+            static const bool readable_cut = [] {
+                const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
+                return !(env && env[0] == '0');
+            }();
+            // FIX-GT7-068: a range unreadable from its first page (IsMappedStart takes any address
+            // in the guest arena, committed or not) had no prefix to cut to: it kept its size and
+            // was copied, all zeros, into upload memory at every bind (32 MB each, as before
+            // FIX-GT7-067). It is bound empty instead: the null descriptor reads zeros too, as
+            // the copy did, and as the NAT-101 ranges over 64 MB already are.
+            bool unreadable = false;
+            if (bindable && readable_cut && !desc.is_written && size >= 4_MB) {
+                if (auto* const memory = r.buffer_cache.GetDirectMemory();
+                    memory && !RegionOver(base, size) && !memory->EnsureImported(base, size)) {
+                    const u64 readable =
+                        Native::ReadablePrefix(reinterpret_cast<const void*>(base), size);
+                    if (readable == 0) {
+                        unreadable = true;
+                        ++stats.unbound;
+                        static std::atomic<u32> empty_logged{};
+                        if (Sample(empty_logged)) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "FIX-GT7-068: read range {:#x}+{:#x} unreadable from its "
+                                        "start; bound empty (reads give zeros)",
+                                        base, size);
                         }
+                    } else if (readable < size) {
+                        static std::atomic<u32> cut_logged{};
+                        if (Sample(cut_logged)) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "FIX-GT7-067: read range {:#x}+{:#x} cut to its "
+                                        "readable {:#x}",
+                                        base, size, readable);
+                        }
+                        size = readable;
                     }
                 }
+            }
+            if (bindable && !unreadable) {
                 // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
                 static const std::pair<VAddr, VAddr> watch_buffer = [] {
