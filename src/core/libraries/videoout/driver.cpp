@@ -315,7 +315,7 @@ void VideoOutDriver::Flip(const Request& req) {
     Common::Nvtx::Mark("flip"); // DIAG-056
     {
         Common::Nvtx::Scope nvtx{"present"};
-        presenter->Present(req.frame);
+        presenter->Present(req.frame, false, true, req.anti_lag_frame);
     }
     {
         const auto now = std::chrono::steady_clock::now();
@@ -435,9 +435,6 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
     RyDiag::Timeline('R', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
                      u64(u32(index)) | (u64(is_eop) << 32)); // DIAG-GT7-007
-    if (!is_eop) {
-        presenter->AntiLagInput(); // PERF-210: on the game's thread, never the command thread
-    }
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -453,8 +450,12 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     }
 
     if (!is_eop) {
+        // PERF-210: on the game's thread, never the command thread
+        const u64 anti_lag_frame = presenter->AntiLagInput();
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand([=, this]() {
+            SubmitFlipInternal(port, index, flip_arg, is_eop, anti_lag_frame);
+        });
     } else {
         SubmitFlipInternal(port, index, flip_arg, is_eop);
     }
@@ -462,7 +463,8 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 anti_lag_frame) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -483,6 +485,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .index = index,
             .eop = is_eop,
             .submitted = queued,
+            .anti_lag_frame = anti_lag_frame,
         });
     }
     RyDiag::Timeline('Q', RyDiag::Seconds(queued), 0.0, 0.0, 0.0,

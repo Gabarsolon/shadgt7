@@ -418,6 +418,8 @@ private:
     void CreateDriverCache();
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
+    bool DriverCacheOutgrown(vk::Device device, vk::PipelineCache cache, u32 count);
+    std::atomic<bool> driver_cache_full{}; // FIX-GT7-050: this session saves no more
     std::filesystem::path driver_cache_path;
     /// PERF-GT7-037: the recipes of compute pipelines that took the driver long to build, and
     /// the thread that builds them again in the background at start.
@@ -560,12 +562,17 @@ private:
         std::span<const u32> code; // FIX-160: over code_copy, not guest memory
         std::vector<u32> code_copy;
         std::vector<u32> fetch_copy; // FIX-189: the fetch shader user_data points at
+        std::vector<Shader::Info::PinnedFetchSharp> fetch_sharps; // FIX-GT7-054
         Shader::RuntimeInfo runtime_info;
         Shader::Backend::Bindings start;
         std::unique_ptr<Shader::Info> info;
         std::vector<u32> spv;
         vk::ShaderModule module{};
         double translate_ms{};
+        u32 diag_id{};        ///< DIAG-GT7-073
+        bool diag_ahead{};    ///< DIAG-GT7-073: queued by a read-ahead state
+        std::chrono::steady_clock::time_point queued_at{};
+        bool too_old{}; ///< FIX-GT7-052: dropped before a worker translated it
         /// Set when harvested: its specialization, and when it became ready.
         Shader::StageSpecialization spec;
         std::chrono::steady_clock::time_point ready_since{};
@@ -603,6 +610,7 @@ private:
         u64 expired{};
         u64 duplicate{};
         u64 failed{};
+        u64 too_old{}; ///< FIX-GT7-052
         u64 waited{};
         double wait_ms{};
         double translate_ms{};
