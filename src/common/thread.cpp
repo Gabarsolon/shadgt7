@@ -368,7 +368,9 @@ struct DriverCompileThreads {
     bool applied_wide = false;
     bool applied_low = false;
     std::atomic<bool> wide_now{false};
-    std::atomic<bool> low_now{false};
+    // FIX-GT7-072: low from the start with RYGT_COMPILE_LOW=1 (no draw waits yet), so that
+    // CompileThreadsLow reads only this, never the counts it would race with.
+    std::atomic<bool> low_now{CompileAlwaysLow()};
     u32 calls = 0;
     u32 reports = 0;
 };
@@ -636,8 +638,8 @@ void SetCompileCatchUp(bool on) {
 }
 
 bool CompileThreadsLow() {
-    return DriverThreads().low_now.load(std::memory_order_relaxed) ||
-           (CompileAlwaysLow() && DriverThreads().waits == 0); // PERF-GT7-055
+    // PERF-GT7-055 (RYGT_COMPILE_LOW=1): ApplyCompileState counts it in low_now under the mutex.
+    return DriverThreads().low_now.load(std::memory_order_relaxed);
 }
 
 namespace {
