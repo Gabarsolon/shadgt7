@@ -637,9 +637,24 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
+        std::atomic<u32> pending{}; ///< PERF-GT7-052: submissions not decoded yet (compute)
+        u32 parked{}; ///< PERF-GT7-052: its front task waits at a label, semaphore or rewind
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available
+
+    /// PERF-GT7-052: a compute queue has a submission to decode and its task is not parked at
+    /// a wait. Resuming a parked one syncs the recorder for nothing: with every pending queue
+    /// counted (fencegpu-2) the recorder was drained 11,000 times in 2 s and the GPU ran dry.
+    bool ComputeQueueRunnable() const {
+        for (u32 q = 1; q < num_mapped_queues; ++q) {
+            const auto& queue = mapped_queues[q];
+            if (queue.parked == 0 && queue.pending.load(std::memory_order_relaxed) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
@@ -671,6 +686,8 @@ private:
     // the draw pipe runs. num_tasks counts the ones the command thread has not decoded yet.
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_tasks{};
+    u32 gfx_packets_since_yield{};    ///< PERF-GT7-052
+    std::atomic<u64> gfx_yields{};    ///< PERF-GT7-052
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

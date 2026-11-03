@@ -1408,6 +1408,9 @@ void Liverpool::Process(std::stop_token stoken) {
                     std::scoped_lock lock{queue.m_access};
                     queue.submits.pop();
                 }
+                if (curr_qid != GfxQueueId) {
+                    queue.pending.fetch_sub(1, std::memory_order_relaxed); // PERF-GT7-052
+                }
                 --num_tasks;
                 // DIAG-051: a graphics submission is decoded; time it through the pipeline.
                 std::optional<std::chrono::steady_clock::time_point> submitted;
@@ -1690,6 +1693,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     u32 num_recent = 0;
     while (!dcb.empty()) {
         ProcessCommands();
+
+        // PERF-GT7-052 (test, RYGT_GFX_YIELD_PACKETS=<n>): every n packets, while a compute
+        // queue has a submission waiting, this queue yields so that one is decoded now. The
+        // graphics decode otherwise yields only at a wait or at its submission's end: a label
+        // GT7's job threads spin on waited 1.2 ms on average between the game's compute submit
+        // and its decode (DIAG-GT7-028, fencegpu-1), a quarter of its round trip.
+        static const u32 yield_packets = [] {
+            const char* env = std::getenv("RYGT_GFX_YIELD_PACKETS");
+            return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+        }();
+        if (yield_packets != 0 && ++gfx_packets_since_yield >= yield_packets) {
+            gfx_packets_since_yield = 0;
+            if (ComputeQueueRunnable()) {
+                gfx_yields.fetch_add(1, std::memory_order_relaxed);
+                YIELD_GFX();
+            }
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -3042,6 +3062,18 @@ bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
     return !scan_finished;
 }
 
+// PERF-GT7-052: while a compute fiber waits at a label, a semaphore or a rewind, the graphics
+// decode does not yield to its queue (Liverpool::ComputeQueueRunnable).
+struct ParkedScope {
+    u32& parked;
+    explicit ParkedScope(u32& parked_) : parked{parked_} {
+        ++parked;
+    }
+    ~ParkedScope() {
+        --parked;
+    }
+};
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -3188,6 +3220,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             const auto wait_start = std::chrono::steady_clock::now();
             const bool waited = !rewind->Valid();
+            ParkedScope parked{mapped_queues[vqid + 1].parked}; // PERF-GT7-052
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -3345,6 +3378,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     SyncRecorder("mem semaphore");
                 }
                 const bool waited = !mem_semaphore->Signaled();
+                ParkedScope parked{mapped_queues[vqid + 1].parked}; // PERF-GT7-052
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -3360,6 +3394,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = std::chrono::steady_clock::now();
+            ParkedScope parked{mapped_queues[vqid + 1].parked}; // PERF-GT7-052
             // PERF-048: as for graphics waits, the other queues decode first.
             bool yielded = false;
             for (u32 turn = 0; draw_pipe && WaitTurnsEnabled() && turn < 4 &&
@@ -3786,6 +3821,13 @@ std::optional<Liverpool::TessSubmitRecord> Liverpool::FindTessSubmit(VAddr base)
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
     const auto original_dcb = dcb;
+    if (gfx_yields.load(std::memory_order_relaxed) != 0) { // PERF-GT7-052
+        if (static s64 last_yield_log = 0; NowNs() - last_yield_log >= 5'000'000'000) {
+            last_yield_log = NowNs();
+            LOG_WARNING(Render, "PERF-GT7-052: the graphics decode yielded {} times to a waiting "
+                        "compute queue", gfx_yields.load(std::memory_order_relaxed));
+        }
+    }
     if (!dcb.empty()) {
         const u64 submit = submitted_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (TessSubmitCheckEnabled()) {
@@ -3908,6 +3950,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
     ++num_tasks;
+    queue.pending.fetch_add(1, std::memory_order_relaxed); // PERF-GT7-052
     submit_cv.notify_one();
 }
 
