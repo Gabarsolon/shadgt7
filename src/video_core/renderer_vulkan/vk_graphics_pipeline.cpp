@@ -451,8 +451,11 @@ GraphicsPipeline::GraphicsPipeline(
         (so_tessellation || (!tessellated && key.prim_type != AmdGpu::PrimitiveType::RectList &&
                              key.prim_type != AmdGpu::PrimitiveType::QuadList)) &&
         !infos[u32(Shader::SwStage::Geometry)] &&
-        !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena &&
-        !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena &&
+        // SO-004: GT7's pixel shaders nearly all ask for per-sample interpolation; with one
+        // sample per pixel that changes nothing, so only multisampled ones stay pipelines.
+        (key.num_samples <= 1 ||
+         (!runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena &&
+          !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena)) &&
         key.depth_samples <= key.num_samples &&
         std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
                             [&](u8 samples) { return samples == 0 || samples == key.num_samples; });
@@ -845,7 +848,7 @@ GraphicsPipeline::GraphicsPipeline(
     // SO-001: a plain pipeline is drawn with shader objects: no pipeline is compiled. Not with
     // tessellation (also the rect/quad list emulation), a geometry shader, sample shading or
     // AMD's mixed sample counts, which shader objects can't express.
-    if (so_candidate && !sdata.multisampling.sampleShadingEnable) {
+    if (so_candidate && (key.num_samples <= 1 || !sdata.multisampling.sampleShadingEnable)) {
         const auto& raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
         so_state.topology = topology;
         so_state.polygon_mode = raster.polygonMode;
@@ -867,6 +870,24 @@ GraphicsPipeline::GraphicsPipeline(
         if (CreateShaderObjects(modules, sdata, attachments,
                                 infos[u32(Shader::SwStage::Fragment)] != nullptr)) {
             return;
+        }
+    }
+    // SO-004 (diagnosis): why a pipeline was not made of shader objects, while they are on.
+    if (instance.IsShaderObjectEnabled()) {
+        const char* why = !so_candidate
+            ? (infos[u32(Shader::SwStage::Geometry)] ? "geometry shader"
+               : key.depth_samples > key.num_samples   ? "depth samples"
+               : (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena ||
+                  runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena)
+                   ? "sample shading"
+                   : "colour samples or tessellation off")
+            : key.num_samples > 1 && sdata.multisampling.sampleShadingEnable
+                ? "sample shading enabled"
+                                                      : "shader object creation (code or driver)";
+        static std::atomic<u32> rejected{};
+        if (const u32 n = ++rejected; n <= 30 || n % 200 == 0) {
+            LOG_WARNING(Render_Vulkan, "SO-004: {} built as a pipeline: {} ({} so far)",
+                        GetDebugString(), why, n);
         }
     }
     if (so_candidate && instance.IsGraphicsPipelineLibrarySupported()) {
@@ -1233,6 +1254,12 @@ bool GraphicsPipeline::CreateShaderObjects(
     }
     if (code[0].empty() || (tessellation && (code[1].empty() || code[2].empty())) ||
         ((fragment || !sdata.fragment.empty()) && code[3].empty())) {
+        static std::atomic<u32> logged{};
+        if (++logged <= 10) {
+            LOG_WARNING(Render_Vulkan,
+                        "SO-004: no kept code: vertex {} control {} evaluation {} fragment {}",
+                        code[0].size(), code[1].size(), code[2].size(), code[3].size());
+        }
         return false; // a module's code wasn't kept: a pipeline as before
     }
     const vk::PushConstantRange push_constants = {
