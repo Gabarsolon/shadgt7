@@ -9,7 +9,8 @@
 namespace Shader::Backend::SPIRV {
 
 template <bool is_float>
-static Id FixImageCoords(EmitContext& ctx, Id coords, AmdGpu::ImageType image_type) {
+static Id FixImageCoords(EmitContext& ctx, Id coords, AmdGpu::ImageType image_type,
+                         bool native_cube = false) {
     const auto coord_type = is_float ? ctx.F32 : ctx.U32;
     const auto zero = is_float ? ctx.f32_zero_value : ctx.u32_zero_value;
 
@@ -31,6 +32,38 @@ static Id FixImageCoords(EmitContext& ctx, Id coords, AmdGpu::ImageType image_ty
             const auto x = ctx.OpCompositeExtract(coord_type[1], coords, 0U);
             const auto y = ctx.OpCompositeExtract(coord_type[1], coords, 1U);
             const auto face = ctx.OpCompositeExtract(coord_type[1], coords, 2U);
+            if (native_cube) {
+                // Port of xacidr4inx's reflection fix (RyGT 0066): GCN supplies face-local
+                // coordinates in [1,2] and eight indices per cube. Recover a direction so
+                // Vulkan can filter across face edges.
+                const Id cube = ctx.OpFloor(ctx.F32[1],
+                    ctx.OpFDiv(ctx.F32[1], face, ctx.ConstF32(8.f)));
+                const Id local_face = ctx.OpFSub(ctx.F32[1], face,
+                    ctx.OpFMul(ctx.F32[1], cube, ctx.ConstF32(8.f)));
+                const Id s = ctx.OpFSub(ctx.F32[1],
+                    ctx.OpFMul(ctx.F32[1], x, ctx.ConstF32(2.f)), ctx.ConstF32(3.f));
+                const Id t = ctx.OpFSub(ctx.F32[1],
+                    ctx.OpFMul(ctx.F32[1], y, ctx.ConstF32(2.f)), ctx.ConstF32(3.f));
+                const Id ns = ctx.OpFNegate(ctx.F32[1], s);
+                const Id nt = ctx.OpFNegate(ctx.F32[1], t);
+                const Id one = ctx.ConstF32(1.f);
+                const Id neg_one = ctx.ConstF32(-1.f);
+                std::array<Id, 5> is_face{};
+                for (u32 f = 0; f < is_face.size(); ++f) {
+                    is_face[f] = ctx.OpFOrdEqual(ctx.U1[1], local_face, ctx.ConstF32(float(f)));
+                }
+                const auto select = [&](std::array<Id, 6> values) {
+                    Id value = values.back();
+                    for (s32 f = 4; f >= 0; --f) {
+                        value = ctx.OpSelect(ctx.F32[1], is_face[f], values[f], value);
+                    }
+                    return value;
+                };
+                return ctx.OpCompositeConstruct(ctx.F32[4],
+                    select({one, neg_one, s, s, s, ns}),
+                    select({nt, nt, one, neg_one, nt, nt}),
+                    select({ns, s, t, nt, one, neg_one}), cube);
+            }
 
             // AMD cube math results in coordinates in the range [1.0, 2.0]. We need
             // to convert this to the range [0.0, 1.0] to get correct results.
@@ -205,8 +238,10 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     const Id result_type = texture.data_types->Get(4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
-    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type);
-    if (texture.view_type == AmdGpu::ImageType::Cube && ctx.hw_stage == HwStage::Fragment) {
+    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type,
+                                                texture.native_cube);
+    if (texture.view_type == AmdGpu::ImageType::Cube && ctx.hw_stage == HwStage::Fragment &&
+        !texture.native_cube) {
         auto [grad_x, grad_y] = CubeGradients(ctx, coords); // FIX-199
         if (Sirit::ValidId(bias)) {
             const Id scale = ctx.OpExp2(ctx.F32[1], bias);
@@ -235,7 +270,8 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     const Id result_type = texture.data_types->Get(4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
-    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type);
+    const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type,
+                                                texture.native_cube);
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Lod, lod);
     operands.AddOffset(ctx, texture.view_type, offset);
@@ -349,8 +385,18 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[2]), zero, mips());
+    case AmdGpu::ImageType::Cube: {
+        if (texture.native_cube) {
+            const Id dims = query(ctx.U32[3]);
+            const Id width = ctx.OpCompositeExtract(ctx.U32[1], dims, 0U);
+            const Id height = ctx.OpCompositeExtract(ctx.U32[1], dims, 1U);
+            const Id faces = ctx.OpIMul(ctx.U32[1],
+                ctx.OpCompositeExtract(ctx.U32[1], dims, 2U), ctx.ConstU32(6u));
+            return ctx.OpCompositeConstruct(ctx.U32[4], width, height, faces, mips());
+        }
+        return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
+    }
     case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Cube:
     case AmdGpu::ImageType::Color3D:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
     default:

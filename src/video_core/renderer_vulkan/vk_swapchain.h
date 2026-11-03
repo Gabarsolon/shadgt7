@@ -41,7 +41,7 @@ public:
     bool AcquireNextImage();
 
     /// Presents the current image and move to the next one
-    bool Present();
+    bool Present(u64 anti_lag_frame = 0);
 
     vk::SurfaceKHR GetSurface() const {
         return surface;

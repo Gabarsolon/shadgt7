@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+#include "common/perf_monitor.h"
 #include "common/small_vector.h"
 #include "common/types.h"
 #include "shader_recompiler/info.h"
@@ -35,11 +37,37 @@ struct VertexAttribute {
     }
 
     AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
-        auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+        auto buffer = info.ReadFetchSharp(sgpr_base, dword_offset);
         buffer.base_address += inst_offset;
         if (data_format) {
             buffer.data_format = data_format;
             buffer.num_format = num_format;
+        }
+        return buffer;
+    }
+
+    /// FIX-060: a V# of a gigabyte or more is garbage, and counts as plain floats in the key.
+    static bool IsGarbage(const AmdGpu::Buffer& sharp) {
+        static const bool enabled = Common::PerfFeatureEnabled(83);
+        return enabled && sharp.GetSize() >= (u64{1} << 30);
+    }
+
+    /// FIX-GT7-054: the V# code is made from. Code made from a garbage V# followed its swizzle
+    /// under the key of plain floats, and a real attribute of four floats then matched it: GT7's
+    /// map markers read R, G, B, R or nothing at all. RYGT_GARBAGE_VSHARP_PLAIN=0: as before.
+    AmdGpu::Buffer GetSharpForCode(const Shader::Info& info) const noexcept {
+        static const bool plain = [] {
+            const char* env = std::getenv("RYGT_GARBAGE_VSHARP_PLAIN");
+            return !(env && env[0] == '0');
+        }();
+        auto buffer = GetSharp(info);
+        if (plain && IsGarbage(buffer)) {
+            buffer.data_format = static_cast<u32>(AmdGpu::DataFormat::Format32_32_32_32);
+            buffer.num_format = static_cast<u32>(AmdGpu::NumberFormat::Float);
+            buffer.dst_sel_x = static_cast<u32>(AmdGpu::CompSwizzle::Red);
+            buffer.dst_sel_y = static_cast<u32>(AmdGpu::CompSwizzle::Green);
+            buffer.dst_sel_z = static_cast<u32>(AmdGpu::CompSwizzle::Blue);
+            buffer.dst_sel_w = static_cast<u32>(AmdGpu::CompSwizzle::Alpha);
         }
         return buffer;
     }
