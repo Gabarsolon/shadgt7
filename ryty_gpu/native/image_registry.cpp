@@ -1304,6 +1304,26 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 entry.rewrite_pattern = *pattern;
                 entry.rewrite_bytes = entry.info.guest_size;
                 entry.rewrite_clock = clock;
+                // FIX-GT7-059: as FIX-209: kept, the same bytes written back by the CPU were taken
+                // for "unchanged" and never uploaded, and the texture kept the fill. GT7's main
+                // menu reads its sky tables from memory a race's fill covers: they stayed zero,
+                // and after a race the menu's ground and buildings were black until the game
+                // closed, whatever the time of day. RYGT_NATIVE_FILL_FORGETS_HASH=0: as before.
+                static const bool forget_hash = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_FILL_FORGETS_HASH");
+                    return !(env && env[0] == '0');
+                }();
+                if (forget_hash) {
+                    entry.content_hash = 0;
+                    static std::atomic<u32> logged{};
+                    if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "FIX-GT7-059: texture {:#x} {}x{} filled by {:#x}+{:#x} with {:#x} "
+                                 "({} so far)",
+                                 entry.info.guest_address, entry.info.size.width,
+                                 entry.info.size.height, address, size, (*pattern)[0], n + 1);
+                    }
+                }
                 return;
             }
             bool made_of_targets;
