@@ -2946,6 +2946,24 @@ static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
     return inplace_ranges;
 }
 
+// FIX-GT7-034: a shader's write to a listed range that could not be compared stays in the region.
+static void NoteListedWriteSkipped(VAddr from, VAddr to) {
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged++; n < 20) {
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-034: shader write {:#x}-{:#x} in a listed range not written back", from, to);
+    }
+}
+
+// FIX-GT7-034: RYGT_NATIVE_INPLACE_WRITEBACK=0: what the GPU writes in listed ranges under a region
+// stays there.
+static bool InplaceWritebackOn() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
 void NativeRenderer::SnapshotBeforeWrite(VAddr address, u64 size) {
     // FIX-203: FIX-194 wrote back every page of a written range the CPU wrote lately, but a
     // shader's storage buffer covers more than it writes: GT7's compute passes bind 875 KB of
@@ -2963,13 +2981,20 @@ void NativeRenderer::SnapshotBeforeWrite(VAddr address, u64 size) {
         return;
     }
     Region* region = RegionOver(address, size);
-    if (!region || address < region->begin || address + size > region->end ||
-        region->cpu_pages.empty()) {
+    if (!region || address < region->begin || address + size > region->end) {
+        return;
+    }
+    // FIX-GT7-034: what the GPU writes in a listed range is written back whatever the CPU did.
+    const bool listed = InplaceWritebackOn() &&
+                        std::ranges::any_of(InplaceRanges(), [&](const auto& listed_range) {
+                            return address < listed_range.second && listed_range.first < address + size;
+                        });
+    if (!listed && region->cpu_pages.empty()) {
         return;
     }
     const VAddr begin = Common::AlignDown(address, 4096);
     const VAddr end = std::min<VAddr>(Common::AlignUp(address + size, 4096), region->end);
-    bool recent = false; // only pages the CPU wrote lately are written back (FIX-194)
+    bool recent = listed; // only pages the CPU wrote lately are written back (FIX-194)
     for (VAddr page = begin; page < end && !recent; page += 4096) {
         const auto it = region->cpu_pages.find(page);
         recent = it != region->cpu_pages.end() && frame - it->second <= RegionRecentFrames;
@@ -3073,7 +3098,55 @@ void NativeRenderer::RetireSnapshots(Stream& s, u64 tick) {
     s.pooled.clear();
 }
 
-void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before) {
+bool NativeRenderer::WriteBackChangedWords(Stream& s, const Region& region,
+                                          const WrittenBefore& before, VAddr run_from,
+                                          VAddr run_to) {
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    const u64 alignment = r.instance.StorageMinAlignment();
+        bool compared = true;
+        direct->ForEachPart(
+            run_from, run_to - run_from,
+            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
+                if (view_offset % alignment != 0 || bytes % 16 != 0) {
+                    compared = false;
+                    return;
+                }
+                auto guest = device->WrapBuffer(
+                    reinterpret_cast<u64>(static_cast<VkBuffer>(view.Handle())),
+                    view.SizeBytes());
+                const std::array<Native::Rhi::Binding, 3> bindings{{
+                    {.slot = 0,
+                     .type = Native::Rhi::BindingType::StorageBuffer,
+                     .buffer = region.buffer.get(),
+                     .offset = run_from - region.begin + offset,
+                     .size = bytes},
+                    {.slot = 1,
+                     .type = Native::Rhi::BindingType::StorageBuffer,
+                     .buffer = before.copy.get(),
+                     .offset = run_from - before.begin + offset,
+                     .size = bytes},
+                    {.slot = 2,
+                     .type = Native::Rhi::BindingType::StorageBuffer,
+                     .buffer = guest.get(),
+                     .offset = view_offset,
+                     .size = bytes},
+                }};
+                const u32 count = static_cast<u32>(bytes / 16);
+                s.list->BindPipeline(writeback_pipeline.get());
+                s.list->PushBindings(bindings);
+                s.list->PushConstants(
+                    0, std::span<const u8>{reinterpret_cast<const u8*>(&count),
+                                           sizeof(count)});
+                s.list->Dispatch((count + 63) / 64, 1, 1);
+                s.keep.push_back(std::move(guest));
+            });
+        s.pipeline = vk::Pipeline{}; // the compare binds its own pipeline
+        ForgetBindings(s); // OPT-014
+    return compared;
+}
+
+void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before,
+                                     bool shader_write) {
     // FIX-194: where the GPU writes a region over pages the CPU wrote lately (the pages FIX-173
     // compares), guest memory gets the bytes too, right behind the write, so it holds what the
     // region does at the next compare (GT Sport's cockpit light, written every third frame in
@@ -3108,16 +3181,41 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
         // pages, so only the 512 states in a page it also writes reached it, and the models past
         // them in the frame's list were not drawn. The bytes written go to guest memory as they
         // would have.
-        static const bool listed_writeback = [] {
-            const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
-            return !(env && env[0] == '0');
-        }();
-        if (listed_writeback && direct && to - from <= MaxWriteback) {
+        if (InplaceWritebackOn() && direct && to - from <= MaxWriteback) {
             for (const auto& [listed_begin, listed_end] : InplaceRanges()) {
                 const VAddr copy_from = std::max(from, listed_begin);
                 const VAddr copy_to = std::min(to, listed_end);
-                if (copy_from >= copy_to ||
-                    !direct->EnsureImported(copy_from, copy_to - copy_from)) {
+                if (copy_from >= copy_to) {
+                    continue;
+                }
+                // A shader's storage buffer covers more than it writes, and the copy runs when the
+                // GPU gets to it, after the CPU may have written there again: only the words the
+                // shader changed go back (FIX-203). A copy or a fill writes all of its range.
+                if (shader_write) {
+                    if (!before || !before->copy) {
+                        NoteListedWriteSkipped(copy_from, copy_to);
+                        continue;
+                    }
+                    const VAddr run_from = Common::AlignDown(copy_from, 4096);
+                    const VAddr run_to = std::min(Common::AlignUp(copy_to, 4096), before->end);
+                    if (run_from < before->begin || run_from >= run_to ||
+                        !direct->EnsureImported(run_from, run_to - run_from)) {
+                        NoteListedWriteSkipped(copy_from, copy_to);
+                        continue;
+                    }
+                    Stream& s = Begin();
+                    GlobalBarrier(); // behind the write
+                    if (WriteBackChangedWords(s, region, *before, run_from, run_to)) {
+                        stats.region_writeback_bytes += run_to - run_from;
+                        ++stats.precise_writebacks;
+                    } else {
+                        NoteListedWriteSkipped(copy_from, copy_to);
+                    }
+                    s.buffers_written = true;
+                    ++stats.region_writebacks;
+                    continue;
+                }
+                if (!direct->EnsureImported(copy_from, copy_to - copy_from)) {
                     continue;
                 }
                 Stream& s = Begin();
@@ -3186,45 +3284,7 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
                 direct->EnsureImported(pages[i], pages[j - 1] + 4096 - pages[i])) {
                 const VAddr run_from = pages[i];
                 const VAddr run_to = pages[j - 1] + 4096;
-                bool compared = true;
-                direct->ForEachPart(
-                    run_from, run_to - run_from,
-                    [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
-                        if (view_offset % alignment != 0 || bytes % 16 != 0) {
-                            compared = false;
-                            return;
-                        }
-                        auto guest = device->WrapBuffer(
-                            reinterpret_cast<u64>(static_cast<VkBuffer>(view.Handle())),
-                            view.SizeBytes());
-                        const std::array<Native::Rhi::Binding, 3> bindings{{
-                            {.slot = 0,
-                             .type = Native::Rhi::BindingType::StorageBuffer,
-                             .buffer = region.buffer.get(),
-                             .offset = run_from - region.begin + offset,
-                             .size = bytes},
-                            {.slot = 1,
-                             .type = Native::Rhi::BindingType::StorageBuffer,
-                             .buffer = before->copy.get(),
-                             .offset = run_from - before->begin + offset,
-                             .size = bytes},
-                            {.slot = 2,
-                             .type = Native::Rhi::BindingType::StorageBuffer,
-                             .buffer = guest.get(),
-                             .offset = view_offset,
-                             .size = bytes},
-                        }};
-                        const u32 count = static_cast<u32>(bytes / 16);
-                        s.list->BindPipeline(writeback_pipeline.get());
-                        s.list->PushBindings(bindings);
-                        s.list->PushConstants(
-                            0, std::span<const u8>{reinterpret_cast<const u8*>(&count),
-                                                   sizeof(count)});
-                        s.list->Dispatch((count + 63) / 64, 1, 1);
-                        s.keep.push_back(std::move(guest));
-                    });
-                s.pipeline = vk::Pipeline{}; // the compare binds its own pipeline
-                ForgetBindings(s); // OPT-014
+                const bool compared = WriteBackChangedWords(s, region, *before, run_from, run_to);
                 if (compared) {
                     stats.region_writeback_bytes += run_to - run_from;
                     ++stats.precise_writebacks;
@@ -7484,9 +7544,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             const auto before = std::ranges::find_if(written_befores, [&](const WrittenBefore& w) {
                 return w.address == address && w.size == size;
             });
-            NoteRegionWrite(address, size, before != written_befores.end()
-                                               ? &*before
-                                               : nullptr); // FIX-194, FIX-203
+            NoteRegionWrite(address, size, before != written_befores.end() ? &*before : nullptr,
+                            true); // FIX-194, FIX-203
         }
     }
     DropWrittenBefores();
