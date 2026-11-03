@@ -319,7 +319,17 @@ struct PartClock {
     }
 };
 
-constexpr u64 ChunkSize = 8_MB;
+// FIX-GT7-047: a list takes a chunk for itself even for a few KB, and keeps it until the GPU ran the
+// list. GT7's race loading has about 350 lists waiting: at 8 MB a chunk, 2.8 GB of RAM the driver
+// zeroes, for under 32 MB of data a frame. RYGT_NATIVE_CHUNK_MB=8: as before.
+u64 ChunkSize() {
+    static const u64 size = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CHUNK_MB");
+        const long long mb = env ? std::strtoll(env, nullptr, 10) : 0;
+        return mb > 0 ? u64(mb) << 20 : u64{1_MB};
+    }();
+    return size;
+}
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
 
 } // namespace
@@ -881,6 +891,13 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     const Instance& instance = r.instance;
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
+    // Port of xacidr4inx's reflection fix (RyGT 0066): square colour images of six layers or
+    // more can be viewed as cube arrays. Not depth images (GT7's shadow cascades).
+    if (instance.IsImageCubeArraySupported() && !info.props.is_volume && !info.props.is_depth &&
+        info.size.width == info.size.height && info.resources.layers >= 6 &&
+        info.num_samples == 1) {
+        flags |= vk::ImageCreateFlagBits::eCubeCompatible;
+    }
     if (info.props.is_volume) {
         flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
         if (instance.Is2dViewOf3dSupported()) {
@@ -1039,6 +1056,9 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
         format = r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{entry.backend_features});
     }
     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
+    if (use == ViewUse::CubeSampled) {
+        view_type = vk::ImageViewType::eCubeArray;
+    }
     if (volume) {
         view_type = vk::ImageViewType::e3D;
     } else if (view_type == vk::ImageViewType::e3D) {
@@ -1578,9 +1598,17 @@ void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
 // game ordered them; written back at the frame's end, the picture would overwrite the newer bytes.
 // It goes at the next global barrier, before that work, and the bytes the work leaves stay right.
 void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
-    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+    const auto meets = [&](const Native::ImageEntry* entry) {
         const VAddr begin = entry->info.guest_address;
-        if (address + std::max<u64>(size, 1) <= begin || begin + entry->info.guest_size <= address) {
+        return address + std::max<u64>(size, 1) > begin && begin + entry->info.guest_size > address;
+    };
+    // FIX-GT7-040: a picture moved here when its frame ended counts too: unnoticed, it reached the
+    // region only at the region's next use, over what this work writes.
+    if (std::ranges::any_of(writebacks, meets)) {
+        writebacks_due = true;
+    }
+    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+        if (!meets(entry)) {
             return false;
         }
         if (std::ranges::find(writebacks, entry) == writebacks.end()) {
@@ -1591,9 +1619,36 @@ void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
     });
 }
 
+// FIX-GT7-040: what work writes in a region stays there, so a picture going back to guest memory
+// first must reach the region first too. Left for the region's next use, it was copied in over the
+// shader's bytes: GT7 fills its rain layer, whose memory also holds its reflection's small mips, and
+// with no rain to draw it samples the fill right away. Those mips showed as a 64 KB block of huge
+// values at every frame of a pre-race screen, under a large halo. A fill or a copy gets its region
+// after this; a draw or dispatch has it already, and refreshes it again when this returns true.
+// RYGT_NATIVE_WRITEBACK_REFRESH=0: as before.
+bool NativeRenderer::SendWritebacksDue() {
+    static const bool refresh = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_REFRESH");
+        return !(env && env[0] == '0');
+    }();
+    if (!refresh || !writebacks_due) {
+        return false;
+    }
+    GlobalBarrier(); // the pictures go back here
+    return true;
+}
+
 void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
     for (const auto& [address, size] : b.gpu_writes) {
         WritebacksBefore(address, size);
+    }
+    if (!SendWritebacksDue()) {
+        return;
+    }
+    for (const auto& [address, size] : b.gpu_writes) {
+        if (Region* region = RegionOver(address, size)) {
+            RefreshRegion(*region);
+        }
     }
 }
 
@@ -1614,11 +1669,38 @@ void NativeRenderer::FlushWritebacks() {
     Stream& s = stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
+    // PERF-GT7-045: a frame's ~190 pictures took 6 to 8 ms of GPU in a row at each frame's end, a
+    // tiling dispatch writing guest memory a word at a time over PCIe, and the game's next compute
+    // work waited behind them (with none, the time from the GPU's end to the next frame fell from
+    // 11.5 to 7.8 ms). Now they are tiled in video memory, then copied to guest memory together.
+    // A picture over the memory of one before it starts a new batch, so they land in the same
+    // order. RYGT_NATIVE_WRITEBACK_BATCH=0: each in turn, as before.
+    static const bool batched = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    Native::DownloadBatch batch;
+    std::vector<std::pair<VAddr, VAddr>> batch_ranges;
+    bool use_batch = false;
+    if (batched) {
+        const u64 step_alignment = std::max<u64>(alignment, 256);
+        u64 bytes = 0;
+        for (const auto* entry : writebacks) {
+            bytes += 2 * Common::AlignUp(u64(entry->info.guest_size), step_alignment);
+        }
+        use_batch = bytes != 0 && registry->BeginDownloads(batch, bytes, alignment);
+    }
     for (auto* entry : writebacks) {
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
         if (!direct || !direct->EnsureImported(address, size)) {
             continue;
+        }
+        if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
+                return address < range.second && range.first < address + size;
+            })) {
+            registry->FinishDownloads(*s.list, batch);
+            batch_ranges.clear();
         }
         const auto found = direct->FindBuffer(address, size);
         if (!found || found->second % alignment != 0) {
@@ -1627,7 +1709,9 @@ void NativeRenderer::FlushWritebacks() {
         auto out = device->WrapBuffer(
             reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
             found->first->SizeBytes());
-        if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
+        if (registry->RecordDownload(*s.list, *entry, *out, found->second,
+                                     use_batch ? &batch : nullptr)) {
+            batch_ranges.emplace_back(address, address + size);
             ++stats.writebacks;
             NoteHistory(address, size, 8, 0); // DIAG-187 (diagnosis)
             // NAT-146: regions over the picture's memory copy it in before their next use.
@@ -1653,6 +1737,9 @@ void NativeRenderer::FlushWritebacks() {
             }
         }
         s.keep.push_back(std::move(out));
+    }
+    if (use_batch) {
+        registry->FinishDownloads(*s.list, batch);
     }
     writebacks.clear();
     writebacks_due = false;
@@ -1714,6 +1801,35 @@ void NativeRenderer::ChunkFlushCheck() {
     }
 }
 
+void NativeRenderer::TrimChunks() {
+    // FIX-GT7-046: free chunks were kept for good. GT7's race loading takes many of them at once,
+    // and they stayed free for the rest of the session while a frame uses far fewer. What stayed
+    // free over the whole period goes back, a little at a time:
+    // the newest are reused first, so the oldest are the ones not needed.
+    // RYGT_NATIVE_CHUNK_TRIM=0: as before.
+    static const bool trim = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CHUNK_TRIM");
+        return !(env && env[0] == '0');
+    }();
+    constexpr u64 PeriodFrames = 150;
+    const size_t KeptChunks = 128_MB / ChunkSize();
+    const size_t AtMostChunks = 256_MB / ChunkSize();
+    if (!trim || frame % PeriodFrames != 0) {
+        return;
+    }
+    std::vector<Chunk> dropped;
+    {
+        std::scoped_lock lock{chunk_mutex};
+        if (free_chunks_low > KeptChunks) {
+            const auto count = std::min(free_chunks_low - KeptChunks, AtMostChunks);
+            const auto first = free_chunks.begin();
+            dropped.assign(std::make_move_iterator(first), std::make_move_iterator(first + count));
+            free_chunks.erase(first, first + count);
+        }
+        free_chunks_low = free_chunks.size();
+    }
+}
+
 NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     auto* semaphore = r.scheduler.GetWorkSemaphore();
     std::scoped_lock lock{chunk_mutex};
@@ -1731,19 +1847,23 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     }();
     while (!no_reuse && !retiring_chunks.empty() &&
            retiring_chunks.front().retire_tick + margin <= known) {
-        if (retiring_chunks.front().buffer->Size() == ChunkSize) {
+        if (retiring_chunks.front().buffer->Size() == ChunkSize()) {
             free_chunks.push_back(std::move(retiring_chunks.front()));
         }
         retiring_chunks.pop_front(); // larger ones are freed (after the GPU, by the device)
     }
-    if (size <= ChunkSize && !free_chunks.empty()) {
+    if (size <= ChunkSize() && !free_chunks.empty()) {
         Chunk chunk = std::move(free_chunks.back());
         free_chunks.pop_back();
+        free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
+    }
+    if (size <= ChunkSize()) {
+        free_chunks_low = 0;
     }
     Chunk chunk;
     chunk.buffer = device->CreateBuffer({
-        .size = std::max(size, ChunkSize),
+        .size = std::max(size, ChunkSize()),
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
@@ -1877,9 +1997,10 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
                         });
     } else {
         // Preserve readable CPU contents and initialize holes consistently with sparse guest
-        // reads. Bound the staging allocation rather than snapshotting a whole large region.
+        // reads. Bound the staging allocation rather than snapshotting a whole large region,
+        // and to a chunk: a larger allocation has a buffer of its own, not used again (FIX-GT7-051).
         for (u64 offset = 0; offset < end - begin;) {
-            const u64 bytes = std::min<u64>(4_MB, end - begin - offset);
+            const u64 bytes = std::min<u64>({4_MB, ChunkSize(), end - begin - offset});
             const auto [upload, upload_offset, data] = Allocate(bytes, 4);
             r.memory->CopySparseMemory(begin + offset, data, bytes);
             s.cmd.copyBuffer(upload, dst, vk::BufferCopy{.srcOffset = upload_offset,
@@ -1898,6 +2019,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
         region.dirty_pages.insert(region.dirty_pages.end(), old.dirty_pages.begin(),
                                   old.dirty_pages.end());
         region.cpu_pages.merge(old.cpu_pages); // FIX-194
+        region.gpu_pages.merge(old.gpu_pages); // FIX-GT7-033
     }
     s.buffers_written = true;
     // CPU writes to it from now on are copied in before its next use.
@@ -2386,8 +2508,21 @@ void NativeRenderer::RefreshRegion(Region& region) {
             ++stats.region_partial_pages;
             continue;
         }
+        // FIX-GT7-033: a page the CPU wrote lately is compared only if the GPU wrote it since its
+        // last copy. Otherwise the compare only risks the page: a piece the region got wrong stays
+        // wrong for as long as the CPU writes the same value. GT7 builds its constants in a heap
+        // of such pages: the flag of its sky table's blit stayed 0 in the region at some addresses
+        // while guest memory held 1, the table lost 3 of its 4 rows whenever a frame's constants
+        // landed there, and the sky lost its clouds and the scene its light for that frame.
+        // RYGT_NATIVE_REGION_COMPARE=1: as before.
+        static const bool compare_all = [] {
+            const char* env = std::getenv("RYGT_NATIVE_REGION_COMPARE");
+            return env && env[0] == '1';
+        }();
+        const bool gpu_wrote = region.gpu_pages.erase(page) != 0;
         const bool compare =
-            !always_whole && (!region_writeback || recent || opened_ahead[k]);
+            !always_whole &&
+            (!region_writeback || (recent ? gpu_wrote || compare_all : opened_ahead[k]));
         // FIX-GT7-018: a page opened ahead counts as written lately only once the CPU changed it
         // (below). Counted at each refresh, every page of a chunk with one write stayed "written
         // lately" for good: opened ahead again and again, and its GPU writes written back.
@@ -2924,6 +3059,24 @@ static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
     return inplace_ranges;
 }
 
+// FIX-GT7-034: a shader's write to a listed range that could not be compared stays in the region.
+static void NoteListedWriteSkipped(VAddr from, VAddr to) {
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged++; n < 20) {
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-034: shader write {:#x}-{:#x} in a listed range not written back", from, to);
+    }
+}
+
+// FIX-GT7-034: RYGT_NATIVE_INPLACE_WRITEBACK=0: what the GPU writes in listed ranges under a region
+// stays there.
+static bool InplaceWritebackOn() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
 void NativeRenderer::SnapshotBeforeWrite(VAddr address, u64 size) {
     // FIX-203: FIX-194 wrote back every page of a written range the CPU wrote lately, but a
     // shader's storage buffer covers more than it writes: GT7's compute passes bind 875 KB of
@@ -2941,13 +3094,20 @@ void NativeRenderer::SnapshotBeforeWrite(VAddr address, u64 size) {
         return;
     }
     Region* region = RegionOver(address, size);
-    if (!region || address < region->begin || address + size > region->end ||
-        region->cpu_pages.empty()) {
+    if (!region || address < region->begin || address + size > region->end) {
+        return;
+    }
+    // FIX-GT7-034: what the GPU writes in a listed range is written back whatever the CPU did.
+    const bool listed = InplaceWritebackOn() &&
+                        std::ranges::any_of(InplaceRanges(), [&](const auto& listed_range) {
+                            return address < listed_range.second && listed_range.first < address + size;
+                        });
+    if (!listed && region->cpu_pages.empty()) {
         return;
     }
     const VAddr begin = Common::AlignDown(address, 4096);
     const VAddr end = std::min<VAddr>(Common::AlignUp(address + size, 4096), region->end);
-    bool recent = false; // only pages the CPU wrote lately are written back (FIX-194)
+    bool recent = listed; // only pages the CPU wrote lately are written back (FIX-194)
     for (VAddr page = begin; page < end && !recent; page += 4096) {
         const auto it = region->cpu_pages.find(page);
         recent = it != region->cpu_pages.end() && frame - it->second <= RegionRecentFrames;
@@ -3051,7 +3211,55 @@ void NativeRenderer::RetireSnapshots(Stream& s, u64 tick) {
     s.pooled.clear();
 }
 
-void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before) {
+bool NativeRenderer::WriteBackChangedWords(Stream& s, const Region& region,
+                                          const WrittenBefore& before, VAddr run_from,
+                                          VAddr run_to) {
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    const u64 alignment = r.instance.StorageMinAlignment();
+        bool compared = true;
+        direct->ForEachPart(
+            run_from, run_to - run_from,
+            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
+                if (view_offset % alignment != 0 || bytes % 16 != 0) {
+                    compared = false;
+                    return;
+                }
+                auto guest = device->WrapBuffer(
+                    reinterpret_cast<u64>(static_cast<VkBuffer>(view.Handle())),
+                    view.SizeBytes());
+                const std::array<Native::Rhi::Binding, 3> bindings{{
+                    {.slot = 0,
+                     .type = Native::Rhi::BindingType::StorageBuffer,
+                     .buffer = region.buffer.get(),
+                     .offset = run_from - region.begin + offset,
+                     .size = bytes},
+                    {.slot = 1,
+                     .type = Native::Rhi::BindingType::StorageBuffer,
+                     .buffer = before.copy.get(),
+                     .offset = run_from - before.begin + offset,
+                     .size = bytes},
+                    {.slot = 2,
+                     .type = Native::Rhi::BindingType::StorageBuffer,
+                     .buffer = guest.get(),
+                     .offset = view_offset,
+                     .size = bytes},
+                }};
+                const u32 count = static_cast<u32>(bytes / 16);
+                s.list->BindPipeline(writeback_pipeline.get());
+                s.list->PushBindings(bindings);
+                s.list->PushConstants(
+                    0, std::span<const u8>{reinterpret_cast<const u8*>(&count),
+                                           sizeof(count)});
+                s.list->Dispatch((count + 63) / 64, 1, 1);
+                s.keep.push_back(std::move(guest));
+            });
+        s.pipeline = vk::Pipeline{}; // the compare binds its own pipeline
+        ForgetBindings(s); // OPT-014
+    return compared;
+}
+
+void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before,
+                                     bool shader_write) {
     // FIX-194: where the GPU writes a region over pages the CPU wrote lately (the pages FIX-173
     // compares), guest memory gets the bytes too, right behind the write, so it holds what the
     // region does at the next compare (GT Sport's cockpit light, written every third frame in
@@ -3086,16 +3294,41 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
         // pages, so only the 512 states in a page it also writes reached it, and the models past
         // them in the frame's list were not drawn. The bytes written go to guest memory as they
         // would have.
-        static const bool listed_writeback = [] {
-            const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
-            return !(env && env[0] == '0');
-        }();
-        if (listed_writeback && direct && to - from <= MaxWriteback) {
+        if (InplaceWritebackOn() && direct && to - from <= MaxWriteback) {
             for (const auto& [listed_begin, listed_end] : InplaceRanges()) {
                 const VAddr copy_from = std::max(from, listed_begin);
                 const VAddr copy_to = std::min(to, listed_end);
-                if (copy_from >= copy_to ||
-                    !direct->EnsureImported(copy_from, copy_to - copy_from)) {
+                if (copy_from >= copy_to) {
+                    continue;
+                }
+                // A shader's storage buffer covers more than it writes, and the copy runs when the
+                // GPU gets to it, after the CPU may have written there again: only the words the
+                // shader changed go back (FIX-203). A copy or a fill writes all of its range.
+                if (shader_write) {
+                    if (!before || !before->copy) {
+                        NoteListedWriteSkipped(copy_from, copy_to);
+                        continue;
+                    }
+                    const VAddr run_from = Common::AlignDown(copy_from, 4096);
+                    const VAddr run_to = std::min(Common::AlignUp(copy_to, 4096), before->end);
+                    if (run_from < before->begin || run_from >= run_to ||
+                        !direct->EnsureImported(run_from, run_to - run_from)) {
+                        NoteListedWriteSkipped(copy_from, copy_to);
+                        continue;
+                    }
+                    Stream& s = Begin();
+                    GlobalBarrier(); // behind the write
+                    if (WriteBackChangedWords(s, region, *before, run_from, run_to)) {
+                        stats.region_writeback_bytes += run_to - run_from;
+                        ++stats.precise_writebacks;
+                    } else {
+                        NoteListedWriteSkipped(copy_from, copy_to);
+                    }
+                    s.buffers_written = true;
+                    ++stats.region_writebacks;
+                    continue;
+                }
+                if (!direct->EnsureImported(copy_from, copy_to - copy_from)) {
                     continue;
                 }
                 Stream& s = Begin();
@@ -3149,6 +3382,7 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
             stats.region_pages_forgotten += pages.size();
             continue;
         }
+        region.gpu_pages.insert(pages.begin(), pages.end()); // FIX-GT7-033
         Stream& s = Begin();
         GlobalBarrier(); // behind the write
         const vk::Buffer src{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
@@ -3163,45 +3397,7 @@ void NativeRenderer::NoteRegionWrite(VAddr address, u64 size, const WrittenBefor
                 direct->EnsureImported(pages[i], pages[j - 1] + 4096 - pages[i])) {
                 const VAddr run_from = pages[i];
                 const VAddr run_to = pages[j - 1] + 4096;
-                bool compared = true;
-                direct->ForEachPart(
-                    run_from, run_to - run_from,
-                    [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
-                        if (view_offset % alignment != 0 || bytes % 16 != 0) {
-                            compared = false;
-                            return;
-                        }
-                        auto guest = device->WrapBuffer(
-                            reinterpret_cast<u64>(static_cast<VkBuffer>(view.Handle())),
-                            view.SizeBytes());
-                        const std::array<Native::Rhi::Binding, 3> bindings{{
-                            {.slot = 0,
-                             .type = Native::Rhi::BindingType::StorageBuffer,
-                             .buffer = region.buffer.get(),
-                             .offset = run_from - region.begin + offset,
-                             .size = bytes},
-                            {.slot = 1,
-                             .type = Native::Rhi::BindingType::StorageBuffer,
-                             .buffer = before->copy.get(),
-                             .offset = run_from - before->begin + offset,
-                             .size = bytes},
-                            {.slot = 2,
-                             .type = Native::Rhi::BindingType::StorageBuffer,
-                             .buffer = guest.get(),
-                             .offset = view_offset,
-                             .size = bytes},
-                        }};
-                        const u32 count = static_cast<u32>(bytes / 16);
-                        s.list->BindPipeline(writeback_pipeline.get());
-                        s.list->PushBindings(bindings);
-                        s.list->PushConstants(
-                            0, std::span<const u8>{reinterpret_cast<const u8*>(&count),
-                                                   sizeof(count)});
-                        s.list->Dispatch((count + 63) / 64, 1, 1);
-                        s.keep.push_back(std::move(guest));
-                    });
-                s.pipeline = vk::Pipeline{}; // the compare binds its own pipeline
-                ForgetBindings(s); // OPT-014
+                const bool compared = WriteBackChangedWords(s, region, *before, run_from, run_to);
                 if (compared) {
                     stats.region_writeback_bytes += run_to - run_from;
                     ++stats.precise_writebacks;
@@ -3284,6 +3480,25 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     const u64 slot = NextOn() ? MemoHash(memo_key.data(), memo_key.size(), 0)
                               : XXH3_64bits(memo_key.data(), sizeof(memo_key));
     BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
+    // PERF-GT7-047: a region or mirror made or dropped elsewhere leaves this range's as it was
+    // (the generation moves ~9 times a frame on GT7's pre-race screens). Not for what is read in
+    // place: a later lookup may give it a mirror (NAT-150).
+    // RYGT_NATIVE_BUFFER_REVALIDATE=0: any change drops every memo, as before.
+    if (memo.address == address && memo.size == size && memo.flags == flags &&
+        memo.generation != buffer_generation) {
+        static const bool revalidate = [] {
+            const char* env = std::getenv("RYGT_NATIVE_BUFFER_REVALIDATE");
+            return !(env && env[0] == '0');
+        }();
+        const std::pair<VAddr, VAddr> range{address, address + size};
+        if (revalidate && (memo.region || memo.mirror) &&
+            memo.hard_generation == buffer_hard_generation &&
+            buffer_log.Seq() - memo.log_seq <= 64 &&
+            buffer_log.Untouched(memo.log_seq, {&range, 1})) {
+            memo.generation = buffer_generation;
+            memo.log_seq = buffer_log.Seq();
+        }
+    }
     if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
         memo.flags == flags) {
         if (memo.region || memo.mirror) {
@@ -3319,6 +3534,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             .size = size,
             .flags = flags,
             .generation = buffer_generation,
+            .hard_generation = buffer_hard_generation,
+            .log_seq = buffer_log.Seq(),
             .buffer = result->first,
             .offset = result->second,
             .region = memo_region,
@@ -5736,6 +5953,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 }
             }
         }
+        const bool cube_sampling =
+            image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
@@ -5809,10 +6028,29 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                (u32(image_desc.is_depth) << 2) |
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
-                               (num_bindings << 16);
+                               (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings <= TextureMemoViews && stage.pgm_hash != 0xaa3822a3 &&
             !r.FrameDumpCollecting()) {
             memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
+            // PERF-GT7-047: a picture made or dropped elsewhere leaves this one as it was:
+            // up to ~300,000 lookups per 10 s on GT7's rain race went through Find again.
+            // RYGT_NATIVE_TEXTURE_REVALIDATE=0: any change drops every memo, as before.
+            if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
+                memo->generation != registry->Generation() + unmap_generation) {
+                static const bool revalidate = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_TEXTURE_REVALIDATE");
+                    return !(env && env[0] == '0');
+                }();
+                const u64 registry_now = registry->Generation();
+                const u64 unmap_now = unmap_generation.load(std::memory_order_acquire);
+                const std::pair<VAddr, VAddr> range{memo->range_begin, memo->range_end};
+                if (revalidate && memo->unmap_generation == unmap_now &&
+                    registry_now - memo->registry_generation <= 256 &&
+                    registry->Untouched(memo->registry_generation, {&range, 1})) {
+                    memo->generation = registry_now + unmap_now;
+                    memo->registry_generation = registry_now;
+                }
+            }
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
@@ -5938,7 +6176,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 view_info.range.extent.levels = 1;
             }
             const vk::ImageView view =
-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+                View(*entry, view_info, storage        ? ViewUse::Storage
+                                        : cube_sampling ? ViewUse::CubeSampled
+                                                        : ViewUse::Sampled);
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         if (memo) {
@@ -5949,7 +6189,14 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             for (u32 i = 0; i < num_bindings; ++i) {
                 memo->views[i] = b.images[first + i].imageView;
             }
-            memo->generation = registry->Generation() + unmap_generation;
+            memo->registry_generation = registry->Generation();
+            memo->unmap_generation = unmap_generation.load(std::memory_order_acquire);
+            memo->generation = memo->registry_generation + memo->unmap_generation;
+            // PERF-GT7-047: what Find looked at, and the picture it answered with.
+            memo->range_begin = std::min(desc.info.guest_address, entry->info.guest_address);
+            memo->range_end =
+                std::max(desc.info.guest_address + std::max<u64>(desc.info.guest_size, 1),
+                         entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
         (storage ? b.stored : b.sampled).push_back(entry);
         slot_text([&] {
@@ -7411,6 +7658,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
         if (entry && std::ranges::find(s.written, entry) == s.written.end()) {
             s.written.push_back(entry);
+            // FIX-GT7-036: its bytes are no longer what a fill before it says.
+            registry->ForgetFills(entry->info.guest_address, entry->info.guest_size);
         }
     };
     for (const auto* entry : b.sampled) {
@@ -7455,9 +7704,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             const auto before = std::ranges::find_if(written_befores, [&](const WrittenBefore& w) {
                 return w.address == address && w.size == size;
             });
-            NoteRegionWrite(address, size, before != written_befores.end()
-                                               ? &*before
-                                               : nullptr); // FIX-194, FIX-203
+            NoteRegionWrite(address, size, before != written_befores.end() ? &*before : nullptr,
+                            true); // FIX-194, FIX-203
         }
     }
     DropWrittenBefores();
@@ -8813,6 +9061,8 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     static thread_local std::array<JobTextureMemo, 4096> memos{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
+        const bool cube_sampling =
+            image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
@@ -8843,7 +9093,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                (u32(image_desc.is_depth) << 2) |
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
-                               (num_bindings << 16);
+                               (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings > 4 || stage.pgm_hash == 0xaa3822a3) {
             return false; // the recorder (FIX-081's grass shader, long arrays)
         }
@@ -8895,7 +9145,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                 view_info.range.extent.levels = 1;
             }
             const vk::ImageView view =
-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+                View(*entry, view_info, storage        ? ViewUse::Storage
+                                        : cube_sampling ? ViewUse::CubeSampled
+                                                        : ViewUse::Sampled);
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         memo.sharp = raw_sharp;
@@ -9190,7 +9442,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
 void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                               bool exact) {
     const u64 clock = ++write_clock; // NAT-148: when the memory was rewritten
-    registry->GpuWrote(address, size, pattern, exact, clock);
+    registry->GpuWrote(address, size, pattern, exact, frame, clock);
     // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
     const auto it = stencil_owners.find(address);
     if (it == stencil_owners.end() || !pattern) {
@@ -9716,6 +9968,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     // resolved picture at its first read: GT Sport's minimaps, resolved into the scratch pool).
     ApplyRewrite(*src);
     ApplyRewrite(*dst);
+    registry->ForgetFills(dst->info.guest_address, dst->info.guest_size); // FIX-GT7-036
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("resolve {:#x} {}x{} x{} -> {:#x} {}x{} x{}",
                                      src->info.guest_address, src->info.size.width,
@@ -9860,6 +10113,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     }
     ++stats.fills;
     WritebacksBefore(address, num_bytes); // PERF-GT7-044
+    SendWritebacksDue();                  // FIX-GT7-040
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
         GlobalBarrier();
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
@@ -9904,6 +10158,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     if (!dst_gds) {
         WritebacksBefore(dst, num_bytes);
     }
+    SendWritebacksDue(); // FIX-GT7-040
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
     const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
                                 : GuestBuffer(src, num_bytes, false);
@@ -9956,6 +10211,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     WritebacksBefore(address, data.size()); // PERF-GT7-044
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
+    registry->ForgetFills(address, data.size()); // FIX-GT7-036: the bytes are no longer the fill
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
     for (auto& [base, region] : regions) {
         const VAddr begin = std::max<VAddr>(address, region.begin);
@@ -10025,6 +10281,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         });
     }
     ++buffer_generation;        // OPT-003
+    ++buffer_hard_generation;   // PERF-GT7-047
     ++unmap_generation;         // OPT-002
 }
 
@@ -10927,6 +11184,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    TrimChunks();
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     if (RyDiag::Enabled() && !AbOn()) {
         // DIAG-GT7-011: the recorder's stack samples of heavy frames (over 3,300 draws, as GT7's
@@ -11128,6 +11386,7 @@ void NativeRenderer::VerifyMirrors() {
     }
     if (changed != 0) {
         ++buffer_generation; // OPT-003: memos see the dirty pages
+        ++buffer_hard_generation; // PERF-GT7-047
     }
 }
 
