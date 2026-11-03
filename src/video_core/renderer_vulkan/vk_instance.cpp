@@ -291,7 +291,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
-        vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
+        vk::PhysicalDeviceShaderQuadControlFeaturesKHR,
+        vk::PhysicalDeviceShaderObjectFeaturesEXT>();
     features = feature_chain.get().features;
     // AMD-300: the features an older Radeon's driver turns off.
     if (const auto simulated = GetSimulatedGpu(); simulated != SimulatedGpu::None) {
@@ -429,6 +430,31 @@ bool Instance::CreateDevice() {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    // SO-001 (RYGT_SHADER_OBJECT=1): VK_EXT_shader_object. Plain pipelines (no tessellation or
+    // geometry shader) are drawn with vertex and fragment shader objects and dynamic state
+    // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
+    // states of extended_dynamic_state3 that those pipelines otherwise fix.
+    if (const char* env = std::getenv("RYGT_SHADER_OBJECT"); env && env[0] == '1') {
+        const auto& d3 = dynamic_state_3_features;
+        const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
+                            d3.extendedDynamicState3PolygonMode &&
+                            d3.extendedDynamicState3RasterizationSamples &&
+                            d3.extendedDynamicState3SampleMask &&
+                            d3.extendedDynamicState3AlphaToCoverageEnable &&
+                            d3.extendedDynamicState3LogicOpEnable &&
+                            d3.extendedDynamicState3ColorBlendEnable &&
+                            d3.extendedDynamicState3ColorBlendEquation &&
+                            d3.extendedDynamicState3ColorWriteMask &&
+                            d3.extendedDynamicState3DepthClipEnable &&
+                            d3.extendedDynamicState3DepthClipNegativeOneToOne &&
+                            d3.extendedDynamicState3ProvokingVertexMode;
+        if (states && feature_chain.get<vk::PhysicalDeviceShaderObjectFeaturesEXT>().shaderObject &&
+            vertex_input_dynamic_state) {
+            shader_object = add_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+        }
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}",
+                    shader_object ? "on" : "not available (driver lacks a needed feature)");
+    }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
     // slows down KosmicKrisp due to unrolling. Revisit if KosmicKrisp moves this to mesh shaders.
     list_restart = driver_id != vk::DriverId::eMesaKosmickrisp &&
@@ -721,8 +747,22 @@ bool Instance::CreateDevice() {
             .customBorderColorWithoutFormat = true,
         },
         vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT{
+            .extendedDynamicState3DepthClampEnable = shader_object,
+            .extendedDynamicState3PolygonMode = shader_object,
+            .extendedDynamicState3RasterizationSamples = shader_object,
+            .extendedDynamicState3SampleMask = shader_object,
+            .extendedDynamicState3AlphaToCoverageEnable = shader_object,
+            .extendedDynamicState3LogicOpEnable = shader_object,
+            .extendedDynamicState3ColorBlendEnable = shader_object,
+            .extendedDynamicState3ColorBlendEquation = shader_object,
             .extendedDynamicState3ColorWriteMask =
                 dynamic_state_3_features.extendedDynamicState3ColorWriteMask,
+            .extendedDynamicState3DepthClipEnable = shader_object,
+            .extendedDynamicState3DepthClipNegativeOneToOne = shader_object,
+            .extendedDynamicState3ProvokingVertexMode = shader_object,
+        },
+        vk::PhysicalDeviceShaderObjectFeaturesEXT{
+            .shaderObject = true, // SO-001
         },
         vk::PhysicalDeviceDepthClipControlFeaturesEXT{
             .depthClipControl = true,
@@ -815,6 +855,9 @@ bool Instance::CreateDevice() {
 
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
+    }
+    if (!shader_object) {
+        device_chain.unlink<vk::PhysicalDeviceShaderObjectFeaturesEXT>();
     }
     if (!dynamic_state_3) {
         device_chain.unlink<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>();

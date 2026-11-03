@@ -8402,7 +8402,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     {
         PhaseClock part{stats.record_ns[4]};
-        if (s.pipeline != pipeline->Handle()) {
+        if (pipeline->UsesShaderObjects()) {
+            // SO-001: no pipeline; the shader objects and the state a pipeline fixes.
+            s.cmd.Run([pipeline](vk::CommandBuffer cmd) { pipeline->BindShaderObjects(cmd); });
+            s.pipeline = vk::Pipeline{};
+        } else if (s.pipeline != pipeline->Handle()) {
             s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
             s.pipeline = pipeline->Handle();
         }

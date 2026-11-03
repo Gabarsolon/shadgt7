@@ -818,6 +818,34 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
+    // SO-001: a plain pipeline is drawn with shader objects: no pipeline is compiled. Not with
+    // tessellation (also the rect/quad list emulation), a geometry shader, sample shading or
+    // AMD's mixed sample counts, which shader objects can't express.
+    if (instance.IsShaderObjectEnabled() && !tessellated && !is_rect_list && !is_quad_list &&
+        !infos[u32(Shader::SwStage::Geometry)] && !sdata.multisampling.sampleShadingEnable &&
+        key.depth_samples <= key.num_samples &&
+        std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
+                            [&](u8 samples) { return samples == 0 || samples == key.num_samples; })) {
+        const auto& raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
+        so_state.topology = topology;
+        so_state.polygon_mode = raster.polygonMode;
+        so_state.samples = sdata.multisampling.rasterizationSamples;
+        so_state.provoking = key.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First
+                                 ? vk::ProvokingVertexModeEXT::eFirstVertex
+                                 : vk::ProvokingVertexModeEXT::eLastVertex;
+        so_state.depth_clamp = raster.depthClampEnable != VK_FALSE;
+        so_state.depth_clip = key.depth_clip_enable != 0;
+        so_state.negative_one_to_one = key.clip_space == AmdGpu::ClipSpace::MinusWToW;
+        so_state.alpha_to_coverage = key.alpha_to_coverage != 0;
+        so_state.logic_op_enable = color_blending.logicOpEnable != VK_FALSE;
+        so_state.logic_op = color_blending.logicOp;
+        so_state.attachments = key.num_color_attachments;
+        if (CreateShaderObjects(modules, sdata, attachments,
+                                infos[u32(Shader::SwStage::Fragment)] != nullptr)) {
+            return;
+        }
+    }
+
     // FIX-057: the driver's optimizer is what ran out of memory on GT Sport's tessellated
     // pipelines (also whole, two at a time); they are compiled without optimization.
     // -DisablePerf 81 optimizes them.
@@ -1149,7 +1177,141 @@ GraphicsPipeline::GraphicsPipeline(
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
 
+bool GraphicsPipeline::CreateShaderObjects(
+    std::span<const vk::ShaderModule> modules, const SerializationSupport& sdata,
+    std::span<const vk::PipelineColorBlendAttachmentState> attachments, bool fragment) {
+    const std::vector<u32> vertex_code = ModuleCode(modules[u32(Shader::SwStage::Vertex)]);
+    std::vector<u32> fragment_code;
+    if (fragment) {
+        fragment_code = ModuleCode(modules[u32(Shader::SwStage::Fragment)]);
+    } else if (!sdata.fragment.empty()) {
+        fragment_code = sdata.fragment; // clip distance emulation's discard shader
+    }
+    if (vertex_code.empty() || ((fragment || !sdata.fragment.empty()) && fragment_code.empty())) {
+        return false; // the module's code wasn't kept: a pipeline as before
+    }
+    const vk::PushConstantRange push_constants = {
+        .stageFlags = AllGraphicsStageBits,
+        .offset = 0,
+        .size = sizeof(Shader::PushData),
+    };
+    // AMD-301: the subgroup size the pipeline stages would have required.
+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size = {
+        .requiredSubgroupSize = 64,
+    };
+    const vk::ShaderStageFlags sized_stages = instance.RequiredSubgroupSizeStages();
+    const auto sized = [&](vk::ShaderStageFlagBits stage) -> const void* {
+        return instance.IsSubgroupSize64Supported() && (sized_stages & stage) ? &subgroup_size
+                                                                               : nullptr;
+    };
+    boost::container::static_vector<vk::ShaderCreateInfoEXT, 2> create_infos;
+    create_infos.push_back(vk::ShaderCreateInfoEXT{
+        .pNext = sized(vk::ShaderStageFlagBits::eVertex),
+        .stage = vk::ShaderStageFlagBits::eVertex,
+        .nextStage = vk::ShaderStageFlagBits::eFragment,
+        .codeType = vk::ShaderCodeTypeEXT::eSpirv,
+        .codeSize = vertex_code.size() * sizeof(u32),
+        .pCode = vertex_code.data(),
+        .pName = "main",
+        .setLayoutCount = num_sets,
+        .pSetLayouts = set_layouts.data(),
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_constants,
+    });
+    if (!fragment_code.empty()) {
+        create_infos.push_back(vk::ShaderCreateInfoEXT{
+            .pNext = sized(vk::ShaderStageFlagBits::eFragment),
+            .stage = vk::ShaderStageFlagBits::eFragment,
+            .codeType = vk::ShaderCodeTypeEXT::eSpirv,
+            .codeSize = fragment_code.size() * sizeof(u32),
+            .pCode = fragment_code.data(),
+            .pName = "main",
+            .setLayoutCount = num_sets,
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_constants,
+        });
+    }
+    std::array<VkShaderEXT, 2> created{};
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+        instance.GetDevice(), static_cast<u32>(create_infos.size()),
+        reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
+        created.data());
+    if (result != VK_SUCCESS) {
+        static std::atomic<u32> logged{};
+        if (++logged <= 8) {
+            LOG_WARNING(Render_Vulkan, "SO-001: shader objects failed ({}); a pipeline instead",
+                        vk::to_string(vk::Result(result)));
+        }
+        for (const VkShaderEXT shader : created) {
+            if (shader) {
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(instance.GetDevice(), shader,
+                                                                 nullptr);
+            }
+        }
+        return false;
+    }
+    shader_objects = {vk::ShaderEXT{created[0]}, vk::ShaderEXT{created[1]}};
+    for (u32 i = 0; i < so_state.attachments; ++i) {
+        const auto& attachment = attachments[i];
+        so_state.blend_enable[i] = attachment.blendEnable;
+        so_state.equations[i] = vk::ColorBlendEquationEXT{
+            .srcColorBlendFactor = attachment.srcColorBlendFactor,
+            .dstColorBlendFactor = attachment.dstColorBlendFactor,
+            .colorBlendOp = attachment.colorBlendOp,
+            .srcAlphaBlendFactor = attachment.srcAlphaBlendFactor,
+            .dstAlphaBlendFactor = attachment.dstAlphaBlendFactor,
+            .alphaBlendOp = attachment.alphaBlendOp,
+        };
+    }
+    static std::atomic<u32> made{};
+    if (const u32 n = ++made; n <= 3 || n % 500 == 0) {
+        LOG_WARNING(Render_Vulkan, "SO-001: {} drawn with shader objects ({} so far)",
+                    GetDebugString(), n);
+    }
+    return true;
+}
+
+void GraphicsPipeline::BindShaderObjects(vk::CommandBuffer cmd) const {
+    std::array<vk::ShaderStageFlagBits, 5> stages{vk::ShaderStageFlagBits::eVertex,
+                                                  vk::ShaderStageFlagBits::eFragment};
+    std::array<vk::ShaderEXT, 5> shaders{shader_objects[0], shader_objects[1]};
+    u32 count = 2;
+    if (instance.IsTessellationShaderEnabled()) {
+        stages[count++] = vk::ShaderStageFlagBits::eTessellationControl;
+        stages[count++] = vk::ShaderStageFlagBits::eTessellationEvaluation;
+    }
+    if (instance.IsGeometryShaderEnabled()) {
+        stages[count++] = vk::ShaderStageFlagBits::eGeometry;
+    }
+    cmd.bindShadersEXT(count, stages.data(), shaders.data());
+    const auto& s = so_state;
+    cmd.setPrimitiveTopology(s.topology);
+    cmd.setPolygonModeEXT(s.polygon_mode);
+    cmd.setRasterizationSamplesEXT(s.samples);
+    const vk::SampleMask mask = ~vk::SampleMask{0};
+    cmd.setSampleMaskEXT(s.samples, &mask);
+    cmd.setAlphaToCoverageEnableEXT(s.alpha_to_coverage);
+    cmd.setDepthClampEnableEXT(s.depth_clamp);
+    cmd.setDepthClipEnableEXT(s.depth_clip);
+    cmd.setDepthClipNegativeOneToOneEXT(s.negative_one_to_one);
+    cmd.setProvokingVertexModeEXT(s.provoking);
+    if (instance.IsLogicOpSupported()) {
+        cmd.setLogicOpEnableEXT(s.logic_op_enable);
+        cmd.setLogicOpEXT(s.logic_op);
+    }
+    if (s.attachments != 0) {
+        cmd.setColorBlendEnableEXT(0, s.attachments, s.blend_enable.data());
+        cmd.setColorBlendEquationEXT(0, s.attachments, s.equations.data());
+    }
+}
+
 GraphicsPipeline::~GraphicsPipeline() {
+    for (const vk::ShaderEXT shader : shader_objects) {
+        if (shader) {
+            instance.GetDevice().destroyShaderEXT(shader);
+        }
+    }
     if (library_link && library_link->optimized.valid()) {
         library_link->optimized.wait();
     }

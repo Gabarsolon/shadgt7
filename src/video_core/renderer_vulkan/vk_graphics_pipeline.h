@@ -107,6 +107,13 @@ public:
         return key;
     }
 
+    /// SO-001: drawn with shader objects instead of a pipeline (Handle() is then null).
+    bool UsesShaderObjects() const noexcept {
+        return static_cast<bool>(shader_objects[0]);
+    }
+    /// SO-001: binds the shader objects and sets the state a pipeline would have fixed.
+    void BindShaderObjects(vk::CommandBuffer cmd) const;
+
     /// FIX-227: the hull shader's LDS emulation mode (0: off) and LS output bytes per vertex.
     u32 LdsEmulation() const {
         return lds_emulation;
@@ -160,6 +167,28 @@ private:
     vk::UniqueDescriptorSetLayout empty_set_layout;
     u32 num_sets = 0;
     std::unique_ptr<LibraryLink> library_link;
+
+    /// SO-001: vertex and fragment shader objects, and the pipeline state they need set.
+    bool CreateShaderObjects(std::span<const vk::ShaderModule> modules,
+                             const SerializationSupport& sdata,
+                             std::span<const vk::PipelineColorBlendAttachmentState> attachments,
+                             bool fragment);
+    std::array<vk::ShaderEXT, 2> shader_objects{};
+    struct {
+        vk::PrimitiveTopology topology{};
+        vk::PolygonMode polygon_mode{};
+        vk::SampleCountFlagBits samples{vk::SampleCountFlagBits::e1};
+        vk::ProvokingVertexModeEXT provoking{};
+        bool depth_clamp{};
+        bool depth_clip{};
+        bool negative_one_to_one{};
+        bool alpha_to_coverage{};
+        bool logic_op_enable{};
+        vk::LogicOp logic_op{};
+        u32 attachments{};
+        std::array<vk::Bool32, AmdGpu::NUM_COLOR_BUFFERS> blend_enable{};
+        std::array<vk::ColorBlendEquationEXT, AmdGpu::NUM_COLOR_BUFFERS> equations{};
+    } so_state;
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};

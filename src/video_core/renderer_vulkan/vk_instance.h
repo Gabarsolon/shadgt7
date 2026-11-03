@@ -173,6 +173,11 @@ public:
         return depth_range_unrestricted;
     }
 
+    /// SO-001: plain pipelines are drawn with shader objects (RYGT_SHADER_OBJECT=1).
+    bool IsShaderObjectEnabled() const {
+        return shader_object;
+    }
+
     /// Returns true when VK_EXT_extended_dynamic_state3 is supported
     bool IsExtendedDynamicState3Supported() const {
         return dynamic_state_3;
@@ -521,6 +526,14 @@ public:
         return features.logicOp;
     }
 
+    /// SO-001: stages a shader object bind must name (null when unused).
+    bool IsGeometryShaderEnabled() const {
+        return features.geometryShader;
+    }
+    bool IsTessellationShaderEnabled() const {
+        return features.tessellationShader;
+    }
+
     bool IsDualSourceBlendSupported() const {
         return features.dualSrcBlend;
     }
@@ -627,6 +640,7 @@ private:
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};
+    bool shader_object{}; ///< SO-001
     bool graphics_pipeline_library{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
