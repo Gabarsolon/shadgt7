@@ -258,7 +258,14 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
                     c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
                     c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
-                    c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
+                    c.pixel_format == info.pixel_format &&
+                    // FIX-GT7-048: 11_11_10 and 10_11_11 are one Vulkan format but not one memory
+                    // layout, and a texture is no crop of a target of the other (PlaceOf). GT7's
+                    // bloom, 480x270 in 10_11_11 at an address some screens draw 960x540 in
+                    // 11_11_10, went into that target: its 480x270 and 240x135 textures then
+                    // came from memory, the picture written back and uploaded each frame.
+                    c.props.is_bgr_packed_float == info.props.is_bgr_packed_float &&
+                    c.resources.levels == 1 &&
                     c.resources.layers == 1 && c.size.width >= info.size.width &&
                     c.size.height >= info.size.height &&
                     (!largest || u64(c.size.width) * c.size.height >
@@ -272,10 +279,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     ++stats.reused_larger;
                     // FIX-GT7-035: the target of this size made before the larger one gets no
                     // more draws, but a texture of its layout would still find it and read its
-                    // last picture. GT7's bloom draws 480x270 at 0x100a2f0000, also a 960x540
+                    // last picture. GT7's bloom drew 480x270 at 0x100a2f0000, also a 960x540
                     // target: the next blur read a 480x270 picture from long ago, and its bright
                     // spots stayed on the screen as white circles. Without it, the texture is a
-                    // crop of the larger target (NAT-104), as the smaller blurs there are.
+                    // crop of the larger target (NAT-104), as the smaller blurs there are. That
+                    // bloom no longer comes here: FIX-GT7-048 keeps it in its own target.
                     if (exact) {
                         MarkReused(*exact);
                     }
