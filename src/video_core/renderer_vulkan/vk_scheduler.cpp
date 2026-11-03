@@ -237,6 +237,7 @@ void Scheduler::CommandThread(std::stop_token stoken) {
             commands.WaitForWork(position, stoken);
             continue;
         }
+        Common::UpdateCoreOwner(2, true); // PERF-GT7-048
         const auto start = std::chrono::steady_clock::now();
         u32 since_progress = 0;
         while (position != end) {

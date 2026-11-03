@@ -433,6 +433,11 @@ void DrawPipe::RunDispatcher(std::stop_token stop) {
     }
 }
 
+bool DrawPipe::QueueIdle() {
+    std::scoped_lock lk{mutex};
+    return finished == pushed && !urgent_running;
+}
+
 void DrawPipe::Drain() {
     if (OnRecorderThread()) {
         return;
@@ -575,6 +580,7 @@ void DrawPipe::Run(std::stop_token stop) {
                 done_cv.notify_all(); // A producer may wait for space.
             }
         }
+        Common::UpdateCoreOwner(1, true); // PERF-GT7-048
         const auto start = std::chrono::steady_clock::now();
         u64 ran = 0;
         Common::Nvtx::Scope nvtx{"recording"}; // DIAG-056

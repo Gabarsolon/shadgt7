@@ -8,17 +8,21 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "common/guest_clock.h"
 #include "common/io_file.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
+#include "common/scm_rev.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
 #include "core/user_settings.h"
@@ -194,11 +198,54 @@ void DrawCompileNotice() {
     draw->AddText(at, IM_COL32(255, 255, 255, 235), text);
 }
 
+// What the watermark says: this renderer's revision, after the prerelease's name when this is
+// that prerelease's renderer (manifest.json beside the exe has its commit; a test renderer copied
+// into a release leaves the release's manifest there). Empty in a tagged release, or with
+// RYGT_WATERMARK=0.
+std::string BuildWatermark() {
+    const char* env = std::getenv("RYGT_WATERMARK");
+    if (Common::g_is_release || (env && env[0] == '0')) {
+        return {};
+    }
+    const std::string revision = Common::g_scm_desc;
+    std::ifstream file{Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                       "manifest.json"};
+    const auto manifest = nlohmann::json::parse(file, nullptr, false);
+    const nlohmann::json::json_pointer commit{"/sources/shadGT7/commit"};
+    if (manifest.contains("name") && manifest["name"].is_string() && manifest.contains(commit) &&
+        manifest.at(commit).is_string() &&
+        revision.contains(manifest.at(commit).get<std::string>().substr(0, 7))) {
+        return fmt::format("{} | {}", manifest["name"].get<std::string>(), revision);
+    }
+    return revision;
+}
+
+std::string g_watermark;
+
+// Faintly in the window's bottom right corner, so a screenshot says what it shows. Sized by the
+// window, to stay readable in a 4K screenshot scaled down to share.
+void DrawWatermark() {
+    if (g_watermark.empty()) {
+        return;
+    }
+    auto* draw = ImGui::GetForegroundDrawList();
+    const auto* viewport = ImGui::GetMainViewport();
+    ImFont* font = ImGui::GetFont();
+    const float font_size = std::max(viewport->Size.y / 100.0f, 12.0f);
+    const ImVec2 size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, g_watermark.c_str());
+    const ImVec2 at{viewport->Pos.x + viewport->Size.x - size.x - 8.0f,
+                    viewport->Pos.y + viewport->Size.y - size.y - 6.0f};
+    draw->AddText(font, font_size, {at.x + 1.0f, at.y + 1.0f}, IM_COL32(0, 0, 0, 70),
+                  g_watermark.c_str());
+    draw->AddText(font, font_size, at, IM_COL32(235, 235, 235, 80), g_watermark.c_str());
+}
+
 // The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
 // type in the window's top left corner, over the game and the splash screen.
 void DrawFpsCounter() {
     Ryty::DrawControllerOverlay();
     DrawCompileNotice();
+    DrawWatermark();
     if (!EmulatorSettings.IsShowFpsCounter()) {
         return;
     }
@@ -470,6 +517,7 @@ void Ryty::RytyLibraryInitialize() {
             }
         }).detach();
     }
+    g_watermark = BuildWatermark();
     Ryty::SetOverlayDraw(&DrawFpsCounter);
 #ifdef ENABLE_DISCORD_RPC
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
