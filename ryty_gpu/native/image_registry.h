@@ -256,7 +256,7 @@ public:
     /// size is only what the shader may write (GT Sport binds its whole scratch pool), so such a
     /// write uploads a target again only when the buffer is about the target's size.
     void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact,
-                  u64 clock);
+                  u64 frame, u64 clock);
     /// NAT-120: uploads the image from guest memory before its next use.
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);
@@ -274,6 +274,8 @@ public:
     /// watched); `exact` is the bytes the instruction wrote there (0: unknown). Small textures
     /// on the page are checked by hash before their next use; large ones only when written.
     void CpuWrite(VAddr address, u64 size, u64 exact);
+    /// FIX-GT7-036: what wrote over these bytes ends the fills remembered there.
+    void ForgetFills(VAddr address, u64 size);
     /// NAT-109: the addresses holding the most images (address, count), for reports.
     std::vector<std::pair<VAddr, u32>> Crowded(u32 count);
 
@@ -358,6 +360,17 @@ private:
     std::unordered_map<const ImageEntry*, UploadTally> upload_tally; ///< DIAG-197
     std::array<Shard, NumShards> shards;
     std::mutex upload_mutex;
+    /// FIX-GT7-036: the last fills, for targets made just after one that covers them.
+    struct RecentFill {
+        VAddr begin = 0;
+        VAddr end = 0;
+        std::array<u32, 2> pattern{};
+        u64 clock = 0;
+        u64 frame = 0;
+    };
+    std::array<RecentFill, 16> recent_fills{};
+    u32 recent_fill_next = 0;
+    std::mutex recent_fills_mutex;
     std::vector<ImageEntry*> pending_uploads;
     std::atomic<u64> generation{0}; ///< OPT-002
     /// OPT-010: the ranges of the pictures made or dropped, by the generation they made.
