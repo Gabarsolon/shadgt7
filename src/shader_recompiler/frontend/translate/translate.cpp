@@ -1183,7 +1183,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
         IR::VectorReg dst_reg{attrib.dest_vgpr};
 
         // Read the V# of the attribute to figure out component number and type.
-        const auto buffer = attrib.GetSharp(info);
+        const auto buffer = attrib.GetSharpForCode(info);
         const auto values =
             ir.CompositeConstruct(ir.GetAttribute(attr, 0), ir.GetAttribute(attr, 1),
                                   ir.GetAttribute(attr, 2), ir.GetAttribute(attr, 3));

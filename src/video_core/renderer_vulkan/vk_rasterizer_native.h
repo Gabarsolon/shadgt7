@@ -151,7 +151,7 @@ public:
                         u32 index_offset);
 
 private:
-    enum class ViewUse : u8 { Sampled, Storage, Attachment };
+    enum class ViewUse : u8 { Sampled, Storage, Attachment, CubeSampled };
 
     struct Chunk {
         std::unique_ptr<Native::Rhi::Buffer> buffer;
@@ -347,6 +347,7 @@ private:
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
     std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align);
+    void TrimChunks();
     Chunk TakeChunk(u64 size);
     vk::DescriptorPool TakeDescriptorPool();
 
@@ -362,6 +363,8 @@ private:
         /// guest memory are what the region holds except for the CPU's new writes (what
         /// FIX-173's compare needs). Pages not here are copied in whole at the next write.
         std::unordered_map<VAddr, u64> cpu_pages;
+        /// FIX-GT7-033: of those, the pages the GPU wrote since their last copy.
+        std::unordered_set<VAddr> gpu_pages;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
@@ -392,7 +395,11 @@ private:
     std::unique_ptr<Native::Rhi::Pipeline> writeback_pipeline;
     void SnapshotBeforeWrite(VAddr address, u64 size);
     void DropWrittenBefores();
-    void NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before = nullptr);
+    void NoteRegionWrite(VAddr address, u64 size, const WrittenBefore* before = nullptr,
+                         bool shader_write = false);
+    /// FIX-203: writes back the words of a run that differ from before the work.
+    bool WriteBackChangedWords(Stream& s, const Region& region, const WrittenBefore& before,
+                               VAddr run_from, VAddr run_to);
     /// FIX-198: whether a draw whose pipeline is still building must wait for it: it draws
     /// into a picture no recent frame drew into.
     bool DrawMustNotSkip(const AmdGpu::Regs& regs);
@@ -591,6 +598,8 @@ private:
         u64 size = 0;
         u32 flags = 0;
         u64 generation = ~u64{0};
+        u64 hard_generation = 0; ///< PERF-GT7-047
+        u64 log_seq = 0;
         vk::Buffer buffer{};
         u64 offset = 0;
         Region* region = nullptr;
@@ -599,6 +608,7 @@ private:
     };
     std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
+    u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
     MemoKind memo_kind = MemoKind::None;
@@ -626,6 +636,10 @@ private:
         u64 generation = ~u64{0};
         Native::ImageEntry* entry = nullptr;
         std::array<vk::ImageView, Views> views{};
+        u64 registry_generation = 0; ///< PERF-GT7-047
+        u64 unmap_generation = 0;
+        VAddr range_begin = 0;
+        VAddr range_end = 0;
     };
     using TextureMemo = TextureMemoOf<TextureMemoViews>;
     using JobTextureMemo = TextureMemoOf<4>; ///< OPT-010's, per job thread (thread-local)
@@ -968,6 +982,7 @@ private:
     /// PERF-GT7-044: the small pictures drawn this frame, written back when it ends.
     std::vector<Native::ImageEntry*> frame_writebacks;
     void QueueWriteback(const Native::ImageEntry* entry);
+    bool SendWritebacksDue(); ///< FIX-GT7-040
     /// PERF-GT7-044: pictures waiting for the frame's end go back before work over their memory.
     void WritebacksBefore(VAddr address, u64 size);
     void WritebacksBefore(const DrawBindings& b);
@@ -1206,6 +1221,7 @@ private:
 
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
+    size_t free_chunks_low = 0; // FIX-GT7-046: the fewest free since the last trim
     std::deque<Chunk> retiring_chunks;
     /// PERF-GT7-007 (B): the device buffers of FIX-203's copies before the work (~2,000 a
     /// second in GT7, each made and destroyed), kept by size class and used again once the GPU

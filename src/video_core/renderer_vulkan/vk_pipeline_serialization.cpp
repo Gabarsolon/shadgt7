@@ -25,11 +25,13 @@ namespace Serialization {
 // 19/20 (FIX-199): cube samples with an implicit level take their gradients from the direction.
 // The 96-byte buffer-offset table moves the quad sample mask and stage offset ranges.
 // 23/24 (FIX-215): samplers record whether they sample a cube map.
-static constexpr u32 ShaderBinaryVersion = 23u;
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 24u;
+// 33/34/35: fragment cube samples use native cube-array views (port of RyGT 0066); stored
+// translations made before sampled cubes as 2D arrays of faces.
+static constexpr u32 ShaderBinaryVersion = 33u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 34u;
 // 25: AMD single-sample KHR barycentrics (on for AMD GPUs) change the
 // fragment interface and interpolation; read only while that option is on.
-static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 25u;
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 35u;
 // 29/30/31 (FIX-227/228): hull shaders, whose unnormalized samples at an explicit LOD are normalized
 // by that mip's dimensions. Other stages keep their versions. RYGT_UNNORMALIZED_MIP=0: hull
 // shaders as before too.
@@ -59,7 +61,9 @@ std::atomic<bool> single_sample_barycentric_cache_enabled{false};
 
 // AMD-307: hw.fs.vertex_order_check was padding before. Where the check is off (every device
 // except AMD's older compiler) it is cleared on load, so old stores keep matching; where it is on,
-// the shader store has its own version (cache_storage.cpp) and holds no older entries.
+// entries carry VertexOrderCheckVersion and older ones are not read: their vertex shaders do not
+// write the position copies.
+static constexpr u32 VertexOrderCheckVersion = 100u;
 static std::atomic<bool> vertex_order_check_cache_enabled{false};
 void SetVertexOrderCheckCacheEnabled(bool enabled) {
     vertex_order_check_cache_enabled.store(enabled, std::memory_order_relaxed);
@@ -204,7 +208,10 @@ void RegisterShaderMeta(const Shader::Info& info,
     meta.Write((single_sample_barycentric ? Serialization::ShaderBinaryVersionSingleSampleBarycentric
                 : masked_fragment         ? Serialization::ShaderBinaryVersionQuadSampleMask
                                           : Serialization::ShaderBinaryVersion) +
-               Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage));
+               Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage) +
+               (vertex_order_check_cache_enabled.load(std::memory_order_relaxed)
+                    ? VertexOrderCheckVersion
+                    : 0u));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -241,6 +248,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
+    if (vertex_order_check_cache_enabled.load(std::memory_order_relaxed)) { // AMD-307
+        if (binary_version < VertexOrderCheckVersion) {
+            return false;
+        }
+        binary_version -= VertexOrderCheckVersion;
+    }
     // FIX-228: hull shader translations made with the other normalization are not read (the
     // stage is checked once the specialization is read).
     const u32 stored_version = binary_version;

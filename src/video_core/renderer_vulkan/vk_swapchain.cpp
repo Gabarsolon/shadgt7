@@ -150,11 +150,7 @@ void Swapchain::RecreateSurface() {
     FindPresentMode();
     // FindPresentFormat() rechecked HDR10 support; the new surface may not advertise it, so the
     // swapchain must not keep requesting it.
-#ifdef RYTY_GPU
-    needs_hdr = supports_hdr;
-#else
     needs_hdr = needs_hdr && supports_hdr;
-#endif
     const vk::Format new_format = needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format;
     LOG_WARNING(Render_Vulkan, "FIX-218: surface lost; created a new surface (HDR={})", needs_hdr);
     if (new_format != previous_format) {
@@ -200,7 +196,7 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
-bool Swapchain::Present() {
+bool Swapchain::Present(u64 anti_lag_frame) {
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
@@ -209,7 +205,7 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
-    instance.AntiLagUpdate(true); // PERF-210
+    instance.AntiLagPresent(anti_lag_frame); // PERF-210
 #ifdef RYTY_GPU
     RytyDlssG::PresentStart();
     auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)

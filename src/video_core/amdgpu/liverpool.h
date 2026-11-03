@@ -583,6 +583,7 @@ private:
     /// MT-005: set by the indexed direct draw packets for the next RecordDraw (its index offset).
     std::optional<u32> staged_index_offset;
     /// Waits for the recorder thread to finish, before the command thread uses the rasterizer.
+    bool WaitsYieldToRecorder() const; ///< PERF-GT7-046
     void SyncRecorder(std::string_view reason);
     /// Whether [address, address + size) overlaps a command buffer being decoded.
     bool WritesLiveCommands(VAddr address, u64 size) const;
