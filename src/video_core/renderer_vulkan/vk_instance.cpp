@@ -456,10 +456,13 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
+        // Not on AMD by default: there tessellated shader objects took 3-5 s each to create and
+        // drew far slower than the fast-linked pipelines (RX 7600); those keep the existing path.
+        // RYGT_SHADER_OBJECT_TESS=1 turns it on, =0 off, on any GPU.
         if (const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS")) {
             shader_object_tessellation = shader_object && tess[0] != '0';
         } else {
-            shader_object_tessellation = shader_object;
+            shader_object_tessellation = shader_object && properties.vendorID != 0x1002;
         }
         LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
