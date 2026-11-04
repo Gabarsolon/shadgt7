@@ -20,6 +20,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
@@ -1364,10 +1365,106 @@ bool GraphicsPipeline::CreateShaderObjects(
     }
     std::array<VkShaderEXT, 4> created{};
     const auto create_start = std::chrono::steady_clock::now();
-    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
-        instance.GetDevice(), static_cast<u32>(create_infos.size()),
-        reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
-        created.data());
+    // SO-009: the driver's compiled shader objects are kept on disk (shader_objects in the cache
+    // folder, one file a set, keyed by the stage code, layouts, flags, GPU and driver version)
+    // and made from those binaries on later starts: the driver compiles a set only once.
+    // RYGT_SO_CACHE=0: always from SPIR-V.
+    static const bool use_cache = [] {
+        const char* env = std::getenv("RYGT_SO_CACHE");
+        return !(env && env[0] == '0');
+    }();
+    const auto cache_file =
+        Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects" /
+        fmt::format("{:016x}.bin", share_key ^ (u64(instance.GetDriverVersion()) << 32) ^
+                                       instance.GetDeviceID());
+    constexpr u32 CacheMagic = 0x31424F53; // "SOB1"
+    bool from_binary = false;
+    VkResult result = VK_ERROR_UNKNOWN;
+    if (use_cache) {
+        std::vector<std::vector<u8>> binaries;
+        if (std::FILE* file = std::fopen(cache_file.string().c_str(), "rb")) {
+            u32 magic = 0, count = 0;
+            bool ok = std::fread(&magic, 4, 1, file) == 1 && std::fread(&count, 4, 1, file) == 1 &&
+                      magic == CacheMagic && count == create_infos.size();
+            for (u32 i = 0; ok && i < count; ++i) {
+                u64 size = 0;
+                ok = std::fread(&size, 8, 1, file) == 1 && size != 0 && size < (64ull << 20);
+                if (ok) {
+                    binaries.emplace_back(size);
+                    ok = std::fread(binaries.back().data(), 1, size, file) == size;
+                }
+            }
+            std::fclose(file);
+            if (!ok) {
+                binaries.clear();
+            }
+        }
+        if (!binaries.empty()) {
+            auto binary_infos = create_infos;
+            for (size_t i = 0; i < binary_infos.size(); ++i) {
+                binary_infos[i].codeType = vk::ShaderCodeTypeEXT::eBinary;
+                binary_infos[i].codeSize = binaries[i].size();
+                binary_infos[i].pCode = binaries[i].data();
+            }
+            result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+                instance.GetDevice(), static_cast<u32>(binary_infos.size()),
+                reinterpret_cast<const VkShaderCreateInfoEXT*>(binary_infos.data()), nullptr,
+                created.data());
+            from_binary = result == VK_SUCCESS;
+            if (!from_binary) {
+                for (VkShaderEXT& shader : created) {
+                    if (shader) {
+                        VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(instance.GetDevice(),
+                                                                         shader, nullptr);
+                        shader = VK_NULL_HANDLE;
+                    }
+                }
+            }
+        }
+    }
+    if (!from_binary) {
+        result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+            instance.GetDevice(), static_cast<u32>(create_infos.size()),
+            reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
+            created.data());
+        if (result == VK_SUCCESS && use_cache) {
+            // Written beside and renamed, so a reader never sees half a file.
+            std::error_code ec;
+            std::filesystem::create_directories(cache_file.parent_path(), ec);
+            auto temporary = cache_file;
+            temporary += fmt::format(".{}", std::hash<std::thread::id>{}(
+                                                std::this_thread::get_id()));
+            bool ok = false;
+            if (std::FILE* file = std::fopen(temporary.string().c_str(), "wb")) {
+                const u32 count = static_cast<u32>(create_infos.size());
+                ok = std::fwrite(&CacheMagic, 4, 1, file) == 1 &&
+                     std::fwrite(&count, 4, 1, file) == 1;
+                for (u32 i = 0; ok && i < count; ++i) {
+                    size_t size = 0;
+                    ok = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetShaderBinaryDataEXT(
+                             instance.GetDevice(), created[i], &size, nullptr) == VK_SUCCESS &&
+                         size != 0;
+                    std::vector<u8> data(size);
+                    ok = ok && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetShaderBinaryDataEXT(
+                                   instance.GetDevice(), created[i], &size, data.data()) ==
+                                   VK_SUCCESS;
+                    const u64 size64 = size;
+                    ok = ok && std::fwrite(&size64, 8, 1, file) == 1 &&
+                         std::fwrite(data.data(), 1, size, file) == size;
+                }
+                std::fclose(file);
+            }
+            if (ok) {
+                std::filesystem::rename(temporary, cache_file, ec);
+            }
+            if (!ok || ec) {
+                std::filesystem::remove(temporary, ec);
+            }
+        }
+    }
+    static std::atomic<u32> binary_hits{};
+    static std::atomic<u32> compiled{};
+    (from_binary ? binary_hits : compiled).fetch_add(1, std::memory_order_relaxed);
     // SO-005 (diagnosis): how long the driver takes to make shader objects, per pipeline.
     {
         const double ms = std::chrono::duration<double, std::milli>(
@@ -1382,9 +1479,11 @@ bool GraphicsPipeline::CreateShaderObjects(
         max_ms = std::max(max_ms, ms);
         if (timed <= 5 || timed % 50 == 0) {
             LOG_WARNING(Render_Vulkan,
-                        "SO-005: shader objects of {} stages made in {:.1f} ms; {} pipelines so far, "
+                        "SO-005: shader objects of {} stages made in {:.1f} ms ({}; SO-009 cache: "
+                        "{} from disk, {} compiled); {} pipelines so far, "
                         "{:.1f} ms average, {:.1f} ms longest",
-                        create_infos.size(), ms, timed, total_ms / timed, max_ms);
+                        create_infos.size(), ms, from_binary ? "from disk" : "compiled",
+                        binary_hits.load(), compiled.load(), timed, total_ms / timed, max_ms);
         }
     }
     if (result != VK_SUCCESS) {
