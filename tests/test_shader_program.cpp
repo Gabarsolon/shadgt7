@@ -359,25 +359,6 @@ TEST(ShaderStore, AcceptsOnlyWholeSpirvModules) {
     EXPECT_FALSE(Vulkan::IsCompleteSpirv({}));
 }
 
-// These focused header tests do not initialize the emulator's logging or fatal-error backend.
-void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fmt::string_view,
-                       fmt::format_args) {
-    ADD_FAILURE() << "Unexpected shader metadata assertion at " << file << ':' << line;
-}
-
-void assert_fail_impl() {
-    std::abort();
-}
-
-void unreachable_impl() {
-    std::abort();
-}
-
-// StageSpecialization parses a fetch shader only for vertex stages, which these tests do not use.
-bool Shader::Gcn::ParseFetchShader(const Shader::Info&, Shader::Gcn::FetchShaderData&) {
-    ADD_FAILURE() << "Unexpected fetch shader parse";
-    return false;
-}
 // FIX-GT7-083: both engines share the store; an ordinary pixel-shader cube sample is a cube-array
 // sample with native cube sampling (the native engine) and samples six faces of a 2D array without
 // it (the classic engine's views). A translation is read only by the side it fits.
@@ -415,4 +396,24 @@ TEST(ShaderStore, StoredCubeSamplesAreReadOnlyByTheCubeSamplingTheyWereMadeWith)
     compute_spec.images[0].type = AmdGpu::ImageType::Cube;
     EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(compute_spec, false));
     EXPECT_TRUE(Vulkan::StoredCubesFit(compute_spec, compute, false, true));
+}
+
+// These focused header tests do not initialize the emulator's logging or fatal-error backend.
+void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fmt::string_view,
+                       fmt::format_args) {
+    ADD_FAILURE() << "Unexpected shader metadata assertion at " << file << ':' << line;
+}
+
+void assert_fail_impl() {
+    std::abort();
+}
+
+void unreachable_impl() {
+    std::abort();
+}
+
+// StageSpecialization parses a fetch shader only for vertex stages, which these tests do not use.
+bool Shader::Gcn::ParseFetchShader(const Shader::Info&, Shader::Gcn::FetchShaderData&) {
+    ADD_FAILURE() << "Unexpected fetch shader parse";
+    return false;
 }
