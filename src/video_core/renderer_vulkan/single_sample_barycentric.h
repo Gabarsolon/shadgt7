@@ -3,13 +3,15 @@
 #include <cstdint>
 #include <cstdlib>
 namespace Vulkan {
-// FIX-220: opt-in again (as upstream): on AMD GPUs only with RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC
-// set to 1, true, on or yes (any case, spaces ignored; the launcher's "AMD graphics fix" box). On
-// by default it made AMD shader loading much slower than 27b.
+// FIX-220: on AMD GPUs, RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC set to 1, true, on or yes (any case,
+// spaces ignored; the launcher's "AMD graphics fix" box) turns it on, any other value off.
+// FIX-GT7-061: on when unset. Only the fragment shaders that read a vertex's own values take it
+// (FIX-217), so loading stays as fast; without it AMD's explicit-vertex path left GT7's Trial
+// Mountain rock walls flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC).
 inline bool SingleSampleBarycentricRequested() {
     const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-    if (!value) {
-        return false;
+    if (!value || !*value) {
+        return true;
     }
     while (*value == ' ' || *value == '"') {
         ++value;
