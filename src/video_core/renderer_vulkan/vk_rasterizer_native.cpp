@@ -10370,9 +10370,17 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
                      VideoCore::PageManager::GetNextPageAddr(address + size - 1));
     }
     registry->Invalidate(address, size, Native::ImageRegistry::Stale::Unmap);
-    // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
-    // done with them).
     std::scoped_lock lock{mutex};
+    DropRegionsOver(address, size);
+    ++buffer_generation;        // OPT-003
+    ++buffer_hard_generation;   // PERF-GT7-047
+    ++unmap_generation;         // OPT-002
+}
+
+u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size) {
+    // NAT-146: regions over the range go (the device frees their buffers once the GPU is done
+    // with them). With `mutex` held.
+    u32 dropped = 0;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         for (auto it = regions.begin(); it != regions.end();) {
@@ -10381,33 +10389,48 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
                 NoteHistory(it->second.begin, it->second.end - it->second.begin, 11,
                             0); // DIAG-187 (diagnosis)
                 it = regions.erase(it);
+                ++dropped;
             } else {
                 ++it;
             }
         }
     }
+    const size_t mirrors_before = mirrors.size();
     DropMirrors(address, size); // NAT-150
+    dropped += u32(mirrors_before - mirrors.size());
     {
         std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
         std::erase_if(page_snapshots, [&](const auto& snapshot) {
             return snapshot.first >= address && snapshot.first < address + size;
         });
     }
-    ++buffer_generation;        // OPT-003
-    ++buffer_hard_generation;   // PERF-GT7-047
-    ++unmap_generation;         // OPT-002
+    return dropped;
 }
 
 void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
     // FIX-GT7-077 (see Rasterizer::OnNewMapping).
+    // FIX-GT7-086: regions and mirrors over the new mapping were made after Ryty's unmap report
+    // (the report dropped those made before), from the old pages; a region whose memory failed
+    // to import was filled from the CPU's bytes once and never refreshes, and a texture's upload
+    // reads a region over it first. They go, as at an unmap, and only then are the textures
+    // marked: an upload that takes the mark reads what is mapped now.
+    u32 dropped = 0;
+    {
+        std::scoped_lock lock{mutex};
+        dropped = DropRegionsOver(address, size);
+        if (dropped != 0) {
+            ++buffer_generation;      // OPT-003
+            ++buffer_hard_generation; // PERF-GT7-047
+        }
+    }
     const u32 textures = registry->InvalidateNewMapping(address, size);
-    if (textures != 0) {
+    if (textures != 0 || dropped != 0) {
         static std::atomic<u32> mappings{};
         if (const u32 n = ++mappings; n <= 40 || n % 100 == 0) {
             LOG_INFO(Render_Vulkan,
-                     "FIX-GT7-077: {} textures over the new mapping {:#x}+{:#x} uploaded again ({} "
-                     "mappings so far)",
-                     textures, address, size, n);
+                     "FIX-GT7-077: {} textures over the new mapping {:#x}+{:#x} uploaded again, "
+                     "{} regions or mirrors dropped ({} mappings so far)",
+                     textures, address, size, dropped, n);
         }
     }
 }

@@ -6084,6 +6084,14 @@ void Rasterizer::OnNewMapping(VAddr addr, u64 size) {
         }
         if (enabled) {
             UnmapMemory(addr, size);
+#ifdef RYTY_GPU
+            // FIX-GT7-086: UnmapMemory marks the textures before direct->OnUnmap drops the views,
+            // so an upload recorded in between read the old pages and took the mark. They are
+            // marked again now that the views are gone.
+            if (native) {
+                native->OnNewMapping(addr, size);
+            }
+#endif
         }
         return;
     }

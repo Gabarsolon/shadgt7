@@ -589,6 +589,8 @@ private:
     void RefreshMirror(Mirror& mirror);
     void MakePendingMirrors();
     void DropMirrors(VAddr address, u64 size);
+    /// NAT-146, FIX-GT7-086: regions and mirrors over the range go (with `mutex` held); how many.
+    u32 DropRegionsOver(VAddr address, u64 size);
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
     Bound last_bound = Bound::InPlace;
