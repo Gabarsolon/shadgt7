@@ -883,6 +883,15 @@ Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& lik
     return entry;
 }
 
+// Port of xacidr4inx's reflection fix (RyGT 0066): square colour images of six layers or more can
+// be viewed as cube arrays. Not depth images (GT7's shadow cascades). FIX-GT7-084: what View checks
+// before it makes a cube-array view.
+static bool CubeCompatible(const Instance& instance, u32 width, u32 height, u32 layers, u32 samples,
+                           bool volume, bool depth) {
+    return instance.IsImageCubeArraySupported() && !volume && !depth && width == height &&
+           layers >= 6 && samples == 1;
+}
+
 Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
     Native::MadeImage made{};
     if (info.pixel_format == vk::Format::eUndefined) {
@@ -891,11 +900,8 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     const Instance& instance = r.instance;
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
-    // Port of xacidr4inx's reflection fix (RyGT 0066): square colour images of six layers or
-    // more can be viewed as cube arrays. Not depth images (GT7's shadow cascades).
-    if (instance.IsImageCubeArraySupported() && !info.props.is_volume && !info.props.is_depth &&
-        info.size.width == info.size.height && info.resources.layers >= 6 &&
-        info.num_samples == 1) {
+    if (CubeCompatible(instance, info.size.width, info.size.height, info.resources.layers,
+                       info.num_samples, info.props.is_volume, info.props.is_depth)) {
         flags |= vk::ImageCreateFlagBits::eCubeCompatible;
     }
     if (info.props.is_volume) {
@@ -1057,6 +1063,26 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     }
     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
     if (use == ViewUse::CubeSampled) {
+        // FIX-GT7-084: the code samples a cube array (NativeCubeSampling), so the view is one:
+        // whole cubes (VUID-VkImageViewCreateInfo-viewType-02961) of a picture made cube
+        // compatible (image-01003). A range the picture cuts short keeps its whole cubes. Under
+        // six faces, a volume, or a picture made without the flag, no view fits the code: the
+        // slot is bound empty, as a failed view was, without the invalid call.
+        const u32 cubes = info.range.extent.layers / 6;
+        if (cubes == 0 || !CubeCompatible(r.instance, image_desc.width, image_desc.height,
+                                          image_desc.layers, image_desc.samples, volume,
+                                          entry.info.props.is_depth)) {
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-084: cube sample of {:#x} ({}x{}, {} layers from {} of {}) "
+                            "bound empty: no cube-array view fits",
+                            entry.info.guest_address, image_desc.width, image_desc.height,
+                            info.range.extent.layers, info.range.base.layer, image_desc.layers);
+            }
+            return {};
+        }
+        info.range.extent.layers = cubes * 6;
         view_type = vk::ImageViewType::eCubeArray;
     }
     if (volume) {
