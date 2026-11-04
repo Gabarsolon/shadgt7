@@ -183,6 +183,7 @@ bool LeanRun() {
     return lean;
 }
 
+#ifdef SHADGT_DIAGNOSTICS
 bool PerfFeatureEnabled(u32 id) {
     static const std::vector<u32> disabled = [] {
         std::vector<u32> ids;
@@ -202,6 +203,7 @@ bool PerfFeatureEnabled(u32 id) {
     }();
     return std::ranges::find(disabled, id) == disabled.end();
 }
+#endif
 
 WorkCounters& GetWorkCounters() {
     static WorkCounters counters;
@@ -218,7 +220,7 @@ struct WorkSnapshot {
 
 static WorkSnapshot TakeSnapshot() {
     const auto& c = GetWorkCounters();
-    const auto l = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
+    const auto l = [](const auto& v) { return v.load(std::memory_order_relaxed); };
     return {l(c.pm4_packets),      l(c.draws),
             l(c.dispatches),       l(c.find_image),
             l(c.obtain_buffer),    l(c.obtain_stream),
@@ -257,7 +259,7 @@ GameFrameTotals GetGameFrameTotals() {
 
 void NoteGameFrame() {
     static const double threshold_ms = [] {
-        const char* env = std::getenv("SHADGT_STALL_MS");
+        const char* env = DiagEnv("SHADGT_STALL_MS");
         return env && *env ? std::stod(env) : 100.0;
     }();
     static auto last_time = std::chrono::steady_clock::now();
@@ -275,7 +277,8 @@ void NoteGameFrame() {
     game_frames.fetch_add(1, std::memory_order_release);
     game_frame_us.fetch_add(u64(ms * 1000.0), std::memory_order_release);
     // DIAG-046: frame-time distribution every 10 s, and frames well above the recent median
-    // (micro hitches) with where the GPU threads' time went.
+    // (micro hitches) with where the GPU threads' time went. The 10 s line is in every build: it
+    // is how a build without diagnostics shows its frame rate.
     {
         static std::vector<double> window_ms;
         static std::array<double, 64> recent{};
@@ -288,8 +291,8 @@ void NoteGameFrame() {
         std::sort(sorted_recent.begin(), sorted_recent.begin() + n_recent);
         const double median = n_recent ? sorted_recent[n_recent / 2] : ms;
         recent[recent_count++ % 64] = ms;
-        if (n_recent >= 16 && ms >= 25.0 && ms > 2.0 * median && ms < threshold_ms &&
-            hitch_lines < 40) {
+        if (DiagnosticsBuilt && n_recent >= 16 && ms >= 25.0 && ms > 2.0 * median &&
+            ms < threshold_ms && hitch_lines < 40) {
             ++hitch_lines;
             const double ticks_per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
             const auto phase_ms = [&](Phase phase) {
@@ -342,7 +345,7 @@ void NoteGameFrame() {
             hitch_lines = 0;
         }
     }
-    if (ms >= threshold_ms) {
+    if (DiagnosticsBuilt && ms >= threshold_ms) {
         const double ticks_per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
         const auto phase_ms = [&](Phase phase) {
             return double(ticks[size_t(phase)] - last_ticks[size_t(phase)]) / ticks_per_ms;

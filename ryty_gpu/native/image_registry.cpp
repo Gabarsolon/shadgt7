@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
@@ -106,7 +107,7 @@ std::atomic<bool> g_dump_request{false};
 const std::vector<VAddr>& WatchedTextures() {
     static const std::vector<VAddr> watched = [] {
         std::vector<VAddr> list;
-        const char* env = std::getenv("RYGT_NATIVE_WATCH_TEXTURE");
+        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_TEXTURE");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -132,7 +133,7 @@ bool WatchedTexture(VAddr begin, VAddr end) {
     // DIAG-167 (RYGT_NATIVE_WATCH_RANGE=<hex lo>-<hex hi>): images starting in that range too
     // (pictures whose address changes from run to run).
     static const std::pair<VAddr, VAddr> range = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WATCH_RANGE");
+        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_RANGE");
         if (!env || !*env) {
             return std::pair<VAddr, VAddr>{};
         }
@@ -932,7 +933,7 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
             return;
         }
         const auto place = PlaceOf(target.info, entry.info);
-        static const bool small_links = std::getenv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+        static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
         static std::atomic<u32> small_logged{};
         if (small_links && place.mip >= 0 && entry.info.size.width <= 8 &&
             entry.info.size.height <= 8 && small_logged++ < 200) {
@@ -987,7 +988,7 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
             }
             if (place.mip >= 0) {
                 // DIAG-181 (diagnosis, RYGT_DIAG_SMALL_LINKS=1): links of tiny textures.
-                static const bool small_links = std::getenv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+                static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
                 static std::atomic<u32> small_logged{};
                 if (small_links && texture.info.size.width <= 8 && texture.info.size.height <= 8 &&
                     small_logged++ < 200) {
@@ -1277,7 +1278,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                                                                   clock, frame};
     }
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
-        static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
+        static const bool dump_on_fill = Common::DiagEnv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
         if (pattern && dump_on_fill) {
             g_dump_request = true; // FIX-156 (diagnosis): dump the next frame
         }
@@ -1303,7 +1304,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 // =<w>x<h>: over textures that size (GT7's 30x17 light grid, 136 KB).
                 static const std::array<u32, 3> diag = [] {
                     std::array<u32, 3> d{};
-                    if (const char* env = std::getenv("RYGT_DIAG_IGNORED_WRITES")) {
+                    if (const char* env = Common::DiagEnv("RYGT_DIAG_IGNORED_WRITES")) {
                         d[0] = 1;
                         if (std::sscanf(env, "%ux%u", &d[1], &d[2]) != 2) {
                             d[1] = d[2] = 0;
@@ -1718,7 +1719,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // (diagnosis) RYGT_DIAG_ZERO_TEXTURES=<w>x<h>x<bits>: textures of that size upload zeros.
         static const std::array<u32, 3> zero_size = [] {
             std::array<u32, 3> parts{};
-            if (const char* env = std::getenv("RYGT_DIAG_ZERO_TEXTURES")) {
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_ZERO_TEXTURES")) {
                 std::sscanf(env, "%ux%ux%u", &parts[0], &parts[1], &parts[2]);
             }
             return parts;
@@ -1742,7 +1743,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // memory by the CPU, never from a region or an imported view.
         static const std::array<u32, 2> cpu_size = [] {
             std::array<u32, 2> parts{};
-            if (const char* env = std::getenv("RYGT_DIAG_UPLOAD_CPU_SIZE")) {
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_CPU_SIZE")) {
                 std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
             }
             return parts;
@@ -1758,7 +1759,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // hash of guest memory at the time.
         static const std::array<u32, 2> diag_size = [] {
             std::array<u32, 2> parts{};
-            if (const char* env = std::getenv("RYGT_DIAG_UPLOAD_SIZE")) {
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_SIZE")) {
                 std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
             }
             return parts;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostics.h"
 #include "common/perf_monitor.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/buffer_copy.h"
@@ -247,7 +248,7 @@ void Runtime::DiagBatchDraw(std::span<const std::tuple<vk::Buffer, u64, u64, boo
                             std::span<const vk::Image> images) {
     auto& d = diag_batch;
     static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_DIAG_BATCH");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_BATCH");
         return env && env[0] == '1';
     }();
     d.enabled = enabled;

@@ -30,6 +30,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 #endif
 
 #include "common/assert.h"
+#include "common/diagnostics.h"
 #include "common/recoverable.h"
 #include "common/logging/log.h"
 #include "common/logging/stdout_level.h"
@@ -77,7 +78,7 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     // memory snapshots, avoiding a full Debug diagnostic flood. The normal
     // Debug/Trace stdout threshold still applies to those snapshots.
     static const bool memory_only = [] {
-        const char* value = std::getenv("RYGT_VRAM_DIAGNOSTICS");
+        const char* value = Common::DiagEnv("RYGT_VRAM_DIAGNOSTICS");
         return value && value[0] == '1';
     }();
     if (memory_only && !fatal_report &&

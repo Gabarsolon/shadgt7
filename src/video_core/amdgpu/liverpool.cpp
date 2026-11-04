@@ -14,6 +14,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/diagnostics.h"
 #include "common/sampling_profiler.h"
 #include "common/scope_exit.h"
 #include "common/debug.h"
@@ -1446,7 +1447,7 @@ void Liverpool::Process(std::stop_token stoken) {
                         // 200 s, times relative to the first one (ms): submit, decoded,
                         // recorded, GPU done, and the jobs pushed and finished by then.
                         static const bool timeline = [] {
-                            const char* env = std::getenv("SHADGT_DIAG_TIMELINE");
+                            const char* env = Common::DiagEnv("SHADGT_DIAG_TIMELINE");
                             return env && env[0] == '1';
                         }();
                         if (timeline) {

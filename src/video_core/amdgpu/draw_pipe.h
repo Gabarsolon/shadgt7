@@ -39,6 +39,7 @@ enum class Part : u32 {
     Count,
 };
 inline constexpr u32 PartCount = static_cast<u32>(Part::Count);
+#ifdef SHADGT_DIAGNOSTICS
 bool On();
 /// The recorder runs jobs from here to the end of the scope (Jobs until a part starts).
 class Running {
@@ -65,6 +66,27 @@ private:
 };
 /// This thread's nanoseconds by part since the last call.
 std::array<u64, PartCount> Take();
+#else
+// Without diagnostics the parts are never timed (several scopes a draw, each a call).
+constexpr bool On() {
+    return false;
+}
+class Running {
+public:
+    Running() noexcept = default;
+    Running(const Running&) = delete;
+    Running& operator=(const Running&) = delete;
+};
+class Scope {
+public:
+    explicit constexpr Scope(Part) noexcept {}
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+};
+inline std::array<u64, PartCount> Take() {
+    return {};
+}
+#endif
 } // namespace RecorderParts
 
 /// PERF-031: the second stage of the GPU command processor. The command thread (stage A) keeps

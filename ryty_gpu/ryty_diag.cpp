@@ -26,6 +26,10 @@
 #include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderdoc.h"
 
+// Without diagnostics in the build (no RYTY_DIAG) ryty_diag.h has empty inline versions, and
+// only the exports below are left, reporting the diagnostics off.
+#ifdef RYTY_DIAG
+
 namespace RyDiag {
 
 std::atomic<u32> g_profile_tag{0}; // DIAG-GT7-002
@@ -1368,6 +1372,8 @@ void FrameShown() {
 }
 
 } // namespace RyDiag
+
+#endif // RYTY_DIAG
 
 // For Ryty's libraries (resolved with GetProcAddress on libSceVideoOut.prx).
 extern "C" __declspec(dllexport) int RyGtDiagEnabled() {

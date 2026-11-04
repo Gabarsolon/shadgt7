@@ -24,6 +24,14 @@
       }
     },
     {
+      "name": "x64-Clang-Release-Diag",
+      "displayName": "Clang x64 Release with diagnostics",
+      "inherits": ["x64-Clang-Release"],
+      "cacheVariables": {
+        "SHADGT_DIAGNOSTICS": "ON"
+      }
+    },
+    {
       "name": "x64-Clang-RelWithDebInfo",
       "displayName": "Clang x64 RelWithDebInfo",
       "inherits": ["x64-Clang-Base"],

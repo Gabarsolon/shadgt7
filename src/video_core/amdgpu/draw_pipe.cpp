@@ -33,6 +33,7 @@ u64 MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 }
 } // namespace
 
+#ifdef SHADGT_DIAGNOSTICS
 namespace RecorderParts {
 namespace {
 thread_local bool t_running = false;
@@ -49,8 +50,8 @@ void Charge(std::chrono::steady_clock::time_point now) {
 
 bool On() {
     static const bool on = [] {
-        const char* ab = std::getenv("RYGT_NATIVE_AB");
-        const char* parts = std::getenv("RYGT_DIAG_RECORDER_PARTS");
+        const char* ab = Common::DiagEnv("RYGT_NATIVE_AB");
+        const char* parts = Common::DiagEnv("RYGT_DIAG_RECORDER_PARTS");
         return (ab && ab[0] == '1') || (parts && parts[0] == '1');
     }();
     return on;
@@ -93,6 +94,7 @@ std::array<u64, PartCount> Take() {
     return std::exchange(t_ns, {});
 }
 } // namespace RecorderParts
+#endif
 
 DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
     : max_pending{max_pending_}, thread_init{std::move(thread_init_)} {

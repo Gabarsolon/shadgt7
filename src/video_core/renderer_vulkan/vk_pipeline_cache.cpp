@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/guest_clock.h"
 #include "common/nvtx.h"
@@ -96,7 +97,7 @@ bool CompilationInProgress() {
 // DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1).
 static bool TranslateJobsDiag() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_DIAG_TRANSLATE_JOBS");
+        const char* env = Common::DiagEnv("RYGT_DIAG_TRANSLATE_JOBS");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -708,7 +709,7 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
     static u32 programs = 0, matching = 0;
     ++programs;
     matching += found;
-    if (std::getenv("RYGT_DIAG_BARY_COUNT") && (found || programs % 100 == 0)) {
+    if (Common::DiagEnv("RYGT_DIAG_BARY_COUNT") && (found || programs % 100 == 0)) {
         LOG_WARNING(Render_Vulkan, "DIAG-222: {} of {} pixel shaders read vertex values ({:#x}{})",
                     matching, programs, params.hash, found ? " does" : "");
     }
@@ -807,7 +808,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             const char* env = std::getenv("RYGT_AMD_BARYCENTRIC_ALL");
             return env && env[0] == '1';
         }();
-        static const bool diag_count = std::getenv("RYGT_DIAG_BARY_COUNT") != nullptr;
+        static const bool diag_count = Common::DiagEnv("RYGT_DIAG_BARY_COUNT") != nullptr;
         const bool candidate = UseSingleSampleBarycentric(
             instance.GetVendorID(), profile.supports_fragment_shader_barycentric,
             S().graphics_key.num_samples, direct_barycentric_requested);
@@ -916,7 +917,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.lds_emulation = u8(TessLdsEmulation(regs)); // FIX-227
         info.sw.tcs.num_patches = u8(info.sw.tcs.lds_emulation ? regs.ls_hs_config.num_patches : 0);
         // DIAG-239 (diagnosis, RYGT_DIAG_TCS_CONFIG=1): the LS/HS configuration, 60 lines at most.
-        if (static const bool diag = std::getenv("RYGT_DIAG_TCS_CONFIG") != nullptr; diag) {
+        if (static const bool diag = Common::DiagEnv("RYGT_DIAG_TCS_CONFIG") != nullptr; diag) {
             static std::mutex seen_mutex;
             static std::set<u32> seen;
             const u32 combo = u32(regs.ls_hs_config.num_patches) |
@@ -1103,7 +1104,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             return (instance.IsFragmentShaderBarycentricSupported() &&
                     instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
-                    !std::getenv("RYGT_DIAG_NO_MANUAL_INTERP")) ||
+                    !Common::DiagEnv("RYGT_DIAG_NO_MANUAL_INTERP")) ||
                    (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                     instance.IsAmdLegacyShaderCompiler());
         }(),
@@ -2175,7 +2176,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     {
         // DIAG-225 (diagnosis, RYGT_DIAG_AA_MASK=1): draws with no pixel shader while
         // PA_SC_AA_MASK hides pixels (the quad sample mask is applied in the pixel shader only).
-        static const bool diag = std::getenv("RYGT_DIAG_AA_MASK") != nullptr;
+        static const bool diag = Common::DiagEnv("RYGT_DIAG_AA_MASK") != nullptr;
         const auto& r = Regs();
         if (diag && !S().infos[u32(SwStage::Fragment)] &&
             (r.reg_array[0xa30e] != ~0u || r.reg_array[0xa30f] != ~0u)) {
@@ -3710,7 +3711,7 @@ bool IsWatchedShader(u64 hash) {
         // The Nurburgring grass: vertex generator, blade generator, and the pass before them.
         // DIAG-039: the dealership shader whose buffer V#s read as float constants.
         std::vector<u64> hashes{0xab6a2d10, 0xaa3822a3, 0x766d0f18, 0xae32f77f};
-        if (const char* env = std::getenv("SHADGT_WATCH_SHADERS"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_WATCH_SHADERS"); env && *env) {
             hashes.clear();
             const std::string list{env};
             for (size_t start = 0; start < list.size();) {
@@ -3943,7 +3944,7 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     if (sane && !read_ahead) {
         // DIAG-067: who writes these constants next, and when (SHADGT_WATCH_TESS=<ms>).
         static const u32 watch_ms = [] {
-            const char* env = std::getenv("SHADGT_WATCH_TESS");
+            const char* env = Common::DiagEnv("SHADGT_WATCH_TESS");
             return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
         }();
         static auto next_watch = std::chrono::steady_clock::now();
