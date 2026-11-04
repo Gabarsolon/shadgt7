@@ -247,7 +247,8 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    Shader::StageSpecialization& spec, size_t& perm_idx) {
+                    Shader::StageSpecialization& spec, size_t& perm_idx,
+                    bool* other_cube_sampling) {
     Serialization::Reader meta{ar};
 
     u32 meta_version{};
@@ -310,6 +311,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     ReadResourceUsage(meta, info);
     if (!StoredCubesFit(spec, info, face_cubes,
                         native_cube_cache_enabled.load(std::memory_order_relaxed))) {
+        if (other_cube_sampling) {
+            *other_cube_sampling = true; // FIX-GT7-088
+        }
         return false; // FIX-GT7-083: made by the other engine's cube sampling
     }
     return true;

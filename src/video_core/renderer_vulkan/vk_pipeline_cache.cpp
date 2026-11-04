@@ -3209,11 +3209,24 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
         Serialization::Archive ar{std::move(entry.meta)};
         // Entries of another format version, cut short, or for another program are skipped.
         bool valid = false;
+        bool other_engine = false;
         try {
             Common::RecoverableScope recoverable;
-            valid = ar.SizeBytes() >= 24 && LoadShaderMeta(ar, *info, spec, stored_idx);
+            valid = ar.SizeBytes() >= 24 &&
+                    LoadShaderMeta(ar, *info, spec, stored_idx, &other_engine);
         } catch (const Common::RecoverableFailure&) {
             valid = false;
+            other_engine = false;
+        }
+        if (!valid && other_engine && stored_idx == perm_idx && info->pgm_hash == pgm_hash) {
+            // FIX-GT7-088: the other engine's translation (FIX-GT7-083) keeps its index, so this
+            // engine's goes after it instead of over its files: switching engines back and forth
+            // with one store translated the shader again each time, and left the pipelines
+            // stored with the overwritten module stale.
+            auto& end = stored_perm_end[pgm_hash];
+            end = std::max(end, perm_idx + 1);
+            ++stale;
+            continue;
         }
         if (!valid || stored_idx != perm_idx || info->pgm_hash != pgm_hash) {
             ++stale;
