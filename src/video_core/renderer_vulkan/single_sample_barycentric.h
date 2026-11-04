@@ -3,21 +3,14 @@
 #include <cstdint>
 #include <cstdlib>
 namespace Vulkan {
-// FIX-220: on AMD GPUs, RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC set to 1, true, on or yes (any case,
-// spaces ignored; the launcher's "AMD graphics fix" box) turns it on, any other value off.
-// FIX-GT7-061: on when unset. Only the fragment shaders that read a vertex's own values take it
-// (FIX-217), so loading stays as fast; without it AMD's explicit-vertex path left GT7's Trial
-// Mountain rock walls flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC).
+// FIX-220: KHR barycentrics on AMD GPUs for the fragment shaders that read a vertex's own values
+// (FIX-217). FIX-GT7-061: on by default: with AMD's explicit-vertex path GT7's Trial Mountain rock
+// walls came out flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC). The
+// launcher's "AMD graphics fix" box sets RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC itself (off when unticked), so
+// that variable no longer turns it off; RYGT_AMD_EXPLICIT_VERTEX=1 does (AMD's path, as before).
 inline bool SingleSampleBarycentricRequested() {
-    const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-    if (!value || !*value) {
-        return true;
-    }
-    while (*value == ' ' || *value == '"') {
-        ++value;
-    }
-    const char c = static_cast<char>(*value | 0x20);
-    return *value == '1' || c == 't' || c == 'y' || (c == 'o' && (value[1] | 0x20) == 'n');
+    const char* value = std::getenv("RYGT_AMD_EXPLICIT_VERTEX");
+    return !(value && value[0] == '1');
 }
 constexpr bool UseSingleSampleBarycentric(std::uint32_t vendor, bool supports_khr,
                                          unsigned raster_samples, bool requested) {
