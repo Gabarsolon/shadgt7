@@ -54,6 +54,66 @@ struct ProtectCost {
 static ProtectCost g_protect_cost;
 
 /// DIAG-190/196 (diagnosis, RYGT_DIAG_FAULT_COST=1): fault and protection costs are timed.
+/// PERF-GT7-051 (diagnosis, RYGT_PROTECT_MAP=1): protections, unprotections and CPU write
+/// faults counted by 1 MB of guest memory; the 15 busiest areas are logged every 10 s.
+static bool ProtectMapOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PROTECT_MAP");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+struct ProtectMapEntry {
+    u64 protects = 0;
+    u64 unprotects = 0;
+    u64 bytes = 0;
+    u64 faults = 0;
+};
+static std::mutex g_protect_map_mutex;
+static std::unordered_map<u64, ProtectMapEntry> g_protect_map;
+static std::chrono::steady_clock::time_point g_protect_map_since = std::chrono::steady_clock::now();
+
+static void NoteProtectMap(u64 address, u64 size, int kind) {
+    std::scoped_lock lock{g_protect_map_mutex};
+    auto& entry = g_protect_map[address >> 20];
+    if (kind == 0) {
+        ++entry.protects;
+        entry.bytes += size;
+    } else if (kind == 1) {
+        ++entry.unprotects;
+        entry.bytes += size;
+    } else {
+        ++entry.faults;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_protect_map_since < std::chrono::seconds{10}) {
+        return;
+    }
+    std::vector<std::pair<u64, ProtectMapEntry>> top(g_protect_map.begin(), g_protect_map.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) {
+        return a.second.protects + a.second.unprotects + a.second.faults >
+               b.second.protects + b.second.unprotects + b.second.faults;
+    });
+    u64 total_protects = 0, total_unprotects = 0, total_faults = 0;
+    for (const auto& [base, e] : top) {
+        total_protects += e.protects;
+        total_unprotects += e.unprotects;
+        total_faults += e.faults;
+    }
+    LOG_WARNING(Render, "PERF-GT7-051: in 10 s {} protections, {} unprotections, {} write faults "
+                        "over {} MB areas; busiest:",
+                total_protects, total_unprotects, total_faults, top.size());
+    for (size_t i = 0; i < std::min<size_t>(15, top.size()); ++i) {
+        const auto& [base, e] = top[i];
+        LOG_WARNING(Render,
+                    "PERF-GT7-051:   {:#x}+1MB: {} protections, {} unprotections, {} write faults, "
+                    "{:.1f} MB changed",
+                    base << 20, e.protects, e.unprotects, e.faults, e.bytes / 1048576.0);
+    }
+    g_protect_map.clear();
+    g_protect_map_since = now;
+}
+
 static bool FaultCostDiag() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_DIAG_FAULT_COST");
@@ -643,6 +703,9 @@ struct SignalImpl : public PageManager::Impl {
         } rest{timed, &lap};
         ++Common::GetWorkCounters().protects;
         Common::GetWorkCounters().protect_bytes += size;
+        if (ProtectMapOn()) {
+            NoteProtectMap(address, size, perms == Core::MemoryPermission::ReadWrite ? 1 : 0);
+        }
         RYDIAG_SCOPE(Protect, address);
         // P2: imported guest views stay writable (the GPU faults on protected imported pages).
         if (VideoCore::g_imported_count.load(std::memory_order_acquire) != 0) {
@@ -949,6 +1012,9 @@ struct SignalImpl : public PageManager::Impl {
             ++Cost().faults;
         }
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        if (ProtectMapOn()) {
+            NoteProtectMap(addr, 0, 2); // PERF-GT7-051
+        }
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         // PERF-031: the draw pipe's recorder thread is a GPU thread too; a fault on the command
         // thread lets the recorder finish first, since the handling uses the caches.
