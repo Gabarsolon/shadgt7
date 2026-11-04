@@ -1377,7 +1377,9 @@ bool GraphicsPipeline::CreateShaderObjects(
         Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects" /
         fmt::format("{:016x}.bin", share_key ^ (u64(instance.GetDriverVersion()) << 32) ^
                                        instance.GetDeviceID());
-    constexpr u32 CacheMagic = 0x31424F53; // "SOB1"
+    // SO-013: format 2 adds a checksum of each binary: a damaged file is never handed to the
+    // driver (compiled again and rewritten instead).
+    constexpr u32 CacheMagic = 0x32424F53; // "SOB2"
     bool from_binary = false;
     VkResult result = VK_ERROR_UNKNOWN;
     if (use_cache) {
@@ -1385,13 +1387,18 @@ bool GraphicsPipeline::CreateShaderObjects(
         if (std::FILE* file = std::fopen(cache_file.string().c_str(), "rb")) {
             u32 magic = 0, count = 0;
             bool ok = std::fread(&magic, 4, 1, file) == 1 && std::fread(&count, 4, 1, file) == 1 &&
-                      magic == CacheMagic && count == create_infos.size();
+                      (magic == CacheMagic || magic == 0x31424F53) && count == create_infos.size();
+            // Files of format 1 (no checksums) are still read, so the cache isn't compiled again.
+            const bool checked = magic == CacheMagic;
             for (u32 i = 0; ok && i < count; ++i) {
                 u64 size = 0;
-                ok = std::fread(&size, 8, 1, file) == 1 && size != 0 && size < (64ull << 20);
+                u64 checksum = 0;
+                ok = std::fread(&size, 8, 1, file) == 1 && size != 0 && size < (64ull << 20) &&
+                     (!checked || std::fread(&checksum, 8, 1, file) == 1);
                 if (ok) {
                     binaries.emplace_back(size);
-                    ok = std::fread(binaries.back().data(), 1, size, file) == size;
+                    ok = std::fread(binaries.back().data(), 1, size, file) == size &&
+                         (!checked || XXH3_64bits(binaries.back().data(), size) == checksum);
                 }
             }
             std::fclose(file);
@@ -1423,10 +1430,29 @@ bool GraphicsPipeline::CreateShaderObjects(
         }
     }
     if (!from_binary) {
+        // SO-014: AMD's driver compiles a shader object set for up to seconds of CPU time; at
+        // normal priority those compiles competed with the game's threads (game-side stalls in
+        // races). Below normal while it runs. RYGT_SO_COMPILE_PRIORITY=0: unchanged.
+        static const bool lower = [] {
+            const char* env = std::getenv("RYGT_SO_COMPILE_PRIORITY");
+            return !(env && env[0] == '0');
+        }();
+#ifdef _WIN32
+        const HANDLE thread = GetCurrentThread();
+        const int priority = GetThreadPriority(thread);
+        if (lower) {
+            SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+        }
+#endif
         result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
             instance.GetDevice(), static_cast<u32>(create_infos.size()),
             reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
             created.data());
+#ifdef _WIN32
+        if (lower) {
+            SetThreadPriority(thread, priority);
+        }
+#endif
         if (result == VK_SUCCESS && use_cache) {
             // Written beside and renamed, so a reader never sees half a file.
             std::error_code ec;
@@ -1449,7 +1475,9 @@ bool GraphicsPipeline::CreateShaderObjects(
                                    instance.GetDevice(), created[i], &size, data.data()) ==
                                    VK_SUCCESS;
                     const u64 size64 = size;
+                    const u64 checksum = XXH3_64bits(data.data(), size);
                     ok = ok && std::fwrite(&size64, 8, 1, file) == 1 &&
+                         std::fwrite(&checksum, 8, 1, file) == 1 &&
                          std::fwrite(data.data(), 1, size, file) == size;
                 }
                 std::fclose(file);

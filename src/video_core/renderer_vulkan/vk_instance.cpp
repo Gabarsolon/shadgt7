@@ -8,6 +8,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/path_util.h"
 #include "common/ryty_config.h"
 #include "common/debug.h"
 #include "common/perf_monitor.h"
@@ -436,7 +437,22 @@ bool Instance::CreateDevice() {
     // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
     // states of extended_dynamic_state3 that those pipelines otherwise fix.
     // SO-011: on by default; RYGT_SHADER_OBJECT=0 builds pipelines as before.
-    if (const char* env = std::getenv("RYGT_SHADER_OBJECT"); !(env && env[0] == '0')) {
+    // SO-012: a start after a lost device with shader objects on uses pipelines once (the marker
+    // is removed, so the start after that tries shader objects again).
+    const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                             "shader_objects" / "device_lost.txt";
+    bool after_loss = false;
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(lost_marker, ec)) {
+            after_loss = true;
+            std::filesystem::remove(lost_marker, ec);
+            LOG_WARNING(Render_Vulkan, "SO-012: the GPU device was lost in the last run with shader "
+                                       "objects: this run builds pipelines");
+        }
+    }
+    if (const char* env = std::getenv("RYGT_SHADER_OBJECT");
+        !after_loss && !(env && env[0] == '0')) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
                             d3.extendedDynamicState3PolygonMode &&
@@ -1266,6 +1282,17 @@ void Instance::ReportDeviceLost() const {
         return;
     }
     LOG_CRITICAL(Render_Vulkan, "DIAG-243: the GPU device was lost");
+    if (shader_object) {
+        // SO-012: the next start uses pipelines once.
+        std::error_code ec;
+        const auto folder =
+            Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects";
+        std::filesystem::create_directories(folder, ec);
+        if (std::FILE* file = std::fopen((folder / "device_lost.txt").string().c_str(), "w")) {
+            std::fputs("GPU device lost with shader objects on; next start uses pipelines\n", file);
+            std::fclose(file);
+        }
+    }
     if (device_fault && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT) {
         const VkDevice dev = static_cast<VkDevice>(*device);
         VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
