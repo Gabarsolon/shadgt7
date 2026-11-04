@@ -796,6 +796,7 @@ void NativeRenderer::BeginHudStream() {
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
+    s.so_known = false; // SO-010
     s.vertex_state_known = false;
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
@@ -1274,6 +1275,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
+    s.so_known = false; // SO-010
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
@@ -1843,6 +1845,7 @@ void NativeRenderer::FlushWritebacks() {
     writebacks.clear();
     writebacks_due = false;
     s.pipeline = vk::Pipeline{}; // the re-tiling binds its own pipeline
+    s.so_known = false; // SO-010
     ForgetBindings(s);            // OPT-014: and its own bindings
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
     const vk::MemoryBarrier2 barrier{
@@ -1879,6 +1882,7 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
             *s.list, std::span<Native::ImageEntry* const>{
                          const_cast<Native::ImageEntry* const*>(bound.data()), bound.size()});
         s.pipeline = vk::Pipeline{}; // the uploads bind their own pipelines
+        s.so_known = false; // SO-010
         ForgetBindings(s);            // OPT-014: and their own bindings
     }
 }
@@ -3368,6 +3372,7 @@ bool NativeRenderer::WriteBackChangedWords(Stream& s, const Region& region,
                 s.keep.push_back(std::move(guest));
             });
         s.pipeline = vk::Pipeline{}; // the compare binds its own pipeline
+        s.so_known = false; // SO-010
         ForgetBindings(s); // OPT-014
     return compared;
 }
@@ -8404,11 +8409,22 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock part{stats.record_ns[4]};
         if (pipeline->UsesShaderObjects()) {
             // SO-001: no pipeline; the shader objects and the state a pipeline fixes.
-            s.cmd.Run([pipeline](vk::CommandBuffer cmd) { pipeline->BindShaderObjects(cmd); });
+            // SO-010: only what changed since the stream's last shader object draw.
+            const bool known = s.so_known;
+            const auto previous = s.so_state;
+            const auto previous_shaders = s.so_shaders;
+            s.cmd.Run([pipeline, known, previous, previous_shaders](vk::CommandBuffer cmd) {
+                pipeline->BindShaderObjects(cmd, known ? &previous : nullptr,
+                                            known ? &previous_shaders : nullptr);
+            });
             s.pipeline = vk::Pipeline{};
+            s.so_known = true;
+            s.so_state = pipeline->GetShaderObjectState();
+            s.so_shaders = pipeline->ShaderObjects();
         } else if (s.pipeline != pipeline->Handle()) {
             s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
             s.pipeline = pipeline->Handle();
+            s.so_known = false; // SO-010
         }
     }
     {
@@ -9968,6 +9984,7 @@ void NativeRenderer::DispatchDirect() {
     if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         s.pipeline = pipeline->Handle();
+        s.so_known = false; // SO-010
     }
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     ProbeDispatch(pipeline->GetStage(Shader::SwStage::Compute), b, false); // DIAG-175
@@ -10048,6 +10065,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         s.pipeline = pipeline->Handle();
+        s.so_known = false; // SO-010
     }
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     cmdbuf.dispatchIndirect(args->first, args->second);
@@ -10698,6 +10716,7 @@ void NativeRenderer::ProbeWatchedPictures() {
                 stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
                 stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 stream.pipeline = vk::Pipeline{};
+                stream.so_known = false; // SO-010
                 ForgetBindings(stream); // OPT-014
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,

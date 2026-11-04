@@ -1543,44 +1543,75 @@ bool GraphicsPipeline::CreateShaderObjects(
     return true;
 }
 
-void GraphicsPipeline::BindShaderObjects(vk::CommandBuffer cmd) const {
-    std::array<vk::ShaderStageFlagBits, 5> stages{vk::ShaderStageFlagBits::eVertex,
-                                                  vk::ShaderStageFlagBits::eFragment};
-    std::array<vk::ShaderEXT, 5> shaders{shader_objects[0], shader_objects[3]};
-    u32 count = 2;
-    if (instance.IsTessellationShaderEnabled()) {
-        stages[count] = vk::ShaderStageFlagBits::eTessellationControl;
-        shaders[count++] = shader_objects[1];
-        stages[count] = vk::ShaderStageFlagBits::eTessellationEvaluation;
-        shaders[count++] = shader_objects[2];
+void GraphicsPipeline::BindShaderObjects(
+    vk::CommandBuffer cmd, const ShaderObjectState* previous,
+    const std::array<vk::ShaderEXT, 4>* previous_shaders) const {
+    if (!previous_shaders || *previous_shaders != shader_objects) {
+        std::array<vk::ShaderStageFlagBits, 5> stages{vk::ShaderStageFlagBits::eVertex,
+                                                      vk::ShaderStageFlagBits::eFragment};
+        std::array<vk::ShaderEXT, 5> shaders{shader_objects[0], shader_objects[3]};
+        u32 count = 2;
+        if (instance.IsTessellationShaderEnabled()) {
+            stages[count] = vk::ShaderStageFlagBits::eTessellationControl;
+            shaders[count++] = shader_objects[1];
+            stages[count] = vk::ShaderStageFlagBits::eTessellationEvaluation;
+            shaders[count++] = shader_objects[2];
+        }
+        if (instance.IsGeometryShaderEnabled()) {
+            stages[count++] = vk::ShaderStageFlagBits::eGeometry;
+        }
+        cmd.bindShadersEXT(count, stages.data(), shaders.data());
     }
-    if (instance.IsGeometryShaderEnabled()) {
-        stages[count++] = vk::ShaderStageFlagBits::eGeometry;
-    }
-    cmd.bindShadersEXT(count, stages.data(), shaders.data());
     const auto& s = so_state;
-    cmd.setPrimitiveTopology(s.topology);
-    if (s.patch_control_points != 0) {
+    const ShaderObjectState* p = previous;
+    // SO-010: each command only when its value differs from the previous draw's.
+    if (!p || p->topology != s.topology) {
+        cmd.setPrimitiveTopology(s.topology);
+    }
+    if (s.patch_control_points != 0 &&
+        (!p || p->patch_control_points != s.patch_control_points)) {
         // SO-003: as the pipeline's tessellation state (no domain origin state: upper left).
         cmd.setPatchControlPointsEXT(s.patch_control_points);
         cmd.setTessellationDomainOriginEXT(vk::TessellationDomainOrigin::eUpperLeft);
     }
-    cmd.setPolygonModeEXT(s.polygon_mode);
-    cmd.setRasterizationSamplesEXT(s.samples);
-    const vk::SampleMask mask = ~vk::SampleMask{0};
-    cmd.setSampleMaskEXT(s.samples, &mask);
-    cmd.setAlphaToCoverageEnableEXT(s.alpha_to_coverage);
-    cmd.setDepthClampEnableEXT(s.depth_clamp);
-    cmd.setDepthClipEnableEXT(s.depth_clip);
-    cmd.setDepthClipNegativeOneToOneEXT(s.negative_one_to_one);
-    cmd.setProvokingVertexModeEXT(s.provoking);
-    if (instance.IsLogicOpSupported()) {
+    if (!p || p->polygon_mode != s.polygon_mode) {
+        cmd.setPolygonModeEXT(s.polygon_mode);
+    }
+    if (!p || p->samples != s.samples) {
+        cmd.setRasterizationSamplesEXT(s.samples);
+        const vk::SampleMask mask = ~vk::SampleMask{0};
+        cmd.setSampleMaskEXT(s.samples, &mask);
+    }
+    if (!p || p->alpha_to_coverage != s.alpha_to_coverage) {
+        cmd.setAlphaToCoverageEnableEXT(s.alpha_to_coverage);
+    }
+    if (!p || p->depth_clamp != s.depth_clamp) {
+        cmd.setDepthClampEnableEXT(s.depth_clamp);
+    }
+    if (!p || p->depth_clip != s.depth_clip) {
+        cmd.setDepthClipEnableEXT(s.depth_clip);
+    }
+    if (!p || p->negative_one_to_one != s.negative_one_to_one) {
+        cmd.setDepthClipNegativeOneToOneEXT(s.negative_one_to_one);
+    }
+    if (!p || p->provoking != s.provoking) {
+        cmd.setProvokingVertexModeEXT(s.provoking);
+    }
+    if (instance.IsLogicOpSupported() &&
+        (!p || p->logic_op_enable != s.logic_op_enable || p->logic_op != s.logic_op)) {
         cmd.setLogicOpEnableEXT(s.logic_op_enable);
         cmd.setLogicOpEXT(s.logic_op);
     }
     if (s.attachments != 0) {
-        cmd.setColorBlendEnableEXT(0, s.attachments, s.blend_enable.data());
-        cmd.setColorBlendEquationEXT(0, s.attachments, s.equations.data());
+        const auto same = [&](const auto& a, const auto& b) {
+            return std::equal(a.begin(), a.begin() + s.attachments, b.begin());
+        };
+        if (!p || p->attachments < s.attachments || !same(p->blend_enable, s.blend_enable)) {
+            cmd.setColorBlendEnableEXT(0, s.attachments, s.blend_enable.data());
+        }
+        if (!p || p->attachments < s.attachments || !same(p->equations, s.equations)) {
+            cmd.setColorBlendEquationEXT(0, s.attachments, s.equations.data());
+        }
     }
 }
 
