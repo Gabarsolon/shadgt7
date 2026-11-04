@@ -21,11 +21,21 @@ struct Program {
         u64 spv_hash{};
         /// PERF-032: listed from the shader store; its module is loaded the first time it matches.
         bool stored{};
+        /// PERF-GT7-058: the inputs it last matched with, as StageSpecialization::PackInputs packs
+        /// them; R7 confirms it again from these when they are the same.
+        struct SpecInputs {
+            bool valid{};
+            Shader::RuntimeInfo runtime_info{};
+            Shader::Backend::Bindings start{};
+            std::vector<u64> words;
+        } inputs;
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
     ModuleList modules{};
+    /// PERF-GT7-058: else_scope_checked was looked at for this program object.
+    bool use_checked{};
 
     /// PERF-044: the inputs of the last permutation search and its outcome. A specialization is
     /// made from the permutation's info, the runtime info, the start bindings and the sharps,

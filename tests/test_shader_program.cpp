@@ -378,3 +378,104 @@ bool Shader::Gcn::ParseFetchShader(const Shader::Info&, Shader::Gcn::FetchShader
     ADD_FAILURE() << "Unexpected fetch shader parse";
     return false;
 }
+
+namespace {
+
+// PERF-GT7-058: what StageSpecialization::PackInputs packs for a stage.
+std::vector<u64> PackFor(const Shader::Info& info) {
+    std::vector<u64> words;
+    Shader::Gcn::FetchShaderData fetch;
+    Shader::StageSpecialization::PackInputs(info, words, fetch);
+    return words;
+}
+
+} // namespace
+
+TEST(ShaderSpecialization, PackedInputsIgnoreAddressesAndKeepWhatSplitsPermutations) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    info.buffer_stride_used.set(0);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto compiled = KeyFor(info);
+    const auto packed = PackFor(info);
+
+    // Another address and size: the same pack and the same specialization.
+    auto moved = BoundBuffer(16);
+    moved.base_address = 0x7650000;
+    moved.num_records = 4096;
+    Bind(info.buffers[0], moved);
+    EXPECT_EQ(packed, PackFor(info));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    // What splits permutations changes the pack.
+    auto stride = BoundBuffer(48);
+    auto add_tid = BoundBuffer(16);
+    add_tid.add_tid_enable = 1;
+    auto coherent = BoundBuffer(16);
+    coherent.mtype = 3;
+    auto swizzled = BoundBuffer(16);
+    swizzled.swizzle_enable = 1;
+    for (const auto& changed : {stride, add_tid, coherent, swizzled}) {
+        Bind(info.buffers[0], changed);
+        EXPECT_FALSE(compiled == KeyFor(info));
+        EXPECT_NE(packed, PackFor(info));
+    }
+
+    // Unbound, or bound empty by its address (FIX-GT7-024): another pack.
+    auto unbound = BoundBuffer(16);
+    unbound.num_records = 0;
+    Bind(info.buffers[0], unbound);
+    EXPECT_NE(packed, PackFor(info));
+    auto empty = BoundBuffer(16);
+    empty.base_address = 0;
+    Bind(info.buffers[0], empty);
+    EXPECT_NE(packed, PackFor(info));
+}
+
+TEST(ShaderSpecialization, PackedImageInputsIgnoreAddressesAndKeepTheFormat) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    info.images.emplace_back();
+    info.resource_usage_known = true;
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = 0x1000;
+    Bind(info.images[0], image);
+    const auto compiled = KeyFor(info);
+    const auto packed = PackFor(info);
+
+    auto moved = image;
+    moved.base_address = 0x9876;
+    Bind(info.images[0], moved);
+    EXPECT_EQ(packed, PackFor(info));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    auto integer = image;
+    integer.num_format = static_cast<u64>(AmdGpu::NumberFormat::Uint);
+    Bind(info.images[0], integer);
+    EXPECT_FALSE(compiled == KeyFor(info));
+    EXPECT_NE(packed, PackFor(info));
+
+    auto unbound = image;
+    unbound.base_address = 0;
+    Bind(info.images[0], unbound);
+    EXPECT_NE(packed, PackFor(info));
+}
+
+// FIX-GT7-082: a vertex stage reads its attributes' V#s from guest memory each time, not from the
+// flattened buffer: a pack recorded after a full match could hold a V# that changed in between
+// (float to integer), and later draws would take the float module with no full comparison. Such
+// stages always get a full comparison.
+TEST(ShaderSpecialization, PackedInputsNeverStandForVertexAttributesReadFromMemory) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Vertex;
+    info.sw_stage = Shader::SwStage::Vertex;
+    info.has_fetch_shader = true;
+    EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
+    info.has_fetch_shader = false;
+    EXPECT_TRUE(Shader::StageSpecialization::Packable(info));
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    EXPECT_TRUE(Shader::StageSpecialization::Packable(info));
+    info.sw_stage = Shader::SwStage::TessellationControl;
+    EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
+}
