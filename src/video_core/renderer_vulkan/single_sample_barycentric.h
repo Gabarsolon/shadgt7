@@ -5,11 +5,10 @@
 namespace Vulkan {
 // FIX-220: KHR barycentrics on AMD GPUs for the fragment shaders that read a vertex's own values
 // (FIX-217). FIX-GT7-061: with AMD's explicit-vertex path GT7's Trial Mountain rock walls came out
-// flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC), so the default follows the
-// GPU: on for RX 7000 (RDNA3) and newer, off for RX 6000 and older (set by the Vulkan instance
-// from the device name). RYGT_AMD_EXPLICIT_VERTEX=1 turns it off on any card; the launcher's
-// "AMD graphics fix" box (RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC=1, true, on or yes) turns it on on
-// any card. Unticked, the box leaves the GPU's default.
+// flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC). The launcher's "AMD Graphics
+// Fix" option (on by default when it finds an AMD GPU) passes RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC:
+// 1, true, on or yes turns it on, any other value off. Unset, it is on for AMD GPUs (the Vulkan
+// instance sets the default). RYGT_AMD_EXPLICIT_VERTEX=1 turns it off whatever else is set.
 inline bool& AmdBarycentricDefault() {
     static bool on = false;
     return on;
@@ -18,16 +17,15 @@ inline bool SingleSampleBarycentricRequested() {
     if (const char* off = std::getenv("RYGT_AMD_EXPLICIT_VERTEX"); off && off[0] == '1') {
         return false;
     }
-    if (const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC")) {
-        while (*value == ' ' || *value == '"') {
-            ++value;
-        }
-        const char c = static_cast<char>(*value | 0x20);
-        if (*value == '1' || c == 't' || c == 'y' || (c == 'o' && (value[1] | 0x20) == 'n')) {
-            return true;
-        }
+    const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+    if (!value || !*value) {
+        return AmdBarycentricDefault();
     }
-    return AmdBarycentricDefault();
+    while (*value == ' ' || *value == '"') {
+        ++value;
+    }
+    const char c = static_cast<char>(*value | 0x20);
+    return *value == '1' || c == 't' || c == 'y' || (c == 'o' && (value[1] | 0x20) == 'n');
 }
 constexpr bool UseSingleSampleBarycentric(std::uint32_t vendor, bool supports_khr,
                                          unsigned raster_samples, bool requested) {

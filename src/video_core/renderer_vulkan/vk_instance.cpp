@@ -452,11 +452,10 @@ bool Instance::CreateDevice() {
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     {
-        // FIX-GT7-061: KHR barycentrics by default on RX 7000 (RDNA3) and newer only.
+        // FIX-GT7-061: KHR barycentrics by default on AMD GPUs (the launcher's option decides
+        // when it passes a value).
         const std::string model{GetModelName()};
-        const bool rdna3_or_newer = model.find("Radeon RX 7") != std::string::npos ||
-                                    model.find("Radeon RX 9") != std::string::npos;
-        AmdBarycentricDefault() = properties.vendorID == 0x1002 && rdna3_or_newer;
+        AmdBarycentricDefault() = properties.vendorID == 0x1002;
         LOG_INFO(Render_Vulkan, "FIX-GT7-061: AMD barycentric fix default {} ({}), in use {}",
                  AmdBarycentricDefault() ? "on" : "off", model,
                  properties.vendorID == 0x1002 && SingleSampleBarycentricRequested());
