@@ -381,6 +381,10 @@ private:
     std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
     std::atomic<u32> logged_partial{};
     void SortRegionWrites();
+    /// PERF-GT7-052: small textures in per-frame memory, checked each frame (not watched).
+    bool PolledFrameTexture(VAddr address, u64 size);
+    std::mutex polled_mutex;
+    std::vector<std::pair<VAddr, u64>> polled_textures;
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size, bool write);
     void RefreshRegion(Region& region);
