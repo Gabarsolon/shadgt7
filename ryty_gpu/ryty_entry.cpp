@@ -593,6 +593,7 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
     }
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+        rasterizer->OnNewMapping(address, size); // FIX-GT7-077
         rasterizer->MapMemory(address, size);
         rasterizer->RegisterMemory(address, size);
         // FIX-153: new memory comes writable. Pages the renderer still tracks there (tracked

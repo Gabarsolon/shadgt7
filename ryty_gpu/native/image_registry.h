@@ -266,6 +266,11 @@ public:
     /// CPU writes to guest memory (file loads, the game writing texture data): textures over the
     /// range are uploaded again before their next use.
     void Invalidate(VAddr address, u64 size, Stale why = Stale::CpuWrite);
+    /// FIX-GT7-077: memory was mapped at [address, address + size): its textures are uploaded
+    /// again at their next use, even when the CPU's bytes hash as before (the picture may hold
+    /// what was mapped there earlier, or zeros from while nothing was). Render targets are left
+    /// alone. Returns how many textures.
+    u32 InvalidateNewMapping(VAddr address, u64 size);
 
     /// NAT-119/120: GPU work (a shader's storage buffer, a CP fill or copy) wrote [address,
     /// address + size), with `pattern` (two dwords, repeated) when it is a fill. As the old

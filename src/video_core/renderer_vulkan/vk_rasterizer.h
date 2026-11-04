@@ -263,6 +263,9 @@ public:
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
+    /// FIX-GT7-077: Ryty mapped guest memory (call before MapMemory): GPU copies of what was mapped
+    /// there before go.
+    void OnNewMapping(VAddr addr, u64 size);
 
     u64 Flush();
     void Finish();

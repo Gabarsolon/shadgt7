@@ -464,6 +464,17 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
     std::erase_if(failed, [&](VAddr base) { return base >= address && base < end; });
 }
 
+bool DirectMemory::ViewsOver(VAddr address, u64 size) {
+    std::scoped_lock lk{mutex};
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::erase_if(failed, [&](VAddr base) { return base >= address && base < end; });
+    auto it = views.upper_bound(address);
+    if (it != views.begin() && std::prev(it)->second.end > address) {
+        return true;
+    }
+    return it != views.end() && it->first < end;
+}
+
 void DirectMemory::HoldReleasesForSplice() {
     g_hold_for_splice.store(true, std::memory_order_relaxed);
 }

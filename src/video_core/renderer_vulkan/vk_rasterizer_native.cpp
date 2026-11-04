@@ -10398,6 +10398,20 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     ++unmap_generation;         // OPT-002
 }
 
+void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
+    // FIX-GT7-077 (see Rasterizer::OnNewMapping).
+    const u32 textures = registry->InvalidateNewMapping(address, size);
+    if (textures != 0) {
+        static std::atomic<u32> mappings{};
+        if (const u32 n = ++mappings; n <= 40 || n % 100 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-GT7-077: {} textures over the new mapping {:#x}+{:#x} uploaded again ({} "
+                     "mappings so far)",
+                     textures, address, size, n);
+        }
+    }
+}
+
 void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
                                bool storage, bool memo, u64 program) {
     if (!Native::WatchSample()) {
