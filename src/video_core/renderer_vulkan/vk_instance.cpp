@@ -464,6 +464,14 @@ bool Instance::CreateDevice() {
         } else {
             shader_object_tessellation = shader_object && properties.vendorID != 0x1002;
         }
+        // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
+        // objects use the independent-sets layouts the pipelines bind their sets with (newer
+        // than these headers: enabled by its name, feature structure type and flag value).
+        if (shader_object) {
+            shader_independent_sets = add_extension("VK_KHR_maintenance11");
+        }
+        LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
+                    shader_independent_sets ? "yes" : "no (VK_KHR_maintenance11 missing)");
         LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
                     shader_object_tessellation ? "too (SO-003)" : "as pipelines");
@@ -925,6 +933,17 @@ bool Instance::CreateDevice() {
         auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
         fault_features.pNext = const_cast<void*>(create_info.pNext);
         create_info.pNext = &fault_features;
+    }
+    // SO-006: VkPhysicalDeviceMaintenance11FeaturesKHR, by hand (not in these headers).
+    struct Maintenance11Features {
+        VkStructureType sType;
+        void* pNext;
+        VkBool32 maintenance11;
+    } maintenance11_features{static_cast<VkStructureType>(1000657000), nullptr, VK_TRUE};
+    if (shader_independent_sets) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        maintenance11_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &maintenance11_features;
     }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {

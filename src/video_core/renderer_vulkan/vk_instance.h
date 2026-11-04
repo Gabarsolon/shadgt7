@@ -177,6 +177,10 @@ public:
     bool IsShaderObjectEnabled() const {
         return shader_object;
     }
+    /// SO-006: shader objects can be made for independent-sets layouts (VK_KHR_maintenance11).
+    bool IsShaderIndependentSetsSupported() const {
+        return shader_independent_sets;
+    }
     /// SO-003: tessellated pipelines are drawn with shader objects too.
     bool IsShaderObjectTessellationEnabled() const {
         return shader_object_tessellation;
@@ -646,6 +650,7 @@ private:
     bool dynamic_state_3{};
     bool shader_object{}; ///< SO-001
     bool shader_object_tessellation{}; ///< SO-003
+    bool shader_independent_sets{};     ///< SO-006
     bool graphics_pipeline_library{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};

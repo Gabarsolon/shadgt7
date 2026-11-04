@@ -1275,6 +1275,59 @@ bool GraphicsPipeline::CreateShaderObjects(
     constexpr std::array<vk::ShaderStageFlagBits, 4> stage_bits{
         vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eTessellationControl,
         vk::ShaderStageFlagBits::eTessellationEvaluation, vk::ShaderStageFlagBits::eFragment};
+    // SO-007: the stages are made together, linked (RYGT_SO_LINK=0: each on its own), so the
+    // driver sees the whole set as it does a pipeline's: it can merge the stages the GPU runs as
+    // one program and drop what the next stage never reads. SO-006: for independent-sets layouts.
+    static const bool link = [] {
+        const char* env = std::getenv("RYGT_SO_LINK");
+        return !(env && env[0] == '0');
+    }();
+    vk::ShaderCreateFlagsEXT flags{};
+    if (link) {
+        flags |= vk::ShaderCreateFlagBitsEXT::eLinkStage;
+    }
+    if (instance.IsShaderIndependentSetsSupported()) {
+        flags |= vk::ShaderCreateFlagsEXT{static_cast<VkShaderCreateFlagsEXT>(0x00040000)};
+    }
+    // SO-008: shader objects are shared by every pipeline with the same stage code and set
+    // layouts (pipelines that differ only in blending, formats or other drawing state).
+    u64 share_key = XXH3_64bits(&flags, sizeof(flags)) ^ num_sets;
+    for (u32 i = 0; i < 4; ++i) {
+        share_key = XXH3_64bits_withSeed(code[i].data(), code[i].size() * sizeof(u32),
+                                         share_key + i);
+    }
+    share_key = XXH3_64bits_withSeed(set_layout_hashes.data(),
+                                     set_layout_hashes.size() * sizeof(set_layout_hashes[0]),
+                                     share_key);
+    static std::mutex shared_mutex;
+    static std::unordered_map<u64, std::array<vk::ShaderEXT, 4>> shared_sets;
+    static std::atomic<u64> shared_hits{};
+    {
+        std::scoped_lock lock{shared_mutex};
+        if (const auto it = shared_sets.find(share_key); it != shared_sets.end()) {
+            shader_objects = it->second;
+            const u64 hits = ++shared_hits;
+            if (hits <= 3 || hits % 200 == 0) {
+                LOG_WARNING(Render_Vulkan, "SO-008: {} reuses shared shader objects ({} reuses)",
+                            GetDebugString(), hits);
+            }
+        }
+    }
+    if (shader_objects[0]) {
+        for (u32 i = 0; i < so_state.attachments; ++i) {
+            const auto& attachment = attachments[i];
+            so_state.blend_enable[i] = attachment.blendEnable;
+            so_state.equations[i] = vk::ColorBlendEquationEXT{
+                .srcColorBlendFactor = attachment.srcColorBlendFactor,
+                .dstColorBlendFactor = attachment.dstColorBlendFactor,
+                .colorBlendOp = attachment.colorBlendOp,
+                .srcAlphaBlendFactor = attachment.srcAlphaBlendFactor,
+                .dstAlphaBlendFactor = attachment.dstAlphaBlendFactor,
+                .alphaBlendOp = attachment.alphaBlendOp,
+            };
+        }
+        return true;
+    }
     boost::container::static_vector<vk::ShaderCreateInfoEXT, 4> create_infos;
     std::array<u32, 4> slot{};
     for (u32 i = 0; i < 4; ++i) {
@@ -1296,6 +1349,7 @@ bool GraphicsPipeline::CreateShaderObjects(
             .pNext = instance.IsSubgroupSize64Supported() && (sized_stages & stage_bits[i])
                          ? &subgroup_size
                          : nullptr,
+            .flags = flags,
             .stage = stage_bits[i],
             .nextStage = next,
             .codeType = vk::ShaderCodeTypeEXT::eSpirv,
@@ -1309,10 +1363,30 @@ bool GraphicsPipeline::CreateShaderObjects(
         });
     }
     std::array<VkShaderEXT, 4> created{};
+    const auto create_start = std::chrono::steady_clock::now();
     const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
         instance.GetDevice(), static_cast<u32>(create_infos.size()),
         reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
         created.data());
+    // SO-005 (diagnosis): how long the driver takes to make shader objects, per pipeline.
+    {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - create_start)
+                              .count();
+        static std::mutex timing_mutex;
+        static u32 timed = 0;
+        static double total_ms = 0, max_ms = 0;
+        std::scoped_lock lock{timing_mutex};
+        ++timed;
+        total_ms += ms;
+        max_ms = std::max(max_ms, ms);
+        if (timed <= 5 || timed % 50 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "SO-005: shader objects of {} stages made in {:.1f} ms; {} pipelines so far, "
+                        "{:.1f} ms average, {:.1f} ms longest",
+                        create_infos.size(), ms, timed, total_ms / timed, max_ms);
+        }
+    }
     if (result != VK_SUCCESS) {
         static std::atomic<u32> logged{};
         if (++logged <= 8) {
@@ -1330,6 +1404,20 @@ bool GraphicsPipeline::CreateShaderObjects(
     for (u32 i = 0; i < 4; ++i) {
         if (!code[i].empty()) {
             shader_objects[i] = vk::ShaderEXT{created[slot[i]]};
+        }
+    }
+    {
+        // SO-008: kept for the renderer's lifetime and shared; a set another build made first
+        // for the same key is used instead of this one.
+        std::scoped_lock lock{shared_mutex};
+        const auto [it, inserted] = shared_sets.try_emplace(share_key, shader_objects);
+        if (!inserted) {
+            for (const vk::ShaderEXT shader : shader_objects) {
+                if (shader) {
+                    instance.GetDevice().destroyShaderEXT(shader);
+                }
+            }
+            shader_objects = it->second;
         }
     }
     for (u32 i = 0; i < so_state.attachments; ++i) {
@@ -1398,11 +1486,7 @@ void GraphicsPipeline::BindShaderObjects(vk::CommandBuffer cmd) const {
 }
 
 GraphicsPipeline::~GraphicsPipeline() {
-    for (const vk::ShaderEXT shader : shader_objects) {
-        if (shader) {
-            instance.GetDevice().destroyShaderEXT(shader);
-        }
-    }
+    // SO-008: shader objects are shared and live as long as the renderer.
     if (library_link && library_link->optimized.valid()) {
         library_link->optimized.wait();
     }
