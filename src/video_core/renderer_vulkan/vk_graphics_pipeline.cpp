@@ -849,7 +849,56 @@ GraphicsPipeline::GraphicsPipeline(
     // SO-001: a plain pipeline is drawn with shader objects: no pipeline is compiled. Not with
     // tessellation (also the rect/quad list emulation), a geometry shader, sample shading or
     // AMD's mixed sample counts, which shader objects can't express.
-    if (so_candidate && (key.num_samples <= 1 || !sdata.multisampling.sampleShadingEnable)) {
+    // SO-016 (diagnosis): kinds of pipelines kept as pipelines, a bit mask from RYGT_SO_SKIP or
+    // so_skip.txt in the game folder: 1 blending, 2 alpha to coverage, 4 logic op, 8 dual-source
+    // factors, 16 no pixel shader, 32 a partial colour write mask.
+    // SO-017: blended pipelines stay pipelines by default (with shader objects GT7's HUD lost
+    // its rev counter ticks and mirror frame and the menu cursor vanished). "0" in so_skip.txt or
+    // RYGT_SO_SKIP=0 draws them with shader objects again.
+    static const u32 so_skip = [] {
+        const char* env = std::getenv("RYGT_SO_SKIP");
+        u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : 1u;
+        if (std::FILE* file = std::fopen("so_skip.txt", "r")) {
+            char text[32]{};
+            if (std::fgets(text, sizeof(text), file)) {
+                bits = u32(std::strtoul(text, nullptr, 0));
+            }
+            std::fclose(file);
+        }
+        if (bits) {
+            LOG_WARNING(Render_Vulkan, "SO-016: pipelines kept for kinds {:#x}", bits);
+        }
+        return bits;
+    }();
+    bool skip_kind = false;
+    if (so_skip) {
+        u32 kinds = 0;
+        for (u32 i = 0; i < key.num_color_attachments; ++i) {
+            const auto& a = attachments[i];
+            kinds |= a.blendEnable ? 1u : 0u;
+            const auto src1 = [](vk::BlendFactor f) {
+                return f == vk::BlendFactor::eSrc1Color || f == vk::BlendFactor::eSrc1Alpha ||
+                       f == vk::BlendFactor::eOneMinusSrc1Color ||
+                       f == vk::BlendFactor::eOneMinusSrc1Alpha;
+            };
+            if (src1(a.srcColorBlendFactor) || src1(a.dstColorBlendFactor) ||
+                src1(a.srcAlphaBlendFactor) || src1(a.dstAlphaBlendFactor)) {
+                kinds |= 8;
+            }
+            if (key.write_masks[i] != (vk::ColorComponentFlagBits::eR |
+                                       vk::ColorComponentFlagBits::eG |
+                                       vk::ColorComponentFlagBits::eB |
+                                       vk::ColorComponentFlagBits::eA)) {
+                kinds |= 32;
+            }
+        }
+        kinds |= sdata.multisampling.alphaToCoverageEnable ? 2u : 0u;
+        kinds |= color_blending.logicOpEnable ? 4u : 0u;
+        kinds |= infos[u32(Shader::SwStage::Fragment)] ? 0u : 16u;
+        skip_kind = (kinds & so_skip) != 0;
+    }
+    if (so_candidate && !skip_kind &&
+        (key.num_samples <= 1 || !sdata.multisampling.sampleShadingEnable)) {
         const auto& raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
         so_state.topology = topology;
         so_state.polygon_mode = raster.polygonMode;
@@ -860,7 +909,9 @@ GraphicsPipeline::GraphicsPipeline(
         so_state.depth_clamp = raster.depthClampEnable != VK_FALSE;
         so_state.depth_clip = key.depth_clip_enable != 0;
         so_state.negative_one_to_one = key.clip_space == AmdGpu::ClipSpace::MinusWToW;
-        so_state.alpha_to_coverage = key.alpha_to_coverage != 0;
+        // SO-015: as the pipeline's: only when the pixel shader writes alpha to target 0 (else
+        // the coverage came from an undefined alpha: HUD sprites and the menu cursor vanished).
+        so_state.alpha_to_coverage = sdata.multisampling.alphaToCoverageEnable != VK_FALSE;
         so_state.logic_op_enable = color_blending.logicOpEnable != VK_FALSE;
         so_state.logic_op = color_blending.logicOp;
         so_state.attachments = key.num_color_attachments;

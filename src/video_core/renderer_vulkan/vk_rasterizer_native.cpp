@@ -8466,7 +8466,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         if (pipeline->UsesShaderObjects()) {
             // SO-001: no pipeline; the shader objects and the state a pipeline fixes.
             // SO-010: only what changed since the stream's last shader object draw.
-            const bool known = s.so_known;
+            // RYGT_SO_DELTA=0 or so_delta.off in the game folder: every state each draw.
+            static const bool delta = [] {
+                const char* env = std::getenv("RYGT_SO_DELTA");
+                return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off");
+            }();
+            const bool known = s.so_known && delta;
             const auto previous = s.so_state;
             const auto previous_shaders = s.so_shaders;
             s.cmd.Run([pipeline, known, previous, previous_shaders](vk::CommandBuffer cmd) {
