@@ -17,7 +17,7 @@ namespace {
 bool KeepCode() {
     static const bool keep = [] {
         const char* env = std::getenv("RYGT_SHADER_OBJECT");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0'); // SO-011: on by default
     }();
     return keep;
 }

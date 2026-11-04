@@ -435,7 +435,8 @@ bool Instance::CreateDevice() {
     // geometry shader) are drawn with vertex and fragment shader objects and dynamic state
     // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
     // states of extended_dynamic_state3 that those pipelines otherwise fix.
-    if (const char* env = std::getenv("RYGT_SHADER_OBJECT"); env && env[0] == '1') {
+    // SO-011: on by default; RYGT_SHADER_OBJECT=0 builds pipelines as before.
+    if (const char* env = std::getenv("RYGT_SHADER_OBJECT"); !(env && env[0] == '0')) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
                             d3.extendedDynamicState3PolygonMode &&
@@ -456,14 +457,10 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // Not on AMD by default: there tessellated shader objects took 3-5 s each to create and
-        // drew far slower than the fast-linked pipelines (RX 7600); those keep the existing path.
-        // RYGT_SHADER_OBJECT_TESS=1 turns it on, =0 off, on any GPU.
-        if (const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS")) {
-            shader_object_tessellation = shader_object && tess[0] != '0';
-        } else {
-            shader_object_tessellation = shader_object && properties.vendorID != 0x1002;
-        }
+        // SO-011: on every GPU again, AMD included, now that shader objects are linked, cached on
+        // disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them pipelines.
+        const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
+        shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
         // than these headers: enabled by its name, feature structure type and flag value).
