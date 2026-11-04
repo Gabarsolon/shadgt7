@@ -1120,6 +1120,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     // Port of xacidr4inx's reflection fix (RyGT 0066): fragment cube samples filter across faces.
     profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
+    SetNativeCubeCacheEnabled(profile.native_cube_sampling); // FIX-GT7-083
     if (SingleSampleBarycentricRequested() && instance.GetVendorID() == 0x1002) {
         LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample interpolation on; KHR {}",
                     profile.supports_fragment_shader_barycentric);

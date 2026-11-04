@@ -378,3 +378,41 @@ bool Shader::Gcn::ParseFetchShader(const Shader::Info&, Shader::Gcn::FetchShader
     ADD_FAILURE() << "Unexpected fetch shader parse";
     return false;
 }
+// FIX-GT7-083: both engines share the store; an ordinary pixel-shader cube sample is a cube-array
+// sample with native cube sampling (the native engine) and samples six faces of a 2D array without
+// it (the classic engine's views). A translation is read only by the side it fits.
+TEST(ShaderStore, StoredCubeSamplesAreReadOnlyByTheCubeSamplingTheyWereMadeWith) {
+    auto info = MakeFragmentInfo(false);
+    auto spec = MakeSpec(*info);
+    spec.images[0].type = AmdGpu::ImageType::Cube;
+    // Made without it: tagged; the classic engine reads it, the native one translates again.
+    const bool faces = Vulkan::TranslatedWithFaceCubes(spec, false);
+    EXPECT_TRUE(faces);
+    EXPECT_TRUE(Vulkan::StoredCubesFit(spec, *info, faces, false));
+    EXPECT_FALSE(Vulkan::StoredCubesFit(spec, *info, faces, true));
+    // Made with it, the cube a native cube sample: not tagged; the classic engine translates again.
+    info->images[0].post_op = Shader::SharpFetchPostOp::NativeCubeSampling;
+    const bool native = Vulkan::TranslatedWithFaceCubes(spec, true);
+    EXPECT_FALSE(native);
+    EXPECT_TRUE(Vulkan::StoredCubesFit(spec, *info, native, true));
+    EXPECT_FALSE(Vulkan::StoredCubesFit(spec, *info, native, false));
+    // A stored cube image, or no cube: both read it.
+    auto other_info = MakeFragmentInfo(false);
+    auto other = MakeSpec(*other_info);
+    other.images[0].type = AmdGpu::ImageType::Cube;
+    other.images[0].is_storage = true;
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(other, false));
+    other.images[0] = {};
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(other, false));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(other, *other_info, false, true));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(other, *other_info, false, false));
+    // Other stages have no native cube samples.
+    Shader::Info compute;
+    compute.hw_stage = Shader::HwStage::Compute;
+    compute.sw_stage = Shader::SwStage::Compute;
+    compute.images.emplace_back();
+    auto compute_spec = MakeSpec(compute);
+    compute_spec.images[0].type = AmdGpu::ImageType::Cube;
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(compute_spec, false));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(compute_spec, compute, false, true));
+}

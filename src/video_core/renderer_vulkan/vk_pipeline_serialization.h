@@ -13,6 +13,7 @@ namespace Vulkan {
 // Set before cache readers/workers start; candidate blobs are ignored on other profiles.
 void SetSingleSampleBarycentricCacheEnabled(bool enabled);
 void SetVertexOrderCheckCacheEnabled(bool enabled); // AMD-307
+void SetNativeCubeCacheEnabled(bool enabled);       // FIX-GT7-083
 
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
