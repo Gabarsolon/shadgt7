@@ -552,6 +552,7 @@ void NativeRenderer::DrawBindings::Clear() {
     push = {};
     sampled.clear();
     stored.clear();
+    image_entries.clear(); // FIX-GT7-080
     gpu_writes.clear();
     fill_pattern.reset();
     fill_address = 0;
@@ -799,6 +800,7 @@ void NativeRenderer::BeginHudStream() {
     s.vertex_state_known = false;
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
+    s.run_texels.Clear(); // PERF-GT7-057
     ++s.serial;        // OPT-015
     ForgetBindings(s); // OPT-014
     // It runs after the main list: what that list wrote is finished first.
@@ -1277,6 +1279,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
+    s.run_texels.Clear(); // PERF-GT7-057
     GpuTimeBegin(s); // DIAG-GT7-001: the first segment is the wait for earlier GPU work
     ++s.serial;        // OPT-015
     ForgetBindings(s); // OPT-014
@@ -1541,6 +1544,7 @@ void NativeRenderer::GlobalBarrier() {
     s.buffers_written = false;
     s.attach_dirty.clear();
     s.read.clear();
+    s.run_texels.Clear(); // PERF-GT7-057
     ++stats.barriers;
     FlushWritebacks();
 }
@@ -6072,6 +6076,17 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             ++stats.compute_texture_lookups;
             stats.compute_texture_bindings += num_bindings;
         }
+        // FIX-GT7-080: which descriptor of a compute stage each picture is bound to (SameTexelKey).
+        const auto note_entry = [&](const Native::ImageEntry* entry) {
+            if (!compute_stage) {
+                return;
+            }
+            const size_t index = size_t(&image_desc - stage.images.data());
+            if (b.image_entries.size() <= index) {
+                b.image_entries.resize(index + 1, nullptr);
+            }
+            b.image_entries[index] = entry;
+        };
         const auto add_write = [&] {
             b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
             b.writes.push_back(vk::WriteDescriptorSet{
@@ -6186,6 +6201,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     b.images.push_back({VK_NULL_HANDLE, memo->views[i], vk::ImageLayout::eGeneral});
                 }
                 (storage ? b.stored : b.sampled).push_back(entry);
+                note_entry(entry); // FIX-GT7-080
                 slot_text([&] {
                     return fmt::format("{} {:#x} {}x{} v{} (memo)",
                                        entry->from_cpu ? "texture" : "target",
@@ -6308,6 +6324,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                          entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
         (storage ? b.stored : b.sampled).push_back(entry);
+        note_entry(entry); // FIX-GT7-080
         slot_text([&] {
             return fmt::format("{} {:#x} {}x{} v{}", entry->from_cpu ? "texture" : "target",
                                entry->info.guest_address, entry->info.size.width,
@@ -6882,7 +6899,7 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 // without loading from them, and must not store the same texels twice in a run: their order is no
 // longer defined. RYGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
 bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program,
-                                     bool recorded) const {
+                                     bool recorded, std::optional<u64> texel) const {
     static const std::vector<u64> listed = [] {
         std::vector<u64> list;
         const char* env = std::getenv("RYGT_NATIVE_OVERLAP_PROGRAMS");
@@ -6897,9 +6914,9 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
         }
         return list;
     }();
-    if (std::ranges::find(listed, program) == listed.end() || s.run_program != program ||
-        s.run_commands != s.commands || s.buffers_written.foreign || recorded ||
-        !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
+    if ((std::ranges::find(listed, program) == listed.end() && !texel) ||
+        s.run_program != program || s.run_commands != s.commands || s.buffers_written.foreign ||
+        recorded || !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
         return true;
     }
     const auto meets = [](const std::vector<const Native::ImageEntry*>& pictures,
@@ -6910,12 +6927,126 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
                    picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
         });
     };
-    return std::ranges::any_of(b.sampled, [&](const auto* entry) {
-               return entry && meets(s.written, entry);
-           }) ||
-           std::ranges::any_of(b.stored, [&](const auto* entry) {
-               return entry && meets(s.read, entry);
-           });
+    // PERF-GT7-057: a same-texel program (SameTexelKey) may read the picture it stores where the
+    // run wrote it, if the run hasn't stored that mip and layer since its last barrier: each of
+    // its dispatches reads only the texels it then stores. FIX-GT7-080: the key says no other of
+    // its pictures meets the stored one, so the sampled picture let through below is the one the
+    // code reads at the texel it stores. FIX-GT7-081: not after a dispatch of the run stored
+    // without a key. FIX-GT7-087: nor onto a picture the run sampled elsewhere.
+    const Native::ImageEntry* self = texel && b.stored.size() == 1 ? b.stored[0] : nullptr;
+    const auto same_picture = [&](const Native::ImageEntry* entry) {
+        return self && entry && entry->info.guest_address == self->info.guest_address &&
+               entry->info.guest_size == self->info.guest_size;
+    };
+    const bool texel_new =
+        self && s.run_texels.IsNew(self->info.guest_address, self->info.guest_size, *texel);
+    // The pictures of a list that meet an entry, but for the picture this dispatch stores.
+    const auto meets_other = [&](const std::vector<const Native::ImageEntry*>& pictures,
+                                 const Native::ImageEntry* entry) {
+        return std::ranges::any_of(pictures, [&](const Native::ImageEntry* picture) {
+            return picture && !same_picture(picture) &&
+                   entry->info.guest_address <
+                       picture->info.guest_address + picture->info.guest_size &&
+                   picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
+        });
+    };
+    for (const auto* entry : b.sampled) {
+        if (entry && meets(s.written, entry) &&
+            !(texel_new && same_picture(entry) && !meets_other(s.written, entry))) {
+            return true; // reads what the run wrote
+        }
+    }
+    for (const auto* entry : b.stored) {
+        if (entry && meets(s.read, entry) &&
+            !(texel_new && same_picture(entry) && !meets_other(s.read, entry))) {
+            return true; // writes what the run read
+        }
+    }
+    return false;
+}
+
+// PERF-GT7-057 (RYGT_NATIVE_SAME_TEXEL=0 turns it off): programs that read a picture they store
+// only at the texel they store, at the mip and layer words of their user data name. GT7's probe
+// filter 0xa8d4b6cd took 30-40% of the GPU's time in races: one run per probe cube, a dispatch per
+// mip [65] and face [66] (layer face + 6 * probe [67]), 42 or 48 of them, each reading cs_img3
+// with texelFetch at the texel it then stores into cs_img4[mip] (its decompiled code, all four
+// variants), and sampling cs_img0 to 2 with textureLod at other coordinates, pictures the run
+// doesn't write. Each waited for the one before at a global barrier, with 1 to 256 groups of 8x8
+// threads on the whole GPU.
+// FIX-GT7-080: the key is the level and layer the two views reach in the picture (Native::
+// SameTexelKey), from the pictures and views bound to the fetched and stored descriptors, which the
+// list names; any other descriptor that meets the stored picture keeps the barrier.
+namespace {
+struct SameTexelProgram {
+    u64 program;
+    u32 mip_word;
+    u32 face_word;
+    u32 probe_word;
+    u32 faces;
+    u32 fetch_image; ///< the descriptor read with texelFetch at the texel stored
+    u32 store_image;
+};
+constexpr SameTexelProgram SameTexelPrograms[] = {{0xa8d4b6cd, 65, 66, 67, 6, 3, 4}};
+
+bool IsSameTexelProgram(u64 program) {
+    return std::ranges::find(SameTexelPrograms, program, &SameTexelProgram::program) !=
+           std::end(SameTexelPrograms);
+}
+} // namespace
+
+static std::optional<u64> SameTexelKey(const Shader::Info& cs,
+                                       std::span<const Native::ImageEntry* const> entries) {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_SAME_TEXEL");
+        return !(env && env[0] == '0');
+    }();
+    if (!on) {
+        return std::nullopt;
+    }
+    const auto it = std::ranges::find(SameTexelPrograms, cs.pgm_hash, &SameTexelProgram::program);
+    if (it == std::end(SameTexelPrograms)) {
+        return std::nullopt;
+    }
+    const auto& words = cs.flattened_ud_buf;
+    if (std::max({it->mip_word, it->face_word, it->probe_word}) >= words.size() ||
+        std::max(it->fetch_image, it->store_image) >= cs.images.size() ||
+        cs.images[it->store_image].mip_fallback_mode ==
+            Shader::MipStorageFallbackMode::ConstantIndex) {
+        return std::nullopt;
+    }
+    boost::container::small_vector<Native::SameTexelImage, 8> images;
+    for (size_t i = 0; i < cs.images.size(); ++i) {
+        const auto& desc = cs.images[i];
+        const Native::ImageEntry* entry = i < entries.size() ? entries[i] : nullptr;
+        Native::SameTexelImage& image = images.emplace_back();
+        image.written = desc.is_written;
+        if (!entry) {
+            continue;
+        }
+        image.address = entry->info.guest_address;
+        image.size = std::max<u64>(entry->info.guest_size, 1);
+        if (i != it->fetch_image && i != it->store_image) {
+            continue;
+        }
+        // The view as BindTextures asks for it, and the picture View keeps it in.
+        const VideoCore::ImageViewInfo view{desc.GetSharp(cs), desc};
+        const auto& picture = entry->image->Desc();
+        image.base_level = view.range.base.level;
+        image.base_layer = view.range.base.layer;
+        image.layers = view.range.extent.layers;
+        image.image_mips = std::max<u32>(picture.mips, 1);
+        image.image_layers =
+            picture.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max<u32>(picture.layers, 1);
+        image.level_per_binding =
+            desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+        image.levels = image.level_per_binding ? desc.NumBindings(cs) : view.range.extent.levels;
+    }
+    const u64 layer = u64(words[it->face_word]) + u64(it->faces) * words[it->probe_word];
+    if (layer > ~u32{0}) {
+        return std::nullopt;
+    }
+    return Native::SameTexelKey(images, it->fetch_image, it->store_image, words[it->mip_word],
+                                u32(layer));
 }
 
 bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
@@ -9953,10 +10084,27 @@ void NativeRenderer::DispatchDirect() {
                           stats.region_refresh_ns != refresh_before ||
                           registry->GetStats().uploads.load(std::memory_order_relaxed) !=
                               uploads_before;
-    if (RunNeedsBarrier(s, b, program, recorded)) { // PERF-GT7-043
+    // PERF-GT7-057, FIX-GT7-080
+    const std::optional<u64> texel =
+        b.stored.size() == 1
+            ? SameTexelKey(pipeline->GetStage(Shader::SwStage::Compute), b.image_entries)
+            : std::nullopt;
+    if (RunNeedsBarrier(s, b, program, recorded, texel)) { // PERF-GT7-043, 057
         GlobalBarrier();
     } else {
         EndRendering();
+    }
+    // PERF-GT7-057; FIX-GT7-081: a dispatch that stores without a key ends the run's exemptions.
+    s.run_texels.Note(texel ? b.stored[0]->info.guest_address : 0, texel, !b.stored.empty());
+    // FIX-GT7-087: what a same-texel program's dispatch sampled, but for its destination read at
+    // the texel it stores (with a key, no other input meets the destination).
+    if (IsSameTexelProgram(program)) {
+        for (const auto* entry : b.sampled) {
+            if (entry && !(texel && entry->info.guest_address == b.stored[0]->info.guest_address &&
+                           entry->info.guest_size == b.stored[0]->info.guest_size)) {
+                s.run_texels.NoteRead(entry->info.guest_address, entry->info.guest_size);
+            }
+        }
     }
     split(3);
     const CmdBuf cmdbuf{s.cmd};

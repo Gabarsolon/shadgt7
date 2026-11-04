@@ -114,6 +114,14 @@ target_compile_features(shadps4_uploaded_pages_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_uploaded_pages_test PRIVATE GTest::gtest_main tsl::robin_map)
 gtest_discover_tests(shadps4_uploaded_pages_test)
 
+# PERF-GT7-057, FIX-GT7-080/081/087: the probe filter's same-texel key and run.
+add_executable(shadps4_same_texel_test test_same_texel.cpp)
+target_include_directories(shadps4_same_texel_test PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                           ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_same_texel_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_same_texel_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_same_texel_test)
+
 add_executable(shadps4_read_ahead_states_test test_read_ahead_states.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/read_ahead_states.cpp)
 target_include_directories(shadps4_read_ahead_states_test PRIVATE ${CMAKE_SOURCE_DIR}/src)

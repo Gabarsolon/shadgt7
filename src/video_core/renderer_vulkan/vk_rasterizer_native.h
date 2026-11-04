@@ -24,6 +24,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/types.h"
+#include "ryty_gpu/native/same_texel.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -183,6 +184,9 @@ private:
         Shader::PushData push{};
         std::vector<const Native::ImageEntry*> sampled;
         std::vector<const Native::ImageEntry*> stored;
+        /// FIX-GT7-080: a compute stage's picture for each image descriptor, in the stage's order
+        /// (null, or past the end, when bound empty).
+        std::vector<const Native::ImageEntry*> image_entries;
         /// NAT-119: guest memory the draw or dispatch writes through storage buffers.
         boost::container::small_vector<std::pair<VAddr, u64>, 8> gpu_writes;
         /// NAT-120: the dispatch is GT Sport's fill shader: what it fills, with what.
@@ -272,6 +276,10 @@ private:
         /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
         u64 run_program = 0;
         u32 run_commands = 0;
+        /// PERF-GT7-057: what the run's same-texel dispatches stored since the last barrier:
+        /// (picture, mip << 32 | layer), what they sampled elsewhere (FIX-GT7-087), or that one
+        /// stored without a key (FIX-GT7-081).
+        Native::SameTexelRun run_texels;
         /// NAT-140: attachments drawn since the last pass or global barrier, and pictures
         /// sampled since the last global barrier: what a new pass has to wait for.
         std::vector<const Native::ImageEntry*> attach_dirty;
@@ -766,7 +774,8 @@ private:
                         bool is_indexed);
     bool NeedsBarrierFor(const DrawBindings& b) const;
     // PERF-GT7-043
-    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded) const;
+    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded,
+                         std::optional<u64> texel = std::nullopt) const; // PERF-GT7-057: texel
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
     void WatchPages(VAddr address, u64 size);
