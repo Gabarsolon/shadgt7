@@ -9,9 +9,11 @@
 
 using namespace Shader;
 
+#ifdef SHADGT_DIAGNOSTICS // without them perf_monitor.h has its own (PERF-GT7-062)
 namespace Common {
 bool PerfFeatureEnabled(u32) { return true; }
 } // namespace Common
+#endif
 
 int main() {
     int tests = 0;
