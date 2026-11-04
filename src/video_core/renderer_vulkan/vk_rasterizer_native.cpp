@@ -1973,15 +1973,42 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     if (size <= ChunkSize()) {
         free_chunks_low = 0;
     }
-    Chunk chunk;
-    chunk.buffer = device->CreateBuffer({
-        .size = std::max(size, ChunkSize()),
-        .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
-                 Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
-                 Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
-        .memory = Native::Rhi::MemoryKind::Upload,
-        .name = "native upload",
-    });
+    const auto create = [&] {
+        Chunk made;
+        made.buffer = device->CreateBuffer({
+            .size = std::max(size, ChunkSize()),
+            .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
+                     Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
+                     Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
+            .memory = Native::Rhi::MemoryKind::Upload,
+            .name = "native upload",
+        });
+        return made;
+    };
+    Chunk chunk = create();
+    if (!chunk.buffer || !chunk.buffer->Mapped()) {
+        // FIX-GT7-048: out of host memory (an RX 480 system ran out during race loading). Free
+        // chunks go back, the GPU is waited for until the chunks it holds are done, and the
+        // allocation is tried again before giving up.
+        LOG_ERROR(Render_Vulkan,
+                  "FIX-GT7-048: no upload memory for {} bytes ({} free, {} retiring chunks): "
+                  "waiting for the GPU and trying again",
+                  size, free_chunks.size(), retiring_chunks.size());
+        free_chunks.clear();
+        if (!retiring_chunks.empty()) {
+            const u64 last = retiring_chunks.back().retire_tick;
+            if (last < r.scheduler.CurrentTick()) {
+                r.scheduler.Wait(last);
+            }
+            semaphore->Refresh();
+            const u64 done = semaphore->KnownGpuTick();
+            while (!retiring_chunks.empty() && retiring_chunks.front().retire_tick <= done) {
+                retiring_chunks.pop_front();
+            }
+        }
+        free_chunks_low = 0;
+        chunk = create();
+    }
     ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
                size);
     return chunk;
