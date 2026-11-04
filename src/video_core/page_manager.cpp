@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <filesystem>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -58,8 +59,11 @@ static ProtectCost g_protect_cost;
 /// faults counted by 1 MB of guest memory; the 15 busiest areas are logged every 10 s.
 static bool ProtectMapOn() {
     static const bool on = [] {
+        // Or a file protect_map.on in the game's folder (the working directory), whatever
+        // started the game.
         const char* env = std::getenv("RYGT_PROTECT_MAP");
-        return env && env[0] == '1';
+        std::error_code ec;
+        return (env && env[0] == '1') || std::filesystem::exists("protect_map.on", ec);
     }();
     return on;
 }
