@@ -6260,8 +6260,27 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(2);
             continue;
         }
-        if (VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits()) !=
-            VideoCore::ImageDescriptorGeometryError::None) {
+        if (const auto geometry_error =
+                VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits());
+            geometry_error != VideoCore::ImageDescriptorGeometryError::None) {
+            // FIX-GT7-076 (diagnosis): the first rejected sample counts, to tell a garbage T#
+            // from a real 16-sample texture.
+            if (geometry_error == VideoCore::ImageDescriptorGeometryError::SampleCount) {
+                static std::atomic<u32> sample_rejects{0};
+                if (sample_rejects.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    std::array<u64, 4> words{};
+                    std::memcpy(words.data(), &tsharp, sizeof(words));
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-076: T# with {} samples bound empty, shader {:#x}, "
+                                "address {:#x}, {}x{} type {} tile {} fmt {}/{}, words {:016x} "
+                                "{:016x} {:016x} {:016x}",
+                                tsharp.NumSamples(), stage.pgm_hash, tsharp.Address(),
+                                tsharp.width + 1, tsharp.height + 1, u32(tsharp.GetType()),
+                                u32(tsharp.GetTileMode()), u32(tsharp.GetDataFmt()),
+                                u32(tsharp.GetNumberFmt()), words[0], words[1], words[2],
+                                words[3]);
+                }
+            }
             bind_null(3);
             continue;
         }

@@ -119,8 +119,20 @@ TEST(ImageDescriptorGeometry, RequiresLegalFullMipChainAndViewOrdering) {
               ImageDescriptorGeometryError::ViewMipLevels);
 }
 
-TEST(ImageDescriptorGeometry, AcceptsSupportedGuestSamplesAndRejectsInvalidExponents) {
+TEST(ImageDescriptorGeometry, MacroTiledMsaaAccepts8SamplesAndRejects16) {
     auto image = MakeImage(AmdGpu::ImageType::Color2DMsaa);
+    image.tiling_index = u64(AmdGpu::TileMode::Thin2DThin);
+    image.last_level = 3;
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::None);
+    image.last_level = 4;
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::SampleCount);
+}
+
+TEST(ImageDescriptorGeometry, MicroTiledMsaaAccepts16SamplesAndRejects32) {
+    auto image = MakeImage(AmdGpu::ImageType::Color2DMsaa);
+    image.tiling_index = u64(AmdGpu::TileMode::Thin1DThin);
     image.last_level = 4;
     EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
               ImageDescriptorGeometryError::None);
