@@ -173,6 +173,19 @@ public:
         return depth_range_unrestricted;
     }
 
+    /// SO-001: plain pipelines are drawn with shader objects (RYGT_SHADER_OBJECT=1).
+    bool IsShaderObjectEnabled() const {
+        return shader_object;
+    }
+    /// SO-006: shader objects can be made for independent-sets layouts (VK_KHR_maintenance11).
+    bool IsShaderIndependentSetsSupported() const {
+        return shader_independent_sets;
+    }
+    /// SO-003: tessellated pipelines are drawn with shader objects too.
+    bool IsShaderObjectTessellationEnabled() const {
+        return shader_object_tessellation;
+    }
+
     /// Returns true when VK_EXT_extended_dynamic_state3 is supported
     bool IsExtendedDynamicState3Supported() const {
         return dynamic_state_3;
@@ -521,6 +534,14 @@ public:
         return features.logicOp;
     }
 
+    /// SO-001: stages a shader object bind must name (null when unused).
+    bool IsGeometryShaderEnabled() const {
+        return features.geometryShader;
+    }
+    bool IsTessellationShaderEnabled() const {
+        return features.tessellationShader;
+    }
+
     bool IsDualSourceBlendSupported() const {
         return features.dualSrcBlend;
     }
@@ -627,6 +648,9 @@ private:
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};
+    bool shader_object{}; ///< SO-001
+    bool shader_object_tessellation{}; ///< SO-003
+    bool shader_independent_sets{};     ///< SO-006
     bool graphics_pipeline_library{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};

@@ -686,9 +686,18 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     }
     VideoCore::DirectMemory::HoldReleasesForSplice(); // FIX-205
     registry->SetUploadHook([this](Native::ImageEntry& entry) {
+        // PERF-GT7-052: small textures in GT7's per-frame memory are checked each frame instead
+        // (their pages hold the data the game rewrites every frame: watched, every one of those
+        // writes faulted, 170,000-257,000 times in 10 s of a race).
+        const u64 size = std::max<u64>(entry.info.guest_size, 1);
+        if (PolledFrameTexture(entry.info.guest_address, size)) {
+            std::scoped_lock lock{polled_mutex};
+            polled_textures.emplace_back(entry.info.guest_address, size);
+            return;
+        }
         // NAT-105: CPU writes to a texture's memory from now on fault once, and the texture
         // is uploaded again.
-        WatchPages(entry.info.guest_address, std::max<u64>(entry.info.guest_size, 1));
+        WatchPages(entry.info.guest_address, size);
     });
     gds = device->CreateBuffer({.size = 64_KB,
                                 .usage = Native::Rhi::BufferUsageStorage |
@@ -797,6 +806,7 @@ void NativeRenderer::BeginHudStream() {
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
+    s.so_known = false; // SO-010
     s.vertex_state_known = false;
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
@@ -1312,6 +1322,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
+    s.so_known = false; // SO-010
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
@@ -1888,6 +1899,7 @@ void NativeRenderer::FlushWritebacks() {
     writebacks.clear();
     writebacks_due = false;
     s.pipeline = vk::Pipeline{}; // the re-tiling binds its own pipeline
+    s.so_known = false; // SO-010
     ForgetBindings(s);            // OPT-014: and its own bindings
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
     const vk::MemoryBarrier2 barrier{
@@ -1924,6 +1936,7 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
             *s.list, std::span<Native::ImageEntry* const>{
                          const_cast<Native::ImageEntry* const*>(bound.data()), bound.size()});
         s.pipeline = vk::Pipeline{}; // the uploads bind their own pipelines
+        s.so_known = false; // SO-010
         ForgetBindings(s);            // OPT-014: and their own bindings
     }
 }
@@ -2005,15 +2018,42 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     if (size <= ChunkSize()) {
         free_chunks_low = 0;
     }
-    Chunk chunk;
-    chunk.buffer = device->CreateBuffer({
-        .size = std::max(size, ChunkSize()),
-        .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
-                 Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
-                 Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
-        .memory = Native::Rhi::MemoryKind::Upload,
-        .name = "native upload",
-    });
+    const auto create = [&] {
+        Chunk made;
+        made.buffer = device->CreateBuffer({
+            .size = std::max(size, ChunkSize()),
+            .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
+                     Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
+                     Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
+            .memory = Native::Rhi::MemoryKind::Upload,
+            .name = "native upload",
+        });
+        return made;
+    };
+    Chunk chunk = create();
+    if (!chunk.buffer || !chunk.buffer->Mapped()) {
+        // FIX-GT7-048: out of host memory (an RX 480 system ran out during race loading). Free
+        // chunks go back, the GPU is waited for until the chunks it holds are done, and the
+        // allocation is tried again before giving up.
+        LOG_ERROR(Render_Vulkan,
+                  "FIX-GT7-048: no upload memory for {} bytes ({} free, {} retiring chunks): "
+                  "waiting for the GPU and trying again",
+                  size, free_chunks.size(), retiring_chunks.size());
+        free_chunks.clear();
+        if (!retiring_chunks.empty()) {
+            const u64 last = retiring_chunks.back().retire_tick;
+            if (last < r.scheduler.CurrentTick()) {
+                r.scheduler.Wait(last);
+            }
+            semaphore->Refresh();
+            const u64 done = semaphore->KnownGpuTick();
+            while (!retiring_chunks.empty() && retiring_chunks.front().retire_tick <= done) {
+                retiring_chunks.pop_front();
+            }
+        }
+        free_chunks_low = 0;
+        chunk = create();
+    }
     ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
                size);
     return chunk;
@@ -3182,6 +3222,26 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     return false;
 }
 
+static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges();
+
+/// PERF-GT7-052 (RYGT_POLL_FRAME_TEXTURES=0: watched as before): a texture of 256 KB or less in a
+/// listed in-place range (GT7's per-frame memory) is checked each frame, not write-watched.
+bool NativeRenderer::PolledFrameTexture(VAddr address, u64 size) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_POLL_FRAME_TEXTURES");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || size > 256_KB) {
+        return false;
+    }
+    for (const auto& [begin, end] : InplaceRanges()) {
+        if (address >= begin && address + size <= end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// FIX-194: written ranges up to this size have their recently CPU-written pages written back.
 constexpr u64 MaxRegionWriteback = 4_MB;
 
@@ -3414,6 +3474,7 @@ bool NativeRenderer::WriteBackChangedWords(Stream& s, const Region& region,
                 s.keep.push_back(std::move(guest));
             });
         s.pipeline = vk::Pipeline{}; // the compare binds its own pipeline
+        s.so_known = false; // SO-010
         ForgetBindings(s); // OPT-014
     return compared;
 }
@@ -8714,9 +8775,29 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     {
         PhaseClock part{stats.record_ns[4]};
-        if (s.pipeline != pipeline->Handle()) {
+        if (pipeline->UsesShaderObjects()) {
+            // SO-001: no pipeline; the shader objects and the state a pipeline fixes.
+            // SO-010: only what changed since the stream's last shader object draw.
+            // RYGT_SO_DELTA=0 or so_delta.off in the game folder: every state each draw.
+            static const bool delta = [] {
+                const char* env = std::getenv("RYGT_SO_DELTA");
+                return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off");
+            }();
+            const bool known = s.so_known && delta;
+            const auto previous = s.so_state;
+            const auto previous_shaders = s.so_shaders;
+            s.cmd.Run([pipeline, known, previous, previous_shaders](vk::CommandBuffer cmd) {
+                pipeline->BindShaderObjects(cmd, known ? &previous : nullptr,
+                                            known ? &previous_shaders : nullptr);
+            });
+            s.pipeline = vk::Pipeline{};
+            s.so_known = true;
+            s.so_state = pipeline->GetShaderObjectState();
+            s.so_shaders = pipeline->ShaderObjects();
+        } else if (s.pipeline != pipeline->Handle()) {
             s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
             s.pipeline = pipeline->Handle();
+            s.so_known = false; // SO-010
         }
     }
     {
@@ -10346,6 +10427,7 @@ void NativeRenderer::DispatchDirect() {
     if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         s.pipeline = pipeline->Handle();
+        s.so_known = false; // SO-010
     }
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     ProbeDispatch(pipeline->GetStage(Shader::SwStage::Compute), b, false); // DIAG-175
@@ -10426,6 +10508,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         s.pipeline = pipeline->Handle();
+        s.so_known = false; // SO-010
     }
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     cmdbuf.dispatchIndirect(args->first, args->second);
@@ -11113,6 +11196,7 @@ void NativeRenderer::ProbeWatchedPictures() {
                 stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
                 stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 stream.pipeline = vk::Pipeline{};
+                stream.so_known = false; // SO-010
                 ForgetBindings(stream); // OPT-014
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,
@@ -11124,6 +11208,19 @@ void NativeRenderer::ProbeWatchedPictures() {
 
 void NativeRenderer::EvictImages() {
     ProbeWatchedPictures(); // FIX-156 (diagnosis)
+    {
+        // PERF-GT7-052: each frame, the per-frame textures uploaded since are looked at again:
+        // stale, the next use uploads them, and NAT-109 skips the copy when their bytes are
+        // unchanged.
+        std::vector<std::pair<VAddr, u64>> polled;
+        {
+            std::scoped_lock lock{polled_mutex};
+            polled.swap(polled_textures);
+        }
+        for (const auto& [address, size] : polled) {
+            registry->Invalidate(address, size, Native::ImageRegistry::Stale::CpuWrite);
+        }
+    }
     // NAT-108: images not used for two seconds go (GT Sport's scratch pool holds render
     // targets of ever-changing sizes: the UI's blur panels, effects).
     constexpr u64 KeepFrames = 120;

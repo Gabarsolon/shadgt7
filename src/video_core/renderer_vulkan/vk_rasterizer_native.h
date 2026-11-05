@@ -37,6 +37,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h" // SO-010
 
 namespace AmdGpu {
 union Regs;
@@ -247,6 +248,11 @@ private:
         RenderState render{};
         DynamicState dynamic{};
         vk::Pipeline pipeline{};
+        /// SO-010: the shader objects and state the last draw set on this stream (valid while no
+        /// pipeline was bound since).
+        bool so_known = false;
+        GraphicsPipeline::ShaderObjectState so_state{};
+        std::array<vk::ShaderEXT, 4> so_shaders{};
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
         /// this list (the same ones are not recorded again).
         bool vertex_state_known = false;
@@ -392,6 +398,10 @@ private:
     std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
     std::atomic<u32> logged_partial{};
     void SortRegionWrites();
+    /// PERF-GT7-052: small textures in per-frame memory, checked each frame (not watched).
+    bool PolledFrameTexture(VAddr address, u64 size);
+    std::mutex polled_mutex;
+    std::vector<std::pair<VAddr, u64>> polled_textures;
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size, bool write);
     void RefreshRegion(Region& region);
