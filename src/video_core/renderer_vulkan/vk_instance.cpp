@@ -511,6 +511,15 @@ bool Instance::CreateDevice() {
              amd_vertex_order);
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
+    {
+        // FIX-GT7-061: KHR barycentrics are off unless asked for (the launcher's option, off by
+        // default): an RX 6600 XT failed to build shaders with them on.
+        const std::string model{GetModelName()};
+        AmdBarycentricDefault() = false;
+        LOG_INFO(Render_Vulkan, "FIX-GT7-061: AMD barycentric fix default {} ({}), in use {}",
+                 AmdBarycentricDefault() ? "on" : "off", model,
+                 properties.vendorID == 0x1002 && SingleSampleBarycentricRequested());
+    }
     const bool direct_barycentric_candidate =
         properties.vendorID == 0x1002 && SingleSampleBarycentricRequested();
     if (!amd_shader_explicit_vertex_parameter || direct_barycentric_candidate) {
