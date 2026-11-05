@@ -70,6 +70,15 @@ void SetVertexOrderCheckCacheEnabled(bool enabled) {
 void SetSingleSampleBarycentricCacheEnabled(bool enabled) {
     single_sample_barycentric_cache_enabled.store(enabled, std::memory_order_relaxed);
 }
+
+// FIX-GT7-083 (TranslatedWithFaceCubes): added to the binary version of a pixel shader translated
+// without native cube sampling that samples a cube. Above every other version and its additions
+// (35 + 6 + 100), so older builds don't read such an entry either.
+static constexpr u32 ClassicCubeVersion = 200u;
+static std::atomic<bool> native_cube_cache_enabled{false};
+void SetNativeCubeCacheEnabled(bool enabled) {
+    native_cube_cache_enabled.store(enabled, std::memory_order_relaxed);
+}
 } // namespace Vulkan
 
 namespace Vulkan {
@@ -210,7 +219,11 @@ void RegisterShaderMeta(const Shader::Info& info,
                Serialization::ShaderBinaryVersionStep(spec.runtime_info.sw_stage) +
                (vertex_order_check_cache_enabled.load(std::memory_order_relaxed)
                     ? VertexOrderCheckVersion
-                    : 0u));
+                    : 0u) +
+               (TranslatedWithFaceCubes(spec,
+                                        native_cube_cache_enabled.load(std::memory_order_relaxed))
+                    ? ClassicCubeVersion
+                    : 0u)); // FIX-GT7-083
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -234,7 +247,8 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    Shader::StageSpecialization& spec, size_t& perm_idx) {
+                    Shader::StageSpecialization& spec, size_t& perm_idx,
+                    bool* other_cube_sampling) {
     Serialization::Reader meta{ar};
 
     u32 meta_version{};
@@ -245,6 +259,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
+    // FIX-GT7-083: cubes sampled as arrays of faces; checked once the stage is read.
+    const bool face_cubes = binary_version >= ClassicCubeVersion;
+    if (face_cubes) {
+        binary_version -= ClassicCubeVersion;
+    }
     if (vertex_order_check_cache_enabled.load(std::memory_order_relaxed)) { // AMD-307
         if (binary_version < VertexOrderCheckVersion) {
             return false;
@@ -290,6 +309,13 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     }
     info.Deserialize(ar, perm_hash_ar);
     ReadResourceUsage(meta, info);
+    if (!StoredCubesFit(spec, info, face_cubes,
+                        native_cube_cache_enabled.load(std::memory_order_relaxed))) {
+        if (other_cube_sampling) {
+            *other_cube_sampling = true; // FIX-GT7-088
+        }
+        return false; // FIX-GT7-083: made by the other engine's cube sampling
+    }
     return true;
 }
 

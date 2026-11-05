@@ -6,6 +6,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include "common/types.h"
 
 namespace Common {
@@ -54,6 +55,12 @@ bool HybridCpu();
 /// found running in nvgpucomp64.dll is moved. Called every 2 s. RYGT_COMPILE_CORES=0 turns the
 /// compile cores off.
 void ConfineDriverCompileThreads();
+/// PERF-GT7-054: calls `fn(handle, thread id)` for each of this process's threads, the handle
+/// opened for `access`; fn returns true to keep the handle, else it is closed. False when the
+/// walk is unavailable (no NtGetNextThread): the caller falls back to a Toolhelp snapshot, which
+/// enumerates every thread on the machine (60 ms here with browsers open). Windows only.
+bool ForEachProcessThread(unsigned long access,
+                          const std::function<bool(void*, unsigned long)>& fn);
 
 /// PERF-GT7-024: while a draw waits for its pipeline (the game is stopped anyway), compile work
 /// may use every core; calls nest (on, then off once per on).

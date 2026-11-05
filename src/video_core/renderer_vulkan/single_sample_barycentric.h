@@ -3,13 +3,23 @@
 #include <cstdint>
 #include <cstdlib>
 namespace Vulkan {
-// FIX-220: opt-in again (as upstream): on AMD GPUs only with RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC
-// set to 1, true, on or yes (any case, spaces ignored; the launcher's "AMD graphics fix" box). On
-// by default it made AMD shader loading much slower than 27b.
+// FIX-220: KHR barycentrics on AMD GPUs for the fragment shaders that read a vertex's own values
+// (FIX-217). FIX-GT7-061: with AMD's explicit-vertex path GT7's Trial Mountain rock walls came out
+// flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC). The launcher's "AMD Graphics
+// Fix" option (off by default; an RX 6600 XT failed to build shaders with it on) passes
+// RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC: 1, true, on or yes turns it on, any other value off. Unset,
+// it is off (the Vulkan instance sets the default). RYGT_AMD_EXPLICIT_VERTEX=1 turns it off whatever else is set.
+inline bool& AmdBarycentricDefault() {
+    static bool on = false;
+    return on;
+}
 inline bool SingleSampleBarycentricRequested() {
-    const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-    if (!value) {
+    if (const char* off = std::getenv("RYGT_AMD_EXPLICIT_VERTEX"); off && off[0] == '1') {
         return false;
+    }
+    const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+    if (!value || !*value) {
+        return AmdBarycentricDefault();
     }
     while (*value == ' ' || *value == '"') {
         ++value;

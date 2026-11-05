@@ -359,6 +359,45 @@ TEST(ShaderStore, AcceptsOnlyWholeSpirvModules) {
     EXPECT_FALSE(Vulkan::IsCompleteSpirv({}));
 }
 
+// FIX-GT7-083: both engines share the store; an ordinary pixel-shader cube sample is a cube-array
+// sample with native cube sampling (the native engine) and samples six faces of a 2D array without
+// it (the classic engine's views). A translation is read only by the side it fits.
+TEST(ShaderStore, StoredCubeSamplesAreReadOnlyByTheCubeSamplingTheyWereMadeWith) {
+    auto info = MakeFragmentInfo(false);
+    auto spec = MakeSpec(*info);
+    spec.images[0].type = AmdGpu::ImageType::Cube;
+    // Made without it: tagged; the classic engine reads it, the native one translates again.
+    const bool faces = Vulkan::TranslatedWithFaceCubes(spec, false);
+    EXPECT_TRUE(faces);
+    EXPECT_TRUE(Vulkan::StoredCubesFit(spec, *info, faces, false));
+    EXPECT_FALSE(Vulkan::StoredCubesFit(spec, *info, faces, true));
+    // Made with it, the cube a native cube sample: not tagged; the classic engine translates again.
+    info->images[0].post_op = Shader::SharpFetchPostOp::NativeCubeSampling;
+    const bool native = Vulkan::TranslatedWithFaceCubes(spec, true);
+    EXPECT_FALSE(native);
+    EXPECT_TRUE(Vulkan::StoredCubesFit(spec, *info, native, true));
+    EXPECT_FALSE(Vulkan::StoredCubesFit(spec, *info, native, false));
+    // A stored cube image, or no cube: both read it.
+    auto other_info = MakeFragmentInfo(false);
+    auto other = MakeSpec(*other_info);
+    other.images[0].type = AmdGpu::ImageType::Cube;
+    other.images[0].is_storage = true;
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(other, false));
+    other.images[0] = {};
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(other, false));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(other, *other_info, false, true));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(other, *other_info, false, false));
+    // Other stages have no native cube samples.
+    Shader::Info compute;
+    compute.hw_stage = Shader::HwStage::Compute;
+    compute.sw_stage = Shader::SwStage::Compute;
+    compute.images.emplace_back();
+    auto compute_spec = MakeSpec(compute);
+    compute_spec.images[0].type = AmdGpu::ImageType::Cube;
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(compute_spec, false));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(compute_spec, compute, false, true));
+}
+
 // These focused header tests do not initialize the emulator's logging or fatal-error backend.
 void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fmt::string_view,
                        fmt::format_args) {
@@ -377,4 +416,105 @@ void unreachable_impl() {
 bool Shader::Gcn::ParseFetchShader(const Shader::Info&, Shader::Gcn::FetchShaderData&) {
     ADD_FAILURE() << "Unexpected fetch shader parse";
     return false;
+}
+
+namespace {
+
+// PERF-GT7-058: what StageSpecialization::PackInputs packs for a stage.
+std::vector<u64> PackFor(const Shader::Info& info) {
+    std::vector<u64> words;
+    Shader::Gcn::FetchShaderData fetch;
+    Shader::StageSpecialization::PackInputs(info, words, fetch);
+    return words;
+}
+
+} // namespace
+
+TEST(ShaderSpecialization, PackedInputsIgnoreAddressesAndKeepWhatSplitsPermutations) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    info.buffer_stride_used.set(0);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto compiled = KeyFor(info);
+    const auto packed = PackFor(info);
+
+    // Another address and size: the same pack and the same specialization.
+    auto moved = BoundBuffer(16);
+    moved.base_address = 0x7650000;
+    moved.num_records = 4096;
+    Bind(info.buffers[0], moved);
+    EXPECT_EQ(packed, PackFor(info));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    // What splits permutations changes the pack.
+    auto stride = BoundBuffer(48);
+    auto add_tid = BoundBuffer(16);
+    add_tid.add_tid_enable = 1;
+    auto coherent = BoundBuffer(16);
+    coherent.mtype = 3;
+    auto swizzled = BoundBuffer(16);
+    swizzled.swizzle_enable = 1;
+    for (const auto& changed : {stride, add_tid, coherent, swizzled}) {
+        Bind(info.buffers[0], changed);
+        EXPECT_FALSE(compiled == KeyFor(info));
+        EXPECT_NE(packed, PackFor(info));
+    }
+
+    // Unbound, or bound empty by its address (FIX-GT7-024): another pack.
+    auto unbound = BoundBuffer(16);
+    unbound.num_records = 0;
+    Bind(info.buffers[0], unbound);
+    EXPECT_NE(packed, PackFor(info));
+    auto empty = BoundBuffer(16);
+    empty.base_address = 0;
+    Bind(info.buffers[0], empty);
+    EXPECT_NE(packed, PackFor(info));
+}
+
+TEST(ShaderSpecialization, PackedImageInputsIgnoreAddressesAndKeepTheFormat) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    info.images.emplace_back();
+    info.resource_usage_known = true;
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = 0x1000;
+    Bind(info.images[0], image);
+    const auto compiled = KeyFor(info);
+    const auto packed = PackFor(info);
+
+    auto moved = image;
+    moved.base_address = 0x9876;
+    Bind(info.images[0], moved);
+    EXPECT_EQ(packed, PackFor(info));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    auto integer = image;
+    integer.num_format = static_cast<u64>(AmdGpu::NumberFormat::Uint);
+    Bind(info.images[0], integer);
+    EXPECT_FALSE(compiled == KeyFor(info));
+    EXPECT_NE(packed, PackFor(info));
+
+    auto unbound = image;
+    unbound.base_address = 0;
+    Bind(info.images[0], unbound);
+    EXPECT_NE(packed, PackFor(info));
+}
+
+// FIX-GT7-082: a vertex stage reads its attributes' V#s from guest memory each time, not from the
+// flattened buffer: a pack recorded after a full match could hold a V# that changed in between
+// (float to integer), and later draws would take the float module with no full comparison. Such
+// stages always get a full comparison.
+TEST(ShaderSpecialization, PackedInputsNeverStandForVertexAttributesReadFromMemory) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Vertex;
+    info.sw_stage = Shader::SwStage::Vertex;
+    info.has_fetch_shader = true;
+    EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
+    info.has_fetch_shader = false;
+    EXPECT_TRUE(Shader::StageSpecialization::Packable(info));
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    EXPECT_TRUE(Shader::StageSpecialization::Packable(info));
+    info.sw_stage = Shader::SwStage::TessellationControl;
+    EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
 }

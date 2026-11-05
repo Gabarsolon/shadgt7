@@ -234,6 +234,121 @@ struct StageSpecialization {
         }
     }
 
+    /// PERF-GT7-058: whether PackInputs may stand for a new specialization of this stage. Not
+    /// tessellation stages (their runtime info comes from memory).
+    /// FIX-GT7-082: nor a vertex stage with a fetch shader. Its attributes' V#s are read from guest
+    /// memory at each read, not from the flattened buffer, so the pack recorded after a full
+    /// match could hold another V# than the one that match was made from (a float attribute that
+    /// became integer in between), and later draws would take the float module for it with no
+    /// full comparison. The packed path saved nothing on vertex stages anyway (GT7 race, 11-04:
+    /// 0.58-0.64 us a call without it, 0.63-0.68 with it).
+    static bool Packable(const Info& info) {
+        return info.sw_stage != SwStage::TessellationControl &&
+               info.sw_stage != SwStage::TessellationEval &&
+               !(info.sw_stage == SwStage::Vertex && info.has_fetch_shader);
+    }
+
+    /// PERF-GT7-058: what the constructor above reads of the sharps and of the fetch shader, as the
+    /// values it derives from them, packed into words without making a specialization. A stage
+    /// with equal words, an equal runtime info, start bindings and fetch shader data, and the same
+    /// info makes an equal specialization, for a stage Packable allows. Keep in step with the
+    /// constructor.
+    static void PackInputs(const Info& info, std::vector<u64>& out, Gcn::FetchShaderData& fetch) {
+        const auto mapping = [](const AmdGpu::CompMapping& m) {
+            return u64(m.array[0]) | u64(m.array[1]) << 8 | u64(m.array[2]) << 16 |
+                   u64(m.array[3]) << 24;
+        };
+        fetch = {};
+        if (info.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info, fetch)) {
+            for (const auto& desc : fetch.attributes) {
+                const auto sharp = desc.GetSharp(info);
+                if (!sharp) {
+                    out.push_back(0);
+                } else if (Gcn::VertexAttribute::IsGarbage(sharp)) {
+                    out.push_back(1);
+                } else {
+                    out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
+                                  mapping(sharp.DstSelect()) << 16);
+                }
+            }
+        }
+        out.push_back(0xb0f5);
+        const bool usage_known = info.resource_usage_known;
+        static const bool empty_without_addressing = Common::PerfFeatureEnabled(172);
+        for (size_t i = 0; i < info.buffers.size(); ++i) {
+            const auto& desc = info.buffers[i];
+            const auto sharp = desc.GetSharp(info);
+            if (!sharp) {
+                out.push_back(0);
+                continue;
+            }
+            u64 w = 1;
+            if (empty_without_addressing && !desc.IsSpecial() && IsBoundEmpty(sharp)) {
+                w |= 2;
+            }
+            w |= u64(!usage_known || info.buffer_stride_used[i] ? sharp.GetStride() : 0) << 2;
+            if (usage_known) {
+                w |= u64(sharp.add_tid_enable) << 16;
+                w |= u64(desc.buffer_type == BufferType::SharedMemory || sharp.mtype == 3) << 17;
+            }
+            w |= u64(desc.is_formatted) << 18;
+            w |= u64(sharp.swizzle_enable) << 19;
+            if (desc.is_formatted) {
+                w |= u64(sharp.GetDataFmt()) << 20;
+                w |= u64(sharp.GetNumberFmt()) << 28;
+                w |= mapping(sharp.DstSelect()) << 32;
+            }
+            u64 w2 = desc.is_formatted ? u64(sharp.GetNumberConversion()) : 0;
+            if (sharp.swizzle_enable) {
+                w2 |= u64(sharp.index_stride) << 32 | u64(sharp.element_size) << 40;
+            }
+            out.push_back(w);
+            out.push_back(w2);
+        }
+        out.push_back(0x1a9e);
+        for (size_t i = 0; i < info.images.size(); ++i) {
+            const auto& desc = info.images[i];
+            const auto sharp = desc.GetSharp(info);
+            // Unbound images too: the constructor records what translation saw (SHD-003).
+            u64 w = sharp ? 1 : 0;
+            const bool fmask = FMaskKeyEnabled() && sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt());
+            w |= u64(fmask ? AmdGpu::ImageType::Invalid : sharp.GetViewType(desc.is_array)) << 1;
+            w |= u64(AmdGpu::IsInteger(sharp.GetNumberFmt())) << 8;
+            w |= u64(desc.is_written) << 9;
+            if (desc.is_written) {
+                w |= mapping(sharp.DstSelect()) << 16;
+            } else if (!usage_known || info.image_srgb_used[i]) {
+                w |= u64(sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb) << 10;
+            }
+            w |= u64(desc.NumBindings(info)) << 48;
+            out.push_back(w);
+            out.push_back(u64(sharp.GetNumberConversion()));
+        }
+        out.push_back(0xf3a5);
+        for (const auto& desc : info.fmasks) {
+            const auto sharp = desc.GetSharp(info);
+            if (!sharp) {
+                out.push_back(0);
+                continue;
+            }
+            u64 w = 1;
+            if (!FMaskKeyEnabled()) {
+                w |= u64(sharp.width) << 8 | u64(sharp.height) << 32;
+            } else if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
+                w |= u64(desc.size_read ? sharp.width + 1 : 1) << 8 |
+                     u64(desc.size_read ? sharp.height + 1 : 1) << 32;
+            }
+            out.push_back(w);
+        }
+        out.push_back(0x5a3b);
+        for (const auto& desc : info.samplers) {
+            const auto sharp = desc.GetSharp(info);
+            out.push_back(!sharp ? 0
+                                 : 1 | u64(sharp.force_unnormalized) << 1 |
+                                       u64(sharp.force_degamma) << 2);
+        }
+    }
+
     void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();

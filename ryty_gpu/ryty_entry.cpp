@@ -41,6 +41,7 @@
 #include "ryty_gpu/ryty_library.h"
 #include "ryty_gpu/native/gts_hooks.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/native/job_walker.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "core/debug_state.h"
@@ -569,10 +570,20 @@ extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) 
     }
 }
 
+// FIX-GT7-085: the recorder's cache of readable 64 KB granules (NAT-147) forgets the range at each
+// report that follows a change. Ryty reports an unmap before it unmaps, and the recorder could
+// read the old pages in between and note their granules readable again; memory mapped there next
+// without CPU access (or protected by the game) then passed Native::Readable, and quad index
+// expansion read it.
+static void ForgetReadableAfterChange(u64 address, u64 size) {
+    Native::ForgetReadable(address, size);
+}
+
 // Ryty calls this after any change to guest mappings or protections (after an unmap completes,
 // for example), so lookups cached in between are not kept.
 extern "C" __declspec(dllexport) void RytyGpuMappingChanged(u64 address, u64 size) {
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
 }
 
 // Ryty calls this after the game changed the protection of guest memory (sceKernelMprotect),
@@ -583,6 +594,7 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
                     size);
     }
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->GetPageManager().ReapplyProtection(address, size);
     }
@@ -593,7 +605,9 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: map {:#x}+{:#x}", address, size);
     }
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+        rasterizer->OnNewMapping(address, size); // FIX-GT7-077
         rasterizer->MapMemory(address, size);
         rasterizer->RegisterMemory(address, size);
         // FIX-153: new memory comes writable. Pages the renderer still tracks there (tracked

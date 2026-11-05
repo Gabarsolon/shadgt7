@@ -12,6 +12,7 @@
 
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
+#include "common/thread.h"
 #include "common/types.h"
 
 #ifdef _WIN32
@@ -75,38 +76,51 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
     std::vector<Usage> usages;
     double total_percent = 0.0;
 
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return {};
-    }
-    const DWORD pid = GetCurrentProcessId();
-    THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
-    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
-        if (entry.th32OwnerProcessID != pid) {
-            continue;
-        }
-        auto [it, inserted] = threads.try_emplace(entry.th32ThreadID);
-        auto& sample = it->second;
-        if (inserted) {
-            sample.handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
-        }
-        if (!sample.handle) {
-            continue;
-        }
+    const auto account = [&](DWORD tid, bool inserted, auto& sample) {
         FILETIME creation, exit, kernel, user;
-        if (!GetThreadTimes(sample.handle, &creation, &exit, &kernel, &user)) {
-            continue;
+        if (!sample.handle || !GetThreadTimes(sample.handle, &creation, &exit, &kernel, &user)) {
+            return;
         }
         sample.seen = true;
         const u64 cpu = FileTimeTo100ns(kernel) + FileTimeTo100ns(user);
         if (!inserted && elapsed_100ns > 0.0 && cpu >= sample.cpu_100ns) {
             const double percent = double(cpu - sample.cpu_100ns) * 100.0 / elapsed_100ns;
             total_percent += percent;
-            usages.push_back({percent, entry.th32ThreadID, sample.handle});
+            usages.push_back({percent, tid, sample.handle});
         }
         sample.cpu_100ns = cpu;
+    };
+    // PERF-GT7-054: this process's threads only (NtGetNextThread); the Toolhelp snapshot walks
+    // every thread on the machine, 60 ms here with browsers open, and ran in a frame.
+    const bool walked = ForEachProcessThread(
+        THREAD_QUERY_LIMITED_INFORMATION, [&](void* handle, unsigned long tid) {
+            auto [it, inserted] = threads.try_emplace(tid);
+            if (inserted) {
+                it->second.handle = static_cast<HANDLE>(handle);
+            }
+            account(tid, inserted, it->second);
+            return inserted; // a new thread's handle is kept; a known one's is closed
+        });
+    if (!walked) {
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return {};
+        }
+        const DWORD pid = GetCurrentProcessId();
+        THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
+        for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != pid) {
+                continue;
+            }
+            auto [it, inserted] = threads.try_emplace(entry.th32ThreadID);
+            if (inserted) {
+                it->second.handle =
+                    OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+            }
+            account(entry.th32ThreadID, inserted, it->second);
+        }
+        CloseHandle(snapshot);
     }
-    CloseHandle(snapshot);
 
     std::erase_if(threads, [](const auto& pair) {
         if (!pair.second.seen && pair.second.handle) {
