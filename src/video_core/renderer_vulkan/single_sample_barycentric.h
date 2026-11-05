@@ -6,9 +6,9 @@ namespace Vulkan {
 // FIX-220: KHR barycentrics on AMD GPUs for the fragment shaders that read a vertex's own values
 // (FIX-217). FIX-GT7-061: with AMD's explicit-vertex path GT7's Trial Mountain rock walls came out
 // flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC). The launcher's "AMD Graphics
-// Fix" option (on by default when it finds an AMD GPU) passes RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC:
-// 1, true, on or yes turns it on, any other value off. Unset, it is on for AMD GPUs (the Vulkan
-// instance sets the default). RYGT_AMD_EXPLICIT_VERTEX=1 turns it off whatever else is set.
+// Fix" option (off by default; an RX 6600 XT failed to build shaders with it on) passes
+// RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC: 1, true, on or yes turns it on, any other value off. Unset,
+// it is off (the Vulkan instance sets the default). RYGT_AMD_EXPLICIT_VERTEX=1 turns it off whatever else is set.
 inline bool& AmdBarycentricDefault() {
     static bool on = false;
     return on;
