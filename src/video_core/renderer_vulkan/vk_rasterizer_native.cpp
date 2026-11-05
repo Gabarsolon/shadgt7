@@ -1299,6 +1299,16 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     } else {
         AcquireList(s); // PERF-GT7-018
     }
+    if (!s.lds_readers.empty()) {
+        // PERF-GT7-060: a list ends through EndRendering, which records them; none may be left.
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_ERROR(Render_Vulkan, "PERF-GT7-060: {} reader passes left from an ended list",
+                      s.lds_readers.size());
+        }
+        s.lds_readers.clear();
+        s.lds_bytes = 0;
+    }
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
@@ -1498,6 +1508,11 @@ void NativeRenderer::GpuTimeCollect() {
 }
 
 void NativeRenderer::EndRendering() {
+    // PERF-GT7-060: whatever ends the pass (a barrier, copies, a dispatch, another pass, the
+    // list's end) comes after the run's reader passes.
+    if (!stream.lds_readers.empty()) {
+        FlushLdsReaders(1);
+    }
     if (stream.rendering) {
         stream.cmd.endRendering();
         stream.rendering = false;
@@ -8590,6 +8605,42 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                                   i, vi->strides[i], color->info.guest_address)});
         }
     }
+    // FIX-227: the scratch of a draw whose hull shader reads other patches' LS outputs (GCN LDS).
+    const u32 lds_mode = pipeline->LdsEmulation();
+    u64 lds_address = 0, lds_bytes = 0, lds_patches = 0;
+    u32 lds_num_cp = 0, lds_vertex_bytes = 0;
+    if (lds_mode != 0 && !indirect && b.push.quad_sample_mask[0] == ~0u &&
+        b.push.quad_sample_mask[1] == ~0u) {
+        lds_num_cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
+        lds_patches = u64(regs.num_indices / lds_num_cp) * regs.num_instances.NumInstances();
+        Shader::TessellationDataConstantBuffer tess_constants{};
+        pipeline->GetStage(Shader::SwStage::TessellationControl)
+            .ReadTessConstantBuffer(tess_constants);
+        // At least 64 bytes a vertex: the hull shader's stride is the one it was translated with.
+        lds_vertex_bytes = std::max<u32>((tess_constants.ls_stride + 15) / 16 * 16, 64u);
+        lds_bytes = std::max<u64>(lds_patches, 1) * lds_num_cp * lds_vertex_bytes;
+        lds_address = LdsScratch(lds_bytes);
+    }
+    // PERF-GT7-060: a run of such draws in one pass, with nothing else recorded between them,
+    // records each one's writer pass, then one barrier, then the reader passes in their order
+    // (FlushLdsReaders), instead of a pass break and a full barrier inside each draw. A draw that
+    // doesn't join (any other draw, or one of these that runs alone) records after the run.
+    std::optional<LdsReader> lds_reader;
+    if (lds_address != 0 && LdsBatchOn() && !hud_black_state && !hud_white_state &&
+        !b.writes_buffers && b.stored.empty() && b.gpu_writes.empty() &&
+        !r.FrameDumpCollecting()) {
+        lds_reader.emplace();
+        if (!CaptureLdsReader(*lds_reader, *pipeline, b, *vi)) {
+            lds_reader.reset();
+        }
+    }
+    if (!lds_reader) {
+        FlushLdsReaders(0);
+    } else if (s.lds_bytes + lds_bytes > (32ull << 20) || s.lds_readers.size() >= 1024) {
+        // The run's slices stay apart in the 128 MB ring; a reader takes ~7 KB. (The demo
+        // race's longest runs are ~300 draws, Daytona's ~145 a frame in all.)
+        FlushLdsReaders(2);
+    }
     {
         PhaseClock part{stats.record_ns[1]};
         BeginRendering(hud_black_state ? *hud_black_state : targets.state);
@@ -8671,25 +8722,68 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     u32(regs.ls_hs_config.num_patches));
     }
     bool lds_pushed = false;
-    if (const u32 lds_mode = pipeline->LdsEmulation();
-        lds_mode != 0 && !indirect && b.push.quad_sample_mask[0] == ~0u &&
-        b.push.quad_sample_mask[1] == ~0u) {
-        const u32 num_cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
-        const u64 patches = u64(regs.num_indices / num_cp) * regs.num_instances.NumInstances();
-        Shader::TessellationDataConstantBuffer tess_constants{};
-        pipeline->GetStage(Shader::SwStage::TessellationControl)
-            .ReadTessConstantBuffer(tess_constants);
-        // At least 64 bytes a vertex: the hull shader's stride is the one it was translated with.
-        const u32 vertex_bytes = std::max<u32>((tess_constants.ls_stride + 15) / 16 * 16, 64u);
-        const u64 address =
-            vertex_bytes != 0 ? LdsScratch(std::max<u64>(patches, 1) * num_cp * vertex_bytes) : 0;
+    bool lds_deferred = false; // PERF-GT7-060: its reader pass waits for its run's barrier
+    bool lds_alone = false;    // PERF-GT7-060: it runs alone (for the runs it would have made)
+    {
+        const u64 address = lds_address;
+        const u32 num_cp = lds_num_cp;
+        const u64 patches = lds_patches;
+        const u32 vertex_bytes = lds_vertex_bytes;
         const auto push_scratch = [&](u64 value) {
             const std::array<u32, 2> words{u32(value), u32(value >> 32)};
             stream.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
                                      u32(offsetof(Shader::PushData, quad_sample_mask)), 8u,
                                      words.data());
         };
-        if (address != 0) {
+        if (address != 0 && lds_reader) {
+            // PERF-GT7-060: the writer pass now, the reader pass after the run's barrier.
+            push_scratch(address | 1);
+            record_draw();
+            LdsReader& reader = *lds_reader;
+            reader.dynamic = s.dynamic;
+            reader.address = address;
+            const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+            const auto [vertex_offset, instance_offset] =
+                DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
+            reader.instances = regs.num_instances.NumInstances();
+            reader.indexed = quad_triangles || is_indexed;
+            reader.count = quad_triangles ? index_count : regs.num_indices;
+            reader.vertex_offset = u32(vertex_offset);
+            reader.first_instance = instance_offset;
+            const Shader::Info* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            reader.ps = ps ? ps->pgm_hash : 0;
+            reader.prims = u64(regs.num_indices) * std::max<u32>(reader.instances, 1);
+            s.lds_readers.push_back(std::move(reader));
+            s.lds_bytes += lds_bytes;
+            // The quad sample mask's words hold the writer's scratch: pushed whole by the next
+            // draw's bindings.
+            s.push_known = false;
+            lds_deferred = true;
+            ++stats.lds_batched;
+            if (++stats.lds_emulated_draws <= 5) {
+                LOG_WARNING(Render_Vulkan, "FIX-227: draw of {} patches ({} instances) with hull "
+                            "shader LDS emulation (mode {}, {} bytes a vertex) at {:#x}, its reader "
+                            "pass after its run's barrier (PERF-GT7-060)",
+                            patches, regs.num_instances.NumInstances(), lds_mode, vertex_bytes,
+                            address);
+            }
+        } else if (address != 0) {
+            lds_alone = true;
+            // PERF-GT7-060: the run it continues, if nothing was recorded since the last one.
+            const std::array<u64, 4> now{stats.barriers, stats.passes, stats.draws,
+                                         stats.dispatches};
+            if (stats.lds_alone_run == 0 || now != stats.lds_alone_marker) {
+                if (stats.lds_alone_run != 0) {
+                    ++stats.lds_alone_runs;
+                    ++stats.lds_alone_lengths[std::min<size_t>(
+                        std::bit_width(stats.lds_alone_run - 1), 6)];
+                    stats.lds_alone_run_max =
+                        std::max(stats.lds_alone_run_max, stats.lds_alone_run);
+                }
+                stats.lds_alone_run = 0;
+            }
+            ++stats.lds_alone_run;
+            ++stats.lds_alone;
             push_scratch(address | 1);
             record_draw();
             const RenderState resumed = [&] {
@@ -8740,7 +8834,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                              (pipeline->LdsEmulation() & 0xff) |
                                  (u32(regs.stage_enable.hs_en != 0) << 8));
         }
-        record_draw();
+        if (!lds_deferred) {
+            record_draw();
+        }
         // DIAG-241 (diagnosis): in a dumped frame, the LDS scratch of the first such draw.
         if (lds_snap_address != 0 && r.FrameDumpCollecting() &&
             std::ranges::none_of(pass_snaps, [](const PassSnap& snap) {
@@ -8830,7 +8926,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     ProbeDraw(targets, regs); // DIAG-170 (diagnosis)
     StripDraw(targets);       // DIAG-173 (diagnosis)
-    if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001
+    // DIAG-GT7-001: a draw whose reader pass waits counts in the segment the reader draws in.
+    if (GpuSegment* seg = lds_deferred ? nullptr : GpuSeg()) {
         ++seg->draws;
         const u64 prims = u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1);
         if (prims > seg->max_prims) {
@@ -8840,6 +8937,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     }
     ++stats.draws;
+    if (lds_alone) {
+        // PERF-GT7-060: the next one continues its run if none of these moved meanwhile.
+        stats.lds_alone_marker = {stats.barriers, stats.passes, stats.draws, stats.dispatches};
+    }
+    if (lds_address != 0) {
+        ReportLdsRuns();
+    }
     if (indirect) {
         indirect_skip.skipped = nullptr;
         ++stats.indirect_draws;
@@ -12027,6 +12131,211 @@ u64 NativeRenderer::LdsScratch(u64 bytes) {
     const u64 offset = Common::AlignUp(lds_scratch_used, 256);
     lds_scratch_used = offset + bytes;
     return lds_scratch->GpuAddress() + offset;
+}
+
+bool NativeRenderer::LdsBatchOn() {
+    // On by default since the Daytona A/B (2820 MHz): race 50.7 fps on against 44.3 off, no car
+    // defect seen. RYGT_NATIVE_LDS_BATCH=0: each draw alone, as before.
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LDS_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+bool NativeRenderer::CaptureLdsReader(LdsReader& reader, const GraphicsPipeline& pipeline,
+                                      const DrawBindings& b, const VertexIndexState& vertices) {
+    reader.pipeline = &pipeline;
+    reader.vertices = vertices;
+    DrawBindings& c = reader.bindings;
+    c.buffers.assign(b.buffers.begin(), b.buffers.end());
+    c.images.assign(b.images.begin(), b.images.end());
+    c.writes = b.writes;
+    c.write_sets = b.write_sets;
+    c.push = b.push;
+    // Where each write's infos are in the draw's own (FlushLdsReaders points the writes there).
+    const auto index_of = [](const auto* info, u32 count, const auto& from) {
+        if (!info) {
+            return u32{~0u};
+        }
+        const auto at = reinterpret_cast<uintptr_t>(info);
+        const auto begin = reinterpret_cast<uintptr_t>(from.data());
+        using Info = std::remove_cvref_t<decltype(*info)>;
+        if (at < begin || (at - begin) % sizeof(Info) != 0 ||
+            (at - begin) / sizeof(Info) + count > from.size()) {
+            return u32{~0u - 1};
+        }
+        return u32((at - begin) / sizeof(Info));
+    };
+    reader.infos.clear();
+    for (auto& write : c.writes) {
+        if (write.pNext || write.pTexelBufferView) {
+            return false;
+        }
+        const u32 buffer = index_of(write.pBufferInfo, write.descriptorCount, b.buffers);
+        const u32 image = index_of(write.pImageInfo, write.descriptorCount, b.images);
+        if (buffer == ~0u - 1 || image == ~0u - 1) {
+            return false; // infos outside the draw's own
+        }
+        reader.infos.emplace_back(buffer, image);
+        write.pBufferInfo = nullptr;
+        write.pImageInfo = nullptr;
+    }
+    return true;
+}
+
+void NativeRenderer::FlushLdsReaders(u32 reason) {
+    Stream& s = stream;
+    if (s.lds_readers.empty()) {
+        return;
+    }
+    // Out of the stream first: what records them below ends and begins the pass again.
+    std::vector<LdsReader> readers = std::move(s.lds_readers);
+    s.lds_readers.clear();
+    s.lds_bytes = 0;
+    const u64 length = readers.size();
+    ++stats.lds_runs;
+    ++stats.lds_run_lengths[std::min<size_t>(std::bit_width(length - 1), 6)];
+    stats.lds_run_max = std::max(stats.lds_run_max, length);
+    ++stats.lds_run_ends[std::min<u32>(reason, 2)];
+    // The run's pass, its clears done: the reader passes draw into it after the barrier.
+    const RenderState current = s.render;
+    RenderState resumed = current;
+    for (u32 i = 0; i < resumed.num_color_attachments; ++i) {
+        resumed.color_attachments[i].is_clear = false;
+    }
+    resumed.depth_stencil_attachment.depth_clear = false;
+    resumed.depth_stencil_attachment.stencil_clear = false;
+    if (s.rendering) {
+        s.cmd.endRendering();
+        s.rendering = false;
+    }
+    // A full barrier, as FIX-227's: one from and to the tessellation control stage alone left
+    // the reader pass reading stale scratch on NVIDIA. Unlike GlobalBarrier it keeps what was
+    // noted written and read: the reader passes come after it.
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    GpuTimeMark(s); // DIAG-GT7-001: the reader passes' segment
+    ++stats.barriers;
+    BeginRendering(resumed);
+    s.render = current; // the same pass to later draws
+    // What the stream had bound is the last writer's: everything again for the first reader.
+    s.pipeline = vk::Pipeline{};
+    s.vertex_state_known = false;
+    ForgetBindings(s);
+    const CmdBuf cmdbuf{s.cmd};
+    const LdsReader* previous = nullptr;
+    const auto same_dynamic = [](const DynamicState& a, const DynamicState& b) {
+        return std::ranges::equal(a.viewports, b.viewports) &&
+               std::ranges::equal(a.scissors, b.scissors) &&
+               a.depth_test_enabled == b.depth_test_enabled &&
+               a.depth_write_enabled == b.depth_write_enabled &&
+               a.depth_compare_op == b.depth_compare_op &&
+               a.depth_bounds_test_enabled == b.depth_bounds_test_enabled &&
+               a.depth_bounds_min == b.depth_bounds_min &&
+               a.depth_bounds_max == b.depth_bounds_max &&
+               a.depth_bias_enabled == b.depth_bias_enabled &&
+               a.depth_bias_constant == b.depth_bias_constant &&
+               a.depth_bias_clamp == b.depth_bias_clamp &&
+               a.depth_bias_slope == b.depth_bias_slope &&
+               a.stencil_test_enabled == b.stencil_test_enabled &&
+               a.stencil_front_ops == b.stencil_front_ops &&
+               a.stencil_front_reference == b.stencil_front_reference &&
+               a.stencil_front_write_mask == b.stencil_front_write_mask &&
+               a.stencil_front_compare_mask == b.stencil_front_compare_mask &&
+               a.stencil_back_ops == b.stencil_back_ops &&
+               a.stencil_back_reference == b.stencil_back_reference &&
+               a.stencil_back_write_mask == b.stencil_back_write_mask &&
+               a.stencil_back_compare_mask == b.stencil_back_compare_mask &&
+               a.primitive_restart_enable == b.primitive_restart_enable &&
+               a.rasterizer_discard_enable == b.rasterizer_discard_enable &&
+               a.cull_mode == b.cull_mode && a.front_face == b.front_face &&
+               a.blend_constants == b.blend_constants &&
+               a.color_write_masks == b.color_write_masks && a.line_width == b.line_width &&
+               a.feedback_loop_enabled == b.feedback_loop_enabled;
+    };
+    for (LdsReader& reader : readers) {
+        const GraphicsPipeline& pipeline = *reader.pipeline;
+        if (s.pipeline != pipeline.Handle()) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
+            s.pipeline = pipeline.Handle();
+        }
+        if (!previous || !same_dynamic(previous->dynamic, reader.dynamic)) {
+            s.dynamic = reader.dynamic;
+            s.dynamic.Invalidate();
+            s.dynamic.Commit(r.instance, cmdbuf);
+        }
+        previous = &reader;
+        RecordVertexIndex(reader.vertices);
+        DrawBindings& bound = reader.bindings;
+        for (size_t i = 0; i < bound.writes.size() && i < reader.infos.size(); ++i) {
+            const auto [buffer, image] = reader.infos[i];
+            bound.writes[i].pBufferInfo = buffer != ~0u ? bound.buffers.data() + buffer : nullptr;
+            bound.writes[i].pImageInfo = image != ~0u ? bound.images.data() + image : nullptr;
+        }
+        PushBindings(pipeline, vk::PipelineBindPoint::eGraphics, bound);
+        const std::array<u32, 2> words{u32(reader.address), u32(reader.address >> 32)};
+        cmdbuf.pushConstants(pipeline.GetLayout(), AllGraphicsStageBits,
+                             u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, words.data());
+        if (reader.indexed) {
+            if (reader.count != 0) {
+                cmdbuf.drawIndexed(reader.count, reader.instances, 0, s32(reader.vertex_offset),
+                                   reader.first_instance);
+            }
+        } else {
+            cmdbuf.draw(reader.count, reader.instances, reader.vertex_offset,
+                        reader.first_instance);
+        }
+        if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001
+            ++seg->draws;
+            if (reader.prims > seg->max_prims) {
+                seg->max_prims = reader.prims;
+                seg->max_prims_ps = reader.ps;
+            }
+        }
+    }
+    s.push_known = false; // the quad sample mask's words hold the last reader's scratch
+    readers.clear();
+    if (s.lds_readers.empty()) {
+        s.lds_readers = std::move(readers); // its storage for the next run
+    }
+}
+
+void NativeRenderer::ReportLdsRuns() {
+    static auto reported = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds{10}) {
+        return;
+    }
+    const auto lengths = [](const std::array<u64, 7>& a) {
+        return fmt::format("{}/{}/{}/{}/{}/{}/{}", a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    };
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GT7-060 ({:.1f} s): {} FIX-227 draws in {} runs sharing a barrier ({:.2f} a "
+                "run, longest {}; by length 1/2/3-4/5-8/9-16/17-32/33+ {}; ended by another draw/"
+                "the pass's end/the limit {}/{}/{}); {} drawn alone, the runs they made {} ({:.2f} "
+                "a run, longest {}; by length {})",
+                std::chrono::duration<double>(now - reported).count(), stats.lds_batched,
+                stats.lds_runs, double(stats.lds_batched) / double(std::max<u64>(stats.lds_runs, 1)),
+                stats.lds_run_max, lengths(stats.lds_run_lengths), stats.lds_run_ends[0],
+                stats.lds_run_ends[1], stats.lds_run_ends[2], stats.lds_alone,
+                stats.lds_alone_runs,
+                double(stats.lds_alone) / double(std::max<u64>(stats.lds_alone_runs, 1)),
+                stats.lds_alone_run_max, lengths(stats.lds_alone_lengths));
+    stats.lds_batched = stats.lds_runs = stats.lds_run_max = 0;
+    stats.lds_run_lengths = {};
+    stats.lds_run_ends = {};
+    stats.lds_alone = stats.lds_alone_runs = stats.lds_alone_run_max = 0;
+    stats.lds_alone_lengths = {};
+    reported = now;
 }
 
 void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {

@@ -235,6 +235,8 @@ private:
         std::vector<u8> bytes;
     };
 
+    struct LdsReader; ///< PERF-GT7-060
+
     /// The command list being recorded and its state.
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
@@ -304,6 +306,10 @@ private:
         /// OPT-015: which list the upload memos belong to (moves on when a list begins or ends).
         u64 serial = 0;
         std::array<UploadMemo, 5 * 3> upload_memos{};
+        /// PERF-GT7-060: FIX-227 draws of the current pass whose writer pass is recorded and
+        /// whose reader pass waits for the run's one barrier (FlushLdsReaders), and their scratch.
+        std::vector<LdsReader> lds_readers;
+        u64 lds_bytes = 0;
     };
 
     struct ViewRecord {
@@ -758,6 +764,33 @@ private:
         vk::IndexType index_type = vk::IndexType::eUint32;
         u32 index_count = 0;
     };
+    /// PERF-GT7-060: a FIX-227 draw's reader pass, recorded after its run's barrier: what it
+    /// binds and draws.
+    struct LdsReader {
+        const GraphicsPipeline* pipeline = nullptr;
+        DynamicState dynamic{};
+        VertexIndexState vertices{};
+        DrawBindings bindings; ///< writes, write_sets, buffers, images and push only
+        /// Each write's first buffer and image info in `bindings` (~0u: none). The infos are
+        /// held in the reader, which moves: the writes point at them only when recorded.
+        std::vector<std::pair<u32, u32>> infos;
+        u64 address = 0;       ///< its scratch
+        bool indexed = false;
+        u32 count = 0, instances = 0, vertex_offset = 0, first_instance = 0;
+        u64 ps = 0, prims = 0; ///< DIAG-GT7-001: its pixel shader and size, for the segment
+    };
+    /// PERF-GT7-060 (on; RYGT_NATIVE_LDS_BATCH=0 off): the FIX-227 draws of a
+    /// run share one barrier.
+    static bool LdsBatchOn();
+    /// PERF-GT7-060: copies what the reader pass binds; false when a descriptor write points
+    /// outside the draw's own infos (the draw then runs alone, as before).
+    static bool CaptureLdsReader(LdsReader& reader, const GraphicsPipeline& pipeline,
+                                 const DrawBindings& b, const VertexIndexState& vertices);
+    /// PERF-GT7-060: the stream's waiting reader passes, after one full barrier, in their pass
+    /// (reason: 0 another draw, 1 the pass ends, 2 the run's limit).
+    void FlushLdsReaders(u32 reason);
+    /// PERF-GT7-060: FIX-227 runs by length, every 10 s.
+    void ReportLdsRuns();
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);
     bool ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
@@ -1331,6 +1364,17 @@ private:
         u64 compute_texture_lookups = 0, compute_texture_hits = 0, compute_texture_bindings = 0;
         u64 small_rewrites = 0; ///< FIX-202: small textures uploaded again after big writes
         u64 lds_emulated_draws = 0; // FIX-227
+        /// PERF-GT7-060: FIX-227 draws whose reader pass waited for their run's barrier, runs
+        /// by length (1, 2, 3-4, 5-8, 9-16, 17-32, 33+) and the longest, runs ended by another
+        /// draw / the pass's end / the run's limit; draws that ran alone (switch off,
+        /// not eligible), and the runs these would have made (nothing between them).
+        u64 lds_batched = 0, lds_runs = 0, lds_run_max = 0;
+        std::array<u64, 7> lds_run_lengths{};
+        std::array<u64, 3> lds_run_ends{};
+        u64 lds_alone = 0, lds_alone_runs = 0, lds_alone_run_max = 0;
+        std::array<u64, 7> lds_alone_lengths{};
+        u64 lds_alone_run = 0;                       ///< the current one's length
+        std::array<u64, 4> lds_alone_marker{};       ///< barriers, passes, draws, dispatches after it
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,
