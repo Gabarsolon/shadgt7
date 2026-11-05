@@ -7,6 +7,7 @@
 #include <semaphore>
 #include <thread>
 #include <random>
+#include <utility>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -120,6 +121,47 @@ TEST(DrawPipe, DrainWaitsForWorkAlreadyRunning) {
     });
     pipe.Drain();
     EXPECT_EQ(done.load(), 9);
+}
+
+TEST(DrawPipe, DrainWaitsForAnIdleHookAlreadyUsingTheCaches) {
+    using namespace std::chrono_literals;
+    std::binary_semaphore entered{0}, release{0}, drained{0};
+    bool armed = false; // only the recorder reads or writes this flag
+    AmdGpu::DrawPipe pipe{nullptr};
+    pipe.SetIdleHook([&] {
+        if (std::exchange(armed, false)) {
+            entered.release();
+            release.acquire();
+        }
+    });
+    pipe.Push([&] { armed = true; });
+    entered.acquire();
+    EXPECT_FALSE(pipe.QueueIdle());
+    std::jthread caller{[&] {
+        pipe.Drain();
+        drained.release();
+    }};
+    EXPECT_FALSE(drained.try_acquire_for(100ms));
+    release.release();
+}
+
+TEST(DrawPipe, IdleWorkCompletesAfterReleaseWithoutAnotherPush) {
+    using namespace std::chrono_literals;
+    bool pending = false; // only accessed on the recorder
+    std::binary_semaphore done{0};
+    AmdGpu::DrawPipe pipe{nullptr};
+    pipe.SetIdleHook([&] {
+        if (std::exchange(pending, false)) {
+            EXPECT_FALSE(pipe.IsExclusive());
+            done.release();
+        }
+    });
+    for (int i = 0; i < 100; ++i) {
+        pipe.Push([&] { pending = true; });
+        pipe.Drain();
+        pipe.ReleaseExclusive();
+        ASSERT_TRUE(done.try_acquire_for(2s));
+    }
 }
 
 TEST(DrawPipe, BoundsTheQueueAndKeepsOrderUnderBackpressure) {
@@ -251,6 +293,7 @@ void Common::Log::VLog(Class, Level, const char*, int, const char*, fmt::string_
 namespace Common {
 void SetCurrentThreadName(const char*) {}
 void PreferPerformanceCores() {}
+void UpdateCoreOwner(u32, bool) {}
 int CurrentCoreIsFast() {
     return -1; // not known, as on a CPU without performance and efficiency cores
 }
