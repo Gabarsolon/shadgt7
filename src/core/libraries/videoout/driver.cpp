@@ -20,6 +20,12 @@
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
+#ifdef RYTY_GPU
+namespace Vulkan {
+bool NativeModeRequested(); // NAT-100 (vk_rasterizer_native.cpp)
+}
+#endif
+
 namespace Libraries::VideoOut {
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
@@ -493,14 +499,24 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     requests_cv.notify_one(); // GT-FF
 }
 
-// GT-FF: RYGT_FAST_FLIPS=1 shows each frame as soon as it is submitted (no faster than the
-// flip rate) instead of at the next vblank, which held a frame up to a vblank period and made
+// GT-FF: shows each frame as soon as it is ready (no faster than the flip rate) instead of
+// at the next vblank, which held a frame up to a vblank period and made
 // frame times alternate between one and two periods whenever the game ran below the refresh
-// rate. Vblanks still tick at their own rate for the game.
+// rate. Vblanks still tick at their own rate for the game. On by default for native rendering
+// without frame generation; RYGT_FAST_FLIPS=0 restores the previous pacing.
 static bool FastFlips() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_FAST_FLIPS");
-        return env && env[0] == '1';
+        bool native_renderer = false;
+#ifdef RYTY_GPU
+        native_renderer = Vulkan::NativeModeRequested();
+#endif
+        const bool enabled = FastFlipsEnabled(env, native_renderer,
+                                             EmulatorSettings.IsFrameGenEnabled() ||
+                                                 EmulatorSettings.IsDlssgEnabled());
+        LOG_INFO(Lib_VideoOut, "GT-FF: ready-frame presentation {} ({})",
+                 enabled ? "on" : "off", env && *env ? "RYGT_FAST_FLIPS" : "default");
+        return enabled;
     }();
     return on;
 }
