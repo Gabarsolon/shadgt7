@@ -744,6 +744,12 @@ private:
     u64 ReuseGeneration() const;
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
+    /// FIX-GT7-090: BindStages again when a region made while binding took in one an earlier
+    /// binding of the same draw or dispatch was given (its writes would go to the old buffer).
+    void BindStagesStable(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                          bool compute, DrawBindings& b);
+    u64 regions_taken_in = 0; ///< FIX-GT7-090: regions made that took in others
+    u64 stage_rebinds = 0;    ///< FIX-GT7-090: BindStages done again for that
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                      Shader::Backend::Bindings& binding, DrawBindings& b);
     void BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,

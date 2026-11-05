@@ -2185,6 +2185,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     WatchPages(begin, end - begin);
     DropMirrors(begin, end - begin); // NAT-150: reads there use the region from now on
     ++stats.regions_made;
+    regions_taken_in += merged.empty() ? 0 : 1; // FIX-GT7-090
     LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
              end - begin, merged.size());
     NoteHistory(begin, end - begin, 10, merged.size()); // DIAG-187 (diagnosis)
@@ -4130,6 +4131,43 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         m.targets = out;
     }
     return true;
+}
+
+void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stages,
+                                      const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    // FIX-GT7-090: the buffers of a draw or dispatch are looked up one after the other, and a
+    // written range reaching past its region makes a bigger one that takes the old one in
+    // (MakeRegion): an earlier binding of the same work still names the old region's buffer,
+    // which is kept only until the list has run. Its writes went there and were lost. GT7's
+    // crowd: cs 0x5972569e writes its section list and, in the same page, its group table; the
+    // first frame the game puts them at a new address, the list's binding made a region (0x3000)
+    // and the table's binding a bigger one taking it in (0x4000), so the first of the three
+    // dispatches wrote its sections into the old buffer. The scatter (cs 0x7dd8d7b6) then read
+    // the stale sections from guest memory (an index of -64), ~313 crowd instances kept
+    // garbage matrices, and vs 0xb1e0c79f drew them as huge triangles at the near plane in the
+    // depth pre-pass: one frame black under the pre-race HUD (triangles, bands, sky, whole
+    // scene). Found by Codex's replays (occlusion queries per draw, the crowd buffers copied
+    // after the scatter). The bindings are made again once nothing more is taken in (they all
+    // name the merged region then). RYGT_NATIVE_STABLE_BINDINGS=0: as before.
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_STABLE_BINDINGS");
+        return !(env && env[0] == '0');
+    }();
+    for (u32 attempt = 0;; ++attempt) {
+        const u64 taken_before = regions_taken_in;
+        BindStages(stages, regs, compute, b);
+        if (!on || regions_taken_in == taken_before || attempt == 3) {
+            return;
+        }
+        ++stage_rebinds;
+        static std::atomic<u32> logged{};
+        if (const u32 n = logged++; n < 20 || n % 1000 == 0) {
+            LOG_INFO(Render_Vulkan, "FIX-GT7-090: a region taken in while binding a {} (frame {}): "
+                     "bound again ({} so far)", compute ? "dispatch" : "draw", frame, n + 1);
+        }
+        b.Clear();
+        b.push = UserData(regs);
+    }
 }
 
 void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
@@ -8383,7 +8421,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     if (!from_prepared) {
         b.Clear();
         b.push = UserData(regs);
-        BindStages(pipeline->GetStages(), regs, false, b);
+        BindStagesStable(pipeline->GetStages(), regs, false, b); // FIX-GT7-090
         WritebacksBefore(b); // PERF-GT7-044
     }
     if (b.failed) {
@@ -10259,7 +10297,7 @@ void NativeRenderer::DispatchDirect() {
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
-    BindStages(pipeline->GetStages(), regs, true, b);
+    BindStagesStable(pipeline->GetStages(), regs, true, b); // FIX-GT7-090
     WritebacksBefore(b); // PERF-GT7-044
     if (b.failed) {
         ++stats.skipped;
@@ -10379,7 +10417,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
-    BindStages(pipeline->GetStages(), regs, true, b);
+    BindStagesStable(pipeline->GetStages(), regs, true, b); // FIX-GT7-090
     WritebacksBefore(b); // PERF-GT7-044
     PrepareImages(b); // PERF-109
     GlobalBarrier();
