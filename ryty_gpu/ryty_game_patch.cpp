@@ -721,6 +721,731 @@ void InstallScriptPatches(u8* base) {
     }
 }
 
+// DIAG-GT7-043: RYGT_DUMP_SCRIPTS=<folder> saves every Adhoc script GT7 loads, one file each, with
+// the time it was loaded in stderr. Since version 15 a script's body is encrypted: the loader reads
+// the "ADCH015" header and 16 bytes, makes a decrypting stream from them and reads through it. What
+// that stream's read returns is saved, so this sees what the game itself gets.
+constexpr u64 kGt7MakeScriptStream = 0x2bec690;     // void make(Stream** out, Stream** in, u8* iv)
+constexpr u64 kGt7MakeScriptStreamCall = 0x2b7e712; // its call in the script loader
+constexpr u64 kGt7ScriptStreamRead = 0x2beb2f0;     // u64 read(Stream*, u8* to, u64 size)
+constexpr u8 kGt7ScriptStreamReadStart[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                            0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x78};
+using MakeScriptStreamFn = void(PS4_SYSV_ABI*)(void**, void*, void*);
+using ScriptStreamReadFn = u64(PS4_SYSV_ABI*)(void*, u8*, u64);
+MakeScriptStreamFn g_make_script_stream = nullptr;
+ScriptStreamReadFn g_script_stream_read = nullptr;
+std::string g_script_dump_folder;
+std::mutex g_script_dump_mutex;
+std::vector<std::pair<void*, FILE*>> g_script_dumps;
+int g_script_dump_count = 0;
+
+// FIX-GT7-060: Arcade opens on the same course, weather and car at every launch: it keeps them in
+// its context for one session only. As the game reads Arcade's scripts, this adds to their bytecode:
+// the top screen writes the choices to a file, and the context's first read of the course and of the
+// car takes them from it. Nothing changes on disk but that file. Every function touched is checked
+// by name and sizes first; if one differs, the script stays as it is. RYGT_ARCADE_MEMORY=0 turns it off.
+constexpr const char* kArcadeMemoryFile = "/APP_DATA/arcade_last.txt";
+
+// Operands of each Adhoc instruction: s symbol, S count and symbols, i 32 bits, b 8 bits, h 16 bits,
+// q 64 bits, F a code frame. An opcode without an entry stops the reading.
+constexpr std::array<const char*, 76> kAdhocOperands = [] {
+    std::array<const char*, 76> a{};
+    a[2] = "s";    a[3] = "S";   a[4] = "s";   a[5] = "s";   a[6] = "i";   a[7] = "sS";  a[8] = "";
+    a[9] = "i";    a[10] = "sF"; a[11] = "Sss"; a[12] = "i"; a[13] = "i";  a[14] = "i";  a[15] = "i";
+    a[20] = "sF";  a[21] = "S";  a[22] = "";   a[23] = "";   a[25] = "i";  a[26] = "S";  a[28] = "s";
+    a[29] = "s";   a[30] = "i";  a[31] = "";   a[32] = "i";  a[33] = "s";  a[34] = "s";  a[35] = "S";
+    a[36] = "Si";  a[37] = "S";  a[38] = "Si"; a[39] = "s";  a[40] = "F";  a[41] = "F";  a[43] = "q";
+    a[44] = "";    a[45] = "ib"; a[47] = "s";  a[48] = "s";  a[49] = "ii"; a[50] = "i";  a[51] = "";
+    a[52] = "";    a[53] = "";   a[54] = "";   a[55] = "b";  a[56] = "";   a[57] = "";   a[58] = "i";
+    a[59] = "q";   a[60] = "q";  a[61] = "";   a[62] = "";   a[63] = "i";  a[64] = "i";  a[65] = "b";
+    a[66] = "";    a[67] = "i";  a[69] = "s";  a[70] = "i";  a[71] = "";   a[72] = "b";  a[73] = "b";
+    a[74] = "h";   a[75] = "h";
+    return a;
+}();
+
+void WriteVarint(std::vector<u8>& out, u32 value) {
+    if (value < 0x80) {
+        out.push_back(static_cast<u8>(value));
+    } else if (value < 0x4000) {
+        out.push_back(static_cast<u8>(0x80 | (value >> 8)));
+        out.push_back(static_cast<u8>(value));
+    } else if (value < 0x200000) {
+        out.push_back(static_cast<u8>(0xc0 | (value >> 16)));
+        out.push_back(static_cast<u8>(value >> 8));
+        out.push_back(static_cast<u8>(value));
+    } else {
+        out.push_back(static_cast<u8>(0xe0 | (value >> 24)));
+        out.push_back(static_cast<u8>(value >> 16));
+        out.push_back(static_cast<u8>(value >> 8));
+        out.push_back(static_cast<u8>(value));
+    }
+}
+
+// Instructions to add to a function. New symbols are always written in full.
+class AdhocCode {
+public:
+    AdhocCode(u32 at, u32 line) : at_{at}, line_{line} {}
+
+    void Sym(std::string_view name) {
+        bytes_.push_back(0);
+        WriteVarint(bytes_, static_cast<u32>(name.size()));
+        bytes_.insert(bytes_.end(), name.begin(), name.end());
+        ++symbols_;
+    }
+    void Op(u8 op) {
+        U32(line_);
+        bytes_.push_back(op);
+        ++count_;
+    }
+    void U32(u32 value) {
+        for (int i = 0; i < 4; ++i) {
+            bytes_.push_back(static_cast<u8>(value >> (i * 8)));
+        }
+    }
+    void Var(u8 op, std::initializer_list<std::string_view> names, u32 slot) {
+        Op(op);
+        U32(static_cast<u32>(names.size()));
+        for (const auto name : names) {
+            Sym(name);
+        }
+        U32(slot);
+    }
+    void Eval(std::initializer_list<std::string_view> names, u32 slot) { Var(38, names, slot); }
+    void Store(std::string_view name, u32 slot) {
+        Var(36, {name}, slot);
+        Op(57);
+    }
+    void Attr(u8 op, std::string_view name) {
+        Op(op);
+        U32(1);
+        Sym(name);
+    }
+    void Get(std::string_view name) { Attr(37, name); }
+    void Call(u32 args) {
+        Op(6);
+        U32(args);
+    }
+    void Method(std::string_view name) {
+        Get(name);
+        Call(0);
+    }
+    void Text(std::string_view text) {
+        Op(29);
+        Sym(text);
+    }
+    void Int(s32 value) {
+        Op(12);
+        U32(static_cast<u32>(value));
+    }
+    void Binary(std::string_view name) {
+        Op(5);
+        Sym(name);
+    }
+    void Element(s32 index, std::string_view array, u32 slot) {
+        Eval({array}, slot);
+        Int(index);
+        Op(62);
+    }
+    // A jump to fill in later; returns where its target goes.
+    size_t Jump(u8 op) {
+        Op(op);
+        U32(0);
+        return bytes_.size() - 4;
+    }
+    u32 Here() const { return at_ + count_; }
+    void Land(size_t jump, u32 target) {
+        for (int i = 0; i < 4; ++i) {
+            bytes_[jump + i] = static_cast<u8>(target >> (i * 8));
+        }
+    }
+    // A jump to an instruction of the original function, which moves by what is added here.
+    void JumpToOriginal(u8 op, u32 original) { later_.emplace_back(Jump(op), original); }
+    void Finish() {
+        for (const auto& [jump, original] : later_) {
+            Land(jump, original + count_);
+        }
+    }
+
+    const std::vector<u8>& Bytes() const { return bytes_; }
+    u32 Count() const { return count_; }
+    u32 Symbols() const { return symbols_; }
+
+private:
+    u32 at_;
+    u32 line_;
+    u32 count_{};
+    u32 symbols_{};
+    std::vector<u8> bytes_;
+    std::vector<std::pair<size_t, u32>> later_;
+};
+
+// parts = the file's fields; the returned jumps are taken if there's no usable file.
+std::vector<size_t> ArcadeReadParts(AdhocCode& code, u32 statics, u32 file, u32 parts) {
+    std::vector<size_t> fail;
+    code.Eval({"pdistd", "Exist", "pdistd::Exist"}, statics);
+    code.Text(kArcadeMemoryFile);
+    code.Call(1);
+    fail.push_back(code.Jump(15));
+    code.Eval({"pdistd", "ReadFile", "pdistd::ReadFile"}, statics + 1);
+    code.Text(kArcadeMemoryFile);
+    code.Call(1);
+    code.Text("buffer");
+    code.Op(62);
+    code.Store("arcade_file", file);
+    code.Eval({"arcade_file"}, file);
+    code.Op(22);
+    code.Binary("__ne__");
+    fail.push_back(code.Jump(15));
+    code.Eval({"arcade_file"}, file);
+    code.Method("toString");
+    code.Get("split");
+    code.Text(",");
+    code.Call(1);
+    code.Store("arcade_parts", parts);
+    code.Eval({"arcade_parts"}, parts);
+    code.Get("size");
+    code.Int(3);
+    code.Binary("__ge__");
+    fail.push_back(code.Jump(15));
+    return fail;
+}
+
+struct ArcadeSite {
+    std::string_view root;
+    std::string_view method;
+    u32 count, locals, statics, at;
+    void (*make)(AdhocCode&, const ArcadeSite&);
+    u32 local; // ctx or ctrl
+    u32 after; // what follows the code once it found what it wanted
+};
+
+// if (!courseInfo_.nickName_) { <here> list = GetCourseList(); ... }
+void MakeArcadeCourse(AdhocCode& code, const ArcadeSite& site) {
+    const u32 parts = site.locals + 1;
+    const auto fail = ArcadeReadParts(code, site.statics, site.locals, parts);
+    code.Eval({"self"}, 0);
+    code.Method("GetCourseList");
+    code.Get("indexOf");
+    code.Element(0, "arcade_parts", parts);
+    code.Call(1);
+    code.Int(1);
+    code.Op(34);
+    code.Sym("__uminus__");
+    code.Binary("__gt__");
+    const size_t unknown = code.Jump(15);
+    code.Element(0, "arcade_parts", parts);
+    code.Eval({"ctx"}, site.local);
+    code.Get("courseInfo_");
+    code.Attr(3, "nickName_");
+    code.Op(57);
+    code.Element(1, "arcade_parts", parts);
+    code.Method("toUInt");
+    code.Eval({"ctx"}, site.local);
+    code.Get("courseInfo_");
+    code.Attr(3, "weatherID_");
+    code.Op(57);
+    code.JumpToOriginal(13, site.after);
+    for (const size_t jump : fail) {
+        code.Land(jump, code.Here());
+    }
+    code.Land(unknown, code.Here());
+}
+
+// if (!playersState_.cp_) { <here> list = GetPresetCarList(); ... }
+void MakeArcadeCar(AdhocCode& code, const ArcadeSite& site) {
+    const u32 parts = site.locals + 1;
+    const u32 iterator = site.locals + 2;
+    const u32 car = site.locals + 3;
+    const auto fail = ArcadeReadParts(code, site.statics, site.locals, parts);
+    code.Eval({"self"}, 0);
+    code.Method("GetPresetCarList");
+    code.Get("iterator");
+    code.Store("arcade_in", iterator);
+    const u32 loop = code.Here();
+    code.Eval({"arcade_in"}, iterator);
+    code.Get("fetch_next");
+    const size_t done = code.Jump(15);
+    code.Eval({"arcade_in"}, iterator);
+    code.Op(8);
+    code.Store("arcade_car", car);
+    code.Eval({"arcade_car"}, car);
+    code.Method("getCarLabel");
+    code.Element(2, "arcade_parts", parts);
+    code.Binary("__eq__");
+    code.Land(code.Jump(15), loop);
+    code.Eval({"arcade_car"}, car);
+    code.Eval({"ctx"}, site.local);
+    code.Get("playersState_");
+    code.Attr(3, "cp_");
+    code.Op(57);
+    code.JumpToOriginal(13, site.after);
+    code.Land(done, code.Here());
+    for (const size_t jump : fail) {
+        code.Land(jump, code.Here());
+    }
+}
+
+// At the top screen's refreshes, once ctrl is known and not nil: writes the current choices.
+void MakeArcadeSave(AdhocCode& code, const ArcadeSite& site) {
+    code.Eval({"ctrl"}, site.local);
+    code.Method("GetPlayersState");
+    code.Get("cp_");
+    code.Op(22);
+    code.Binary("__ne__");
+    const size_t no_car = code.Jump(15);
+    code.Eval({"pdistd", "WriteFile", "pdistd::WriteFile"}, site.statics);
+    code.Text(kArcadeMemoryFile);
+    code.Eval({"ctrl"}, site.local);
+    code.Method("GetCourseInfo");
+    code.Get("nickName_");
+    code.Text(",");
+    code.Eval({"ctrl"}, site.local);
+    code.Method("GetCourseInfo");
+    code.Get("weatherID_");
+    code.Method("toString");
+    code.Text(",");
+    code.Eval({"ctrl"}, site.local);
+    code.Method("GetPlayersState");
+    code.Get("cp_");
+    code.Method("getCarLabel");
+    code.Op(30);
+    code.U32(5);
+    code.Call(2);
+    code.Op(54);
+    code.Land(no_car, code.Here());
+}
+
+constexpr std::string_view kArcadeControl = "gt7/menu/app/arcade/control.swift";
+constexpr std::string_view kArcadeTop = "gt7/menu/app/arcade/events/TopRootEvent.swift";
+const ArcadeSite kArcadeSites[] = {
+    {kArcadeControl, "GetCourseInfo", 74, 7, 4, 24, MakeArcadeCourse, 2, 71},
+    {kArcadeControl, "GetPlayersState", 46, 4, 2, 24, MakeArcadeCar, 2, 43},
+    {kArcadeTop, "updateCourseInfo", 160, 9, 20, 16, MakeArcadeSave, 2, 0},
+    {kArcadeTop, "updateCarInfo", 259, 15, 18, 16, MakeArcadeSave, 3, 0},
+};
+
+// Copies a script file, changing the symbol indices and jumps that the added code moves.
+class ArcadeScriptPatch {
+public:
+    explicit ArcadeScriptPatch(const std::vector<u8>& in) : in_{in} {}
+
+    // False if the file isn't the one with Arcade or anything differs.
+    bool Run(std::vector<u8>& out) {
+        Varint();
+        const u32 frames = Varint();
+        out_.reserve(in_.size() + 16384);
+        out_.insert(out_.end(), in_.begin(), in_.begin() + pos_);
+        for (u32 i = 0; i < frames && ok_; ++i) {
+            const size_t start = pos_;
+            names_.clear();
+            map_.clear();
+            mapped_ = 0;
+            root_ = RootSource();
+            write_ = root_ == kArcadeControl || root_ == kArcadeTop;
+            Frame({}, true);
+            if (!ok_ || pos_ + 16 > in_.size()) {
+                return false;
+            }
+            if (!write_) {
+                out_.insert(out_.end(), in_.begin() + start, in_.begin() + pos_);
+            }
+            out_.insert(out_.end(), in_.begin() + pos_, in_.begin() + pos_ + 16);
+            pos_ += 16;
+        }
+        if (!ok_ || placed_ != std::size(kArcadeSites)) {
+            return false;
+        }
+        out.swap(out_);
+        return true;
+    }
+
+    u32 Placed() const { return placed_; }
+
+private:
+    u8 U8() {
+        if (pos_ >= in_.size()) {
+            ok_ = false;
+            return 0;
+        }
+        return in_[pos_++];
+    }
+    u32 U32() {
+        if (pos_ + 4 > in_.size()) {
+            ok_ = false;
+            return 0;
+        }
+        u32 value;
+        std::memcpy(&value, in_.data() + pos_, 4);
+        pos_ += 4;
+        return value;
+    }
+    u32 Varint() {
+        u32 value = U8();
+        if (value & 0x80) {
+            int more = 0;
+            u32 mask = 0x80;
+            while (value & mask) {
+                ++more;
+                mask >>= 1;
+            }
+            value &= mask - 1;
+            for (int i = 0; i < more; ++i) {
+                value = (value << 8) | U8();
+            }
+        }
+        return value;
+    }
+    void Out32(u32 value) {
+        if (write_) {
+            for (int i = 0; i < 4; ++i) {
+                out_.push_back(static_cast<u8>(value >> (i * 8)));
+            }
+        }
+    }
+    u32 Copy32() {
+        const u32 value = U32();
+        Out32(value);
+        return value;
+    }
+    void Copy(size_t size) {
+        if (pos_ + size > in_.size()) {
+            ok_ = false;
+            return;
+        }
+        if (write_) {
+            out_.insert(out_.end(), in_.begin() + pos_, in_.begin() + pos_ + size);
+        }
+        pos_ += size;
+    }
+    std::string_view RootSource() {
+        const size_t start = pos_;
+        std::string_view name;
+        if (pos_ < in_.size() && in_[pos_] == 0) {
+            ++pos_;
+            const u32 size = Varint();
+            if (pos_ + size <= in_.size()) {
+                name = {reinterpret_cast<const char*>(in_.data() + pos_), size};
+            }
+        }
+        pos_ = start;
+        return name;
+    }
+    // A frame of the file numbers its symbols from 1, as each is first written in full.
+    std::string_view Symbol() {
+        if (pos_ < in_.size() && in_[pos_] != 0) {
+            const u32 index = Varint();
+            if (!write_) {
+                return {};
+            }
+            if (index == 0 || index > map_.size()) {
+                ok_ = false;
+                return {};
+            }
+            WriteVarint(out_, map_[index - 1]);
+            return names_[index - 1];
+        }
+        U8();
+        const u32 size = Varint();
+        if (pos_ + size > in_.size() || size > 4096) {
+            ok_ = false;
+            return {};
+        }
+        const std::string_view name{reinterpret_cast<const char*>(in_.data() + pos_), size};
+        pos_ += size;
+        if (write_) {
+            map_.push_back(++mapped_);
+            names_.push_back(name);
+            out_.push_back(0);
+            WriteVarint(out_, size);
+            out_.insert(out_.end(), name.begin(), name.end());
+        }
+        return name;
+    }
+    std::string_view Symbols() {
+        const u32 count = Copy32();
+        if (count > 4096) {
+            ok_ = false;
+            return {};
+        }
+        std::string_view first;
+        for (u32 i = 0; i < count && ok_; ++i) {
+            const auto name = Symbol();
+            if (i == 0) {
+                first = name;
+            }
+        }
+        return first;
+    }
+    void Frame(std::string_view method, bool root) {
+        Symbol();
+        Copy(1);
+        for (int list = 0; list < 2; ++list) {
+            const u32 count = Copy32();
+            for (u32 i = 0; i < count && ok_; ++i) {
+                Symbol();
+                Copy32();
+            }
+        }
+        Copy32();
+        const u32 stack = U32();
+        const u32 locals = U32();
+        const u32 statics = U32();
+        const u32 count = U32();
+        if (!ok_ || count > 0x400000) {
+            ok_ = false;
+            return;
+        }
+        const ArcadeSite* site = nullptr;
+        if (write_ && !root) {
+            for (const auto& candidate : kArcadeSites) {
+                if (candidate.root == root_ && candidate.method == method &&
+                    candidate.count == count && candidate.locals == locals &&
+                    candidate.statics == statics) {
+                    site = &candidate;
+                }
+            }
+        }
+        // The frame's header comes first, so the added code is made now.
+        AdhocCode code{site ? site->at : 0, 0};
+        if (site) {
+            site->make(code, *site);
+            code.Finish();
+        }
+        Out32(stack + (site ? 8 : 0));
+        Out32(locals + (site ? 4 : 0));
+        Out32(statics + (site ? 2 : 0));
+        Out32(count + code.Count());
+        for (u32 i = 0; i < count && ok_; ++i) {
+            if (site && i == site->at) {
+                // Each site's first instruction is a variable's evaluation.
+                if (pos_ + 5 > in_.size() || in_[pos_ + 4] != 38) {
+                    ok_ = false;
+                    return;
+                }
+                out_.insert(out_.end(), code.Bytes().begin(), code.Bytes().end());
+                mapped_ += code.Symbols();
+                ++placed_;
+            }
+            Copy32();
+            const u8 op = U8();
+            if (write_) {
+                out_.push_back(op);
+            }
+            const char* operands = op < kAdhocOperands.size() ? kAdhocOperands[op] : nullptr;
+            if (!operands) {
+                ok_ = false;
+                return;
+            }
+            const bool jump = op == 13 || op == 14 || op == 15 || op == 70 || op == 63 || op == 64 ||
+                              op == 32;
+            std::string_view name;
+            for (const char* operand = operands; *operand && ok_; ++operand) {
+                switch (*operand) {
+                case 's':
+                    name = Symbol();
+                    break;
+                case 'S':
+                    name = Symbols();
+                    break;
+                case 'i':
+                    if (jump && site) {
+                        const u32 target = U32();
+                        Out32(target > site->at ? target + code.Count() : target);
+                    } else {
+                        Copy32();
+                    }
+                    break;
+                case 'b':
+                    Copy(1);
+                    break;
+                case 'h':
+                    Copy(2);
+                    break;
+                case 'q':
+                    Copy(8);
+                    break;
+                case 'F':
+                    Frame(name, false);
+                    break;
+                default:
+                    ok_ = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    const std::vector<u8>& in_;
+    std::vector<u8> out_;
+    size_t pos_{};
+    bool ok_{true};
+    bool write_{};
+    std::string_view root_;
+    std::vector<std::string_view> names_;
+    std::vector<u32> map_;
+    u32 mapped_{};
+    u32 placed_{};
+};
+
+// The game reads its scripts in small pieces through this stream: the first read takes the whole
+// script, and the following ones are served from the copy, changed if it's the one with Arcade.
+struct ScriptCopy {
+    void* stream;
+    std::vector<u8> data;
+    size_t served;
+    bool loaded;
+};
+bool g_arcade_memory = false;
+std::vector<ScriptCopy> g_script_copies;
+
+void PS4_SYSV_ABI MakeScriptStreamHook(void** out, void* in, void* iv) {
+    g_make_script_stream(out, in, iv);
+    std::scoped_lock lock{g_script_dump_mutex};
+    if (g_arcade_memory) {
+        const auto copy = std::find_if(g_script_copies.begin(), g_script_copies.end(),
+                                       [out](const auto& c) { return c.stream == *out; });
+        if (copy != g_script_copies.end()) {
+            g_script_copies.erase(copy);
+        }
+        g_script_copies.push_back({*out, {}, 0, false});
+    }
+    if (g_script_dump_folder.empty()) {
+        return;
+    }
+    const auto entry = std::find_if(g_script_dumps.begin(), g_script_dumps.end(),
+                                    [out](const auto& dump) { return dump.first == *out; });
+    if (entry != g_script_dumps.end()) {
+        std::fclose(entry->second);
+        g_script_dumps.erase(entry);
+    }
+    const std::string path =
+        fmt::format("{}\\{:05}.adc", g_script_dump_folder, ++g_script_dump_count);
+    SYSTEMTIME now{};
+    GetSystemTime(&now);
+    std::fprintf(stderr, "[scripts] %02d:%02d:%02d.%03d UTC #%d\n", now.wHour, now.wMinute,
+                 now.wSecond, now.wMilliseconds, g_script_dump_count);
+    if (FILE* file = std::fopen(path.c_str(), "wb")) {
+        g_script_dumps.emplace_back(*out, file);
+    }
+}
+
+u64 ReadScriptCopy(ScriptCopy& copy, u8* to, u64 size) {
+    if (!copy.loaded) {
+        copy.loaded = true;
+        static constexpr u64 kChunk = 1u << 20;
+        std::vector<u8> data;
+        for (;;) {
+            const size_t have = data.size();
+            data.resize(have + kChunk);
+            const s32 got = static_cast<s32>(g_script_stream_read(copy.stream, data.data() + have, kChunk));
+            data.resize(have + static_cast<size_t>(std::max(got, 0)));
+            if (got <= 0) {
+                break;
+            }
+        }
+        ArcadeScriptPatch patch{data};
+        std::vector<u8> changed;
+        if (patch.Run(changed)) {
+            std::fprintf(stderr, "[patch] FIX-GT7-060 Arcade remembers its choices (%zu bytes added)\n",
+                         changed.size() - data.size());
+            data.swap(changed);
+        } else if (patch.Placed() != 0) {
+            std::fprintf(stderr, "[patch] FIX-GT7-060: Arcade's scripts differ, not applied\n");
+        }
+        copy.data.swap(data);
+    }
+    const u64 count = std::min<u64>(size, copy.data.size() - copy.served);
+    if (to && count != 0) {
+        std::memcpy(to, copy.data.data() + copy.served, static_cast<size_t>(count));
+    }
+    copy.served += static_cast<size_t>(count);
+    return count;
+}
+
+u64 PS4_SYSV_ABI ScriptStreamReadHook(void* stream, u8* to, u64 size) {
+    u64 read = 0;
+    bool from_copy = false;
+    if (g_arcade_memory) {
+        std::scoped_lock lock{g_script_dump_mutex};
+        const auto copy = std::find_if(g_script_copies.begin(), g_script_copies.end(),
+                                       [stream](const auto& c) { return c.stream == stream; });
+        if (copy != g_script_copies.end()) {
+            read = ReadScriptCopy(*copy, to, size);
+            from_copy = true;
+        }
+    }
+    if (!from_copy) {
+        read = g_script_stream_read(stream, to, size);
+    }
+    const s32 count = static_cast<s32>(read);
+    if (count > 0 && to && !g_script_dump_folder.empty()) {
+        std::scoped_lock lock{g_script_dump_mutex};
+        const auto entry = std::find_if(g_script_dumps.begin(), g_script_dumps.end(),
+                                        [stream](const auto& dump) { return dump.first == stream; });
+        if (entry != g_script_dumps.end()) {
+            std::fwrite(to, 1, static_cast<size_t>(count), entry->second);
+            std::fflush(entry->second);
+        }
+    }
+    return read;
+}
+
+void InstallGt7ScriptDump(u8* base) {
+    const char* folder = std::getenv("RYGT_DUMP_SCRIPTS");
+    const bool dump = folder && folder[0];
+    const char* memory = std::getenv("RYGT_ARCADE_MEMORY");
+    u8* const read = base + kGt7ScriptStreamRead + kTextRvaShift;
+    constexpr size_t kMoved = sizeof(kGt7ScriptStreamReadStart);
+    // Only GT7 has these bytes here: FIX-GT7-060 stays silent elsewhere.
+    if (std::memcmp(read, kGt7ScriptStreamReadStart, kMoved) != 0) {
+        if (dump) {
+            std::fprintf(stderr, "[patch] DIAG-GT7-043: original bytes differ, not applied\n");
+        }
+        return;
+    }
+    g_arcade_memory = !(memory && memory[0] == '0');
+    if (!dump && !g_arcade_memory) {
+        return;
+    }
+    u8* stubs = AllocNear(base);
+    if (!stubs) {
+        std::fprintf(stderr, "[patch] DIAG-GT7-043: no memory near the game's code for the hooks\n");
+        g_arcade_memory = false;
+        return;
+    }
+    if (dump) {
+        g_script_dump_folder = folder;
+        CreateDirectoryA(folder, nullptr);
+    }
+    g_make_script_stream =
+        reinterpret_cast<MakeScriptStreamFn>(base + kGt7MakeScriptStream + kTextRvaShift);
+    if (!RedirectCall(base, stubs, kGt7MakeScriptStreamCall, kGt7MakeScriptStream,
+                      reinterpret_cast<void*>(&MakeScriptStreamHook), "DIAG-GT7-043 script loads")) {
+        return;
+    }
+    // The read's first instructions move to a trampoline; they don't depend on where they run.
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    u8* const trampoline = stubs + 16;
+    std::memcpy(trampoline, read, kMoved);
+    std::memcpy(trampoline + kMoved, jump, 6);
+    const u8* const resume = read + kMoved;
+    std::memcpy(trampoline + kMoved + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, kMoved + 14);
+    g_script_stream_read = reinterpret_cast<ScriptStreamReadFn>(trampoline);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(read, kMoved, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    const void* const hook = reinterpret_cast<void*>(&ScriptStreamReadHook);
+    std::memcpy(read, jump, 6);
+    std::memcpy(read + 6, &hook, 8);
+    std::memset(read + 14, 0x90, kMoved - 14);
+    DWORD ignored = 0;
+    VirtualProtect(read, kMoved, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), read, kMoved);
+    std::fprintf(stderr, "[patch] DIAG-GT7-043 script reads applied\n");
+}
+
 void InstallMiscHooks(u8* base) {
     const char* diag = std::getenv("RYGT_ENV_DIAG");
     const char* scale = std::getenv("RYGT_ENV_SCALE");
@@ -1224,6 +1949,7 @@ void RytyApplyGamePatches() {
     InstallMiscHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
