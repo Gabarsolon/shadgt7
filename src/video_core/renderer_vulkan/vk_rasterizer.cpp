@@ -6056,6 +6056,55 @@ bool Rasterizer::IsMappedStart(VAddr address) {
     return memory->IsValidMapping(address);
 }
 
+void Rasterizer::OnNewMapping(VAddr addr, u64 size) {
+    // FIX-GT7-077: Ryty reports an unmap before it unmaps. A texture still in use was uploaded again
+    // in between, from views imported then: aliases of the old pages, which nothing dropped at the
+    // map that followed. GT7 streams its track textures into partially resident memory and gives
+    // the freed pages to other textures: the near asphalt showed their tiles (flat green, red or
+    // blue road, 64 KB tiles of masks and normal maps) until those pages were unmapped again, often
+    // a lap later. Views still there at a map are stale: the range is treated as unmapped first.
+    // Without them, textures there are still uploaded again: uploaded while nothing was mapped,
+    // they hold zeros, and memory mapped with its data already in it writes nothing they would
+    // see. RYGT_MAP_DROPS_COPIES=0: as before (stale views are still counted in the log; imports
+    // that failed in the range are retried).
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_MAP_DROPS_COPIES");
+        return !(env && env[0] == '0');
+    }();
+    if (size == 0) {
+        return;
+    }
+    if (auto* direct = buffer_cache.GetDirectMemory(); direct && direct->ViewsOver(addr, size)) {
+        static std::atomic<u32> stale{};
+        if (const u32 n = ++stale; n <= 40 || n % 100 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-077: views of what was mapped before at {:#x}+{:#x} {} at its new "
+                        "mapping ({} so far)",
+                        addr, size, enabled ? "dropped" : "kept (RYGT_MAP_DROPS_COPIES=0)", n);
+        }
+        if (enabled) {
+            UnmapMemory(addr, size);
+#ifdef RYTY_GPU
+            // FIX-GT7-086: UnmapMemory marks the textures before direct->OnUnmap drops the views,
+            // so an upload recorded in between read the old pages and took the mark. They are
+            // marked again now that the views are gone.
+            if (native) {
+                native->OnNewMapping(addr, size);
+            }
+#endif
+        }
+        return;
+    }
+    if (!enabled) {
+        return;
+    }
+#ifdef RYTY_GPU
+    if (native) {
+        native->OnNewMapping(addr, size);
+    }
+#endif
+}
+
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
 #ifdef RYTY_GPU

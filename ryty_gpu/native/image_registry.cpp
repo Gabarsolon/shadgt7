@@ -1264,6 +1264,18 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     });
 }
 
+u32 ImageRegistry::InvalidateNewMapping(VAddr address, u64 size) {
+    ForgetFills(address, size); // FIX-GT7-036
+    u32 count = 0;
+    ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
+        if (entry.from_cpu) {
+            MarkStale(entry, Stale::Unmap); // forced: not skipped by NAT-109's hash
+            ++count;
+        }
+    });
+    return count;
+}
+
 void ImageRegistry::MarkReused(ImageEntry& entry) {
     if (entry.reused.exchange(true, std::memory_order_relaxed)) {
         return;

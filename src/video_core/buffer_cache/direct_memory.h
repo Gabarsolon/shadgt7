@@ -77,6 +77,12 @@ public:
     /// released once the GPU has finished the work recorded so far.
     void OnUnmap(VAddr address, u64 size);
 
+    /// FIX-GT7-077: Ryty mapped [address, address + size) (it reports after it did). Whether views
+    /// of the memory mapped there before are still in the page table: a view imported between
+    /// Ryty's unmap report and its unmap is an alias of the old pages, which the game then gives
+    /// to other data. Bases that failed to import there may import again.
+    bool ViewsOver(VAddr address, u64 size);
+
     /// D4: the command processor rewrites this range while queued draws may still read it (CE
     /// dumps, WriteData): its buffers keep the copy path, which snapshots at bind time.
     void MarkVolatile(VAddr address, u64 size);

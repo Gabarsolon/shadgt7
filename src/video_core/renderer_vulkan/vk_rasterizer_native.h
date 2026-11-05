@@ -101,6 +101,9 @@ public:
     bool InlineWrite(VAddr address, std::span<const u8> data);
     /// Guest memory is unmapped: textures over it are uploaded again when next used.
     void OnUnmap(VAddr address, u64 size);
+    /// FIX-GT7-077: guest memory was mapped where no view of older memory is left: textures over
+    /// it are uploaded again when next used.
+    void OnNewMapping(VAddr address, u64 size);
     /// NAT-105: the CPU wrote watched memory (a page fault on any thread): the textures there
     /// are uploaded again before their next use, and their pages are no longer watched.
     void OnCpuWrite(VAddr address, u64 size, u64 exact);
@@ -586,6 +589,8 @@ private:
     void RefreshMirror(Mirror& mirror);
     void MakePendingMirrors();
     void DropMirrors(VAddr address, u64 size);
+    /// NAT-146, FIX-GT7-086: regions and mirrors over the range go (with `mutex` held); how many.
+    u32 DropRegionsOver(VAddr address, u64 size);
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
     Bound last_bound = Bound::InPlace;
