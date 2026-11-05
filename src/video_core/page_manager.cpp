@@ -13,6 +13,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/decoder.h"
+#include "common/diagnostics.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
@@ -120,7 +121,7 @@ static void NoteProtectMap(u64 address, u64 size, int kind) {
 
 static bool FaultCostDiag() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_DIAG_FAULT_COST");
+        const char* env = Common::DiagEnv("RYGT_DIAG_FAULT_COST");
         return env && env[0] == '1';
     }();
     return on;

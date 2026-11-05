@@ -17,6 +17,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "common/diagnostics.h"
 #include "common/guest_clock.h"
 #include "common/io_file.h"
 #include "common/logging/log.h"
@@ -287,7 +288,7 @@ void DrawFpsCounter() {
 // first bytes of one block of each size. The walk holds the heap's lock, so nothing it does may
 // allocate: the table is allocated before.
 void StartHeapReport() {
-    const char* env = std::getenv("SHADGT_HEAP_REPORT");
+    const char* env = Common::DiagEnv("SHADGT_HEAP_REPORT");
     if (env == nullptr) {
         return;
     }
@@ -485,7 +486,7 @@ void Ryty::RytyLibraryInitialize() {
     // DIAG-075: SHADGT_WATCH_WRITE=<hex address>:<seconds>:<ms>[;...] logs the writes to a guest
     // address (thread, code address, value) for ms milliseconds, seconds after the renderer
     // starts; several watches run one after another.
-    if (const char* watch = std::getenv("SHADGT_WATCH_WRITE"); watch != nullptr && *watch != 0) {
+    if (const char* watch = Common::DiagEnv("SHADGT_WATCH_WRITE"); watch != nullptr && *watch != 0) {
         std::thread([list = std::string(watch)] {
             const auto start = std::chrono::steady_clock::now();
             for (std::size_t pos = 0; pos < list.size();) {

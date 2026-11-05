@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <fmt/format.h>
 
+#include "common/diagnostics.h"
 #include "common/ryty_config.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -167,7 +168,7 @@ void MiscMonitor() {
     // RYGT_ENV_AB=<seconds>: the scale is on and off for alternating periods of the same run,
     // with draws per frame and frame rate logged for each state (run-to-run differences of the
     // test race are larger than the effects measured).
-    const char* ab_env = std::getenv("RYGT_ENV_AB");
+    const char* ab_env = Common::DiagEnv("RYGT_ENV_AB");
     const u32 ab_ticks = ab_env ? static_cast<u32>(std::atof(ab_env) * 10.0) : 0;
     struct AbTotals {
         u64 draws, frames, ticks;
@@ -301,7 +302,7 @@ void MiscMonitor() {
             }
             // RYGT_ENV_WATCH=<hex offset>: which code reads that field of the first instance that
             // gets a course's values (a hardware read/write watch, at once and again 40 s later).
-            static const char* watch_env = std::getenv("RYGT_ENV_WATCH");
+            static const char* watch_env = Common::DiagEnv("RYGT_ENV_WATCH");
             static const u32 watch_offset =
                 watch_env ? static_cast<u32>(std::strtoul(watch_env, nullptr, 16)) : 0;
             static u8* watched = nullptr;
@@ -342,7 +343,7 @@ void RecordMisc(void* self, int site) {
     // EnvironmentSetting for its first 1.5 s (skipped while another watch runs).
     // (Not during boot: the watch logs through the renderer's log, which starts later.)
     static const auto first_record = std::chrono::steady_clock::now();
-    if (const char* env = std::getenv("RYGT_ENV_WATCH_NEW");
+    if (const char* env = Common::DiagEnv("RYGT_ENV_WATCH_NEW");
         env && site == 0 && std::chrono::steady_clock::now() - first_record > std::chrono::seconds{30}) {
         const u32 offset = static_cast<u32>(std::strtoul(env, nullptr, 16));
         Vulkan::RytyWatchWrites(reinterpret_cast<u64>(self) + offset, 1500,
@@ -1447,7 +1448,7 @@ void InstallGt7ScriptDump(u8* base) {
 }
 
 void InstallMiscHooks(u8* base) {
-    const char* diag = std::getenv("RYGT_ENV_DIAG");
+    const char* diag = Common::DiagEnv("RYGT_ENV_DIAG");
     const char* scale = std::getenv("RYGT_ENV_SCALE");
     if (!(diag && diag[0] == '1') && !scale && !std::getenv("RYGT_ENV_SET")) {
         return;

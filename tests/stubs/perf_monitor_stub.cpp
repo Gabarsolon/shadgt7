@@ -6,8 +6,11 @@
 namespace Common {
 
 // Every PERF switch at its default, as a run without SHADGT_DISABLE_PERF (common/perf_monitor.cpp).
+// Without diagnostics perf_monitor.h has its own (PERF-GT7-062).
+#ifdef SHADGT_DIAGNOSTICS
 bool PerfFeatureEnabled(u32) {
     return true;
 }
+#endif
 
 } // namespace Common

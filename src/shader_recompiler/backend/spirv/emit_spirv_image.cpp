@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/static_vector.hpp>
+#include "common/diagnostics.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/microinstruction.h"
@@ -279,13 +280,13 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
                                                    operands.mask, operands.operands);
     // DIAG-232 (diagnosis, RYGT_DIAG_HS_SAMPLE_ZERO=1): hull shader texture samples read 0 (GT7's
     // car hull shaders cull patches against a depth pyramid with them).
-    static const bool hs_zero = std::getenv("RYGT_DIAG_HS_SAMPLE_ZERO") != nullptr;
+    static const bool hs_zero = Common::DiagEnv("RYGT_DIAG_HS_SAMPLE_ZERO") != nullptr;
     if (hs_zero && ctx.sw_stage == SwStage::TessellationControl && !texture.is_integer) {
         return ctx.ConstantNull(ctx.F32[4]);
     }
     // DIAG-236 (diagnosis, RYGT_DIAG_HS_SAMPLE_SCALE=<float>): hull shader samples scaled.
     static const float hs_scale = [] {
-        const char* env = std::getenv("RYGT_DIAG_HS_SAMPLE_SCALE");
+        const char* env = Common::DiagEnv("RYGT_DIAG_HS_SAMPLE_SCALE");
         return env && *env ? std::strtof(env, nullptr) : 0.0f;
     }();
     if (hs_scale != 0.0f && ctx.sw_stage == SwStage::TessellationControl && !texture.is_integer) {

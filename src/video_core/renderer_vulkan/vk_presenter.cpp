@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -687,7 +688,7 @@ std::atomic<u64> g_prepared_frames{0};
 
 static int FlashWatchMode() {
     static const int mode = [] {
-        const char* env = std::getenv("SHADGT_FLASH_WATCH");
+        const char* env = Common::DiagEnv("SHADGT_FLASH_WATCH");
         return env ? std::atoi(env) : 0;
     }();
     return mode;
@@ -734,7 +735,7 @@ static void CheckFlashFrame(const ScreenshotReadback& readback) {
         // SHADGT_FLASH_WATCH=4: every frame is written as it comes, to recorder_all_<time>\, for
         // scripted runs.
         static const bool write_all = [] {
-            const char* env = std::getenv("SHADGT_FLASH_WATCH");
+            const char* env = Common::DiagEnv("SHADGT_FLASH_WATCH");
             return env && std::atoi(env) == 4;
         }();
         if (write_all) {

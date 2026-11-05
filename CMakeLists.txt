@@ -25,6 +25,30 @@ option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 # DIAG-056: path to the nvtx3 headers of an NVIDIA Nsight Systems install, for timeline ranges.
 set(SHADGT_NVTX_INCLUDE "" CACHE PATH "nvtx3 include directory (Nsight Systems timeline ranges)")
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
+# Diagnostics (common/diagnostics.h): RYGT_DIAG=1's stutter capture, the per-draw step timers and
+# work counters, the 2 s reports, the F1 dumps and every other diagnostic environment switch.
+# AUTO builds them into Debug and RelWithDebInfo and compiles them out of Release and MinSizeRel,
+# where they cost frame time even when unused; ON or OFF overrides the build type (an optimized
+# build for measurements: -DCMAKE_BUILD_TYPE=Release -DSHADGT_DIAGNOSTICS=ON).
+set(SHADGT_DIAGNOSTICS "AUTO" CACHE STRING "Diagnostics: AUTO (by build type), ON or OFF")
+set_property(CACHE SHADGT_DIAGNOSTICS PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${SHADGT_DIAGNOSTICS}" shadgt_diagnostics_mode)
+if (shadgt_diagnostics_mode STREQUAL "AUTO")
+    set(SHADGT_DIAGNOSTICS_ON "$<NOT:$<CONFIG:Release,MinSizeRel>>")
+    if (CMAKE_CONFIGURATION_TYPES)
+        message(STATUS "Diagnostics: in Debug and RelWithDebInfo")
+    elseif (CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+        message(STATUS "Diagnostics: off (${CMAKE_BUILD_TYPE}; -DSHADGT_DIAGNOSTICS=ON keeps them)")
+    else()
+        message(STATUS "Diagnostics: on (${CMAKE_BUILD_TYPE})")
+    endif()
+elseif (SHADGT_DIAGNOSTICS)
+    set(SHADGT_DIAGNOSTICS_ON 1)
+    message(STATUS "Diagnostics: on (SHADGT_DIAGNOSTICS=${SHADGT_DIAGNOSTICS})")
+else()
+    set(SHADGT_DIAGNOSTICS_ON 0)
+    message(STATUS "Diagnostics: off (SHADGT_DIAGNOSTICS=${SHADGT_DIAGNOSTICS})")
+endif()
 
 # Determine the target architecture.
 set(BASE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
@@ -249,6 +273,8 @@ endif()
 
 add_subdirectory(externals)
 include_directories(src)
+# After the externals: only this project's code sees it.
+add_compile_definitions($<${SHADGT_DIAGNOSTICS_ON}:SHADGT_DIAGNOSTICS>)
 
 set(AJM_LIB src/core/libraries/ajm/ajm.cpp
             src/core/libraries/ajm/ajm.h
@@ -776,6 +802,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/debug.h
            src/common/decoder.cpp
            src/common/decoder.h
+           src/common/diagnostics.h
            src/common/elf_info.h
            src/common/endian.h
            src/common/enum.h

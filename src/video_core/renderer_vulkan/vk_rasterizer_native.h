@@ -23,6 +23,7 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include "common/diagnostics.h"
 #include "common/types.h"
 #include "ryty_gpu/native/same_texel.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -1273,7 +1274,7 @@ private:
         // (no OPT-004 shortcut): in GT7's busy scenes (~3,000 draws) those frames missed the
         // 30 fps deadline.
         static const bool on = [] {
-            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            const char* env = Common::DiagEnv("RYGT_NATIVE_INPLACE_STATS");
             return env && env[0] == '1';
         }();
         return on && (frame & 7) == 0;

@@ -20,6 +20,7 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/diagnostics.h"
 #include "common/unmapped_allocations.h"
 #include "common/io_file.h"
 #include "common/perf_monitor.h"
@@ -161,7 +162,7 @@ static std::atomic<BufferCache*> s_own_write_cache{nullptr}; // FIX-073
 // DIAG-072: SHADGT_TRACE_READBACKS=1 keeps the last readbacks written into guest memory.
 static bool TraceReadbacks() {
     static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_TRACE_READBACKS");
+        const char* env = Common::DiagEnv("SHADGT_TRACE_READBACKS");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -1740,7 +1741,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
     }
     static const bool diag_time = [] {
-        const char* env = std::getenv("SHADGT_DIAG_OBTAIN");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_OBTAIN");
         return env && env[0] == '1';
     }();
     if (diag_time) {
@@ -1961,7 +1962,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // D1: guest memory obtained here is imported for the GPU (coverage logged every 2 s).
     // Diagnostic only (SHADGT_DIAG_D1=1): it imports memory on every obtain.
     static const bool diag_d1 = [] {
-        const char* env = std::getenv("SHADGT_DIAG_D1");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_D1");
         return env && env[0] == '1';
     }();
     if (diag_d1 && direct_memory && !is_texel_buffer) {
@@ -2064,7 +2065,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // DIAG-109 (SHADGT_DIAG_OBTAIN=1): how many read-only obtains repeat a range already obtained
     // in the same upload epoch (what a per-epoch memo of obtains could skip).
     static const bool diag_obtain = [] {
-        const char* env = std::getenv("SHADGT_DIAG_OBTAIN");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_OBTAIN");
         return env && env[0] == '1';
     }();
     if (diag_obtain) {

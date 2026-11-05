@@ -27,6 +27,7 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 
+#ifdef SHADGT_DIAGNOSTICS // without them perf_monitor.h has its own (PERF-GT7-062)
 namespace Common {
 bool PerfFeatureEnabled(u32 id) {
     const char* env = std::getenv("SHADGT_DISABLE_PERF");
@@ -37,6 +38,7 @@ bool PerfFeatureEnabled(u32 id) {
     return list.find("," + std::to_string(id) + ",") == std::string::npos;
 }
 } // namespace Common
+#endif
 
 namespace Shader::Optimization {
 extern std::string* g_wave64_trace;

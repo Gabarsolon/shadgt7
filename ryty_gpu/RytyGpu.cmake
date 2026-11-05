@@ -132,7 +132,9 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/core/loader/dwarf.cpp
 )
 
-target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1 RYTY_DIAG=1)
+# RYTY_DIAG: this library holds the stutter diagnostics (ryty_diag.h), when the build has them.
+target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1
+    $<${SHADGT_DIAGNOSTICS_ON}:RYTY_DIAG=1>)
 
 # shadGT's Discord Rich Presence, in the renderer library only ("Running on ryGT").
 if (ENABLE_DISCORD_RPC)
