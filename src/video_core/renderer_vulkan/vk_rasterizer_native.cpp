@@ -13,6 +13,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
 
 #include <algorithm>
@@ -2007,8 +2008,10 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
            retiring_chunks.front().retire_tick + margin <= known) {
         if (retiring_chunks.front().buffer->Size() == ChunkSize()) {
             free_chunks.push_back(std::move(retiring_chunks.front()));
+        } else {
+            device->DestroyCompletedBuffer(std::move(retiring_chunks.front().buffer));
         }
-        retiring_chunks.pop_front(); // larger ones are freed (after the GPU, by the device)
+        retiring_chunks.pop_front();
     }
     if (size <= ChunkSize() && !free_chunks.empty()) {
         Chunk chunk = std::move(free_chunks.back());
@@ -2033,27 +2036,26 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     };
     Chunk chunk = create();
     if (!chunk.buffer || !chunk.buffer->Mapped()) {
-        // FIX-GT7-048: out of host memory (an RX 480 system ran out during race loading). Free
-        // chunks go back, the GPU is waited for until the chunks it holds are done, and the
-        // allocation is tried again before giving up.
         LOG_ERROR(Render_Vulkan,
                   "FIX-GT7-048: no upload memory for {} bytes ({} free, {} retiring chunks): "
-                  "waiting for the GPU and trying again",
+                  "reclaiming completed allocations",
                   size, free_chunks.size(), retiring_chunks.size());
-        free_chunks.clear();
-        if (!retiring_chunks.empty()) {
-            const u64 last = retiring_chunks.back().retire_tick;
-            if (last < r.scheduler.CurrentTick()) {
-                r.scheduler.Wait(last);
-            }
-            semaphore->Refresh();
-            const u64 done = semaphore->KnownGpuTick();
-            while (!retiring_chunks.empty() && retiring_chunks.front().retire_tick <= done) {
-                retiring_chunks.pop_front();
-            }
-        }
+        device->DestroyCompletedBuffer(std::move(chunk.buffer));
         free_chunks_low = 0;
-        chunk = create();
+        chunk = RecoverUploadMemory(
+            size, r.scheduler.CurrentTick(), !no_reuse, free_chunks, retiring_chunks,
+            [&] {
+                semaphore->Refresh();
+                return semaphore->KnownGpuTick();
+            },
+            [&](u64 tick) { r.scheduler.Wait(tick); },
+            [&](std::unique_ptr<Native::Rhi::Buffer> buffer) {
+                device->DestroyCompletedBuffer(std::move(buffer));
+            },
+            [&] {
+                device->Collect();
+                return create();
+            });
     }
     ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
                size);

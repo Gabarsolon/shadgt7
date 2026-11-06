@@ -209,6 +209,7 @@ public:
         : device{device}, buffer{buffer}, allocation{allocation}, memory{memory}, size{size},
           address{address}, mapped{mapped} {}
     ~VulkanBuffer() override;
+    void ReleaseCompleted();
     u64 Size() const override {
         return size;
     }
@@ -453,6 +454,7 @@ public:
         return caps;
     }
     std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) override;
+    void DestroyCompletedBuffer(std::unique_ptr<Buffer> buffer) override;
     std::unique_ptr<Buffer> WrapBuffer(u64 native_handle, u64 size) override {
         auto buffer = std::make_unique<VulkanBuffer>(
             *this, vk::Buffer{reinterpret_cast<VkBuffer>(native_handle)}, VmaAllocation{},
@@ -533,6 +535,25 @@ void VulkanBuffer::Invalidate(u64 offset, u64 size) {
     if (allocation) {
         vmaInvalidateAllocation(device.allocator, allocation, offset,
                                 size == ~0ULL ? VK_WHOLE_SIZE : size);
+    }
+}
+
+void VulkanBuffer::ReleaseCompleted() {
+    if (!owned) {
+        return;
+    }
+    if (allocation) {
+        vmaDestroyBuffer(device.allocator, static_cast<VkBuffer>(buffer), allocation);
+    } else {
+        device.device.destroyBuffer(buffer);
+        device.device.freeMemory(memory);
+    }
+    owned = false;
+}
+
+void VulkanDevice::DestroyCompletedBuffer(std::unique_ptr<Buffer> buffer) {
+    if (buffer) {
+        static_cast<VulkanBuffer&>(*buffer).ReleaseCompleted();
     }
 }
 
