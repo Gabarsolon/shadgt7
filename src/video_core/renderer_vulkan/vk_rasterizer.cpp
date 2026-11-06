@@ -2853,8 +2853,26 @@ void Rasterizer::FlushDeferredFences() {
     }
 }
 
+#ifdef RYTY_GPU
+static bool SpunLabel(VAddr address) {
+    return (address >= 0x102046a3f0 && address < 0x102046a400) ||
+           (address >= 0x10200004e0 && address < 0x1020000500);
+}
+
+static s64 FenceBatchNs() {
+    static const s64 ns = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FENCE_BATCH_MS");
+        return env && *env ? s64(std::strtod(env, nullptr) * 1e6) : s64{2'000'000};
+    }();
+    return ns;
+}
+#endif
+
 void Rasterizer::OnRecorderIdle() {
 #ifdef RYTY_GPU
+    if (FenceBatchNs() > 0) {
+        FlushDeferredFences();
+    }
     if (native) {
         native->BeginAhead(); // PERF-GT7-008
     }
@@ -3034,7 +3052,22 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         const char* env = std::getenv("SHADGT_DIRECT_HOLD_FLUSH");
         return env && env[0] == '1';
     }();
-    if (flush || hold_flush || readbacks_pending || address_pending || !direct_hold) {
+    bool submit_now = flush;
+#ifdef RYTY_GPU
+    const s64 fence_batch_ns = FenceBatchNs();
+    if (flush && fence_batch_ns > 0 && direct_hold && !SpunLabel(address)) {
+        static std::atomic<s64> last_fence_submit_ns{0};
+        const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        if (now_ns - last_fence_submit_ns.load(std::memory_order_relaxed) < fence_batch_ns) {
+            submit_now = false;
+        } else {
+            last_fence_submit_ns.store(now_ns, std::memory_order_relaxed);
+        }
+    }
+#endif
+    if (submit_now || hold_flush || readbacks_pending || address_pending || !direct_hold) {
         scheduler.Flush();
         deferred_unflushed.store(false, std::memory_order_relaxed);
     } else {
