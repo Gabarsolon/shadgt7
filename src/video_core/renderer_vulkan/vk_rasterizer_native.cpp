@@ -1956,6 +1956,23 @@ void NativeRenderer::ChunkFlushCheck() {
     if (stream.commands >= SpliceAfter) {
         Splice();
         r.scheduler.Flush();
+        return;
+    }
+    static const u32 feed_min = [] {
+        const char* on = std::getenv("RYGT_FEED_GPU");
+        if (on && on[0] == '0') {
+            return 0u;
+        }
+        const char* env = std::getenv("RYGT_FEED_GPU_MIN");
+        return std::max<u32>(env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u, 1u);
+    }();
+    if (feed_min == 0 || stream.commands < feed_min || (stream.commands & 15) != 0) {
+        return;
+    }
+    const u64 tick = r.scheduler.CurrentTick();
+    if (tick > 1 && r.scheduler.IsFree(tick - 1)) {
+        Splice();
+        r.scheduler.Flush();
     }
 }
 
