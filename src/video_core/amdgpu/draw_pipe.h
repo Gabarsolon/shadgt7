@@ -39,6 +39,7 @@ enum class Part : u32 {
     Count,
 };
 inline constexpr u32 PartCount = static_cast<u32>(Part::Count);
+#ifdef SHADGT_DIAGNOSTICS
 bool On();
 /// The recorder runs jobs from here to the end of the scope (Jobs until a part starts).
 class Running {
@@ -65,6 +66,27 @@ private:
 };
 /// This thread's nanoseconds by part since the last call.
 std::array<u64, PartCount> Take();
+#else
+// Without diagnostics the parts are never timed (several scopes a draw, each a call).
+constexpr bool On() {
+    return false;
+}
+class Running {
+public:
+    Running() noexcept = default;
+    Running(const Running&) = delete;
+    Running& operator=(const Running&) = delete;
+};
+class Scope {
+public:
+    explicit constexpr Scope(Part) noexcept {}
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+};
+inline std::array<u64, PartCount> Take() {
+    return {};
+}
+#endif
 } // namespace RecorderParts
 
 /// PERF-031: the second stage of the GPU command processor. The command thread (stage A) keeps
@@ -91,14 +113,10 @@ public:
     /// `thread_init` runs first on the recorder thread (thread name, thread-local state).
     explicit DrawPipe(std::function<void()> thread_init, size_t max_pending = 4096);
 
-    /// D5: runs on the recorder each time it runs out of work, before it waits. Set once (the
-    /// recorder may already run: it calls the hook only once it saw it set).
+    /// D5: runs on the recorder when it runs out of work and owns the caches. Set once.
     void SetIdleHook(std::function<void()>&& hook) {
-        {
-            std::scoped_lock lk{mutex};
-            idle_hook = std::move(hook);
-        }
-        has_idle_hook.store(true, std::memory_order_release);
+        std::scoped_lock lk{mutex};
+        idle_hook = std::move(hook);
     }
     ~DrawPipe();
 
@@ -251,7 +269,7 @@ private:
     std::deque<Work> urgent;
     std::atomic<bool> has_urgent{};
     bool exclusive{};
-    bool urgent_running{};
+    bool recorder_callback_running{}; // an urgent job or the idle hook is using the caches
     u64 pushed{};
     u64 finished{};
     // The command thread writes the one per job, the recorder the other: each its own cache line.
@@ -262,7 +280,6 @@ private:
     std::atomic<std::thread::id> recorder_id{};
     std::function<void()> thread_init;
     std::function<void()> idle_hook; // D5
-    std::atomic<bool> has_idle_hook{false};
     Stats stats{};
     std::jthread recorder;
     std::mutex idle_mutex; // DIAG-114

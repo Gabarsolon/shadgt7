@@ -12,6 +12,7 @@
 
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
+#include "common/thread.h"
 #include "common/types.h"
 
 #ifdef _WIN32
@@ -75,38 +76,51 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
     std::vector<Usage> usages;
     double total_percent = 0.0;
 
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return {};
-    }
-    const DWORD pid = GetCurrentProcessId();
-    THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
-    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
-        if (entry.th32OwnerProcessID != pid) {
-            continue;
-        }
-        auto [it, inserted] = threads.try_emplace(entry.th32ThreadID);
-        auto& sample = it->second;
-        if (inserted) {
-            sample.handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
-        }
-        if (!sample.handle) {
-            continue;
-        }
+    const auto account = [&](DWORD tid, bool inserted, auto& sample) {
         FILETIME creation, exit, kernel, user;
-        if (!GetThreadTimes(sample.handle, &creation, &exit, &kernel, &user)) {
-            continue;
+        if (!sample.handle || !GetThreadTimes(sample.handle, &creation, &exit, &kernel, &user)) {
+            return;
         }
         sample.seen = true;
         const u64 cpu = FileTimeTo100ns(kernel) + FileTimeTo100ns(user);
         if (!inserted && elapsed_100ns > 0.0 && cpu >= sample.cpu_100ns) {
             const double percent = double(cpu - sample.cpu_100ns) * 100.0 / elapsed_100ns;
             total_percent += percent;
-            usages.push_back({percent, entry.th32ThreadID, sample.handle});
+            usages.push_back({percent, tid, sample.handle});
         }
         sample.cpu_100ns = cpu;
+    };
+    // PERF-GT7-054: this process's threads only (NtGetNextThread); the Toolhelp snapshot walks
+    // every thread on the machine, 60 ms here with browsers open, and ran in a frame.
+    const bool walked = ForEachProcessThread(
+        THREAD_QUERY_LIMITED_INFORMATION, [&](void* handle, unsigned long tid) {
+            auto [it, inserted] = threads.try_emplace(tid);
+            if (inserted) {
+                it->second.handle = static_cast<HANDLE>(handle);
+            }
+            account(tid, inserted, it->second);
+            return inserted; // a new thread's handle is kept; a known one's is closed
+        });
+    if (!walked) {
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return {};
+        }
+        const DWORD pid = GetCurrentProcessId();
+        THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
+        for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != pid) {
+                continue;
+            }
+            auto [it, inserted] = threads.try_emplace(entry.th32ThreadID);
+            if (inserted) {
+                it->second.handle =
+                    OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+            }
+            account(entry.th32ThreadID, inserted, it->second);
+        }
+        CloseHandle(snapshot);
     }
-    CloseHandle(snapshot);
 
     std::erase_if(threads, [](const auto& pair) {
         if (!pair.second.seen && pair.second.handle) {
@@ -183,6 +197,7 @@ bool LeanRun() {
     return lean;
 }
 
+#ifdef SHADGT_DIAGNOSTICS
 bool PerfFeatureEnabled(u32 id) {
     static const std::vector<u32> disabled = [] {
         std::vector<u32> ids;
@@ -202,6 +217,7 @@ bool PerfFeatureEnabled(u32 id) {
     }();
     return std::ranges::find(disabled, id) == disabled.end();
 }
+#endif
 
 WorkCounters& GetWorkCounters() {
     static WorkCounters counters;
@@ -218,7 +234,7 @@ struct WorkSnapshot {
 
 static WorkSnapshot TakeSnapshot() {
     const auto& c = GetWorkCounters();
-    const auto l = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
+    const auto l = [](const auto& v) { return v.load(std::memory_order_relaxed); };
     return {l(c.pm4_packets),      l(c.draws),
             l(c.dispatches),       l(c.find_image),
             l(c.obtain_buffer),    l(c.obtain_stream),
@@ -257,7 +273,7 @@ GameFrameTotals GetGameFrameTotals() {
 
 void NoteGameFrame() {
     static const double threshold_ms = [] {
-        const char* env = std::getenv("SHADGT_STALL_MS");
+        const char* env = DiagEnv("SHADGT_STALL_MS");
         return env && *env ? std::stod(env) : 100.0;
     }();
     static auto last_time = std::chrono::steady_clock::now();
@@ -275,7 +291,8 @@ void NoteGameFrame() {
     game_frames.fetch_add(1, std::memory_order_release);
     game_frame_us.fetch_add(u64(ms * 1000.0), std::memory_order_release);
     // DIAG-046: frame-time distribution every 10 s, and frames well above the recent median
-    // (micro hitches) with where the GPU threads' time went.
+    // (micro hitches) with where the GPU threads' time went. The 10 s line is in every build: it
+    // is how a build without diagnostics shows its frame rate.
     {
         static std::vector<double> window_ms;
         static std::array<double, 64> recent{};
@@ -288,8 +305,8 @@ void NoteGameFrame() {
         std::sort(sorted_recent.begin(), sorted_recent.begin() + n_recent);
         const double median = n_recent ? sorted_recent[n_recent / 2] : ms;
         recent[recent_count++ % 64] = ms;
-        if (n_recent >= 16 && ms >= 25.0 && ms > 2.0 * median && ms < threshold_ms &&
-            hitch_lines < 40) {
+        if (DiagnosticsBuilt && n_recent >= 16 && ms >= 25.0 && ms > 2.0 * median &&
+            ms < threshold_ms && hitch_lines < 40) {
             ++hitch_lines;
             const double ticks_per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
             const auto phase_ms = [&](Phase phase) {
@@ -342,7 +359,7 @@ void NoteGameFrame() {
             hitch_lines = 0;
         }
     }
-    if (ms >= threshold_ms) {
+    if (DiagnosticsBuilt && ms >= threshold_ms) {
         const double ticks_per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
         const auto phase_ms = [&](Phase phase) {
             return double(ticks[size_t(phase)] - last_ticks[size_t(phase)]) / ticks_per_ms;

@@ -120,6 +120,10 @@ public:
     /// FIX-221: a hash of a few samples of each layer, checked once a frame while it is used.
     std::vector<u64> layer_samples;
     u64 layer_check_frame = 0;
+    /// FIX-GT7-027: each layer's whole hash when the texture was last uploaded, and the next
+    /// layer the frame's check compares with memory.
+    std::vector<u64> layer_uploaded;
+    u32 layer_cursor = 0;
     /// FIX-198: the native renderer's frame the picture was last written in, and the last frame
     /// before that one it was written in (0: none).
     std::atomic<u64> written_frame{0};
@@ -266,6 +270,11 @@ public:
     /// CPU writes to guest memory (file loads, the game writing texture data): textures over the
     /// range are uploaded again before their next use.
     void Invalidate(VAddr address, u64 size, Stale why = Stale::CpuWrite);
+    /// FIX-GT7-077: memory was mapped at [address, address + size): its textures are uploaded
+    /// again at their next use, even when the CPU's bytes hash as before (the picture may hold
+    /// what was mapped there earlier, or zeros from while nothing was). Render targets are left
+    /// alone. Returns how many textures.
+    u32 InvalidateNewMapping(VAddr address, u64 size);
 
     /// NAT-119/120: GPU work (a shader's storage buffer, a CP fill or copy) wrote [address,
     /// address + size), with `pattern` (two dwords, repeated) when it is a fill. As the old
@@ -288,6 +297,9 @@ public:
     /// FIX-221: a large layered texture whose layers' memory changed with no CPU write seen is
     /// uploaded again (true when it was asked for).
     bool LayersRewritten(ImageEntry& entry, u64 frame);
+    /// FIX-GT7-027 (diagnosis, frame dumps): how many layers' memory differs from their upload
+    /// now (-1: their upload's hashes aren't known).
+    int LayersDifferingFromUpload(const ImageEntry& entry) const;
     static bool SmallRewritesOn();
     static constexpr u64 SmallRewriteSize = 64 * 1024;
 

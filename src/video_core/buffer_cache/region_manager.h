@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <mutex>
@@ -411,7 +412,13 @@ private:
     std::atomic<u32> cpu_version{1};
 
     // PERF-012: hot pages and their uploads in the current epoch.
-    static constexpr u8 HotPageFaults = 8;
+    // PERF-GT7-050 (RYGT_HOT_PAGE_FAULTS=1..64, default 8): write faults before a page becomes
+    // hot. GT7 races had memory-protection work in 113 of 115 frames that missed a vsync.
+    inline static const u8 HotPageFaults = [] {
+        const char* env = std::getenv("RYGT_HOT_PAGE_FAULTS");
+        const long value = env && *env ? std::strtol(env, nullptr, 10) : 8;
+        return static_cast<u8>(value < 1 ? 1 : value > 64 ? 64 : value);
+    }();
     inline static const bool hot_pages_enabled = Common::PerfFeatureEnabled(12);
     RegionBits hot{};
     RegionBits uploaded{};

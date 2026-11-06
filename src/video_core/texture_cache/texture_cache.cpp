@@ -16,6 +16,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/diagnostics.h"
 #include "common/div_ceil.h"
 #include "common/read_capture.h"
 #include "common/path_util.h"
@@ -1005,7 +1006,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
         // DIAG-140 (SHADGT_DIAG_FROSTED=1): the other images at the address of GT Sport's
         // frosted-glass picture when it is looked up.
         static const bool diag_frosted = [] {
-            const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+            const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
             return env && env[0] == '1';
         }();
         if (diag_frosted && info.guest_address == 0x1009bc0000 && info.size.width == 960 &&
@@ -1727,7 +1728,7 @@ void TextureCache::GarbageCollectUnusedImages() {
 
 void TextureCache::ReportMemoryBreakdown() {
     static const bool enabled = [] {
-        const char* value = std::getenv("RYGT_VRAM_DIAGNOSTICS");
+        const char* value = Common::DiagEnv("RYGT_VRAM_DIAGNOSTICS");
         return value && value[0] == '1';
     }();
     if (!enabled) return;

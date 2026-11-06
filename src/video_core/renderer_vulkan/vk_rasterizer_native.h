@@ -23,7 +23,9 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include "common/diagnostics.h"
 #include "common/types.h"
+#include "ryty_gpu/native/same_texel.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -36,6 +38,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h" // SO-010
 
 namespace AmdGpu {
 union Regs;
@@ -101,6 +104,9 @@ public:
     bool InlineWrite(VAddr address, std::span<const u8> data);
     /// Guest memory is unmapped: textures over it are uploaded again when next used.
     void OnUnmap(VAddr address, u64 size);
+    /// FIX-GT7-077: guest memory was mapped where no view of older memory is left: textures over
+    /// it are uploaded again when next used.
+    void OnNewMapping(VAddr address, u64 size);
     /// NAT-105: the CPU wrote watched memory (a page fault on any thread): the textures there
     /// are uploaded again before their next use, and their pages are no longer watched.
     void OnCpuWrite(VAddr address, u64 size, u64 exact);
@@ -183,6 +189,9 @@ private:
         Shader::PushData push{};
         std::vector<const Native::ImageEntry*> sampled;
         std::vector<const Native::ImageEntry*> stored;
+        /// FIX-GT7-080: a compute stage's picture for each image descriptor, in the stage's order
+        /// (null, or past the end, when bound empty).
+        std::vector<const Native::ImageEntry*> image_entries;
         /// NAT-119: guest memory the draw or dispatch writes through storage buffers.
         boost::container::small_vector<std::pair<VAddr, u64>, 8> gpu_writes;
         /// NAT-120: the dispatch is GT Sport's fill shader: what it fills, with what.
@@ -228,6 +237,8 @@ private:
         std::vector<u8> bytes;
     };
 
+    struct LdsReader; ///< PERF-GT7-060
+
     /// The command list being recorded and its state.
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
@@ -238,6 +249,11 @@ private:
         RenderState render{};
         DynamicState dynamic{};
         vk::Pipeline pipeline{};
+        /// SO-010: the shader objects and state the last draw set on this stream (valid while no
+        /// pipeline was bound since).
+        bool so_known = false;
+        GraphicsPipeline::ShaderObjectState so_state{};
+        std::array<vk::ShaderEXT, 4> so_shaders{};
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
         /// this list (the same ones are not recorded again).
         bool vertex_state_known = false;
@@ -272,6 +288,10 @@ private:
         /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
         u64 run_program = 0;
         u32 run_commands = 0;
+        /// PERF-GT7-057: what the run's same-texel dispatches stored since the last barrier:
+        /// (picture, mip << 32 | layer), what they sampled elsewhere (FIX-GT7-087), or that one
+        /// stored without a key (FIX-GT7-081).
+        Native::SameTexelRun run_texels;
         /// NAT-140: attachments drawn since the last pass or global barrier, and pictures
         /// sampled since the last global barrier: what a new pass has to wait for.
         std::vector<const Native::ImageEntry*> attach_dirty;
@@ -293,6 +313,10 @@ private:
         /// OPT-015: which list the upload memos belong to (moves on when a list begins or ends).
         u64 serial = 0;
         std::array<UploadMemo, 5 * 3> upload_memos{};
+        /// PERF-GT7-060: FIX-227 draws of the current pass whose writer pass is recorded and
+        /// whose reader pass waits for the run's one barrier (FlushLdsReaders), and their scratch.
+        std::vector<LdsReader> lds_readers;
+        u64 lds_bytes = 0;
     };
 
     struct ViewRecord {
@@ -375,6 +399,10 @@ private:
     std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
     std::atomic<u32> logged_partial{};
     void SortRegionWrites();
+    /// PERF-GT7-052: small textures in per-frame memory, checked each frame (not watched).
+    bool PolledFrameTexture(VAddr address, u64 size);
+    std::mutex polled_mutex;
+    std::vector<std::pair<VAddr, u64>> polled_textures;
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size, bool write);
     void RefreshRegion(Region& region);
@@ -586,6 +614,8 @@ private:
     void RefreshMirror(Mirror& mirror);
     void MakePendingMirrors();
     void DropMirrors(VAddr address, u64 size);
+    /// NAT-146, FIX-GT7-086: regions and mirrors over the range go (with `mutex` held); how many.
+    u32 DropRegionsOver(VAddr address, u64 size);
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
     Bound last_bound = Bound::InPlace;
@@ -725,6 +755,12 @@ private:
     u64 ReuseGeneration() const;
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
+    /// FIX-GT7-090: BindStages again when a region made while binding took in one an earlier
+    /// binding of the same draw or dispatch was given (its writes would go to the old buffer).
+    void BindStagesStable(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                          bool compute, DrawBindings& b);
+    u64 regions_taken_in = 0; ///< FIX-GT7-090: regions made that took in others
+    u64 stage_rebinds = 0;    ///< FIX-GT7-090: BindStages done again for that
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                      Shader::Backend::Bindings& binding, DrawBindings& b);
     void BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
@@ -745,6 +781,33 @@ private:
         vk::IndexType index_type = vk::IndexType::eUint32;
         u32 index_count = 0;
     };
+    /// PERF-GT7-060: a FIX-227 draw's reader pass, recorded after its run's barrier: what it
+    /// binds and draws.
+    struct LdsReader {
+        const GraphicsPipeline* pipeline = nullptr;
+        DynamicState dynamic{};
+        VertexIndexState vertices{};
+        DrawBindings bindings; ///< writes, write_sets, buffers, images and push only
+        /// Each write's first buffer and image info in `bindings` (~0u: none). The infos are
+        /// held in the reader, which moves: the writes point at them only when recorded.
+        std::vector<std::pair<u32, u32>> infos;
+        u64 address = 0;       ///< its scratch
+        bool indexed = false;
+        u32 count = 0, instances = 0, vertex_offset = 0, first_instance = 0;
+        u64 ps = 0, prims = 0; ///< DIAG-GT7-001: its pixel shader and size, for the segment
+    };
+    /// PERF-GT7-060 (on; RYGT_NATIVE_LDS_BATCH=0 off): the FIX-227 draws of a
+    /// run share one barrier.
+    static bool LdsBatchOn();
+    /// PERF-GT7-060: copies what the reader pass binds; false when a descriptor write points
+    /// outside the draw's own infos (the draw then runs alone, as before).
+    static bool CaptureLdsReader(LdsReader& reader, const GraphicsPipeline& pipeline,
+                                 const DrawBindings& b, const VertexIndexState& vertices);
+    /// PERF-GT7-060: the stream's waiting reader passes, after one full barrier, in their pass
+    /// (reason: 0 another draw, 1 the pass ends, 2 the run's limit).
+    void FlushLdsReaders(u32 reason);
+    /// PERF-GT7-060: FIX-227 runs by length, every 10 s.
+    void ReportLdsRuns();
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);
     bool ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
@@ -766,7 +829,8 @@ private:
                         bool is_indexed);
     bool NeedsBarrierFor(const DrawBindings& b) const;
     // PERF-GT7-043
-    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded) const;
+    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded,
+                         std::optional<u64> texel = std::nullopt) const; // PERF-GT7-057: texel
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
     void WatchPages(VAddr address, u64 size);
@@ -1210,7 +1274,7 @@ private:
         // (no OPT-004 shortcut): in GT7's busy scenes (~3,000 draws) those frames missed the
         // 30 fps deadline.
         static const bool on = [] {
-            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            const char* env = Common::DiagEnv("RYGT_NATIVE_INPLACE_STATS");
             return env && env[0] == '1';
         }();
         return on && (frame & 7) == 0;
@@ -1317,6 +1381,17 @@ private:
         u64 compute_texture_lookups = 0, compute_texture_hits = 0, compute_texture_bindings = 0;
         u64 small_rewrites = 0; ///< FIX-202: small textures uploaded again after big writes
         u64 lds_emulated_draws = 0; // FIX-227
+        /// PERF-GT7-060: FIX-227 draws whose reader pass waited for their run's barrier, runs
+        /// by length (1, 2, 3-4, 5-8, 9-16, 17-32, 33+) and the longest, runs ended by another
+        /// draw / the pass's end / the run's limit; draws that ran alone (switch off,
+        /// not eligible), and the runs these would have made (nothing between them).
+        u64 lds_batched = 0, lds_runs = 0, lds_run_max = 0;
+        std::array<u64, 7> lds_run_lengths{};
+        std::array<u64, 3> lds_run_ends{};
+        u64 lds_alone = 0, lds_alone_runs = 0, lds_alone_run_max = 0;
+        std::array<u64, 7> lds_alone_lengths{};
+        u64 lds_alone_run = 0;                       ///< the current one's length
+        std::array<u64, 4> lds_alone_marker{};       ///< barriers, passes, draws, dispatches after it
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,

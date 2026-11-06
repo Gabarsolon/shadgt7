@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "common/guest_clock.h"
@@ -325,7 +326,7 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
     // SHADGT_FRAMEGEN_AB=<seconds> (test): generation alternates on and off in one run, with
     // the game's frame rate logged for each.
     static const double ab_period = [] {
-        const char* env = std::getenv("SHADGT_FRAMEGEN_AB");
+        const char* env = Common::DiagEnv("SHADGT_FRAMEGEN_AB");
         return env ? std::atof(env) : 0.0;
     }();
     bool enabled = true;

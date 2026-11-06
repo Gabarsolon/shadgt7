@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
@@ -106,7 +107,7 @@ std::atomic<bool> g_dump_request{false};
 const std::vector<VAddr>& WatchedTextures() {
     static const std::vector<VAddr> watched = [] {
         std::vector<VAddr> list;
-        const char* env = std::getenv("RYGT_NATIVE_WATCH_TEXTURE");
+        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_TEXTURE");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -132,7 +133,7 @@ bool WatchedTexture(VAddr begin, VAddr end) {
     // DIAG-167 (RYGT_NATIVE_WATCH_RANGE=<hex lo>-<hex hi>): images starting in that range too
     // (pictures whose address changes from run to run).
     static const std::pair<VAddr, VAddr> range = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WATCH_RANGE");
+        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_RANGE");
         if (!env || !*env) {
             return std::pair<VAddr, VAddr>{};
         }
@@ -809,17 +810,54 @@ bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
         changed += !first && entry.layer_samples[l] != h;
         entry.layer_samples[l] = h;
     }
-    if (changed == 0) {
+    // FIX-GT7-027: the samples miss a layer rewritten where they don't look (four 64-byte
+    // samples of a 16 or 64 KB layer: one per page). Tokyo's buildings went black at their first
+    // close-ups, and the scene's draws there sample these pools (suspected, not yet confirmed:
+    // frame dumps list the layers differing from their upload). Each frame, about 4 MB of whole
+    // layers are also compared with their hashes at the last upload, in turn (the 24 MB pool in
+    // 6 frames).
+    // RYGT_NATIVE_LAYER_HASH=0: samples only, as before.
+    static const bool whole_layers = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_HASH");
+        return !(env && env[0] == '0');
+    }();
+    u32 stale_layers = 0;
+    if (whole_layers && entry.layer_uploaded.size() == layers) {
+        constexpr u64 Budget = 4ull << 20;
+        const u32 count = u32(std::clamp<u64>(Budget / layer_size, 1, layers));
+        for (u32 i = 0; i < count; ++i) {
+            const u32 l = entry.layer_cursor;
+            entry.layer_cursor = (l + 1) % layers;
+            const VAddr base = entry.info.guest_address + l * layer_size;
+            stale_layers += Core::HashGuestBytes(base, layer_size) != entry.layer_uploaded[l];
+        }
+    }
+    if (changed == 0 && stale_layers == 0) {
         return false;
     }
     MarkStale(entry, Stale::CpuWrite);
     static std::atomic<u32> logged{};
     if (const u32 n = logged++; n < 40 || n % 1000 == 0) {
-        LOG_WARNING(Render_Vulkan, "FIX-221: texture {:#x} {}x{} layers {}: {} layers changed "
-                    "unseen; uploaded again ({} so far)", entry.info.guest_address,
-                    entry.info.size.width, entry.info.size.height, layers, changed, n + 1);
+        LOG_WARNING(Render_Vulkan, "FIX-221: texture {:#x} {}x{} layers {}: {} layers' samples "
+                    "changed unseen, {} whole layers differ from the upload (FIX-GT7-027); "
+                    "uploaded again ({} so far)", entry.info.guest_address, entry.info.size.width,
+                    entry.info.size.height, layers, changed, stale_layers, n + 1);
     }
     return true;
+}
+
+int ImageRegistry::LayersDifferingFromUpload(const ImageEntry& entry) const {
+    const u32 layers = entry.info.resources.layers;
+    if (layers == 0 || entry.layer_uploaded.size() != layers) {
+        return -1;
+    }
+    const u64 layer_size = entry.info.guest_size / layers;
+    int differing = 0;
+    for (u32 l = 0; l < layers; ++l) {
+        differing += Core::HashGuestBytes(entry.info.guest_address + l * layer_size, layer_size) !=
+                     entry.layer_uploaded[l];
+    }
+    return differing;
 }
 
 bool TargetPartsOn() {
@@ -932,7 +970,7 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
             return;
         }
         const auto place = PlaceOf(target.info, entry.info);
-        static const bool small_links = std::getenv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+        static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
         static std::atomic<u32> small_logged{};
         if (small_links && place.mip >= 0 && entry.info.size.width <= 8 &&
             entry.info.size.height <= 8 && small_logged++ < 200) {
@@ -987,7 +1025,7 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
             }
             if (place.mip >= 0) {
                 // DIAG-181 (diagnosis, RYGT_DIAG_SMALL_LINKS=1): links of tiny textures.
-                static const bool small_links = std::getenv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+                static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
                 static std::atomic<u32> small_logged{};
                 if (small_links && texture.info.size.width <= 8 && texture.info.size.height <= 8 &&
                     small_logged++ < 200) {
@@ -1227,6 +1265,18 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     });
 }
 
+u32 ImageRegistry::InvalidateNewMapping(VAddr address, u64 size) {
+    ForgetFills(address, size); // FIX-GT7-036
+    u32 count = 0;
+    ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
+        if (entry.from_cpu) {
+            MarkStale(entry, Stale::Unmap); // forced: not skipped by NAT-109's hash
+            ++count;
+        }
+    });
+    return count;
+}
+
 void ImageRegistry::MarkReused(ImageEntry& entry) {
     if (entry.reused.exchange(true, std::memory_order_relaxed)) {
         return;
@@ -1277,7 +1327,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                                                                   clock, frame};
     }
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
-        static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
+        static const bool dump_on_fill = Common::DiagEnv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
         if (pattern && dump_on_fill) {
             g_dump_request = true; // FIX-156 (diagnosis): dump the next frame
         }
@@ -1303,7 +1353,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 // =<w>x<h>: over textures that size (GT7's 30x17 light grid, 136 KB).
                 static const std::array<u32, 3> diag = [] {
                     std::array<u32, 3> d{};
-                    if (const char* env = std::getenv("RYGT_DIAG_IGNORED_WRITES")) {
+                    if (const char* env = Common::DiagEnv("RYGT_DIAG_IGNORED_WRITES")) {
                         d[0] = 1;
                         if (std::sscanf(env, "%ux%u", &d[1], &d[2]) != 2) {
                             d[1] = d[2] = 0;
@@ -1715,10 +1765,22 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
             // for "unchanged" and never uploaded, and the texture kept the forced picture.
             entry->content_hash = 0;
         }
+        // FIX-GT7-027: a large layered texture's layers as uploaded (its pages are watched
+        // already, so a later write differs from these; read before the copy is recorded, the
+        // GPU's copy is never older than them).
+        if (entry->from_cpu && info.resources.layers >= 16 && size > HashedSize) {
+            const u32 layers = info.resources.layers;
+            const u64 layer_size = size / layers;
+            entry->layer_uploaded.resize(layers);
+            for (u32 l = 0; l < layers; ++l) {
+                entry->layer_uploaded[l] =
+                    Core::HashGuestBytes(info.guest_address + l * layer_size, layer_size);
+            }
+        }
         // (diagnosis) RYGT_DIAG_ZERO_TEXTURES=<w>x<h>x<bits>: textures of that size upload zeros.
         static const std::array<u32, 3> zero_size = [] {
             std::array<u32, 3> parts{};
-            if (const char* env = std::getenv("RYGT_DIAG_ZERO_TEXTURES")) {
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_ZERO_TEXTURES")) {
                 std::sscanf(env, "%ux%ux%u", &parts[0], &parts[1], &parts[2]);
             }
             return parts;
@@ -1742,7 +1804,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // memory by the CPU, never from a region or an imported view.
         static const std::array<u32, 2> cpu_size = [] {
             std::array<u32, 2> parts{};
-            if (const char* env = std::getenv("RYGT_DIAG_UPLOAD_CPU_SIZE")) {
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_CPU_SIZE")) {
                 std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
             }
             return parts;
@@ -1758,7 +1820,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // hash of guest memory at the time.
         static const std::array<u32, 2> diag_size = [] {
             std::array<u32, 2> parts{};
-            if (const char* env = std::getenv("RYGT_DIAG_UPLOAD_SIZE")) {
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_SIZE")) {
                 std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
             }
             return parts;

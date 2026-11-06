@@ -247,6 +247,12 @@ public:
         return ring != nullptr || direct;
     }
 
+    /// SO-001: commands recorded by a function of the command buffer (shader object binds).
+    template <typename F>
+    void Run(F&& fn) const {
+        Call(std::forward<F>(fn));
+    }
+
     void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
         Call([=](vk::CommandBuffer cmd) { cmd.bindPipeline(bind_point, pipeline); });
     }

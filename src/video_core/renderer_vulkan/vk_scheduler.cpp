@@ -30,6 +30,9 @@ static void RecordGpuWait(const std::source_location& loc, std::chrono::steady_c
     ++counters.gpu_waits;
     counters.gpu_wait_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
     RyDiag::RecordElapsed(RyDiag::Zone::GpuWait, d, loc.line());
+    if (!Common::DiagnosticsBuilt) {
+        return; // the table below only feeds the 2 s report
+    }
     static std::mutex mutex;
     static std::map<std::string, std::pair<u32, double>> sites;
     static auto window_start = std::chrono::steady_clock::now();
@@ -220,7 +223,7 @@ void Scheduler::CommandThread(std::stop_token stoken) {
         if (position == end) {
             commands.SetReplayed(position);
             const auto now = std::chrono::steady_clock::now();
-            if (now - window_start >= std::chrono::seconds{2}) {
+            if (Common::DiagnosticsBuilt && now - window_start >= std::chrono::seconds{2}) {
                 const double seconds = std::chrono::duration<double>(now - window_start).count();
                 LOG_WARNING(Render_Vulkan,
                             "PERF-084 command thread in {:.1f} s: {} commands, busy {:.0f}%; "
@@ -598,7 +601,15 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     // PERF-DIAG-007: every 2 s, how busy the GPU was (sampled: submitted work not yet complete)
     // and which threads used the CPU, to tell GPU-bound, CPU-bound and serialized frames apart.
     Common::SetCurrentThreadName("shadGT:PerfMonitor");
-    Common::SampleThreadCpuUsage(0);
+    // PERF-GT7-054: the thread sampling (a Toolhelp snapshot of every thread on the system,
+    // twice) ran 61 ms in a 65 ms frame at normal priority, every 2 s, in play too: 6 of 70
+    // pre-race spikes in two runs. Low priority, so the game's and the renderer's threads come
+    // first, and the snapshots every 10 s.
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    if (Common::DiagnosticsBuilt) {
+        Common::SampleThreadCpuUsage(0);
+    }
+    u32 windows = 0;
     auto window_start = std::chrono::steady_clock::now();
     u64 samples = 0;
     u64 busy_samples = 0;
@@ -614,14 +625,23 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
             continue;
         }
         const u64 tick = work_semaphore.CurrentTick();
-        Common::ConfineDriverCompileThreads(); // PERF-GT7-024
-        LOG_WARNING(Render_Vulkan, "Perf monitor {:.1f} s: GPU busy {:.0f}%, {} submits; CPU {}",
-                    std::chrono::duration<double>(now - window_start).count(),
-                    samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick,
-                    Common::SampleThreadCpuUsage(10));
-        LOG_WARNING(Render_Vulkan, "Frontend work in {:.1f} s: {}",
-                    std::chrono::duration<double>(now - window_start).count(),
-                    Common::TakeWorkCounters());
+        const bool sample_threads = ++windows % 5 == 0; // PERF-GT7-054: every 10 s
+        if (sample_threads) {
+            Common::ConfineDriverCompileThreads(); // PERF-GT7-024
+        }
+        // The reports, not the thread: it also confines the driver's compile threads and
+        // watches for a stuck GPU (DIAG-103) in every build.
+        if (Common::DiagnosticsBuilt) {
+            LOG_WARNING(Render_Vulkan,
+                        "Perf monitor {:.1f} s: GPU busy {:.0f}%, {} submits; CPU {}",
+                        std::chrono::duration<double>(now - window_start).count(),
+                        samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick,
+                        sample_threads ? Common::SampleThreadCpuUsage(10)
+                                       : std::string{"(threads sampled every 10 s)"});
+            LOG_WARNING(Render_Vulkan, "Frontend work in {:.1f} s: {}",
+                        std::chrono::duration<double>(now - window_start).count(),
+                        Common::TakeWorkCounters());
+        }
         // DIAG-103: the GPU busy with nothing new submitted for 10 s: the GPU (or a wait on it) is
         // stuck; once per run, every thread's stack goes to user\log\gpu-stuck-stacks.txt.
         static u32 stuck_windows = 0;

@@ -107,6 +107,41 @@ public:
         return key;
     }
 
+    /// SO-001: the state a pipeline would have fixed, set at each draw (SO-010: only what
+    /// changed since the draw before on the same command stream).
+    struct ShaderObjectState {
+        vk::PrimitiveTopology topology{};
+        vk::PolygonMode polygon_mode{};
+        vk::SampleCountFlagBits samples{vk::SampleCountFlagBits::e1};
+        vk::ProvokingVertexModeEXT provoking{};
+        bool depth_clamp{};
+        bool depth_clip{};
+        bool negative_one_to_one{};
+        bool alpha_to_coverage{};
+        bool logic_op_enable{};
+        vk::LogicOp logic_op{};
+        u32 attachments{};
+        u32 patch_control_points{}; ///< SO-003: 0 without tessellation
+        std::array<vk::Bool32, AmdGpu::NUM_COLOR_BUFFERS> blend_enable{};
+        std::array<vk::ColorBlendEquationEXT, AmdGpu::NUM_COLOR_BUFFERS> equations{};
+    };
+
+    /// SO-001: drawn with shader objects instead of a pipeline (Handle() is then null).
+    bool UsesShaderObjects() const noexcept {
+        return static_cast<bool>(shader_objects[0]);
+    }
+    /// SO-001: binds the shader objects and sets the state a pipeline would have fixed.
+    /// SO-010: with the previous draw's shaders and state on the same stream (no pipeline bound
+    /// since), only what differs is recorded.
+    void BindShaderObjects(vk::CommandBuffer cmd, const ShaderObjectState* previous,
+                           const std::array<vk::ShaderEXT, 4>* previous_shaders) const;
+    const ShaderObjectState& GetShaderObjectState() const noexcept {
+        return so_state;
+    }
+    const std::array<vk::ShaderEXT, 4>& ShaderObjects() const noexcept {
+        return shader_objects;
+    }
+
     /// FIX-227: the hull shader's LDS emulation mode (0: off) and LS output bytes per vertex.
     u32 LdsEmulation() const {
         return lds_emulation;
@@ -160,6 +195,15 @@ private:
     vk::UniqueDescriptorSetLayout empty_set_layout;
     u32 num_sets = 0;
     std::unique_ptr<LibraryLink> library_link;
+
+    /// SO-001: vertex and fragment shader objects, and the pipeline state they need set.
+    bool CreateShaderObjects(std::span<const vk::ShaderModule> modules,
+                             const SerializationSupport& sdata,
+                             std::span<const vk::PipelineColorBlendAttachmentState> attachments,
+                             bool fragment);
+    /// Vertex, tessellation control, tessellation evaluation and fragment shader objects.
+    std::array<vk::ShaderEXT, 4> shader_objects{};
+    ShaderObjectState so_state;
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};

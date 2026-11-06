@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/guest_clock.h"
 #include "common/nvtx.h"
@@ -96,7 +97,7 @@ bool CompilationInProgress() {
 // DIAG-GT7-073 (diagnosis, RYGT_DIAG_TRANSLATE_JOBS=1).
 static bool TranslateJobsDiag() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_DIAG_TRANSLATE_JOBS");
+        const char* env = Common::DiagEnv("RYGT_DIAG_TRANSLATE_JOBS");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -708,7 +709,7 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
     static u32 programs = 0, matching = 0;
     ++programs;
     matching += found;
-    if (std::getenv("RYGT_DIAG_BARY_COUNT") && (found || programs % 100 == 0)) {
+    if (Common::DiagEnv("RYGT_DIAG_BARY_COUNT") && (found || programs % 100 == 0)) {
         LOG_WARNING(Render_Vulkan, "DIAG-222: {} of {} pixel shaders read vertex values ({:#x}{})",
                     matching, programs, params.hash, found ? " does" : "");
     }
@@ -807,7 +808,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             const char* env = std::getenv("RYGT_AMD_BARYCENTRIC_ALL");
             return env && env[0] == '1';
         }();
-        static const bool diag_count = std::getenv("RYGT_DIAG_BARY_COUNT") != nullptr;
+        static const bool diag_count = Common::DiagEnv("RYGT_DIAG_BARY_COUNT") != nullptr;
         const bool candidate = UseSingleSampleBarycentric(
             instance.GetVendorID(), profile.supports_fragment_shader_barycentric,
             S().graphics_key.num_samples, direct_barycentric_requested);
@@ -916,7 +917,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.lds_emulation = u8(TessLdsEmulation(regs)); // FIX-227
         info.sw.tcs.num_patches = u8(info.sw.tcs.lds_emulation ? regs.ls_hs_config.num_patches : 0);
         // DIAG-239 (diagnosis, RYGT_DIAG_TCS_CONFIG=1): the LS/HS configuration, 60 lines at most.
-        if (static const bool diag = std::getenv("RYGT_DIAG_TCS_CONFIG") != nullptr; diag) {
+        if (static const bool diag = Common::DiagEnv("RYGT_DIAG_TCS_CONFIG") != nullptr; diag) {
             static std::mutex seen_mutex;
             static std::set<u32> seen;
             const u32 combo = u32(regs.ls_hs_config.num_patches) |
@@ -1103,7 +1104,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             return (instance.IsFragmentShaderBarycentricSupported() &&
                     instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
-                    !std::getenv("RYGT_DIAG_NO_MANUAL_INTERP")) ||
+                    !Common::DiagEnv("RYGT_DIAG_NO_MANUAL_INTERP")) ||
                    (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                     instance.IsAmdLegacyShaderCompiler());
         }(),
@@ -1120,6 +1121,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     // Port of xacidr4inx's reflection fix (RyGT 0066): fragment cube samples filter across faces.
     profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
+    SetNativeCubeCacheEnabled(profile.native_cube_sampling); // FIX-GT7-083
     if (SingleSampleBarycentricRequested() && instance.GetVendorID() == 0x1002) {
         LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample interpolation on; KHR {}",
                     profile.supports_fragment_shader_barycentric);
@@ -2175,7 +2177,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     {
         // DIAG-225 (diagnosis, RYGT_DIAG_AA_MASK=1): draws with no pixel shader while
         // PA_SC_AA_MASK hides pixels (the quad sample mask is applied in the pixel shader only).
-        static const bool diag = std::getenv("RYGT_DIAG_AA_MASK") != nullptr;
+        static const bool diag = Common::DiagEnv("RYGT_DIAG_AA_MASK") != nullptr;
         const auto& r = Regs();
         if (diag && !S().infos[u32(SwStage::Fragment)] &&
             (r.reg_array[0xa30e] != ~0u || r.reg_array[0xa30f] != ~0u)) {
@@ -3208,11 +3210,24 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
         Serialization::Archive ar{std::move(entry.meta)};
         // Entries of another format version, cut short, or for another program are skipped.
         bool valid = false;
+        bool other_engine = false;
         try {
             Common::RecoverableScope recoverable;
-            valid = ar.SizeBytes() >= 24 && LoadShaderMeta(ar, *info, spec, stored_idx);
+            valid = ar.SizeBytes() >= 24 &&
+                    LoadShaderMeta(ar, *info, spec, stored_idx, &other_engine);
         } catch (const Common::RecoverableFailure&) {
             valid = false;
+            other_engine = false;
+        }
+        if (!valid && other_engine && stored_idx == perm_idx && info->pgm_hash == pgm_hash) {
+            // FIX-GT7-088: the other engine's translation (FIX-GT7-083) keeps its index, so this
+            // engine's goes after it instead of over its files: switching engines back and forth
+            // with one store translated the shader again each time, and left the pipelines
+            // stored with the overwritten module stale.
+            auto& end = stored_perm_end[pgm_hash];
+            end = std::max(end, perm_idx + 1);
+            ++stale;
+            continue;
         }
         if (!valid || stored_idx != perm_idx || info->pgm_hash != pgm_hash) {
             ++stale;
@@ -3710,7 +3725,7 @@ bool IsWatchedShader(u64 hash) {
         // The Nurburgring grass: vertex generator, blade generator, and the pass before them.
         // DIAG-039: the dealership shader whose buffer V#s read as float constants.
         std::vector<u64> hashes{0xab6a2d10, 0xaa3822a3, 0x766d0f18, 0xae32f77f};
-        if (const char* env = std::getenv("SHADGT_WATCH_SHADERS"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_WATCH_SHADERS"); env && *env) {
             hashes.clear();
             const std::string list{env};
             for (size_t start = 0; start < list.size();) {
@@ -3943,7 +3958,7 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     if (sane && !read_ahead) {
         // DIAG-067: who writes these constants next, and when (SHADGT_WATCH_TESS=<ms>).
         static const u32 watch_ms = [] {
-            const char* env = std::getenv("SHADGT_WATCH_TESS");
+            const char* env = Common::DiagEnv("SHADGT_WATCH_TESS");
             return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
         }();
         static auto next_watch = std::chrono::steady_clock::now();
@@ -4596,6 +4611,48 @@ PipelineCache::Result PipelineCache::GetProgramForJob(HwStage hw_stage,
     return none();
 }
 
+namespace {
+// PERF-GT7-058 (RYGT_SPEC_FAST=0 off, =2 makes the specialization too and logs a packed match
+// it doesn't confirm): R7's last permutation is confirmed from the
+// packed inputs it last matched with. GT7's race decode made ~2.2 million specializations per
+// 10 s this way, ~1 us each with their runtime info copied and compared: ~18% of
+// its thread, with only the buffers' addresses changing from one frame to the next.
+int SpecFastMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("RYGT_SPEC_FAST");
+        return env && *env ? std::clamp(env[0] - '0', 0, 2) : 1;
+    }();
+    return mode;
+}
+
+bool SpecPackable(const Shader::Info& info) {
+    return Shader::StageSpecialization::Packable(info); // FIX-GT7-082: no vertex fetch
+}
+
+std::vector<u64>& SpecWordsScratch() {
+    thread_local std::vector<u64> words;
+    return words;
+}
+
+Shader::Gcn::FetchShaderData& SpecFetchScratch() {
+    thread_local Shader::Gcn::FetchShaderData fetch;
+    return fetch;
+}
+
+void RecordSpecInputs(Program::Module& module, const Shader::Info& info,
+                      const Shader::RuntimeInfo& runtime_info,
+                      const Shader::Backend::Bindings& start) {
+    if (!SpecPackable(info)) {
+        return;
+    }
+    module.inputs.words.clear();
+    Shader::StageSpecialization::PackInputs(info, module.inputs.words, SpecFetchScratch());
+    module.inputs.runtime_info = runtime_info;
+    module.inputs.start = start;
+    module.inputs.valid = true;
+}
+} // namespace
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -4638,7 +4695,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // FIX-018: stored permutations of a program with an else after an empty if were translated
     // with the else running for every invocation. Translate those programs again, once; the new
     // permutations start after the stored ones, so their pipelines are new as well.
-    const bool first_use = else_scope_checked.insert(params.hash).second;
+    // PERF-GT7-058: the set is looked at once per program object, not at every call.
+    bool first_use = false;
+    if (!it_pgm.value()->use_checked) {
+        it_pgm.value()->use_checked = true;
+        first_use = else_scope_checked.insert(params.hash).second;
+    }
     if (first_use && IsWatchedShader(params.hash)) {
         // DIAG-031: the guest code of watched shaders, raw and as a listing, in the log folder.
         const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
@@ -4653,14 +4715,16 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // PERF-GT7-027: only a program with stored translations is looked at (each look decodes the
     // whole program up to four times, on the command thread, for hundreds of new programs at a
     // new track's start); a new one is translated by the fixed translator anyway.
-    const bool has_stored = !it_pgm.value()->modules.empty() ||
-                            stored_perm_end.find(params.hash) != stored_perm_end.end();
+    const auto has_stored = [&] { // PERF-GT7-058: only looked up on first use
+        return !it_pgm.value()->modules.empty() ||
+               stored_perm_end.find(params.hash) != stored_perm_end.end();
+    };
     u32 needed_fixes = 0;
     // FIX-GT7-055: SHD-010 clears a store another build filled, so what this one holds was made by
     // this translator: without this, the second launch of a new store translated again every
     // program needing a fix (32 on the main menu) and left the first translation unused on disk.
     static const bool other_builds_stored = Storage::StoreMayHoldOtherBuilds();
-    if (first_use && has_stored && other_builds_stored) {
+    if (first_use && other_builds_stored && has_stored()) {
         needed_fixes |= Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
         if (Shader::HasLegacyMad(params.code)) {
             needed_fixes |= 16u; // FIX-101
@@ -4687,7 +4751,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                      hw_stage, params.hash);
         }
     }
-    const auto known = else_scope_fixed.find(params.hash);
+    const auto known = needed_fixes != 0 ? else_scope_fixed.find(params.hash)
+                                          : else_scope_fixed.end(); // PERF-GT7-058
     const u32 applied_fixes = known != else_scope_fixed.end() ? known->second.fixes : 0u;
     if ((needed_fixes & ~applied_fixes) != 0) {
         auto& boundary = stored_perm_end[params.hash];
@@ -4768,10 +4833,44 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             info.pgm_base = params.Base();
             info.user_data = params.user_data;
             { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
-            if (permutation.spec == [&] {
+            // PERF-GT7-058: the same packed inputs as its last match decide without a new
+            // specialization.
+            const int fast_mode = SpecFastMode();
+            bool matched = false;
+            bool decided = false;
+            if (fast_mode != 0 && permutation.inputs.valid && SpecPackable(info) &&
+                permutation.inputs.start == binding &&
+                permutation.inputs.runtime_info == runtime_info) {
+                auto& words = SpecWordsScratch();
+                auto& fetch = SpecFetchScratch();
+                words.clear();
+                Shader::StageSpecialization::PackInputs(info, words, fetch);
+                if (words == permutation.inputs.words &&
+                    fetch == permutation.spec.fetch_shader_data) {
+                    matched = true;
+                    decided = fast_mode == 1;
+                }
+            }
+            if (!decided) {
+                const bool slow = permutation.spec == [&] {
                     Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
                     return Shader::StageSpecialization(info, runtime_info, profile, binding);
-                }()) {
+                }();
+                if (matched && !slow) {
+                    static std::atomic<u32> logged{};
+                    if (const u32 n = logged++; n < 32) {
+                        LOG_ERROR(Render_Vulkan,
+                                  "PERF-GT7-058: {}_{:#x} permutation {} matched by its packed "
+                                  "inputs, not by its specialization ({} so far)",
+                                  hw_stage, params.hash, last_match, n + 1);
+                    }
+                }
+                matched = slow;
+                if (slow && fast_mode != 0) {
+                    RecordSpecInputs(permutation, info, runtime_info, binding);
+                }
+            }
+            if (matched) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
                     RecoverAttributeFlags(info, permutation.spec, params, runtime_info, last_match);
                 }
@@ -4855,6 +4954,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             memo.flats.assign(flats.begin(), flats.end());
         }
         last_match = perm_idx; // R7
+        if (!memo_usable && SpecFastMode() != 0) {
+            RecordSpecInputs(permutation, info, runtime_info, binding); // PERF-GT7-058
+        }
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
         }

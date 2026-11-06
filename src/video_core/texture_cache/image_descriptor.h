@@ -96,6 +96,13 @@ inline ImageDescriptorGeometryError CheckImageDescriptorGeometry(
     if (image.NumSamples() > 16) {
         return ImageDescriptorGeometryError::SampleCount;
     }
+    // FIX-GT7-076: the macro tile tables (GetMacroTileExtents) stop at 8 samples, and no render
+    // target stores more than 8 fragments. A macro-tiled MSAA T# with last_level 4 (16 samples)
+    // passed here and stopped GT7 on tile.h's assertion in BindTextures (2026-11-04, after a
+    // race, right after the replay was saved). The tile mode is known to be valid from above.
+    if (image.NumSamples() > 8 && AmdGpu::IsMacroTiled(AmdGpu::GetArrayMode(image.GetTileMode()))) {
+        return ImageDescriptorGeometryError::SampleCount;
+    }
     return ImageDescriptorGeometryError::None;
 }
 

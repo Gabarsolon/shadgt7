@@ -14,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/ranges.h>
 #include "common/debug.h"
+#include "common/diagnostics.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "core/debug_state.h"
@@ -1317,7 +1318,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // DIAG-116 (SHADGT_DIAG_PASSES=1): draws per render pass (color target 0 and depth target,
     // with their sizes), every 4 s: where a frame's draws go.
     static const bool diag_passes = [] {
-        const char* env = std::getenv("SHADGT_DIAG_PASSES");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_PASSES");
         return env && (env[0] == '1' || env[0] == '2');
     }();
     if (diag_passes) {
@@ -1354,7 +1355,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         static std::unordered_map<u64, VideoCore::ImageId> to_dump;
         static bool dumped = false;
         static const auto dump_start = std::chrono::steady_clock::now();
-        static const bool dump_passes = std::getenv("SHADGT_DIAG_PASSES")[0] == '2';
+        static const bool dump_passes = Common::DiagEnv("SHADGT_DIAG_PASSES")[0] == '2';
         static bool cleared = !dump_passes;
         if (!cleared && std::chrono::steady_clock::now() - dump_start > std::chrono::seconds{229}) {
             cleared = true; // only targets of the last second before the dump
@@ -1550,7 +1551,7 @@ const char* RoleName(DiagRole role) {
 // only with SHADGT_DIAG_HISTORY=1.
 static bool DiagHistoryEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_DIAG_HISTORY");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_HISTORY");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -2033,7 +2034,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // ~33 ms bound (pipeline, image views, non-stream buffers; stream offsets ignored), i.e. what
     // a draw-state cache could reuse.
     static const bool diag_reuse = [] {
-        const char* env = std::getenv("SHADGT_DIAG_REUSE");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_REUSE");
         return env && env[0] == '1';
     }();
     if (diag_reuse) {
@@ -2658,7 +2659,7 @@ extern std::atomic<u64> g_defer_unflushed; // D5
 // into a cached copy that guest memory does not have yet.
 static bool DirectHazardDiag() {
     static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_DIAG_DIRECT_HAZARD");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_DIRECT_HAZARD");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -2785,7 +2786,7 @@ static void NoteDirectRead() {
     g_last_direct_read_ms.store(NowMs() | 1, std::memory_order_relaxed);
     // DIAG-141 (SHADGT_DIAG_FROSTED=1): in-place reads while the menu bar is on screen.
     static const bool diag = [] {
-        const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
         return env && env[0] == '1';
     }();
     if (diag && MenuBarShown()) {
@@ -2963,7 +2964,7 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     if (direct_hold && MenuBarShown()) {
         // DIAG-141: fences held while the menu bar is on screen.
         static const bool diag = [] {
-            const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+            const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
             return env && env[0] == '1';
         }();
         static std::atomic<u32> n{};
@@ -3058,7 +3059,7 @@ void Rasterizer::FrameDumpNoteOld() {
 
 bool Rasterizer::ExposureLogOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_EXPOSURE_LOG");
+        const char* env = Common::DiagEnv("RYGT_EXPOSURE_LOG");
         return env && env[0] == '1';
     }();
     return on;
@@ -3077,7 +3078,7 @@ void Rasterizer::ExposureLogShader(const Shader::Info& stage, const char* render
     }
     exposure_last = now;
     static const float dump_exposure = [] {
-        const char* env = std::getenv("RYGT_FRAME_DUMP_EXPOSURE");
+        const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_EXPOSURE");
         return env && *env ? float(std::atof(env)) : -1.0f;
     }();
     const float key = std::bit_cast<float>(now[1]);
@@ -3106,7 +3107,7 @@ void Rasterizer::FrameDumpFlip() {
     // CPU reads back of GPU results, per frame).
     static const std::vector<VAddr> peek = [] {
         std::vector<VAddr> list;
-        const char* env = std::getenv("RYGT_PEEK");
+        const char* env = Common::DiagEnv("RYGT_PEEK");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -3120,7 +3121,7 @@ void Rasterizer::FrameDumpFlip() {
     }();
     if (!peek.empty()) {
         static const double peek_at = [] {
-            const char* env = std::getenv("RYGT_PEEK_AT");
+            const char* env = Common::DiagEnv("RYGT_PEEK_AT");
             return env ? std::atof(env) : 200.0;
         }();
         static const auto peek_start = std::chrono::steady_clock::now();
@@ -3179,7 +3180,7 @@ void Rasterizer::FrameDumpFlip() {
     // several frames of one run, e.g. a lit and a dark cockpit).
     static const std::vector<double> dump_times = [] {
         std::vector<double> times;
-        if (const char* env = std::getenv("RYGT_FRAME_DUMP_AT"); env && *env) {
+        if (const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_AT"); env && *env) {
             std::string list{env};
             for (size_t pos = 0; pos < list.size();) {
                 const size_t end = std::min(list.find(',', pos), list.size());
@@ -3243,7 +3244,7 @@ void Rasterizer::FrameDumpFlip() {
     // NAT-128 (RYGT_FRAME_DUMP_FRAMES=n): n frames are collected (events of each, the targets and
     // textures as the last one left them), for work the game does every few frames only.
     static const u32 dump_frames = [] {
-        const char* env = std::getenv("RYGT_FRAME_DUMP_FRAMES");
+        const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_FRAMES");
         return env && *env ? std::max(std::atoi(env), 1) : 1;
     }();
     static u32 frames_seen = 0;
@@ -3336,7 +3337,7 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
     }
     // DIAG-168 (diagnosis, RYGT_TRACE_DRAWS=1): every draw into a traced pass, as below.
     static const bool trace_draws = [] {
-        const char* env = std::getenv("RYGT_TRACE_DRAWS");
+        const char* env = Common::DiagEnv("RYGT_TRACE_DRAWS");
         return env && env[0] == '1';
     }();
     bool traced_draw = false;
@@ -3433,7 +3434,7 @@ void Rasterizer::FrameDumpEvent(std::string text) {
 
 std::pair<VAddr, VAddr> Rasterizer::TraceRange() {
     static const std::pair<VAddr, VAddr> range = [] {
-        const char* env = std::getenv("RYGT_TRACE_RANGE");
+        const char* env = Common::DiagEnv("RYGT_TRACE_RANGE");
         if (!env || !*env) {
             return std::pair<VAddr, VAddr>{};
         }
@@ -3448,7 +3449,7 @@ std::pair<VAddr, VAddr> Rasterizer::TraceRange() {
 bool Rasterizer::TracedElsewhere(VAddr address, u64 size) {
     static const std::vector<std::pair<VAddr, VAddr>> ranges = [] {
         std::vector<std::pair<VAddr, VAddr>> list;
-        const char* env = std::getenv("RYGT_TRACE_RANGE");
+        const char* env = Common::DiagEnv("RYGT_TRACE_RANGE");
         const char* at = env ? std::strchr(env, ',') : nullptr;
         while (at && *at == ',') {
             char* end = nullptr;
@@ -3727,7 +3728,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                                                             : 0;
         if (special != 0) {
             // DIAG-122 (SHADGT_DIAG_SPECIAL=1): which dispatches the renderer replaces.
-            static const bool diag = std::getenv("SHADGT_DIAG_SPECIAL") != nullptr;
+            static const bool diag = Common::DiagEnv("SHADGT_DIAG_SPECIAL") != nullptr;
             static std::atomic<u32> logged{};
             if (diag && logged++ < 400) {
                 const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
@@ -3830,7 +3831,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // DIAG-081 (SHADGT_TRACE_GS_INPUTS=N): the vertex inputs of the first N geometry-shader
     // draws after 150 s: each V# and the first floats at its address.
     if (static const int trace_gs = [] {
-            const char* env = std::getenv("SHADGT_TRACE_GS_INPUTS");
+            const char* env = Common::DiagEnv("SHADGT_TRACE_GS_INPUTS");
             return env ? std::atoi(env) : 0;
         }();
         trace_gs > 0 && pipeline->GetStages()[u32(Shader::SwStage::Geometry)] != nullptr) {
@@ -4415,7 +4416,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // dispatch (cs 0xab6a2d10), then the vertex ranges of the grass draws that follow.
     static std::atomic<u32> grass_dispatches{};
     static const u32 dump_at = [] {
-        const char* env = std::getenv("SHADGT_DUMP_GRASS_AT");
+        const char* env = Common::DiagEnv("SHADGT_DUMP_GRASS_AT");
         return env && *env ? u32(std::stoul(env)) : 0u;
     }();
     if (stage.pgm_hash == 0xab6a2d10 && ++grass_dispatches == dump_at) {
@@ -4495,7 +4496,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // DIAG-133 (SHADGT_DIAG_SLOW_US=<us>): busy-waits that long per direct table, to
                 // tell timing races from wrong reads.
                 static const s64 slow_us = [] {
-                    const char* env = std::getenv("SHADGT_DIAG_SLOW_US");
+                    const char* env = Common::DiagEnv("SHADGT_DIAG_SLOW_US");
                     return env && *env ? std::atoll(env) : s64{0};
                 }();
                 if (slow_us > 0) {
@@ -4652,7 +4653,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     // changed between recording (what a copy would have used) and the GPU's
                     // completion.
                     static const bool change_diag = [] {
-                        const char* env = std::getenv("SHADGT_DIAG_DIRECT_CHANGE");
+                        const char* env = Common::DiagEnv("SHADGT_DIAG_DIRECT_CHANGE");
                         return env && env[0] == '1';
                     }();
                     if (change_diag && size <= 64_KB) {
@@ -5233,7 +5234,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // DIAG-139 (SHADGT_DIAG_FROSTED=1): the pictures GT Sport's frosted glass
             // (ps 0x90b5dcdd) reads, a few times a second.
             static const bool diag_frosted = [] {
-                const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+                const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
                 return env && env[0] == '1';
             }();
             if (diag_frosted && ((stage.pgm_hash & 0xffffffff) == 0x90b5dcdd || t_frosted_rt ||
@@ -5316,7 +5317,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& image = texture_cache.GetImage(image_id);
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
             static const bool dump_all = [] {
-                const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
             if (frame_dump_collecting && !is_storage &&
@@ -5625,7 +5626,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         {
             // DIAG-139: render targets in GT Sport's frosted-glass scratch memory.
             static const bool diag_frosted = [] {
-                const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+                const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
                 return env && env[0] == '1';
             }();
             if (cb == 0) {
@@ -6056,6 +6057,55 @@ bool Rasterizer::IsMappedStart(VAddr address) {
     return memory->IsValidMapping(address);
 }
 
+void Rasterizer::OnNewMapping(VAddr addr, u64 size) {
+    // FIX-GT7-077: Ryty reports an unmap before it unmaps. A texture still in use was uploaded again
+    // in between, from views imported then: aliases of the old pages, which nothing dropped at the
+    // map that followed. GT7 streams its track textures into partially resident memory and gives
+    // the freed pages to other textures: the near asphalt showed their tiles (flat green, red or
+    // blue road, 64 KB tiles of masks and normal maps) until those pages were unmapped again, often
+    // a lap later. Views still there at a map are stale: the range is treated as unmapped first.
+    // Without them, textures there are still uploaded again: uploaded while nothing was mapped,
+    // they hold zeros, and memory mapped with its data already in it writes nothing they would
+    // see. RYGT_MAP_DROPS_COPIES=0: as before (stale views are still counted in the log; imports
+    // that failed in the range are retried).
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_MAP_DROPS_COPIES");
+        return !(env && env[0] == '0');
+    }();
+    if (size == 0) {
+        return;
+    }
+    if (auto* direct = buffer_cache.GetDirectMemory(); direct && direct->ViewsOver(addr, size)) {
+        static std::atomic<u32> stale{};
+        if (const u32 n = ++stale; n <= 40 || n % 100 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-077: views of what was mapped before at {:#x}+{:#x} {} at its new "
+                        "mapping ({} so far)",
+                        addr, size, enabled ? "dropped" : "kept (RYGT_MAP_DROPS_COPIES=0)", n);
+        }
+        if (enabled) {
+            UnmapMemory(addr, size);
+#ifdef RYTY_GPU
+            // FIX-GT7-086: UnmapMemory marks the textures before direct->OnUnmap drops the views,
+            // so an upload recorded in between read the old pages and took the mark. They are
+            // marked again now that the views are gone.
+            if (native) {
+                native->OnNewMapping(addr, size);
+            }
+#endif
+        }
+        return;
+    }
+    if (!enabled) {
+        return;
+    }
+#ifdef RYTY_GPU
+    if (native) {
+        native->OnNewMapping(addr, size);
+    }
+#endif
+}
+
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
 #ifdef RYTY_GPU
@@ -6262,9 +6312,9 @@ void Rasterizer::UpdateDepthStencilState() const {
                                            !regs.depth_render_control.depth_clear_enable);
         // DIAG-227 (diagnosis, RYGT_DIAG_GEQUAL_ALWAYS=1): GREATER_EQUAL depth tests always pass
         // (whether the colour pass after a depth pre-pass fails its depth test).
-        static const bool gequal_always = std::getenv("RYGT_DIAG_GEQUAL_ALWAYS") != nullptr;
+        static const bool gequal_always = Common::DiagEnv("RYGT_DIAG_GEQUAL_ALWAYS") != nullptr;
         auto op = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
-        static const bool tess_always = std::getenv("RYGT_DIAG_TESS_ALWAYS") != nullptr;
+        static const bool tess_always = Common::DiagEnv("RYGT_DIAG_TESS_ALWAYS") != nullptr;
         if (tess_always && regs.stage_enable.hs_en) {
             op = vk::CompareOp::eAlways; // DIAG-227: tessellated draws only
         }
@@ -6281,7 +6331,7 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 
     // DIAG-228 (diagnosis, RYGT_DIAG_NO_DEPTH_BIAS=1): no depth bias at all.
-    static const bool no_bias = std::getenv("RYGT_DIAG_NO_DEPTH_BIAS") != nullptr;
+    static const bool no_bias = Common::DiagEnv("RYGT_DIAG_NO_DEPTH_BIAS") != nullptr;
     // FIX-224: a tessellated draw tested GREATER(_EQUAL) or LESS(_EQUAL) against depth a depth
     // pre-pass wrote for the same surface from its plain triangles gets a small bias toward the
     // camera. GT7 draws the car's body once untessellated into depth and then tessellated in colour

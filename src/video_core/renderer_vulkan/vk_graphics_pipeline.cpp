@@ -20,6 +20,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
@@ -441,7 +442,34 @@ GraphicsPipeline::GraphicsPipeline(
 
     // SHD-002: one set per stage; with libraries, sets are independent so each shader library
     // is made with its own stages' sets only.
-    const bool independent_sets = instance.IsGraphicsPipelineLibrarySupported();
+    // SO-001: a pipeline drawn with shader objects gets a layout without independent sets: the
+    // shaders are made with its set layouts and bound sets must match them exactly.
+    // SO-003: tessellated ones too (also the rect/quad list emulation) where the device has
+    // dynamic patch control points and domain origin.
+    const bool so_tessellation = instance.IsShaderObjectTessellationEnabled();
+    const bool so_candidate =
+        instance.IsShaderObjectEnabled() &&
+        (so_tessellation || (!tessellated && key.prim_type != AmdGpu::PrimitiveType::RectList &&
+                             key.prim_type != AmdGpu::PrimitiveType::QuadList)) &&
+        !infos[u32(Shader::SwStage::Geometry)] &&
+        // SO-004: GT7's pixel shaders nearly all ask for per-sample interpolation; with one
+        // sample per pixel that changes nothing, so only multisampled ones stay pipelines.
+        (key.num_samples <= 1 ||
+         (!runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena &&
+          !runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena)) &&
+        key.depth_samples <= key.num_samples &&
+        std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
+                            [&](u8 samples) { return samples == 0 || samples == key.num_samples; });
+    // SO-002: shader object pipelines keep the independent sets layout. The validation layer
+    // asks for VK_SHADER_CREATE_INDEPENDENT_SETS (not in these headers) to match it; a layout
+    // without independent sets lost the GPU device within 35 s on an RX 7600 (three runs), with
+    // it two minutes ran clean. RYGT_SO_INDEPENDENT=0 (diagnosis): the strict layout.
+    static const bool so_independent = [] {
+        const char* env = std::getenv("RYGT_SO_INDEPENDENT");
+        return !(env && env[0] == '0');
+    }();
+    const bool independent_sets =
+        instance.IsGraphicsPipelineLibrarySupported() && (!so_candidate || so_independent);
     const vk::PipelineLayoutCreateInfo layout_info = {
         .flags = independent_sets ? vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT
                                   : vk::PipelineLayoutCreateFlags{},
@@ -818,6 +846,112 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
+    // SO-001: a plain pipeline is drawn with shader objects: no pipeline is compiled. Not with
+    // tessellation (also the rect/quad list emulation), a geometry shader, sample shading or
+    // AMD's mixed sample counts, which shader objects can't express.
+    // SO-016 (diagnosis): kinds of pipelines kept as pipelines, a bit mask from RYGT_SO_SKIP or
+    // so_skip.txt in the game folder: 1 blending, 2 alpha to coverage, 4 logic op, 8 dual-source
+    // factors, 16 no pixel shader, 32 a partial colour write mask.
+    // SO-017: blended pipelines stay pipelines by default (with shader objects GT7's HUD lost
+    // its rev counter ticks and mirror frame and the menu cursor vanished). "0" in so_skip.txt or
+    // RYGT_SO_SKIP=0 draws them with shader objects again.
+    static const u32 so_skip = [] {
+        const char* env = std::getenv("RYGT_SO_SKIP");
+        u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : 1u;
+        if (std::FILE* file = std::fopen("so_skip.txt", "r")) {
+            char text[32]{};
+            if (std::fgets(text, sizeof(text), file)) {
+                bits = u32(std::strtoul(text, nullptr, 0));
+            }
+            std::fclose(file);
+        }
+        if (bits) {
+            LOG_WARNING(Render_Vulkan, "SO-016: pipelines kept for kinds {:#x}", bits);
+        }
+        return bits;
+    }();
+    bool skip_kind = false;
+    if (so_skip) {
+        u32 kinds = 0;
+        for (u32 i = 0; i < key.num_color_attachments; ++i) {
+            const auto& a = attachments[i];
+            kinds |= a.blendEnable ? 1u : 0u;
+            const auto src1 = [](vk::BlendFactor f) {
+                return f == vk::BlendFactor::eSrc1Color || f == vk::BlendFactor::eSrc1Alpha ||
+                       f == vk::BlendFactor::eOneMinusSrc1Color ||
+                       f == vk::BlendFactor::eOneMinusSrc1Alpha;
+            };
+            if (src1(a.srcColorBlendFactor) || src1(a.dstColorBlendFactor) ||
+                src1(a.srcAlphaBlendFactor) || src1(a.dstAlphaBlendFactor)) {
+                kinds |= 8;
+            }
+            if (key.write_masks[i] != (vk::ColorComponentFlagBits::eR |
+                                       vk::ColorComponentFlagBits::eG |
+                                       vk::ColorComponentFlagBits::eB |
+                                       vk::ColorComponentFlagBits::eA)) {
+                kinds |= 32;
+            }
+        }
+        kinds |= sdata.multisampling.alphaToCoverageEnable ? 2u : 0u;
+        kinds |= color_blending.logicOpEnable ? 4u : 0u;
+        kinds |= infos[u32(Shader::SwStage::Fragment)] ? 0u : 16u;
+        skip_kind = (kinds & so_skip) != 0;
+    }
+    if (so_candidate && !skip_kind &&
+        (key.num_samples <= 1 || !sdata.multisampling.sampleShadingEnable)) {
+        const auto& raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
+        so_state.topology = topology;
+        so_state.polygon_mode = raster.polygonMode;
+        so_state.samples = sdata.multisampling.rasterizationSamples;
+        so_state.provoking = key.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First
+                                 ? vk::ProvokingVertexModeEXT::eFirstVertex
+                                 : vk::ProvokingVertexModeEXT::eLastVertex;
+        so_state.depth_clamp = raster.depthClampEnable != VK_FALSE;
+        so_state.depth_clip = key.depth_clip_enable != 0;
+        so_state.negative_one_to_one = key.clip_space == AmdGpu::ClipSpace::MinusWToW;
+        // SO-015: as the pipeline's: only when the pixel shader writes alpha to target 0 (else
+        // the coverage came from an undefined alpha: HUD sprites and the menu cursor vanished).
+        so_state.alpha_to_coverage = sdata.multisampling.alphaToCoverageEnable != VK_FALSE;
+        so_state.logic_op_enable = color_blending.logicOpEnable != VK_FALSE;
+        so_state.logic_op = color_blending.logicOp;
+        so_state.attachments = key.num_color_attachments;
+        so_state.patch_control_points =
+            tessellated || is_rect_list || is_quad_list
+                ? tessellation_state.patchControlPoints
+                : 0;
+        if (CreateShaderObjects(modules, sdata, attachments,
+                                infos[u32(Shader::SwStage::Fragment)] != nullptr)) {
+            return;
+        }
+    }
+    // SO-004 (diagnosis): why a pipeline was not made of shader objects, while they are on.
+    if (instance.IsShaderObjectEnabled()) {
+        const char* why = !so_candidate
+            ? (infos[u32(Shader::SwStage::Geometry)] ? "geometry shader"
+               : key.depth_samples > key.num_samples   ? "depth samples"
+               : (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena ||
+                  runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena)
+                   ? "sample shading"
+                   : "colour samples or tessellation off")
+            : key.num_samples > 1 && sdata.multisampling.sampleShadingEnable
+                ? "sample shading enabled"
+                                                      : "shader object creation (code or driver)";
+        static std::atomic<u32> rejected{};
+        if (const u32 n = ++rejected; n <= 30 || n % 200 == 0) {
+            LOG_WARNING(Render_Vulkan, "SO-004: {} built as a pipeline: {} ({} so far)",
+                        GetDebugString(), why, n);
+        }
+    }
+    if (so_candidate && instance.IsGraphicsPipelineLibrarySupported()) {
+        // SO-001: no shader objects after all: the layout libraries need (independent sets).
+        auto layout_ci = layout_info;
+        layout_ci.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
+        auto [result, independent] = instance.GetDevice().createPipelineLayoutUnique(layout_ci);
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create graphics pipeline layout: {}",
+                   vk::to_string(result));
+        pipeline_layout = std::move(independent);
+    }
+
     // FIX-057: the driver's optimizer is what ran out of memory on GT Sport's tessellated
     // pipelines (also whole, two at a time); they are compiled without optimization.
     // -DisablePerf 81 optimizes them.
@@ -1149,7 +1283,419 @@ GraphicsPipeline::GraphicsPipeline(
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
 
+bool GraphicsPipeline::CreateShaderObjects(
+    std::span<const vk::ShaderModule> modules, const SerializationSupport& sdata,
+    std::span<const vk::PipelineColorBlendAttachmentState> attachments, bool fragment) {
+    // SO-001/SO-003: the stages in draw order; the rect/quad list emulation's control and
+    // evaluation shaders and the clip distance emulation's discard shader are generated code.
+    const bool tessellation = so_state.patch_control_points != 0;
+    const auto code_of = [&](Shader::SwStage stage, const std::vector<u32>& generated) {
+        const auto module = modules[u32(stage)];
+        return module ? ModuleCode(module) : generated;
+    };
+    std::array<std::vector<u32>, 4> code;
+    code[0] = ModuleCode(modules[u32(Shader::SwStage::Vertex)]);
+    if (tessellation) {
+        code[1] = code_of(Shader::SwStage::TessellationControl, sdata.tcs);
+        code[2] = code_of(Shader::SwStage::TessellationEval, sdata.tes);
+    }
+    if (fragment) {
+        code[3] = ModuleCode(modules[u32(Shader::SwStage::Fragment)]);
+    } else if (!sdata.fragment.empty()) {
+        code[3] = sdata.fragment; // clip distance emulation's discard shader
+    }
+    if (code[0].empty() || (tessellation && (code[1].empty() || code[2].empty())) ||
+        ((fragment || !sdata.fragment.empty()) && code[3].empty())) {
+        static std::atomic<u32> logged{};
+        if (++logged <= 10) {
+            LOG_WARNING(Render_Vulkan,
+                        "SO-004: no kept code: vertex {} control {} evaluation {} fragment {}",
+                        code[0].size(), code[1].size(), code[2].size(), code[3].size());
+        }
+        return false; // a module's code wasn't kept: a pipeline as before
+    }
+    const vk::PushConstantRange push_constants = {
+        .stageFlags = AllGraphicsStageBits,
+        .offset = 0,
+        .size = sizeof(Shader::PushData),
+    };
+    // AMD-301: the subgroup size the pipeline stages would have required.
+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size = {
+        .requiredSubgroupSize = 64,
+    };
+    const vk::ShaderStageFlags sized_stages = instance.RequiredSubgroupSizeStages();
+    constexpr std::array<vk::ShaderStageFlagBits, 4> stage_bits{
+        vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eTessellationControl,
+        vk::ShaderStageFlagBits::eTessellationEvaluation, vk::ShaderStageFlagBits::eFragment};
+    // SO-007: the stages are made together, linked (RYGT_SO_LINK=0: each on its own), so the
+    // driver sees the whole set as it does a pipeline's: it can merge the stages the GPU runs as
+    // one program and drop what the next stage never reads. SO-006: for independent-sets layouts.
+    static const bool link = [] {
+        const char* env = std::getenv("RYGT_SO_LINK");
+        return !(env && env[0] == '0');
+    }();
+    vk::ShaderCreateFlagsEXT flags{};
+    if (link) {
+        flags |= vk::ShaderCreateFlagBitsEXT::eLinkStage;
+    }
+    if (instance.IsShaderIndependentSetsSupported()) {
+        flags |= vk::ShaderCreateFlagsEXT{static_cast<VkShaderCreateFlagsEXT>(0x00040000)};
+    }
+    // SO-008: shader objects are shared by every pipeline with the same stage code and set
+    // layouts (pipelines that differ only in blending, formats or other drawing state).
+    u64 share_key = XXH3_64bits(&flags, sizeof(flags)) ^ num_sets;
+    for (u32 i = 0; i < 4; ++i) {
+        share_key = XXH3_64bits_withSeed(code[i].data(), code[i].size() * sizeof(u32),
+                                         share_key + i);
+    }
+    share_key = XXH3_64bits_withSeed(set_layout_hashes.data(),
+                                     set_layout_hashes.size() * sizeof(set_layout_hashes[0]),
+                                     share_key);
+    static std::mutex shared_mutex;
+    static std::unordered_map<u64, std::array<vk::ShaderEXT, 4>> shared_sets;
+    static std::atomic<u64> shared_hits{};
+    {
+        std::scoped_lock lock{shared_mutex};
+        if (const auto it = shared_sets.find(share_key); it != shared_sets.end()) {
+            shader_objects = it->second;
+            const u64 hits = ++shared_hits;
+            if (hits <= 3 || hits % 200 == 0) {
+                LOG_WARNING(Render_Vulkan, "SO-008: {} reuses shared shader objects ({} reuses)",
+                            GetDebugString(), hits);
+            }
+        }
+    }
+    if (shader_objects[0]) {
+        for (u32 i = 0; i < so_state.attachments; ++i) {
+            const auto& attachment = attachments[i];
+            so_state.blend_enable[i] = attachment.blendEnable;
+            so_state.equations[i] = vk::ColorBlendEquationEXT{
+                .srcColorBlendFactor = attachment.srcColorBlendFactor,
+                .dstColorBlendFactor = attachment.dstColorBlendFactor,
+                .colorBlendOp = attachment.colorBlendOp,
+                .srcAlphaBlendFactor = attachment.srcAlphaBlendFactor,
+                .dstAlphaBlendFactor = attachment.dstAlphaBlendFactor,
+                .alphaBlendOp = attachment.alphaBlendOp,
+            };
+        }
+        return true;
+    }
+    boost::container::static_vector<vk::ShaderCreateInfoEXT, 4> create_infos;
+    std::array<u32, 4> slot{};
+    for (u32 i = 0; i < 4; ++i) {
+        if (code[i].empty()) {
+            continue;
+        }
+        vk::ShaderStageFlags next{};
+        for (u32 j = i + 1; j < 4; ++j) {
+            if (!code[j].empty()) {
+                next = stage_bits[j];
+                break;
+            }
+        }
+        if (i == 0 && !tessellation) {
+            next = vk::ShaderStageFlagBits::eFragment;
+        }
+        slot[i] = static_cast<u32>(create_infos.size());
+        create_infos.push_back(vk::ShaderCreateInfoEXT{
+            .pNext = instance.IsSubgroupSize64Supported() && (sized_stages & stage_bits[i])
+                         ? &subgroup_size
+                         : nullptr,
+            .flags = flags,
+            .stage = stage_bits[i],
+            .nextStage = next,
+            .codeType = vk::ShaderCodeTypeEXT::eSpirv,
+            .codeSize = code[i].size() * sizeof(u32),
+            .pCode = code[i].data(),
+            .pName = "main",
+            .setLayoutCount = num_sets,
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_constants,
+        });
+    }
+    std::array<VkShaderEXT, 4> created{};
+    const auto create_start = std::chrono::steady_clock::now();
+    // SO-009: the driver's compiled shader objects are kept on disk (shader_objects in the cache
+    // folder, one file a set, keyed by the stage code, layouts, flags, GPU and driver version)
+    // and made from those binaries on later starts: the driver compiles a set only once.
+    // RYGT_SO_CACHE=0: always from SPIR-V.
+    static const bool use_cache = [] {
+        const char* env = std::getenv("RYGT_SO_CACHE");
+        return !(env && env[0] == '0');
+    }();
+    const auto cache_file =
+        Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects" /
+        fmt::format("{:016x}.bin", share_key ^ (u64(instance.GetDriverVersion()) << 32) ^
+                                       instance.GetDeviceID());
+    // SO-013: format 2 adds a checksum of each binary: a damaged file is never handed to the
+    // driver (compiled again and rewritten instead).
+    constexpr u32 CacheMagic = 0x32424F53; // "SOB2"
+    bool from_binary = false;
+    VkResult result = VK_ERROR_UNKNOWN;
+    if (use_cache) {
+        std::vector<std::vector<u8>> binaries;
+        if (std::FILE* file = std::fopen(cache_file.string().c_str(), "rb")) {
+            u32 magic = 0, count = 0;
+            bool ok = std::fread(&magic, 4, 1, file) == 1 && std::fread(&count, 4, 1, file) == 1 &&
+                      (magic == CacheMagic || magic == 0x31424F53) && count == create_infos.size();
+            // Files of format 1 (no checksums) are still read, so the cache isn't compiled again.
+            const bool checked = magic == CacheMagic;
+            for (u32 i = 0; ok && i < count; ++i) {
+                u64 size = 0;
+                u64 checksum = 0;
+                ok = std::fread(&size, 8, 1, file) == 1 && size != 0 && size < (64ull << 20) &&
+                     (!checked || std::fread(&checksum, 8, 1, file) == 1);
+                if (ok) {
+                    binaries.emplace_back(size);
+                    ok = std::fread(binaries.back().data(), 1, size, file) == size &&
+                         (!checked || XXH3_64bits(binaries.back().data(), size) == checksum);
+                }
+            }
+            std::fclose(file);
+            if (!ok) {
+                binaries.clear();
+            }
+        }
+        if (!binaries.empty()) {
+            auto binary_infos = create_infos;
+            for (size_t i = 0; i < binary_infos.size(); ++i) {
+                binary_infos[i].codeType = vk::ShaderCodeTypeEXT::eBinary;
+                binary_infos[i].codeSize = binaries[i].size();
+                binary_infos[i].pCode = binaries[i].data();
+            }
+            result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+                instance.GetDevice(), static_cast<u32>(binary_infos.size()),
+                reinterpret_cast<const VkShaderCreateInfoEXT*>(binary_infos.data()), nullptr,
+                created.data());
+            from_binary = result == VK_SUCCESS;
+            if (!from_binary) {
+                for (VkShaderEXT& shader : created) {
+                    if (shader) {
+                        VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(instance.GetDevice(),
+                                                                         shader, nullptr);
+                        shader = VK_NULL_HANDLE;
+                    }
+                }
+            }
+        }
+    }
+    if (!from_binary) {
+        // SO-014: AMD's driver compiles a shader object set for up to seconds of CPU time; at
+        // normal priority those compiles competed with the game's threads (game-side stalls in
+        // races). Below normal while it runs. RYGT_SO_COMPILE_PRIORITY=0: unchanged.
+        static const bool lower = [] {
+            const char* env = std::getenv("RYGT_SO_COMPILE_PRIORITY");
+            return !(env && env[0] == '0');
+        }();
+#ifdef _WIN32
+        const HANDLE thread = GetCurrentThread();
+        const int priority = GetThreadPriority(thread);
+        if (lower) {
+            SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+        }
+#endif
+        result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+            instance.GetDevice(), static_cast<u32>(create_infos.size()),
+            reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
+            created.data());
+#ifdef _WIN32
+        if (lower) {
+            SetThreadPriority(thread, priority);
+        }
+#endif
+        if (result == VK_SUCCESS && use_cache) {
+            // Written beside and renamed, so a reader never sees half a file.
+            std::error_code ec;
+            std::filesystem::create_directories(cache_file.parent_path(), ec);
+            auto temporary = cache_file;
+            temporary += fmt::format(".{}", std::hash<std::thread::id>{}(
+                                                std::this_thread::get_id()));
+            bool ok = false;
+            if (std::FILE* file = std::fopen(temporary.string().c_str(), "wb")) {
+                const u32 count = static_cast<u32>(create_infos.size());
+                ok = std::fwrite(&CacheMagic, 4, 1, file) == 1 &&
+                     std::fwrite(&count, 4, 1, file) == 1;
+                for (u32 i = 0; ok && i < count; ++i) {
+                    size_t size = 0;
+                    ok = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetShaderBinaryDataEXT(
+                             instance.GetDevice(), created[i], &size, nullptr) == VK_SUCCESS &&
+                         size != 0;
+                    std::vector<u8> data(size);
+                    ok = ok && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetShaderBinaryDataEXT(
+                                   instance.GetDevice(), created[i], &size, data.data()) ==
+                                   VK_SUCCESS;
+                    const u64 size64 = size;
+                    const u64 checksum = XXH3_64bits(data.data(), size);
+                    ok = ok && std::fwrite(&size64, 8, 1, file) == 1 &&
+                         std::fwrite(&checksum, 8, 1, file) == 1 &&
+                         std::fwrite(data.data(), 1, size, file) == size;
+                }
+                std::fclose(file);
+            }
+            if (ok) {
+                std::filesystem::rename(temporary, cache_file, ec);
+            }
+            if (!ok || ec) {
+                std::filesystem::remove(temporary, ec);
+            }
+        }
+    }
+    static std::atomic<u32> binary_hits{};
+    static std::atomic<u32> compiled{};
+    (from_binary ? binary_hits : compiled).fetch_add(1, std::memory_order_relaxed);
+    // SO-005 (diagnosis): how long the driver takes to make shader objects, per pipeline.
+    {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - create_start)
+                              .count();
+        static std::mutex timing_mutex;
+        static u32 timed = 0;
+        static double total_ms = 0, max_ms = 0;
+        std::scoped_lock lock{timing_mutex};
+        ++timed;
+        total_ms += ms;
+        max_ms = std::max(max_ms, ms);
+        if (timed <= 5 || timed % 50 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "SO-005: shader objects of {} stages made in {:.1f} ms ({}; SO-009 cache: "
+                        "{} from disk, {} compiled); {} pipelines so far, "
+                        "{:.1f} ms average, {:.1f} ms longest",
+                        create_infos.size(), ms, from_binary ? "from disk" : "compiled",
+                        binary_hits.load(), compiled.load(), timed, total_ms / timed, max_ms);
+        }
+    }
+    if (result != VK_SUCCESS) {
+        static std::atomic<u32> logged{};
+        if (++logged <= 8) {
+            LOG_WARNING(Render_Vulkan, "SO-001: shader objects failed ({}); a pipeline instead",
+                        vk::to_string(vk::Result(result)));
+        }
+        for (const VkShaderEXT shader : created) {
+            if (shader) {
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(instance.GetDevice(), shader,
+                                                                 nullptr);
+            }
+        }
+        return false;
+    }
+    for (u32 i = 0; i < 4; ++i) {
+        if (!code[i].empty()) {
+            shader_objects[i] = vk::ShaderEXT{created[slot[i]]};
+        }
+    }
+    {
+        // SO-008: kept for the renderer's lifetime and shared; a set another build made first
+        // for the same key is used instead of this one.
+        std::scoped_lock lock{shared_mutex};
+        const auto [it, inserted] = shared_sets.try_emplace(share_key, shader_objects);
+        if (!inserted) {
+            for (const vk::ShaderEXT shader : shader_objects) {
+                if (shader) {
+                    instance.GetDevice().destroyShaderEXT(shader);
+                }
+            }
+            shader_objects = it->second;
+        }
+    }
+    for (u32 i = 0; i < so_state.attachments; ++i) {
+        const auto& attachment = attachments[i];
+        so_state.blend_enable[i] = attachment.blendEnable;
+        so_state.equations[i] = vk::ColorBlendEquationEXT{
+            .srcColorBlendFactor = attachment.srcColorBlendFactor,
+            .dstColorBlendFactor = attachment.dstColorBlendFactor,
+            .colorBlendOp = attachment.colorBlendOp,
+            .srcAlphaBlendFactor = attachment.srcAlphaBlendFactor,
+            .dstAlphaBlendFactor = attachment.dstAlphaBlendFactor,
+            .alphaBlendOp = attachment.alphaBlendOp,
+        };
+    }
+    static std::atomic<u32> made{};
+    static std::atomic<u32> made_tessellated{};
+    const u32 n = ++made;
+    const u32 t = tessellation ? ++made_tessellated : made_tessellated.load();
+    if (n <= 3 || n % 500 == 0 || (tessellation && (t <= 3 || t % 100 == 0))) {
+        LOG_WARNING(Render_Vulkan,
+                    "SO-001: {} drawn with shader objects ({} so far, {} tessellated, SO-003)",
+                    GetDebugString(), n, t);
+    }
+    return true;
+}
+
+void GraphicsPipeline::BindShaderObjects(
+    vk::CommandBuffer cmd, const ShaderObjectState* previous,
+    const std::array<vk::ShaderEXT, 4>* previous_shaders) const {
+    if (!previous_shaders || *previous_shaders != shader_objects) {
+        std::array<vk::ShaderStageFlagBits, 5> stages{vk::ShaderStageFlagBits::eVertex,
+                                                      vk::ShaderStageFlagBits::eFragment};
+        std::array<vk::ShaderEXT, 5> shaders{shader_objects[0], shader_objects[3]};
+        u32 count = 2;
+        if (instance.IsTessellationShaderEnabled()) {
+            stages[count] = vk::ShaderStageFlagBits::eTessellationControl;
+            shaders[count++] = shader_objects[1];
+            stages[count] = vk::ShaderStageFlagBits::eTessellationEvaluation;
+            shaders[count++] = shader_objects[2];
+        }
+        if (instance.IsGeometryShaderEnabled()) {
+            stages[count++] = vk::ShaderStageFlagBits::eGeometry;
+        }
+        cmd.bindShadersEXT(count, stages.data(), shaders.data());
+    }
+    const auto& s = so_state;
+    const ShaderObjectState* p = previous;
+    // SO-010: each command only when its value differs from the previous draw's.
+    if (!p || p->topology != s.topology) {
+        cmd.setPrimitiveTopology(s.topology);
+    }
+    if (s.patch_control_points != 0 &&
+        (!p || p->patch_control_points != s.patch_control_points)) {
+        // SO-003: as the pipeline's tessellation state (no domain origin state: upper left).
+        cmd.setPatchControlPointsEXT(s.patch_control_points);
+        cmd.setTessellationDomainOriginEXT(vk::TessellationDomainOrigin::eUpperLeft);
+    }
+    if (!p || p->polygon_mode != s.polygon_mode) {
+        cmd.setPolygonModeEXT(s.polygon_mode);
+    }
+    if (!p || p->samples != s.samples) {
+        cmd.setRasterizationSamplesEXT(s.samples);
+        const vk::SampleMask mask = ~vk::SampleMask{0};
+        cmd.setSampleMaskEXT(s.samples, &mask);
+    }
+    if (!p || p->alpha_to_coverage != s.alpha_to_coverage) {
+        cmd.setAlphaToCoverageEnableEXT(s.alpha_to_coverage);
+    }
+    if (!p || p->depth_clamp != s.depth_clamp) {
+        cmd.setDepthClampEnableEXT(s.depth_clamp);
+    }
+    if (!p || p->depth_clip != s.depth_clip) {
+        cmd.setDepthClipEnableEXT(s.depth_clip);
+    }
+    if (!p || p->negative_one_to_one != s.negative_one_to_one) {
+        cmd.setDepthClipNegativeOneToOneEXT(s.negative_one_to_one);
+    }
+    if (!p || p->provoking != s.provoking) {
+        cmd.setProvokingVertexModeEXT(s.provoking);
+    }
+    if (instance.IsLogicOpSupported() &&
+        (!p || p->logic_op_enable != s.logic_op_enable || p->logic_op != s.logic_op)) {
+        cmd.setLogicOpEnableEXT(s.logic_op_enable);
+        cmd.setLogicOpEXT(s.logic_op);
+    }
+    if (s.attachments != 0) {
+        const auto same = [&](const auto& a, const auto& b) {
+            return std::equal(a.begin(), a.begin() + s.attachments, b.begin());
+        };
+        if (!p || p->attachments < s.attachments || !same(p->blend_enable, s.blend_enable)) {
+            cmd.setColorBlendEnableEXT(0, s.attachments, s.blend_enable.data());
+        }
+        if (!p || p->attachments < s.attachments || !same(p->equations, s.equations)) {
+            cmd.setColorBlendEquationEXT(0, s.attachments, s.equations.data());
+        }
+    }
+}
+
 GraphicsPipeline::~GraphicsPipeline() {
+    // SO-008: shader objects are shared and live as long as the renderer.
     if (library_link && library_link->optimized.valid()) {
         library_link->optimized.wait();
     }
