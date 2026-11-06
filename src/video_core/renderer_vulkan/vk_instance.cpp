@@ -296,6 +296,11 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderObjectFeaturesEXT,
         vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>();
     features = feature_chain.get().features;
+    struct Maintenance11Features {
+        VkStructureType sType;
+        void* pNext;
+        VkBool32 maintenance11;
+    } maintenance11_features{static_cast<VkStructureType>(1000657000), nullptr, VK_FALSE};
     // AMD-300: the features an older Radeon's driver turns off.
     if (const auto simulated = GetSimulatedGpu(); simulated != SimulatedGpu::None) {
         auto& vk11 = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
@@ -467,7 +472,7 @@ bool Instance::CreateDevice() {
                             d3.extendedDynamicState3DepthClipNegativeOneToOne &&
                             d3.extendedDynamicState3ProvokingVertexMode;
         if (states && feature_chain.get<vk::PhysicalDeviceShaderObjectFeaturesEXT>().shaderObject &&
-            vertex_input_dynamic_state) {
+            vertex_input_dynamic_state && graphics_pipeline_library) {
             shader_object = add_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
         }
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
@@ -475,16 +480,25 @@ bool Instance::CreateDevice() {
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
         // SO-011: on every GPU again, AMD included, now that shader objects are linked, cached on
         // disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them pipelines.
-        const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
-        shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
         // than these headers: enabled by its name, feature structure type and flag value).
         if (shader_object) {
-            shader_independent_sets = add_extension("VK_KHR_maintenance11");
+            if (add_extension("VK_KHR_maintenance11")) {
+                VkPhysicalDeviceFeatures2 maintenance_features{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                    .pNext = &maintenance11_features,
+                };
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(
+                    static_cast<VkPhysicalDevice>(physical_device), &maintenance_features);
+                shader_independent_sets = maintenance11_features.maintenance11 != VK_FALSE;
+            }
+            shader_object = shader_independent_sets;
         }
+        const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
+        shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
         LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
-                    shader_independent_sets ? "yes" : "no (VK_KHR_maintenance11 missing)");
+                    shader_independent_sets ? "yes" : "no (using pipelines)");
         LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
                     shader_object_tessellation ? "too (SO-003)" : "as pipelines");
@@ -956,12 +970,6 @@ bool Instance::CreateDevice() {
         fault_features.pNext = const_cast<void*>(create_info.pNext);
         create_info.pNext = &fault_features;
     }
-    // SO-006: VkPhysicalDeviceMaintenance11FeaturesKHR, by hand (not in these headers).
-    struct Maintenance11Features {
-        VkStructureType sType;
-        void* pNext;
-        VkBool32 maintenance11;
-    } maintenance11_features{static_cast<VkStructureType>(1000657000), nullptr, VK_TRUE};
     if (shader_independent_sets) {
         auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
         maintenance11_features.pNext = const_cast<void*>(create_info.pNext);

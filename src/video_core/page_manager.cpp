@@ -59,6 +59,9 @@ static ProtectCost g_protect_cost;
 /// PERF-GT7-051 (diagnosis, RYGT_PROTECT_MAP=1): protections, unprotections and CPU write
 /// faults counted by 1 MB of guest memory; the 15 busiest areas are logged every 10 s.
 static bool ProtectMapOn() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    }
     static const bool on = [] {
         // Or a file protect_map.on in the game's folder (the working directory), whatever
         // started the game.

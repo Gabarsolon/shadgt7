@@ -147,6 +147,13 @@ target_compile_features(shadps4_shared_build_map_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_shared_build_map_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_shared_build_map_test)
 
+add_executable(shadps4_shader_object_cache_test test_shader_object_cache.cpp)
+target_include_directories(shadps4_shader_object_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_shader_object_cache_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_shader_object_cache_test PRIVATE GTest::gtest_main xxHash::xxhash)
+gtest_discover_tests(shadps4_shader_object_cache_test)
+
+
 add_executable(shadps4_spirv_check_test test_spirv_check.cpp)
 target_include_directories(shadps4_spirv_check_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_spirv_check_test PRIVATE cxx_std_23)
