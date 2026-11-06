@@ -49,6 +49,12 @@ target_link_libraries(shadps4_buffer_copy_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
 gtest_discover_tests(shadps4_buffer_copy_test)
 
+add_executable(shadps4_upload_memory_recovery_test test_upload_memory_recovery.cpp)
+target_include_directories(shadps4_upload_memory_recovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_upload_memory_recovery_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_upload_memory_recovery_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_upload_memory_recovery_test)
+
 add_executable(shadps4_device_service_test test_device_service.cpp
     ${CMAKE_SOURCE_DIR}/src/core/libraries/device_service/device_service.cpp)
 target_include_directories(shadps4_device_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -146,12 +152,6 @@ target_include_directories(shadps4_shared_build_map_test PRIVATE ${CMAKE_SOURCE_
 target_compile_features(shadps4_shared_build_map_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_shared_build_map_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_shared_build_map_test)
-
-add_executable(shadps4_upload_memory_recovery_test test_upload_memory_recovery.cpp)
-target_include_directories(shadps4_upload_memory_recovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_features(shadps4_upload_memory_recovery_test PRIVATE cxx_std_23)
-target_link_libraries(shadps4_upload_memory_recovery_test PRIVATE GTest::gtest_main)
-gtest_discover_tests(shadps4_upload_memory_recovery_test)
 
 add_executable(shadps4_spirv_check_test test_spirv_check.cpp)
 target_include_directories(shadps4_spirv_check_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
