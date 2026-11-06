@@ -514,6 +514,7 @@ public:
     virtual const DeviceCaps& Caps() const = 0;
 
     virtual std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) = 0;
+    virtual void DestroyCompletedBuffer(std::unique_ptr<Buffer> buffer) {}
     /// Wraps existing CPU memory (page aligned, `Caps().host_import_alignment`) as a buffer the
     /// GPU reads and writes in place; nullptr when unsupported.
     /// NAT-107: a buffer made elsewhere (Vulkan: a VkBuffer), not owned: bound and copied
