@@ -637,9 +637,22 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
+        std::atomic<u32> pending{};
+        u32 parked{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
-    u32 num_mapped_queues{1u}; // GFX is always available
+    std::atomic<u32> num_mapped_queues{1u}; // GFX is always available
+
+    bool ComputeQueueRunnable() const {
+        const u32 queues = num_mapped_queues.load(std::memory_order_acquire);
+        for (u32 q = 1; q < queues; ++q) {
+            const auto& queue = mapped_queues[q];
+            if (queue.parked == 0 && queue.pending.load(std::memory_order_relaxed) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
@@ -671,6 +684,7 @@ private:
     // the draw pipe runs. num_tasks counts the ones the command thread has not decoded yet.
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_tasks{};
+    u32 gfx_packets_since_yield{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

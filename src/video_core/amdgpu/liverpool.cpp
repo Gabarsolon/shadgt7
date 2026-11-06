@@ -1388,7 +1388,7 @@ void Liverpool::Process(std::stop_token stoken) {
         while (num_tasks || num_commands) {
             ProcessCommands();
 
-            curr_qid = (curr_qid + 1) % num_mapped_queues;
+            curr_qid = (curr_qid + 1) % num_mapped_queues.load(std::memory_order_acquire);
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -1408,6 +1408,9 @@ void Liverpool::Process(std::stop_token stoken) {
                 {
                     std::scoped_lock lock{queue.m_access};
                     queue.submits.pop();
+                    if (curr_qid != GfxQueueId) {
+                        queue.pending.fetch_sub(1, std::memory_order_relaxed);
+                    }
                 }
                 --num_tasks;
                 // DIAG-051: a graphics submission is decoded; time it through the pipeline.
@@ -1691,6 +1694,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     u32 num_recent = 0;
     while (!dcb.empty()) {
         ProcessCommands();
+
+        static const u32 yield_packets = [] {
+            const char* env = std::getenv("RYGT_GFX_YIELD_PACKETS");
+            return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u;
+        }();
+        if (yield_packets != 0 && ++gfx_packets_since_yield >= yield_packets) {
+            gfx_packets_since_yield = 0;
+            if (ComputeQueueRunnable()) {
+                YIELD_GFX();
+            }
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -3043,6 +3057,16 @@ bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
     return !scan_finished;
 }
 
+struct ParkedScope {
+    u32& parked;
+    explicit ParkedScope(u32& parked_) : parked{parked_} {
+        ++parked;
+    }
+    ~ParkedScope() {
+        --parked;
+    }
+};
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -3189,6 +3213,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             const auto wait_start = std::chrono::steady_clock::now();
             const bool waited = !rewind->Valid();
+            ParkedScope parked{mapped_queues[vqid + 1].parked};
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -3346,6 +3371,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     SyncRecorder("mem semaphore");
                 }
                 const bool waited = !mem_semaphore->Signaled();
+                ParkedScope parked{mapped_queues[vqid + 1].parked};
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -3361,6 +3387,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = std::chrono::steady_clock::now();
+            ParkedScope parked{mapped_queues[vqid + 1].parked};
             // PERF-048: as for graphics waits, the other queues decode first.
             bool yielded = false;
             for (u32 turn = 0; draw_pipe && WaitTurnsEnabled() && turn < 4 &&
@@ -3903,10 +3930,13 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.pending.fetch_add(1, std::memory_order_relaxed);
     }
 
     std::scoped_lock lk{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
+    num_mapped_queues.store(
+        std::max(num_mapped_queues.load(std::memory_order_relaxed), gnm_vqid + 1),
+        std::memory_order_release);
     ++num_submits;
     ++num_tasks;
     submit_cv.notify_one();
