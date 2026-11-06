@@ -1956,6 +1956,23 @@ void NativeRenderer::ChunkFlushCheck() {
     if (stream.commands >= SpliceAfter) {
         Splice();
         r.scheduler.Flush();
+        return;
+    }
+    static const u32 feed_min = [] {
+        const char* on = std::getenv("RYGT_FEED_GPU");
+        if (on && on[0] == '0') {
+            return 0u;
+        }
+        const char* env = std::getenv("RYGT_FEED_GPU_MIN");
+        return std::max<u32>(env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u, 1u);
+    }();
+    if (feed_min == 0 || stream.commands < feed_min || (stream.commands & 15) != 0) {
+        return;
+    }
+    const u64 tick = r.scheduler.CurrentTick();
+    if (tick > 1 && r.scheduler.IsFree(tick - 1)) {
+        Splice();
+        r.scheduler.Flush();
     }
 }
 
@@ -6122,7 +6139,27 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                                    head[2], head[3])
                                      : std::string{"unreadable"});
                 };
+                static const u64 mirror_storage = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_MIRROR_STORAGE");
+                    return env && *env ? std::strtoull(env, nullptr, 10) * 1_MB : u64{64} * 1_MB;
+                }();
+                const bool mirrored_read = !desc.is_written && size <= mirror_storage &&
+                                           size > SnapshotBelow() &&
+                                           vsharp.num_records != UINT32_MAX;
+                bool mirror_bound = mirrored_read;
+                std::optional<std::pair<vk::Buffer, u64>> in_view;
+                if (mirrored_read && !RegionOver(base, size) && !MirrorHolding(base, size)) {
+                    std::ignore = MirrorBuffer(base, size);
+                    mirror_bound = false;
+                    if (direct && direct->EnsureImported(base, size)) {
+                        if (const auto view = direct->FindBuffer(base, size)) {
+                            in_view = std::pair{view->first->Handle(), view->second};
+                            last_bound = Bound::InPlace;
+                        }
+                    }
+                }
                 if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                    !mirror_bound && !in_view &&
                     (desc.is_written || size > SnapshotBelow()) && // FIX-170
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
@@ -6131,7 +6168,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         in_place.Note(2, base, size); // NAT-142
                     }
                     log_buffer("in place through the page table (D3)");
-                } else if (const auto found = GuestBuffer(base, size, desc.is_written)) {
+                } else if (const auto found = in_view ? in_view : GuestBuffer(base, size,
+                                                                            desc.is_written,
+                                                                            mirror_bound)) {
                     log_buffer(last_bound == Bound::Region   ? "region"
                                : last_bound == Bound::Mirror ? "mirror"
                                                              : "in place");
