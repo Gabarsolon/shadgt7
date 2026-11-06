@@ -460,16 +460,13 @@ GraphicsPipeline::GraphicsPipeline(
         key.depth_samples <= key.num_samples &&
         std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
                             [&](u8 samples) { return samples == 0 || samples == key.num_samples; });
-    // SO-002: shader object pipelines keep the independent sets layout. The validation layer
-    // asks for VK_SHADER_CREATE_INDEPENDENT_SETS (not in these headers) to match it; a layout
-    // without independent sets lost the GPU device within 35 s on an RX 7600 (three runs), with
-    // it two minutes ran clean. RYGT_SO_INDEPENDENT=0 (diagnosis): the strict layout.
     static const bool so_independent = [] {
         const char* env = std::getenv("RYGT_SO_INDEPENDENT");
         return !(env && env[0] == '0');
     }();
     const bool independent_sets =
-        instance.IsGraphicsPipelineLibrarySupported() && (!so_candidate || so_independent);
+        instance.IsGraphicsPipelineLibrarySupported() &&
+        (!so_candidate || (so_independent && instance.IsShaderIndependentSetsSupported()));
     const vk::PipelineLayoutCreateInfo layout_info = {
         .flags = independent_sets ? vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT
                                   : vk::PipelineLayoutCreateFlags{},
@@ -920,7 +917,8 @@ GraphicsPipeline::GraphicsPipeline(
                 ? tessellation_state.patchControlPoints
                 : 0;
         if (CreateShaderObjects(modules, sdata, attachments,
-                                infos[u32(Shader::SwStage::Fragment)] != nullptr)) {
+                                infos[u32(Shader::SwStage::Fragment)] != nullptr,
+                                independent_sets)) {
             return;
         }
     }
@@ -1285,7 +1283,8 @@ GraphicsPipeline::GraphicsPipeline(
 
 bool GraphicsPipeline::CreateShaderObjects(
     std::span<const vk::ShaderModule> modules, const SerializationSupport& sdata,
-    std::span<const vk::PipelineColorBlendAttachmentState> attachments, bool fragment) {
+    std::span<const vk::PipelineColorBlendAttachmentState> attachments, bool fragment,
+    bool independent_sets) {
     // SO-001/SO-003: the stages in draw order; the rect/quad list emulation's control and
     // evaluation shaders and the clip distance emulation's discard shader are generated code.
     const bool tessellation = so_state.patch_control_points != 0;
@@ -1338,7 +1337,7 @@ bool GraphicsPipeline::CreateShaderObjects(
     if (link) {
         flags |= vk::ShaderCreateFlagBitsEXT::eLinkStage;
     }
-    if (instance.IsShaderIndependentSetsSupported()) {
+    if (independent_sets) {
         flags |= vk::ShaderCreateFlagsEXT{static_cast<VkShaderCreateFlagsEXT>(0x00040000)};
     }
     // SO-008: shader objects are shared by every pipeline with the same stage code and set

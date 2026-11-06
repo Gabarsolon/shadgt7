@@ -105,8 +105,8 @@ static bool TranslateJobsDiag() {
 
 class PipelineCache::TranslateWorkers {
 public:
-    TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
-        : profile{profile_}, device{device_} {
+    TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count, bool keep_code_)
+        : profile{profile_}, device{device_}, keep_code{keep_code_} {
         for (u32 i = 0; i < count; ++i) {
             threads.emplace_back([this, i](std::stop_token stop) { Run(stop, i); });
         }
@@ -208,7 +208,7 @@ private:
         if (!Common::PerfFeatureEnabled(44)) {
             info->resource_usage_known = false;
         }
-        job.module = CompileSPV(job.spv, device);
+        job.module = CompileSPV(job.spv, device, keep_code);
         job.info = std::move(info);
         job.translate_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
@@ -231,6 +231,7 @@ private:
 
     const Shader::Profile& profile;
     vk::Device device;
+    const bool keep_code;
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<std::shared_ptr<TranslateJob>> queue;
@@ -1204,7 +1205,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (Common::PerfFeatureEnabled(102)) {
         const u32 count = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
         translate_workers =
-            std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count);
+            std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count,
+                                               instance.IsShaderObjectEnabled());
         translate_stats.since = std::chrono::steady_clock::now();
     }
 }
@@ -3128,9 +3130,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
-        module = CompileSPV(*patch, instance.GetDevice());
+        module = CompileSPV(*patch, instance.GetDevice(), instance.IsShaderObjectEnabled());
     } else {
-        module = CompileSPV(spv, instance.GetDevice());
+        module = CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
     }
     // PERF-DIAG-013: where runtime shader compile time goes.
     LOG_WARNING(
@@ -3703,7 +3705,7 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
                     "PERF-032: {} shader S().modules loaded from the store instead of translated",
                     loaded);
     }
-    return CompileSPV(spv, instance.GetDevice());
+    return CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
 }
 
 void PipelineCache::DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage) {
@@ -5169,7 +5171,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             if (m.module == module) {
                 const auto& d = instance.GetDevice();
                 d.destroyShaderModule(m.module);
-                m.module = CompileSPV(spv_code, d);
+                m.module = CompileSPV(spv_code, d, instance.IsShaderObjectEnabled());
                 new_module = m.module;
             }
         }

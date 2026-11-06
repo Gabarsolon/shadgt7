@@ -200,7 +200,7 @@ private:
     bool CreateShaderObjects(std::span<const vk::ShaderModule> modules,
                              const SerializationSupport& sdata,
                              std::span<const vk::PipelineColorBlendAttachmentState> attachments,
-                             bool fragment);
+                             bool fragment, bool independent_sets);
     /// Vertex, tessellation control, tessellation evaluation and fragment shader objects.
     std::array<vk::ShaderEXT, 4> shader_objects{};
     ShaderObjectState so_state;
