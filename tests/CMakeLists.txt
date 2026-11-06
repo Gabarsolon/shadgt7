@@ -185,6 +185,12 @@ target_compile_features(shadps4_fps_lock_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_fps_lock_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_fps_lock_test)
 
+add_executable(shadgt_unique_function_test test_unique_function.cpp)
+target_include_directories(shadgt_unique_function_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_unique_function_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_unique_function_test PRIVATE GTest::gtest_main Threads::Threads)
+gtest_discover_tests(shadgt_unique_function_test)
+
 add_executable(shadps4_recycling_pool_test test_recycling_pool.cpp)
 target_include_directories(shadps4_recycling_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_recycling_pool_test PRIVATE cxx_std_23)

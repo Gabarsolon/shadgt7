@@ -39,8 +39,12 @@ which the ryGT7 launcher sets from its options.
   (default 4; 0 walks on the job's thread, as before).
 - DLSS multi-frame generation (GT-MFG): `RYGT_DLSSG_FRAMES=1..5` generated frames a game frame
   (default 1, as before; more than 1 needs an RTX 50 and falls back to 1 when refused).
-- Fast flips (GT-FF): `RYGT_FAST_FLIPS=1` shows a frame as soon as it is submitted, no faster than
-  the flip rate, instead of at the next vblank. Off by default.
+- Fast flips (GT-FF): enabled by default with the native renderer when FSR/DLSS frame generation
+  is off. Frames can be presented between vblank ticks, after their GPU work finishes and subject
+  to the existing flip-rate pacing. The game's vblank clock is unchanged. This reduces uneven
+  presentation below the refresh rate; it does not increase rendering throughput.
+  `RYGT_FAST_FLIPS=0` restores presentation on vblank ticks. The explicit `=1` override is still
+  available; other rendering modes and frame generation keep their previous default.
 
 ## Build
 

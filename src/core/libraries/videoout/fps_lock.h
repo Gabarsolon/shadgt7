@@ -9,6 +9,16 @@
 
 namespace Libraries::VideoOut {
 
+/// Present between vblank ticks by default on the native renderer, without frame generation.
+/// Preserve the existing explicit opt-in, and allow =0 to restore flip-on-vblank pacing.
+constexpr bool FastFlipsEnabled(const char* override_value, bool native_renderer,
+                                bool frame_generation) {
+    if (override_value && *override_value) {
+        return override_value[0] == '1';
+    }
+    return native_renderer && !frame_generation;
+}
+
 /// PERF-075: the flip rate the presenter honours with a frame-rate lock. A flip rate of N lets a
 /// flip happen only every N+1 vblanks, so a 30 FPS lock on a 60 Hz vblank is rate 1. The lock
 /// only ever slows flips down: a game asking for a lower rate keeps it. 0 means no lock.
