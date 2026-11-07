@@ -6,6 +6,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/videoout/driver.h"
@@ -520,8 +521,18 @@ s32 PS4_SYSV_ABI sceVideoOutSetWindowModeMargins(s32 handle, s32 top, s32 bottom
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    driver = std::make_unique<VideoOutDriver>(EmulatorSettings.GetInternalScreenWidth(),
-                                              EmulatorSettings.GetInternalScreenHeight());
+    u32 port_width = EmulatorSettings.GetInternalScreenWidth();
+    u32 port_height = EmulatorSettings.GetInternalScreenHeight();
+    // NEO-GT7-001: in the PS4 Pro mode (RYGT_NEO=1 in libkernel.prx) the port reports a 2160p TV,
+    // as a Pro on a 4K set does: GT7 picks its 3200x1800 (or 2160p=1: 3840x2160) picture from the
+    // TV height. The base mode keeps the configured port.
+    if (Libraries::Kernel::sceKernelIsNeoMode()) {
+        port_width = 3840;
+        port_height = 2160;
+        LOG_WARNING(Lib_VideoOut, "NEO-GT7-001: video port {}x{} (PS4 Pro on a 2160p TV)",
+                    port_width, port_height);
+    }
+    driver = std::make_unique<VideoOutDriver>(port_width, port_height);
 
     LIB_FUNCTION("SbU3dwp80lQ", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutGetFlipStatus);
     LIB_FUNCTION("U46NwOiJpys", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutSubmitFlip);
