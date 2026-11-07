@@ -1360,13 +1360,19 @@ void PipelineCache::CompilePackShaders(std::stop_token stop) {
                 CompilePack::Recipe recipe;
                 if (files[index].filename().string().starts_with("lib-")) {
                     std::vector<u8> raw;
-                    const int outcome = CompilePack::ReadLibraryFile(files[index], raw)
-                                            ? BuildPackLibrary(instance, *pipeline_cache, raw)
-                                            : 0;
+                    const bool readable = CompilePack::ReadLibraryFile(files[index], raw);
+                    const int outcome =
+                        readable ? BuildPackLibrary(instance, *pipeline_cache, raw) : 0;
+                    if (!readable) {
+                        std::error_code remove_ec; // an older format or damaged: kept again when built
+                        std::filesystem::remove(files[index], remove_ec);
+                    }
                     (outcome == 1 ? built : outcome == 2 ? cached : failed)++;
                     ++libraries;
                 } else if (!CompilePack::Read(files[index], recipe)) {
                     ++failed;
+                    std::error_code remove_ec; // an older format or damaged: kept again when built
+                    std::filesystem::remove(files[index], remove_ec);
                 } else {
                     const auto cache_file =
                         cache_dir / "shader_objects" /
