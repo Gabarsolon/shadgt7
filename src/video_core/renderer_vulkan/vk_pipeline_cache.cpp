@@ -43,6 +43,7 @@
 #include "video_core/amdgpu/read_ahead_states.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/compile_pack.h"
+#include "video_core/renderer_vulkan/compile_pack_pipeline.h"
 #include "video_core/renderer_vulkan/shader_object_cache.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -1164,6 +1165,150 @@ static bool BuildPackRecipe(const Instance& instance, const CompilePack::Recipe&
     return ok;
 }
 
+// PERF-GT7-108: replays one library recipe into the driver's VkPipelineCache (kept on disk at
+// exit). 1: compiled, 2: the driver had it (created in under 10 ms), 0: refused.
+static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
+                            const std::vector<u8>& raw) {
+    CompilePack::LibraryReplay r;
+    if (!CompilePack::DeserializeLibrary(raw, r)) {
+        return 0;
+    }
+    const vk::Device device = instance.GetDevice();
+    std::vector<vk::UniqueShaderModule> modules;
+    std::vector<VkPipelineShaderStageCreateInfo> stages;
+    const VkSpecializationInfo* spec = nullptr;
+    for (const auto& [bit, code] : r.stages) {
+        auto [result, module] = device.createShaderModuleUnique(vk::ShaderModuleCreateInfo{
+            .codeSize = code.size() * sizeof(u32),
+            .pCode = code.data(),
+        });
+        if (result != vk::Result::eSuccess) {
+            return 0;
+        }
+        stages.push_back(VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = bit,
+            .module = *module,
+            .pName = "main",
+            .pSpecializationInfo = spec,
+        });
+        modules.push_back(std::move(module));
+    }
+    std::array<VkDescriptorSetLayout, Shader::Backend::MaxDescriptorSets> sets{};
+    std::vector<vk::UniqueDescriptorSetLayout> owned;
+    if (r.layout.sets.size() > sets.size()) {
+        return 0;
+    }
+    for (size_t s = 0; s < r.layout.sets.size(); ++s) {
+        if (!r.layout.sets[s]) {
+            continue;
+        }
+        std::vector<vk::DescriptorSetLayoutBinding> bindings;
+        for (const auto& b : r.layout.sets[s]->bindings) {
+            bindings.push_back({b.binding, static_cast<vk::DescriptorType>(b.type), b.count,
+                                vk::ShaderStageFlags{b.stages}, nullptr});
+        }
+        auto [result, layout] = device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlags{r.layout.sets[s]->flags},
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+        if (result != vk::Result::eSuccess) {
+            return 0;
+        }
+        sets[s] = *layout;
+        owned.push_back(std::move(layout));
+    }
+    const vk::PushConstantRange push = {
+        .stageFlags = vk::ShaderStageFlags{r.layout.push_stages},
+        .offset = 0,
+        .size = r.layout.push_size,
+    };
+    auto [layout_result, pipeline_layout] =
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .flags = vk::PipelineLayoutCreateFlags{r.layout.flags},
+            .setLayoutCount = static_cast<u32>(r.layout.sets.size()),
+            .pSetLayouts = reinterpret_cast<const vk::DescriptorSetLayout*>(sets.data()),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push,
+        });
+    if (layout_result != vk::Result::eSuccess) {
+        return 0;
+    }
+    r.rendering.colorAttachmentCount = static_cast<u32>(r.color_formats.size());
+    r.rendering.pColorAttachmentFormats = r.color_formats.data();
+    r.library.pNext = &r.rendering;
+    if (r.sample_counts) {
+        r.sample_counts->colorAttachmentCount = static_cast<u32>(r.color_samples.size());
+        r.sample_counts->pColorAttachmentSamples = r.color_samples.data();
+        r.rendering.pNext = &*r.sample_counts;
+    }
+    if (r.vertex_input) {
+        r.vertex_input->vertexBindingDescriptionCount = static_cast<u32>(r.vertex_bindings.size());
+        r.vertex_input->pVertexBindingDescriptions = r.vertex_bindings.data();
+        r.vertex_input->vertexAttributeDescriptionCount = static_cast<u32>(r.vertex_attributes.size());
+        r.vertex_input->pVertexAttributeDescriptions = r.vertex_attributes.data();
+    }
+    if (r.viewport && r.clip_control) {
+        r.viewport->pNext = &*r.clip_control;
+    }
+    if (r.raster) {
+        const void* head = nullptr;
+        for (auto it = r.raster_order.rbegin(); it != r.raster_order.rend(); ++it) {
+            if (*it == 1) {
+                r.provoking.pNext = head;
+                head = &r.provoking;
+            } else {
+                r.depth_clip.pNext = head;
+                head = &r.depth_clip;
+            }
+        }
+        r.raster->pNext = head;
+    }
+    if (r.multisample) {
+        r.multisample->pSampleMask = r.sample_mask.empty() ? nullptr : r.sample_mask.data();
+    }
+    if (r.color_blend) {
+        r.color_blend->attachmentCount = static_cast<u32>(r.blend_attachments.size());
+        r.color_blend->pAttachments = r.blend_attachments.data();
+    }
+    if (r.dynamic) {
+        r.dynamic->dynamicStateCount = static_cast<u32>(r.dynamic_states.size());
+        r.dynamic->pDynamicStates = r.dynamic_states.data();
+    }
+    const VkGraphicsPipelineCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &r.library,
+        .flags = r.flags,
+        .stageCount = static_cast<u32>(stages.size()),
+        .pStages = stages.data(),
+        .pVertexInputState = r.vertex_input ? &*r.vertex_input : nullptr,
+        .pInputAssemblyState = r.input_assembly ? &*r.input_assembly : nullptr,
+        .pTessellationState = r.tessellation ? &*r.tessellation : nullptr,
+        .pViewportState = r.viewport ? &*r.viewport : nullptr,
+        .pRasterizationState = r.raster ? &*r.raster : nullptr,
+        .pMultisampleState = r.multisample ? &*r.multisample : nullptr,
+        .pDepthStencilState = r.depth_stencil ? &*r.depth_stencil : nullptr,
+        .pColorBlendState = r.color_blend ? &*r.color_blend : nullptr,
+        .pDynamicState = r.dynamic ? &*r.dynamic : nullptr,
+        .layout = *pipeline_layout,
+        .basePipelineIndex = -1,
+    };
+    const auto start = std::chrono::steady_clock::now();
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateGraphicsPipelines(
+        device, static_cast<VkPipelineCache>(cache), 1, &info, nullptr, &pipeline);
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (pipeline) {
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyPipeline(device, pipeline, nullptr);
+    }
+    if (result != VK_SUCCESS) {
+        return 0;
+    }
+    return ms < 10.0 ? 2 : 1;
+}
+
 void PipelineCache::CompilePackShaders(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:CompilePack");
     const auto cache_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
@@ -1186,7 +1331,7 @@ void PipelineCache::CompilePackShaders(std::stop_token stop) {
     CompilePack::g_running.store(true, std::memory_order_release);
     const auto start = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
-    std::atomic<u32> built{0}, cached{0}, failed{0};
+    std::atomic<u32> built{0}, cached{0}, failed{0}, libraries{0};
     const u32 cores = std::max(2u, std::thread::hardware_concurrency());
     const u32 workers = std::clamp(cores - 2, 1u, 14u);
     std::vector<std::thread> pool;
@@ -1201,7 +1346,14 @@ void PipelineCache::CompilePackShaders(std::stop_token stop) {
                     break;
                 }
                 CompilePack::Recipe recipe;
-                if (!CompilePack::Read(files[index], recipe)) {
+                if (files[index].filename().string().starts_with("lib-")) {
+                    std::vector<u8> raw;
+                    const int outcome = CompilePack::ReadLibraryFile(files[index], raw)
+                                            ? BuildPackLibrary(instance, *pipeline_cache, raw)
+                                            : 0;
+                    (outcome == 1 ? built : outcome == 2 ? cached : failed)++;
+                    ++libraries;
+                } else if (!CompilePack::Read(files[index], recipe)) {
                     ++failed;
                 } else {
                     const auto cache_file =
@@ -1230,10 +1382,13 @@ void PipelineCache::CompilePackShaders(std::stop_token stop) {
         thread.join();
     }
     CompilePack::g_running.store(false, std::memory_order_release);
+    if (libraries.load() != 0) {
+        SaveDriverCache(false); // the libraries are in the driver's cache: on disk now
+    }
     LOG_WARNING(Render_Vulkan,
-                "PERF-GT7-108: compile pack of {} recipes: {} compiled, {} already in the cache, {} "
-                "failed, in {:.1f} s on {} threads{}",
-                files.size(), built.load(), cached.load(), failed.load(),
+                "PERF-GT7-108: compile pack of {} recipes ({} of them pipeline libraries): {} "
+                "compiled, {} already in the cache, {} failed, in {:.1f} s on {} threads{}",
+                files.size(), libraries.load(), built.load(), cached.load(), failed.load(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
                 workers, stop.stop_requested() ? " (stopped)" : "");
 }
