@@ -9,6 +9,7 @@
 namespace Common {
 
 thread_local const ReadCapture* t_read_capture = nullptr;
+thread_local GuestReadLog* t_guest_read_log = nullptr; // PERF-GT7-111
 
 namespace {
 std::atomic<u64> g_next_capture_id{1};

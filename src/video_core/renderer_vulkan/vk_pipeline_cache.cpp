@@ -103,6 +103,202 @@ static bool TranslateJobsDiag() {
     return enabled;
 }
 
+// PERF-GT7-111 : the precompile manifest. A record per translation made on a worker:
+// its inputs and the guest reads it made (descriptors, the SRT walker's output: values, no code),
+// and its SPIR-V's hash. The code and the fetch shader go to a local capture, never into a record.
+// RYGT_MANIFEST_RECORD=1 writes them; RYGT_MANIFEST_VERIFY=1 translates every record again at
+// start from the capture, replaying the reads, and compares the SPIR-V.
+static std::filesystem::path g_manifest_dir;
+static std::filesystem::path g_capture_dir;
+static bool ManifestRecordOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_MANIFEST_RECORD");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+static_assert(std::is_trivially_copyable_v<Shader::RuntimeInfo>);
+static_assert(std::is_trivially_copyable_v<Shader::Backend::Bindings>);
+static_assert(std::is_trivially_copyable_v<Shader::Info::PinnedFetchSharp>);
+
+struct ManifestRecord {
+    u32 hw_stage{};
+    u32 sw_stage{};
+    u64 hash{};
+    u64 code_xxh{};
+    u32 code_words{};
+    u64 spv_xxh{};
+    Shader::RuntimeInfo runtime_info{};
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    u32 fetch_base = ~0u;
+    u64 fetch_xxh{};
+    u32 fetch_words{};
+    Shader::Backend::Bindings start{};
+    std::vector<Shader::Info::PinnedFetchSharp> pinned;
+    std::vector<Common::GuestReadLog::Span> spans;
+    std::vector<u8> bytes;
+    // v2: the fetch shader's description, so no fetch code is needed to translate again.
+    bool has_fetch_data = false;
+    bool fetch_ok = false;
+    u32 fetch_size = 0;
+    s8 vertex_offset_sgpr = -1;
+    s8 instance_offset_sgpr = -1;
+    std::vector<Shader::Gcn::VertexAttribute> attributes;
+};
+static_assert(std::is_trivially_copyable_v<Shader::Gcn::VertexAttribute>);
+
+static constexpr char ManifestMagic[8] = {'R', 'Y', 'G', 'T', 'M', 'A', 'N', '1'};
+
+template <typename T>
+static void PutPod(std::vector<u8>& out, const T& value) {
+    const auto* p = reinterpret_cast<const u8*>(&value);
+    out.insert(out.end(), p, p + sizeof(T));
+}
+template <typename T>
+static bool GetPod(const std::vector<u8>& in, size_t& at, T& value) {
+    if (in.size() - at < sizeof(T)) return false;
+    std::memcpy(&value, in.data() + at, sizeof(T));
+    at += sizeof(T);
+    return true;
+}
+
+static bool WriteWords(const std::filesystem::path& file, std::span<const u32> words) {
+    std::error_code ec;
+    if (std::filesystem::exists(file, ec)) return true;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    std::FILE* f = std::fopen(file.string().c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(words.data(), 4, words.size(), f) == words.size();
+    std::fclose(f);
+    return ok;
+}
+
+static std::vector<u32> ReadWords(const std::filesystem::path& file) {
+    std::vector<u32> words;
+    if (std::FILE* f = std::fopen(file.string().c_str(), "rb")) {
+        std::fseek(f, 0, SEEK_END);
+        const long size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (size > 0 && size % 4 == 0) {
+            words.resize(size_t(size) / 4);
+            if (std::fread(words.data(), 4, words.size(), f) != words.size()) words.clear();
+        }
+        std::fclose(f);
+    }
+    return words;
+}
+
+static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> code,
+                                std::span<const u32> fetch) {
+    std::vector<u8> out(ManifestMagic, ManifestMagic + sizeof(ManifestMagic));
+    PutPod(out, u32{2});
+    PutPod(out, r.hw_stage);
+    PutPod(out, r.sw_stage);
+    PutPod(out, r.hash);
+    PutPod(out, r.code_xxh);
+    PutPod(out, r.code_words);
+    PutPod(out, r.spv_xxh);
+    PutPod(out, r.runtime_info);
+    PutPod(out, r.user_data);
+    PutPod(out, r.fetch_base);
+    PutPod(out, r.fetch_xxh);
+    PutPod(out, r.fetch_words);
+    PutPod(out, r.start);
+    PutPod(out, u32(r.pinned.size()));
+    for (const auto& pin : r.pinned) PutPod(out, pin);
+    PutPod(out, u32(r.spans.size()));
+    for (const auto& span : r.spans) {
+        PutPod(out, span.address);
+        PutPod(out, span.size);
+    }
+    PutPod(out, u32(r.bytes.size()));
+    out.insert(out.end(), r.bytes.begin(), r.bytes.end());
+    PutPod(out, u8(r.has_fetch_data));
+    PutPod(out, u8(r.fetch_ok));
+    PutPod(out, r.fetch_size);
+    PutPod(out, r.vertex_offset_sgpr);
+    PutPod(out, r.instance_offset_sgpr);
+    PutPod(out, u32(r.attributes.size()));
+    for (const auto& attribute : r.attributes) PutPod(out, attribute);
+    const auto file = g_manifest_dir / fmt::format("{:016x}-{:016x}.rec", r.hash, r.spv_xxh);
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec)) {
+        std::filesystem::create_directories(file.parent_path(), ec);
+        auto temporary = file;
+        temporary += fmt::format(".{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        if (std::FILE* f = std::fopen(temporary.string().c_str(), "wb")) {
+            const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+            std::fclose(f);
+            if (ok) std::filesystem::rename(temporary, file, ec);
+            if (!ok || ec) std::filesystem::remove(temporary, ec);
+        }
+    }
+    // The local capture: the game's code, for this PC only.
+    WriteWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh), code);
+    if (!fetch.empty()) {
+        WriteWords(g_capture_dir / fmt::format("fetch-{:016x}.code", r.fetch_xxh), fetch);
+    }
+}
+
+static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord& r) {
+    std::vector<u8> in;
+    if (std::FILE* f = std::fopen(file.string().c_str(), "rb")) {
+        std::fseek(f, 0, SEEK_END);
+        const long size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (size > 0) {
+            in.resize(size_t(size));
+            if (std::fread(in.data(), 1, in.size(), f) != in.size()) in.clear();
+        }
+        std::fclose(f);
+    }
+    if (in.size() < sizeof(ManifestMagic) || std::memcmp(in.data(), ManifestMagic, 8) != 0) {
+        return false;
+    }
+    size_t at = 8;
+    u32 version = 0, pins = 0, spans = 0, bytes = 0;
+    if (!GetPod(in, at, version) || (version != 1 && version != 2) ||
+        !GetPod(in, at, r.hw_stage) ||
+        !GetPod(in, at, r.sw_stage) || !GetPod(in, at, r.hash) || !GetPod(in, at, r.code_xxh) ||
+        !GetPod(in, at, r.code_words) || !GetPod(in, at, r.spv_xxh) ||
+        !GetPod(in, at, r.runtime_info) || !GetPod(in, at, r.user_data) ||
+        !GetPod(in, at, r.fetch_base) || !GetPod(in, at, r.fetch_xxh) ||
+        !GetPod(in, at, r.fetch_words) || !GetPod(in, at, r.start) || !GetPod(in, at, pins) ||
+        pins > 256) {
+        return false;
+    }
+    r.pinned.resize(pins);
+    for (auto& pin : r.pinned) {
+        if (!GetPod(in, at, pin)) return false;
+    }
+    if (!GetPod(in, at, spans) || spans > 1u << 20) return false;
+    r.spans.resize(spans);
+    u32 offset = 0;
+    for (auto& span : r.spans) {
+        if (!GetPod(in, at, span.address) || !GetPod(in, at, span.size)) return false;
+        span.offset = offset;
+        offset += span.size;
+    }
+    if (!GetPod(in, at, bytes) || bytes != offset || in.size() - at < bytes) return false;
+    r.bytes.assign(in.begin() + at, in.begin() + at + bytes);
+    at += bytes;
+    if (version == 1) return at == in.size();
+    u8 has = 0, ok = 0;
+    u32 count = 0;
+    if (!GetPod(in, at, has) || !GetPod(in, at, ok) || !GetPod(in, at, r.fetch_size) ||
+        !GetPod(in, at, r.vertex_offset_sgpr) || !GetPod(in, at, r.instance_offset_sgpr) ||
+        !GetPod(in, at, count) || count > 64) {
+        return false;
+    }
+    r.has_fetch_data = has != 0;
+    r.fetch_ok = ok != 0;
+    r.attributes.resize(count);
+    for (auto& attribute : r.attributes) {
+        if (!GetPod(in, at, attribute)) return false;
+    }
+    return at == in.size();
+}
+
 class PipelineCache::TranslateWorkers {
 public:
     TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count, bool keep_code_)
@@ -196,14 +392,63 @@ private:
         const auto start = std::chrono::steady_clock::now();
         Shader::Optimization::g_diag_compiling_code = job.code;
         Shader::Optimization::g_diag_compiling_hash = job.hash;
+        // PERF-GT7-111 : the translation's guest reads, for the manifest.
+        Common::GuestReadLog read_log;
+        // Not a geometry shader: its copy shader comes as a pointer in RuntimeInfo (gs_info.vs_copy),
+        // which a translation made again outside the draw would read wherever it then points.
+        const bool record = ManifestRecordOn() && !g_manifest_dir.empty() &&
+                            job.sw_stage != Shader::SwStage::Geometry;
+        if (record) {
+            Common::t_guest_read_log = &read_log;
+        }
         try {
             Common::RecoverableScope recoverable;
             const auto program = Shader::TranslateProgram(job.code, pools, *info, runtime_info,
                                                           profile);
             job.spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+            if (record) {
+                // PERF-GT7-117 : the reads of its specialization too (vertex attributes,
+                // tessellation constants), which a pre-translation replays after the translation.
+                [[maybe_unused]] const Shader::StageSpecialization spec{*info, job.runtime_info,
+                                                                        profile, job.start};
+            }
         } catch (const Common::RecoverableFailure&) {
+            Common::t_guest_read_log = nullptr;
             // Translated again on the command thread when needed, which reports the failure.
             return;
+        }
+        Common::t_guest_read_log = nullptr;
+        if (record) {
+            ManifestRecord rec;
+            rec.hw_stage = u32(job.hw_stage);
+            rec.sw_stage = u32(job.sw_stage);
+            rec.hash = job.hash;
+            rec.code_words = u32(job.code.size());
+            rec.code_xxh = XXH3_64bits(job.code.data(), job.code.size_bytes());
+            rec.spv_xxh = XXH3_64bits(job.spv.data(), job.spv.size() * sizeof(u32));
+            rec.runtime_info = job.runtime_info;
+            rec.user_data = job.user_data;
+            if (!job.fetch_copy.empty()) {
+                if (const auto base = Shader::FetchShaderSgprBase(job.code)) {
+                    rec.fetch_base = *base;
+                }
+                rec.fetch_words = u32(job.fetch_copy.size());
+                rec.fetch_xxh = XXH3_64bits(job.fetch_copy.data(), job.fetch_copy.size() * 4);
+            }
+            rec.start = job.start;
+            if (info->has_fetch_shader) {
+                Shader::Gcn::FetchShaderData fetch;
+                rec.has_fetch_data = true;
+                rec.fetch_ok = Shader::Gcn::ParseFetchShader(*info, fetch);
+                rec.fetch_size = fetch.size;
+                rec.vertex_offset_sgpr = fetch.vertex_offset_sgpr;
+                rec.instance_offset_sgpr = fetch.instance_offset_sgpr;
+                rec.attributes.assign(fetch.attributes.begin(), fetch.attributes.end());
+            }
+            rec.pinned = info->pinned_fetch_sharps;
+            rec.spans = std::move(read_log.spans);
+            rec.bytes = std::move(read_log.bytes);
+            WriteManifestRecord(rec, job.code, job.fetch_copy);
         }
         if (!Common::PerfFeatureEnabled(44)) {
             info->resource_usage_known = false;
@@ -1023,6 +1268,276 @@ void PipelineCache::WarmComputePipelines(std::stop_token stop) {
              warmed, files.size(), total_ms, longest_ms);
 }
 
+void PipelineCache::VerifyManifest() {
+    Common::SetCurrentThreadName("shadGT:ManifestVerify");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    std::this_thread::sleep_for(std::chrono::seconds{5});
+    Shader::Pools pools;
+    u32 records = 0, same = 0, differ = 0, failed = 0, no_code = 0, with_misses = 0;
+    u32 from_description = 0;
+    std::unordered_set<u64> spv_hashes;
+    // RYGT_MANIFEST_CODE=scan: the code found in the game's memory by the shader scan
+    // (RYGT_DIAG_SHADER_SCAN_CODE=1), as a player would have it, instead of the translations' own.
+    const char* code_env = std::getenv("RYGT_MANIFEST_CODE");
+    const bool from_scan = code_env && std::string_view{code_env} == "scan";
+    const auto code_dir =
+        from_scan ? g_capture_dir.parent_path() / (g_capture_dir.stem().string() + ".scan")
+                  : g_capture_dir;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(g_manifest_dir, ec)) {
+        if (entry.path().extension() != ".rec") continue;
+        ManifestRecord r;
+        if (!ReadManifestRecord(entry.path(), r) ||
+            Shader::SwStage(r.sw_stage) == Shader::SwStage::Geometry) {
+            ++failed;
+            continue;
+        }
+        ++records;
+        spv_hashes.insert(r.spv_xxh);
+        auto code = ReadWords(code_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+        std::vector<u32> fetch;
+        Shader::Gcn::FetchOverride fetch_override;
+        if (r.has_fetch_data) {
+            fetch_override.ok = r.fetch_ok;
+            fetch_override.data.size = r.fetch_size;
+            fetch_override.data.vertex_offset_sgpr = r.vertex_offset_sgpr;
+            fetch_override.data.instance_offset_sgpr = r.instance_offset_sgpr;
+            for (const auto& attribute : r.attributes) {
+                fetch_override.data.attributes.push_back(attribute);
+            }
+        } else if (r.fetch_words != 0) {
+            fetch = ReadWords(g_capture_dir / fmt::format("fetch-{:016x}.code", r.fetch_xxh));
+        }
+        if (code.size() != r.code_words ||
+            (!r.has_fetch_data && r.fetch_words != 0 && fetch.size() != r.fetch_words)) {
+            ++no_code;
+            continue;
+        }
+        auto user_data = r.user_data;
+        if (r.fetch_base != ~0u && r.fetch_base + 1 < user_data.size()) {
+            // The recording's pointer is to its own copy: the fetch code, or nothing with a
+            // description (never read then).
+            const u64 pointer = fetch.empty() ? 0 : reinterpret_cast<u64>(fetch.data());
+            std::memcpy(&user_data[r.fetch_base], &pointer, sizeof(pointer));
+        }
+        from_description += r.has_fetch_data ? 1 : 0;
+        const Shader::ShaderParams params{
+            .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+            .code = code,
+            .hash = r.hash,
+        };
+        Shader::Info info{Shader::HwStage(r.hw_stage), Shader::SwStage(r.sw_stage), params};
+        info.pinned_fetch_sharps = r.pinned;
+        auto runtime_info = r.runtime_info;
+        auto binding = r.start;
+        Common::GuestReadLog log;
+        log.spans = std::move(r.spans);
+        log.bytes = std::move(r.bytes);
+        log.replay = true;
+        Common::t_guest_read_log = &log;
+        Shader::Gcn::t_fetch_override = r.has_fetch_data ? &fetch_override : nullptr;
+        std::vector<u32> spv;
+        try {
+            Common::RecoverableScope recoverable;
+            const auto program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+            spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+            [[maybe_unused]] const Shader::StageSpecialization spec{info, r.runtime_info, profile,
+                                                                    r.start};
+        } catch (...) {
+            Common::t_guest_read_log = nullptr;
+            Shader::Gcn::t_fetch_override = nullptr;
+            ++failed;
+            continue;
+        }
+        Common::t_guest_read_log = nullptr;
+        Shader::Gcn::t_fetch_override = nullptr;
+        with_misses += log.misses != 0 || log.next != log.spans.size() ? 1 : 0;
+        if (XXH3_64bits(spv.data(), spv.size() * sizeof(u32)) == r.spv_xxh) {
+            ++same;
+        } else {
+            ++differ;
+            if (differ <= 5) {
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-GT7-111: {:#x} translated again differs ({} reads replayed of "
+                            "{}, {} missed)",
+                            r.hash, log.next, log.spans.size(), log.misses);
+            }
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GT7-111: manifest verification ({} code): {} records, {} same SPIR-V, {} "
+                "different, {} failed, {} without local code, {} with reads not replayed as "
+                "recorded, {} with the fetch shader from its description",
+                from_scan ? "scanned" : "translated", records, same, differ, failed, no_code,
+                with_misses, from_description);
+}
+
+// PERF-GT7-117 : RYGT_MANIFEST_PRETRANSLATE=1 translates at start, in the background, the
+// manifest's records whose program the shader store does not have (after a renderer update the
+// store starts empty: SHD-010), from the local code, and stores them as a draw's translation
+// would be: the draws then find them as in a warm start instead of waiting for (or skipping on)
+// their translations. A record is stored only when every guest read replays as recorded.
+void PipelineCache::PretranslateManifest() {
+    Common::SetCurrentThreadName("shadGT:Pretranslate");
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+    if (!use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
+        return;
+    }
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(g_manifest_dir, ec)) {
+        if (entry.path().extension() == ".rec") files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    // Records a program has (<hash>-<spv>.rec): the permutation indices it reserves.
+    std::unordered_map<u64, u32> records_of;
+    for (const auto& file : files) {
+        ++records_of[std::strtoull(file.stem().string().substr(0, 16).c_str(), nullptr, 16)];
+    }
+    const auto start_time = std::chrono::steady_clock::now();
+    std::atomic<size_t> next{0};
+    std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
+    std::atomic<u32> in_use{0};
+    std::mutex mutex;
+    struct Stored {
+        u32 next_idx = 0;
+        std::vector<Shader::StageSpecialization> specs;
+    };
+    std::unordered_map<u64, Stored> programs;
+    const auto work = [&] {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        Shader::Pools pools;
+        for (size_t i = next++; i < files.size(); i = next++) {
+            ManifestRecord r;
+            if (!ReadManifestRecord(files[i], r) ||
+                Shader::SwStage(r.sw_stage) == Shader::SwStage::Geometry) {
+                ++failed; // geometry shaders: see the recording
+                continue;
+            }
+            {
+                std::scoped_lock lk{mutex};
+                auto [it, added] = programs.try_emplace(r.hash);
+                if (added && Storage::DataBase::Instance().Exists(
+                                 Storage::BlobType::ShaderMeta,
+                                 fmt::format("{:#018x}", HashCombine(r.hash, u64{0})))) {
+                    it->second.next_idx = ~0u; // the store has this program: left alone
+                } else if (added) {
+                    // Its indices are reserved under the lookup lock, unless the game already
+                    // uses the program: a translation of the command thread then writes past
+                    // them (stored_perm_end), never over a pre-translated one.
+                    std::scoped_lock lookup{lookup_mutex};
+                    if (program_cache.contains(r.hash)) {
+                        it->second.next_idx = ~0u;
+                        ++in_use;
+                        continue;
+                    }
+                    auto& end = stored_perm_end[r.hash];
+                    end = std::max<size_t>(end, records_of[r.hash]);
+                }
+                if (it->second.next_idx == ~0u) {
+                    ++already;
+                    continue;
+                }
+            }
+            auto code = ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+            if (code.size() != r.code_words) {
+                ++no_code;
+                continue;
+            }
+            Shader::Gcn::FetchOverride fetch_override;
+            std::vector<u32> fetch;
+            if (r.has_fetch_data) {
+                fetch_override.ok = r.fetch_ok;
+                fetch_override.data.size = r.fetch_size;
+                fetch_override.data.vertex_offset_sgpr = r.vertex_offset_sgpr;
+                fetch_override.data.instance_offset_sgpr = r.instance_offset_sgpr;
+                for (const auto& attribute : r.attributes) {
+                    fetch_override.data.attributes.push_back(attribute);
+                }
+            } else if (r.fetch_words != 0) {
+                fetch = ReadWords(g_capture_dir / fmt::format("fetch-{:016x}.code", r.fetch_xxh));
+                if (fetch.size() != r.fetch_words) {
+                    ++no_code;
+                    continue;
+                }
+            }
+            auto user_data = r.user_data;
+            if (r.fetch_base != ~0u && r.fetch_base + 1 < user_data.size()) {
+                const u64 pointer = fetch.empty() ? 0 : reinterpret_cast<u64>(fetch.data());
+                std::memcpy(&user_data[r.fetch_base], &pointer, sizeof(pointer));
+            }
+            const Shader::ShaderParams params{
+                .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{user_data},
+                .code = code,
+                .hash = r.hash,
+            };
+            auto info = std::make_unique<Shader::Info>(Shader::HwStage(r.hw_stage),
+                                                       Shader::SwStage(r.sw_stage), params);
+            info->pinned_fetch_sharps = r.pinned;
+            auto runtime_info = r.runtime_info;
+            auto binding = r.start;
+            Common::GuestReadLog log;
+            log.spans = std::move(r.spans);
+            log.bytes = std::move(r.bytes);
+            log.replay = true;
+            Common::t_guest_read_log = &log;
+            Shader::Gcn::t_fetch_override = r.has_fetch_data ? &fetch_override : nullptr;
+            std::vector<u32> spv;
+            std::optional<Shader::StageSpecialization> spec;
+            try {
+                Common::RecoverableScope recoverable;
+                const auto program = Shader::TranslateProgram(code, pools, *info, runtime_info,
+                                                              profile);
+                spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+                // As HarvestTranslations makes a worker's: from the translated info.
+                spec.emplace(*info, r.runtime_info, profile, r.start);
+            } catch (...) {
+                spec.reset();
+            }
+            Common::t_guest_read_log = nullptr;
+            Shader::Gcn::t_fetch_override = nullptr;
+            if (!spec) {
+                ++failed;
+                continue;
+            }
+            if (log.misses != 0 || log.next != log.spans.size()) {
+                ++unreplayed;
+                continue;
+            }
+            std::scoped_lock lk{mutex};
+            auto& program = programs[r.hash];
+            if (std::ranges::find(program.specs, *spec) != program.specs.end()) {
+                ++duplicate;
+                continue;
+            }
+            const u32 perm_idx = program.next_idx++;
+            RegisterShaderMeta(*info, spec->fetch_shader_data, *spec, HashCombine(r.hash, u64{perm_idx}),
+                               perm_idx);
+            RegisterShaderBinary(std::move(spv), r.hash, perm_idx);
+            program.specs.push_back(std::move(*spec));
+            ++stored;
+        }
+    };
+    const u32 count = std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < count; ++t) {
+        threads.emplace_back(work);
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GT7-117: {} records in {:.1f} s on {} threads: {} translations stored, {} "
+                "for programs already stored or in use, {} duplicates, {} with reads not replayed "
+                "as recorded (not stored), {} without local code, {} failed; {} programs in use "
+                "left alone",
+                files.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
+                count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
+                no_code.load(), failed.load(), in_use.load());
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -1133,6 +1648,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         SingleSampleBarycentricRequested()));
     CreateDriverCache();
     g_exit_save_cache.store(this); // FIX-GT7-023
+    {
+        // PERF-GT7-111 : the manifest and capture folders, and the start-up verification.
+        const auto cache_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
+        const auto serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+        const auto gpu = fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID());
+        g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial) / gpu;
+        g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
+        const char* verify = std::getenv("RYGT_MANIFEST_VERIFY");
+        if (verify && verify[0] == '1') {
+            std::thread([this] { VerifyManifest(); }).detach();
+        }
+        const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
+        pretranslate_wanted = pretranslate && pretranslate[0] == '1';
+    }
     if (WarmComputeOn()) { // PERF-GT7-037
         warm_compute_thread =
             std::jthread([this](std::stop_token stop) { WarmComputePipelines(stop); });
@@ -1169,6 +1698,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         } else {
             Storage::DataBase::Instance().Open();
             use_stored_shaders = Storage::DataBase::Instance().IsOpened();
+            if (pretranslate_wanted && use_stored_shaders) {
+                std::thread([this] { PretranslateManifest(); }).detach(); // PERF-GT7-117
+            }
             // D10: the old renderer's translations stand in while the new renderer's are built.
             // SHADGT_LEGACY_FALLBACK=0 turns it off.
             // SHD-002: not with stage descriptor sets: the old translations bind everything
