@@ -1080,8 +1080,9 @@ GraphicsPipeline::GraphicsPipeline(
             BuildWatch part_watch{debug_str, i == 1 ? "pre-raster library"
                                              : i == 2 ? "fragment library"
                                                       : "interface library"};
-            auto [library_result, library] =
-                device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+            auto [library_result, library] = CreateWithRetries("library of", debug_str, [&] {
+                return device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+            }); // FIX-GT7-101
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
@@ -1203,7 +1204,9 @@ GraphicsPipeline::GraphicsPipeline(
             .pNext = &link_libraries,
             .layout = *pipeline_layout,
         };
-        auto [link_result, linked] = device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+        auto [link_result, linked] = CreateWithRetries("link of", debug_str, [&] {
+            return device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+        }); // FIX-GT7-101
         ASSERT_MSG(link_result == vk::Result::eSuccess, "Failed to link graphics pipeline: {}",
                    vk::to_string(link_result));
         pipeline = std::move(linked);
@@ -1268,8 +1271,9 @@ GraphicsPipeline::GraphicsPipeline(
 
     std::optional<BuildWatch> whole_watch;
     whole_watch.emplace(debug_str, "whole pipeline compile");
-    auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
+        return device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    }); // FIX-GT7-101
     whole_watch.reset();
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
     LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,

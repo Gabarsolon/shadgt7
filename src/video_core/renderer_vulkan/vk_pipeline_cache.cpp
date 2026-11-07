@@ -427,6 +427,15 @@ public:
     }
     /// PERF-GT7-029: during a catch-up, 8 at a time on every core; PERF-GT7-032: below normal
     /// priority (RYGT_CATCH_UP_LOW=0: normal, as before).
+    /// FIX-GT7-106: many draws on screen wait for their pipelines.
+    void SetBacklog(bool on) {
+        {
+            std::scoped_lock lk{extra_mutex};
+            backlog = on;
+            ApplyExtra();
+        }
+        Common::SetCompileBacklog(on);
+    }
     void SetCatchUp(bool on) {
         {
             std::scoped_lock lk{extra_mutex};
@@ -459,6 +468,7 @@ private:
         const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
                                       CompileConcurrency(), 12u);
         const u32 width = waiting > 0      ? widest
+                          : backlog        ? std::clamp(8u, CompileConcurrency(), widest)
                           : foreground > 0 ? CompileConcurrency()
                           : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
                                            : CompileConcurrency();
@@ -480,6 +490,7 @@ private:
     int waiting = 0;
     int foreground = 0;
     bool catch_up = false;
+    bool backlog = false; ///< FIX-GT7-106
     u32 pace = 64; ///< PERF-GT7-034: no limit
 
     static u32 AllCores() {
@@ -3494,6 +3505,35 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
                         "times, {:.1f} s in all); compiles back on their cores",
                         std::chrono::duration<double>(now - c.since).count(), c.skipped,
                         catch_up_bumped.exchange(0), c.step_backs, c.stepped_seconds);
+        }
+    }
+    // FIX-GT7-106: while many draws on screen wait for their pipelines
+    // (a first GT7 race: ~1,600, the road side, trees and sky missing for minutes), compiles use
+    // every core, 8 at a time, below normal priority, until few are left. On 3 cores the world
+    // filled in at ~3.5 pipelines a second; on every core at ~7 (the game ~40 fps instead of ~55
+    // meanwhile, a half-empty scene either way). PERF-GT7-029's catch-up stopped after a second
+    // there: it counts only some skips, and a build a thread waits for on itself narrowed it.
+    // RYGT_COMPILE_BACKLOG=<n>: from n draws (256 by default, off below n / 4), 0 never.
+    static const size_t backlog_enter = [] {
+        const char* env = std::getenv("RYGT_COMPILE_BACKLOG");
+        return env && *env ? size_t(std::strtoull(env, nullptr, 10)) : size_t{256};
+    }();
+    if (backlog_enter != 0) {
+        size_t backlog = 0;
+        {
+            std::scoped_lock lk2{on_screen_mutex};
+            backlog = on_screen.size();
+        }
+        const bool want =
+            backlog >= backlog_enter || (c.backlog && backlog > backlog_enter / 4);
+        if (want != c.backlog) {
+            c.backlog = want;
+            build_workers->SetBacklog(want);
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-106: {} draws on screen wait for their pipelines: compiles {}",
+                        backlog,
+                        want ? "on every core, 8 at a time, below normal priority"
+                             : "back to their cores");
         }
     }
     // PERF-GT7-033, PERF-GT7-034: the background compiles follow the game's frame rate.

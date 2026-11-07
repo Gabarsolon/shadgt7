@@ -126,8 +126,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
-    auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+    auto [pipeline_result, pipe] = CreateWithRetries("compute pipeline", debug_str, [&] {
+        return instance.GetDevice().createComputePipelineUnique(pipeline_cache,
+                                                                compute_pipeline_ci);
+    }); // FIX-GT7-101
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

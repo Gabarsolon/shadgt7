@@ -528,6 +528,7 @@ private:
         u64 skipped = 0;
         // PERF-GT7-033: stepped back while the game runs slower than 30 fps.
         bool stepped_back = false;
+        bool backlog = false; ///< FIX-GT7-106: draws on screen waiting widen the compiles
         std::chrono::steady_clock::time_point pace_start{};
         std::chrono::steady_clock::time_point stepped_since{};
         u64 pace_frames = 0;

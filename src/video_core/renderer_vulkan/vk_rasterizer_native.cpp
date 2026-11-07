@@ -3130,6 +3130,31 @@ std::string NativeRenderer::OneOffText() {
     return text;
 }
 
+bool NativeRenderer::OneOffBudgetLeft() {
+    // FIX-GT7-102: on a first GT7 race load (every shader new) one frame lasted 185 s: about
+    // 5,000 draws into ~20 new pictures waited for their pipelines (FIX-198), one after the
+    // other, as each draw's GPU work had to finish before the command stream went on. DIAG-GT7-008
+    // then saw nearly all of those pictures redrawn the very next frame (0 or 1 not redrawn within
+    // 300 frames, 3 or 4 sampled before their redraw). A frame now waits that long at most; its
+    // other one-off draws are skipped and show as their pipelines arrive, as in keep-going mode.
+    // In play the pipelines are usually known and the budget is not reached.
+    static const u64 budget_ns = [] {
+        u64 ms = 250;
+        if (const char* env = std::getenv("RYGT_ONE_OFF_BUDGET_MS"); env && *env) {
+            ms = std::strtoull(env, nullptr, 10);
+        }
+        return ms * 1000000ull;
+    }();
+    if (budget_ns == 0) {
+        return true;
+    }
+    if (one_off_budget_frame != frame) {
+        one_off_budget_frame = frame;
+        one_off_wait_ns_frame = 0;
+    }
+    return one_off_wait_ns_frame < budget_ns;
+}
+
 bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // FIX-198: GPU.compile_mode 2 (keep going) skips a draw while its new pipeline builds, so
     // the game never stops for a compile: what it draws shows a frame or so later, as it's drawn
@@ -8355,12 +8380,22 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         return r.AcquireGraphicsPipeline(params, !indirect && !quad_list);
     }();
-    if (!pipeline && DrawMustNotSkip(regs)) {
+    const bool must_wait = !pipeline && DrawMustNotSkip(regs);
+    if (must_wait && OneOffBudgetLeft()) {
         // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
         PhaseClock clock{stats.phase_ns[0]};
+        const auto wait_start = std::chrono::steady_clock::now();
         pipeline = r.AcquireGraphicsPipelineWaiting(params);
+        one_off_wait_ns_frame += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - wait_start)
+                                         .count()); // FIX-GT7-102
         ++stats.one_off_waits;
         WatchOneOffs(regs, false); // DIAG-GT7-008, PERF-GT7-023
+    } else if (must_wait) {
+        // FIX-GT7-102: this frame already waited its budget for one-off pipelines: skipped as
+        // other draws are, and watched as a skip (it never makes its kind safe).
+        ++stats.one_off_budget_skips;
+        WatchOneOffs(regs, true);
     } else if (!pipeline && !one_off_hits.empty()) {
         // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
         // draws are, and still watched (one sampled before its redraw makes its kind wait again).
@@ -13053,6 +13088,11 @@ void NativeRenderer::Report() {
     if (stats.one_off_exempt != 0) {
         LOG_INFO(Render_Vulkan, "PERF-GT7-023: {} draws into one-off pictures of kinds always "
                  "redrawn skipped instead of waiting", std::exchange(stats.one_off_exempt, 0));
+    }
+    if (stats.one_off_budget_skips != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-GT7-102: {} draws into pictures not drawn lately skipped "
+                 "once their frame had waited its budget for one-off pipelines",
+                 std::exchange(stats.one_off_budget_skips, 0));
     }
     SaveOneOffKinds(false); // PERF-GT7-023
     if (OneOffDiagOn()) {
