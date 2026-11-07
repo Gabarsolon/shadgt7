@@ -19,8 +19,11 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     const auto& tcs = ctx.runtime_info.sw.tcs;
     const u32 num_cp = std::max(tcs.num_input_control_points, 1u);
     const u32 num_attrs = (tcs.ls_stride + 15) / 16;
-    ASSERT_MSG(num_attrs <= 4, "FIX-227: LS stride {} past the scratch's 64 bytes a vertex",
-               tcs.ls_stride);
+    // FIX-GT7-119: the scratch follows the stride (the draw makes it max(stride, 64) bytes a
+    // vertex, the reads use this stride too); 4 attributes was a leftover limit: GT7's hull
+    // shaders of an 80-byte LS stride failed to translate at every race start (37 in 4 s on
+    // Monza), their tessellated draws were never drawn and waited each frame.
+    ASSERT_MSG(num_attrs <= 8, "FIX-227: LS stride {} past 128 bytes a vertex", tcs.ls_stride);
     const Id push_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
     const auto push_word = [&](u32 index) {
         return ctx.OpLoad(ctx.U32[1],
