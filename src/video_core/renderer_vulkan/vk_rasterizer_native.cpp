@@ -8776,30 +8776,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     {
         PhaseClock part{stats.record_ns[4]};
-        if (pipeline->UsesShaderObjects()) {
-            // SO-001: no pipeline; the shader objects and the state a pipeline fixes.
-            // SO-010: only what changed since the stream's last shader object draw.
-            // RYGT_SO_DELTA=0 or so_delta.off in the game folder: every state each draw.
-            static const bool delta = [] {
-                const char* env = std::getenv("RYGT_SO_DELTA");
-                return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off");
-            }();
-            const bool known = s.so_known && delta;
-            const auto previous = s.so_state;
-            const auto previous_shaders = s.so_shaders;
-            s.cmd.Run([pipeline, known, previous, previous_shaders](vk::CommandBuffer cmd) {
-                pipeline->BindShaderObjects(cmd, known ? &previous : nullptr,
-                                            known ? &previous_shaders : nullptr);
-            });
-            s.pipeline = vk::Pipeline{};
-            s.so_known = true;
-            s.so_state = pipeline->GetShaderObjectState();
-            s.so_shaders = pipeline->ShaderObjects();
-        } else if (s.pipeline != pipeline->Handle()) {
-            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-            s.pipeline = pipeline->Handle();
-            s.so_known = false; // SO-010
-        }
+        BindGraphics(s, *pipeline); // SO-001/SO-010/SO-018
     }
     {
         PhaseClock part{stats.record_ns[5]};
@@ -12320,6 +12297,34 @@ bool NativeRenderer::CaptureLdsReader(LdsReader& reader, const GraphicsPipeline&
     return true;
 }
 
+void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline) {
+    if (pipeline.UsesShaderObjects()) {
+        // SO-001: no pipeline; the shader objects and the state a pipeline fixes.
+        // SO-010: only what changed since the stream's last shader object draw.
+        // RYGT_SO_DELTA=0 or so_delta.off in the game folder: every state each draw.
+        static const bool delta = [] {
+            const char* env = std::getenv("RYGT_SO_DELTA");
+            return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off");
+        }();
+        const bool known = s.so_known && delta;
+        const auto previous = s.so_state;
+        const auto previous_shaders = s.so_shaders;
+        const GraphicsPipeline* const bound = &pipeline;
+        s.cmd.Run([bound, known, previous, previous_shaders](vk::CommandBuffer cmd) {
+            bound->BindShaderObjects(cmd, known ? &previous : nullptr,
+                                     known ? &previous_shaders : nullptr);
+        });
+        s.pipeline = vk::Pipeline{};
+        s.so_known = true;
+        s.so_state = pipeline.GetShaderObjectState();
+        s.so_shaders = pipeline.ShaderObjects();
+    } else if (s.pipeline != pipeline.Handle()) {
+        s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
+        s.pipeline = pipeline.Handle();
+        s.so_known = false; // SO-010
+    }
+}
+
 void NativeRenderer::FlushLdsReaders(u32 reason) {
     Stream& s = stream;
     if (s.lds_readers.empty()) {
@@ -12364,7 +12369,15 @@ void NativeRenderer::FlushLdsReaders(u32 reason) {
     BeginRendering(resumed);
     s.render = current; // the same pass to later draws
     // What the stream had bound is the last writer's: everything again for the first reader.
+    // SO-018 (diagnosis): what each reader drew with before SO-018, when only pipelines were
+    // bound here: a shader object reader (no pipeline handle) drew with the shaders bound last
+    // (the run's last writer's), or with no pipeline after a pipeline reader bound a null one.
+    int so018_kind = s.so_known ? 0 : 1; // 0 shader objects, 1 a pipeline, 2 a null pipeline
+    const auto so018_writer_shaders = s.so_shaders;
+    vk::Pipeline so018_pipeline{};
+    u32 so018_readers = 0, so018_other = 0, so018_null = 0;
     s.pipeline = vk::Pipeline{};
+    s.so_known = false; // SO-018: the first shader object reader sets all its state
     s.vertex_state_known = false;
     ForgetBindings(s);
     const CmdBuf cmdbuf{s.cmd};
@@ -12400,10 +12413,24 @@ void NativeRenderer::FlushLdsReaders(u32 reason) {
     };
     for (LdsReader& reader : readers) {
         const GraphicsPipeline& pipeline = *reader.pipeline;
-        if (s.pipeline != pipeline.Handle()) {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
-            s.pipeline = pipeline.Handle();
+        if (pipeline.UsesShaderObjects()) { // SO-018 (diagnosis)
+            ++so018_readers;
+            if (so018_pipeline) {
+                so018_pipeline = vk::Pipeline{};
+                so018_kind = 2;
+                ++so018_null;
+            }
+            if (so018_kind != 0 || so018_writer_shaders != pipeline.ShaderObjects()) {
+                ++so018_other;
+            }
+        } else if (so018_pipeline != pipeline.Handle()) {
+            so018_pipeline = pipeline.Handle();
+            so018_kind = 1;
         }
+        // SO-018: a reader drawn with shader objects binds them and the state a pipeline fixes,
+        // as its writer pass did (its Handle() is null: binding only pipelines here left it the
+        // shaders bound last, or bound a null pipeline after a pipeline reader).
+        BindGraphics(s, pipeline);
         if (!previous || !same_dynamic(previous->dynamic, reader.dynamic)) {
             s.dynamic = reader.dynamic;
             s.dynamic.Invalidate();
@@ -12439,6 +12466,24 @@ void NativeRenderer::FlushLdsReaders(u32 reason) {
         }
     }
     s.push_known = false; // the quad sample mask's words hold the last reader's scratch
+    if (so018_readers != 0) {
+        static std::atomic<u64> total_readers{}, total_other{}, total_null{};
+        static std::atomic<u32> logged{};
+        const u64 readers_so_far = total_readers += so018_readers;
+        const u64 other_so_far = total_other += so018_other;
+        const u64 null_so_far = total_null += so018_null;
+        if (so018_other != 0) {
+            if (const u32 n = ++logged; n <= 5 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "SO-018: a run of {} reader passes, {} with shader objects: {} of "
+                            "them drew with other shaders before SO-018 ({} after a null "
+                            "pipeline bind); so far {} shader object readers, {} with other "
+                            "shaders, {} after a null bind ({} such runs)",
+                            length, so018_readers, so018_other, so018_null, readers_so_far,
+                            other_so_far, null_so_far, n);
+            }
+        }
+    }
     readers.clear();
     if (s.lds_readers.empty()) {
         s.lds_readers = std::move(readers); // its storage for the next run

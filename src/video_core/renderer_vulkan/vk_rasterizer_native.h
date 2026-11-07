@@ -806,6 +806,9 @@ private:
     /// PERF-GT7-060: the stream's waiting reader passes, after one full barrier, in their pass
     /// (reason: 0 another draw, 1 the pass ends, 2 the run's limit).
     void FlushLdsReaders(u32 reason);
+    /// SO-018: binds a draw's pipeline, or its shader objects and the state a pipeline would fix
+    /// (SO-001; SO-010: only what changed since the stream's last shader object draw).
+    void BindGraphics(Stream& s, const GraphicsPipeline& pipeline);
     /// PERF-GT7-060: FIX-227 runs by length, every 10 s.
     void ReportLdsRuns();
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
