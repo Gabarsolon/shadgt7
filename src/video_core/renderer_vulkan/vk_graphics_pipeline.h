@@ -194,6 +194,9 @@ private:
     /// SHD-002: the layout of sets between stage sets (no bindings).
     vk::UniqueDescriptorSetLayout empty_set_layout;
     u32 num_sets = 0;
+    /// PERF-GT7-108: the set layouts' bindings, for the compile pack's recipes.
+    std::array<std::vector<vk::DescriptorSetLayoutBinding>, Shader::Backend::MaxDescriptorSets>
+        pack_bindings{};
     std::unique_ptr<LibraryLink> library_link;
 
     /// SO-001: vertex and fragment shader objects, and the pipeline state they need set.

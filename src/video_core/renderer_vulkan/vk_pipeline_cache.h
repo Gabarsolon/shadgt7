@@ -430,6 +430,9 @@ private:
     std::filesystem::path WarmComputeDir() const;
     void WarmComputePipelines(std::stop_token stop);
     std::jthread warm_compute_thread;
+    /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1).
+    void CompilePackShaders(std::stop_token stop);
+    std::jthread compile_pack_thread;
     u32 pipelines_at_driver_save{};
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::atomic<bool> driver_cache_writing{}; // PERF-036
