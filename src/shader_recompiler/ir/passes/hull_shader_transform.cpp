@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <unordered_map>
 #include "common/assert.h"
 #include "shader_recompiler/info.h"
@@ -404,12 +405,24 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
 
                 const u32 num_dwords = u32(opcode) - u32(IR::Opcode::StoreBufferU32) + 1;
 
+                // TESS-001: the launcher's Tessellation option off (RYGT_TESSELLATION=0) draws
+                // tessellated surfaces flat: every factor is limited to 1, so each patch is drawn
+                // as its own triangles with no added detail. A factor of 0 or less still culls the
+                // patch, as the game asks. (Skipping these draws instead would lose the cars: GT7
+                // draws their bodies tessellated in the colour pass.)
+                static const bool flat = [] {
+                    const char* env = std::getenv("RYGT_TESSELLATION");
+                    return env && env[0] == '0';
+                }();
                 const auto GetValue = [&](IR::Value data) -> IR::F32 {
+                    IR::F32 value;
                     if (auto* inst = data.TryInst();
                         inst && inst->GetOpcode() == IR::Opcode::BitCastU32F32) {
-                        return IR::F32{inst->Arg(0)};
+                        value = IR::F32{inst->Arg(0)};
+                    } else {
+                        value = ir.BitCast<IR::F32, IR::U32>(IR::U32{data});
                     }
-                    return ir.BitCast<IR::F32, IR::U32>(IR::U32{data});
+                    return flat ? IR::F32{ir.FPMin(value, ir.Imm32(1.0f))} : value;
                 };
 
                 auto get_factor_attr = [&](u32 gcn_factor_idx) -> IR::Patch {
