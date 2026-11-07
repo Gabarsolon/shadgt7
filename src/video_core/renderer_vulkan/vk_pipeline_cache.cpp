@@ -1166,12 +1166,13 @@ static bool BuildPackRecipe(const Instance& instance, const CompilePack::Recipe&
 }
 
 // PERF-GT7-108: replays one library recipe into the driver's VkPipelineCache (kept on disk at
-// exit). 1: compiled, 2: the driver had it (created in under 10 ms), 0: refused.
+// exit). 1: compiled, 2: the driver had it (created in under 10 ms), 0: refused, -1: not
+// decodable (an older format).
 static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
                             const std::vector<u8>& raw) {
     CompilePack::LibraryReplay r;
     if (!CompilePack::DeserializeLibrary(raw, r)) {
-        return 0;
+        return -1;
     }
     const vk::Device device = instance.GetDevice();
     std::vector<vk::UniqueShaderModule> modules;
@@ -1363,7 +1364,7 @@ void PipelineCache::CompilePackShaders(std::stop_token stop) {
                     const bool readable = CompilePack::ReadLibraryFile(files[index], raw);
                     const int outcome =
                         readable ? BuildPackLibrary(instance, *pipeline_cache, raw) : 0;
-                    if (!readable) {
+                    if (!readable || outcome < 0) {
                         std::error_code remove_ec; // an older format or damaged: kept again when built
                         std::filesystem::remove(files[index], remove_ec);
                     }
