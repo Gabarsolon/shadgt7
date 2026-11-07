@@ -584,7 +584,7 @@ private:
     bool AsyncTranslation() const;
     /// FIX-078 (lookup lock held): moves the finished translations of a program to its ready
     /// list, first waiting for its unfinished ones when `wait`.
-    void HarvestTranslations(u64 hash, bool wait);
+    bool HarvestTranslations(u64 hash, bool wait, bool budgeted = false); ///< PERF-GT7-115: false when a budgeted wait ran out
     /// FIX-078 (lookup lock held): a ready translation made for the inputs of this lookup. A draw
     /// (`insert`) adds it as a permutation; the read-ahead only learns it exists. Translations
     /// no draw matches (made from read-ahead states that were never drawn) are dropped later.
@@ -614,6 +614,10 @@ private:
         u64 waited{};
         double wait_ms{};
         double translate_ms{};
+        // DIAG-GT7-123: the waits by stage (Shader::SwStage), and by why they waited.
+        u64 waited_stage[8]{};
+        double wait_ms_stage[8]{};
+        u64 waited_writer{}, waited_forced{}, waited_shaders{}, waited_dropped{};
         std::chrono::steady_clock::time_point since{};
     } translate_stats;
     std::unique_ptr<TranslateWorkers> translate_workers;

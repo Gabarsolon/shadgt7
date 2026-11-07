@@ -119,9 +119,22 @@ public:
     }
 
     void Queue(std::shared_ptr<TranslateJob> job) {
+        // PERF-GT7-114: a hull shader's draw always waits for its translation (its tessellation
+        // factor writes keep it from being skipped, SHD-005), so it goes before the others, in
+        // order, and is never dropped as too old: on a cold Monza race start 211 draws waited
+        // 1.5 s for hull shaders queued behind ~2,500 newer jobs, one wait after another.
+        // RYGT_TRANSLATE_URGENT_HS=0: in the common queue, as before.
+        static const bool urgent_hs = [] {
+            const char* env = std::getenv("RYGT_TRANSLATE_URGENT_HS");
+            return !(env && env[0] == '0');
+        }();
         {
             std::scoped_lock lk{mutex};
-            queue.push_back(std::move(job));
+            if (urgent_hs && job->sw_stage == Shader::SwStage::TessellationControl) {
+                urgent.push_back(std::move(job));
+            } else {
+                queue.push_back(std::move(job));
+            }
         }
         cv.notify_one();
     }
@@ -146,8 +159,11 @@ private:
             std::vector<std::shared_ptr<TranslateJob>> too_old;
             {
                 std::unique_lock lk{mutex};
-                cv.wait(lk, stop, [this] { return !queue.empty(); });
-                if (max_age.count() > 0) {
+                cv.wait(lk, stop, [this] { return !queue.empty() || !urgent.empty(); });
+                if (!urgent.empty()) {
+                    job = std::move(urgent.front()); // PERF-GT7-114
+                    urgent.pop_front();
+                } else if (max_age.count() > 0) {
                     const auto now = std::chrono::steady_clock::now();
                     while (!queue.empty() && now - queue.front()->queued_at > max_age) {
                         too_old.push_back(std::move(queue.front()));
@@ -235,6 +251,7 @@ private:
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<std::shared_ptr<TranslateJob>> queue;
+    std::deque<std::shared_ptr<TranslateJob>> urgent; // PERF-GT7-114: hull shaders, first in order
     std::vector<std::jthread> threads;
 };
 
@@ -4087,7 +4104,45 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     return sane;
 }
 
+// PERF-GT7-115: the command thread's waits for hull shader translations, in windows of 33 ms. A
+// hull shader writes its tessellation factors, so SHD-005 never skips its draw, and GT7 has no
+// race signal for the GT Sport race policies (FIX-110, FIX-115): a cold Monza race start waited
+// 1.5 s for 211-233 of them, one after another (first frames 500-900 ms). Past the budget the
+// tessellated draw is skipped and comes back once its translation is done (one or two frames);
+// its factor writes are only read by the draw itself. RYGT_HS_WAIT_BUDGET_MS=<ms> (8), 0: waits
+// as before.
+static std::chrono::milliseconds HsWaitBudget() {
+    static const std::chrono::milliseconds budget = [] {
+        const char* env = std::getenv("RYGT_HS_WAIT_BUDGET_MS");
+        return std::chrono::milliseconds{env && *env ? std::strtol(env, nullptr, 0) : 8};
+    }();
+    return budget;
+}
+struct HsWaitWindow {
+    std::chrono::steady_clock::time_point start{};
+    std::chrono::steady_clock::duration used{};
+    u64 skipped = 0;
+};
+static HsWaitWindow& HsWindow() {
+    static thread_local HsWaitWindow window;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window.start > std::chrono::milliseconds{33}) {
+        window.start = now;
+        window.used = {};
+    }
+    return window;
+}
+
 bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderParams& params) {
+    if (sw_stage == SwStage::TessellationControl && HsWaitBudget().count() > 0 && !force_wait &&
+        !wait_for_shaders && regs_override == nullptr && AsyncTranslation() &&
+        !DrawnOnce(params.hash)) {
+        auto& window = HsWindow();
+        if (window.used >= HsWaitBudget()) {
+            ++window.skipped;
+            return true; // PERF-GT7-115
+        }
+    }
     // SHD-005: as a race's draws are skipped while their new pipeline builds (PERF-076), a draw
     // whose new shader still translates on a worker is skipped too, instead of the command thread
     // waiting for it (GT Sport's first race on a track stopped for 100-300 ms whenever a few
@@ -4355,11 +4410,12 @@ std::function<void()> PipelineCache::TakeShaderWait() {
     };
 }
 
-void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
+bool PipelineCache::HarvestTranslations(u64 hash, bool wait, bool budgeted) {
     const auto it = translate_jobs.find(hash);
     if (it == translate_jobs.end()) {
-        return;
+        return true;
     }
+    bool in_time = true;
     auto& jobs = it.value();
     if (wait && shaders_unlocked) {
         NoteUnlockedShaderWait(hash); // PERF-GT7-036: waited for without the lookup lock
@@ -4368,21 +4424,50 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
     if (wait) {
         const auto wait_start = std::chrono::steady_clock::now();
         bool waited = false;
+        u32 stage = 7;
+        bool dropped = false;
         for (const auto& job : jobs) {
             if (!job->done) {
                 // As CompileModule: the game never sees a PS4 wait for a shader.
                 Common::GuestClock::CompilePause hold;
                 RYDIAG_SCOPE(ShaderCompile, hash);
                 std::unique_lock lk{job->mutex};
-                job->cv.wait(lk, [&] { return job->done.load(); });
+                if (budgeted) {
+                    // PERF-GT7-115: no longer than what is left of the window's budget.
+                    auto& window = HsWindow();
+                    const auto left = HsWaitBudget() - window.used;
+                    if (left <= std::chrono::steady_clock::duration::zero() ||
+                        !job->cv.wait_for(lk, left, [&] { return job->done.load(); })) {
+                        in_time = false;
+                        waited = true;
+                        stage = std::min<u32>(u32(job->sw_stage), 7);
+                        break;
+                    }
+                } else {
+                    job->cv.wait(lk, [&] { return job->done.load(); });
+                }
                 waited = true;
+                stage = std::min<u32>(u32(job->sw_stage), 7);
+                dropped |= job->too_old;
             }
         }
         if (waited) {
             ++translate_stats.waited;
-            translate_stats.wait_ms += std::chrono::duration<double, std::milli>(
-                                           std::chrono::steady_clock::now() - wait_start)
-                                           .count();
+            if (stage == u32(SwStage::TessellationControl)) {
+                HsWindow().used += std::chrono::steady_clock::now() - wait_start; // PERF-GT7-115
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - wait_start)
+                                  .count();
+            translate_stats.wait_ms += ms;
+            // DIAG-GT7-123
+            ++translate_stats.waited_stage[stage];
+            translate_stats.wait_ms_stage[stage] += ms;
+            const auto writer = code_writes_memory.find(hash);
+            translate_stats.waited_writer += writer != code_writes_memory.end() && writer->second;
+            translate_stats.waited_forced += force_wait;
+            translate_stats.waited_shaders += wait_for_shaders;
+            translate_stats.waited_dropped += dropped;
         }
     }
     auto& ready = ready_translations[hash];
@@ -4445,10 +4530,29 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
                         std::chrono::duration<double>(now - stats.since).count(), stats.queued,
                         stats.used, stats.translate_ms, stats.expired, stats.duplicate,
                         stats.failed, stats.too_old, stats.waited, stats.wait_ms);
+            if (stats.waited != 0) {
+                std::string by_stage;
+                static constexpr const char* names[8] = {"fs", "hs", "ds", "vs", "gs", "cs",
+                                                         "?", "?"};
+                for (u32 i = 0; i < 8; ++i) {
+                    if (stats.waited_stage[i] != 0) {
+                        by_stage += fmt::format(" {} {}/{:.0f} ms", names[i], stats.waited_stage[i],
+                                                stats.wait_ms_stage[i]);
+                    }
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-GT7-123: waits by stage:{}; memory writers {}, forced {}, "
+                            "wait-for-shaders {}, dropped as too old {}; PERF-GT7-115: {} "
+                            "tessellated draws skipped past the budget",
+                            by_stage, stats.waited_writer, stats.waited_forced,
+                            stats.waited_shaders, stats.waited_dropped,
+                            std::exchange(HsWindow().skipped, 0));
+            }
         }
         stats = {};
         stats.since = now;
     }
+    return in_time;
 }
 
 std::optional<PipelineCache::Result> PipelineCache::TryLegacyProgram(
@@ -4779,9 +4883,19 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // first waits for any still running, as one of them is likely the permutation it needs.
     // D10: with the fallback a draw does not wait for translations in progress (the old
     // translations draw meanwhile); only when there are none (fallback_nested).
-    const bool skip_wait = SkipTranslationWait(sw_stage, params); // SHD-005
-    HarvestTranslations(params.hash, regs_override == nullptr && !force_legacy && !skip_wait &&
-                                         (!legacy_fallback || fallback_nested));
+    bool skip_wait = SkipTranslationWait(sw_stage, params); // SHD-005
+    // PERF-GT7-115: a hull shader's wait is bounded by the window's budget; past it the draw is
+    // skipped like a SHD-005 one.
+    const bool hs_budgeted = sw_stage == SwStage::TessellationControl &&
+                             HsWaitBudget().count() > 0 && !force_wait && !wait_for_shaders &&
+                             regs_override == nullptr && AsyncTranslation() &&
+                             !DrawnOnce(params.hash);
+    if (!HarvestTranslations(params.hash, regs_override == nullptr && !force_legacy && !skip_wait &&
+                                              (!legacy_fallback || fallback_nested),
+                             hs_budgeted)) {
+        skip_wait = true;
+        ++HsWindow().skipped;
+    }
     // D10: a key is made of new translations only, or (forced) of old ones only.
     if (force_legacy) {
         if (auto legacy = TryLegacyProgram(hw_stage, params, runtime_info, binding)) {
