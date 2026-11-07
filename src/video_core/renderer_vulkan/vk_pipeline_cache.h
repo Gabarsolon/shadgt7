@@ -635,6 +635,8 @@ private:
         std::chrono::steady_clock::time_point since{};
     } store_stats;
     std::unique_ptr<StoreReaders> store_readers;
+    std::mutex prefetched_mutex; ///< PERF-GT7-118
+    std::unordered_map<u64, vk::ShaderModule> prefetched_modules; ///< by HashCombine(program, permutation)
 
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
