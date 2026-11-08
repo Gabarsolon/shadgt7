@@ -3279,9 +3279,46 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     };
     one_off_hits.clear(); // DIAG-GT7-008
     OneOffHit described{};
+    // FIX-GT7-131: a colour target counts as drawn lately only through a picture of its own memory
+    // layout (pitch, texel size, tiling, samples). Another layout at the same address (GT7's scratch
+    // pool holds a 1920x2160 menu backdrop, a pitch of 2048, where Scapes put a photo's 1920x1080
+    // work picture, a pitch of 1920) made a draw into a layout never drawn skippable: at a photo's
+    // first frames the work picture's draw was skipped for its new pipeline, the frames' average
+    // read the pool's memory instead (small RGBA8 menu pictures read as RGBA16F: huge values, NaN)
+    // and kept them to the end: noise blocks in every first photo. RYGT_NATIVE_ONE_OFF_LAYOUT=0:
+    // any picture at the address, as before.
+    static const bool same_layout_on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+        return !(env && env[0] == '0');
+    }();
+    // Out of play only (FIX-GT7-109): in a Monza race the rule made draws into GT7's scratch pool
+    // (0x100a0b0000, other layouts drawn there every frame) wait for new pipelines: 40-60 ms
+    // frames, and a 1.36 s one where FIX-GT7-121 knew the kind as harmful and the wait had no
+    // bound. In play another layout at the address counts again, as before; a draw skipped into a
+    // layout no picture has still leaves its target empty (in Draw), which kept the photos clean.
+    const bool same_layout = same_layout_on && !g_game_in_play.load(std::memory_order_relaxed);
+    const VideoCore::ImageInfo* layout = nullptr;
     const auto drawn_lately = [&](VAddr address) {
         const Native::ImageEntry* entry = registry->FindExisting(
-            address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
+            address, [&](const Native::ImageEntry& e) {
+                return !e.from_cpu && e.image != nullptr &&
+                       (!layout || (e.info.pitch == layout->pitch &&
+                                    e.info.num_bits == layout->num_bits &&
+                                    e.info.tile_mode == layout->tile_mode &&
+                                    e.info.num_samples == layout->num_samples));
+            });
+        if (!entry && layout && registry->FindExisting(address, [](const Native::ImageEntry& e) {
+                return !e.from_cpu && e.image != nullptr;
+            })) {
+            static std::atomic<u32> layout_logged{};
+            if (const u32 n = layout_logged++; n < 64 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-131: a draw into {:#x} (pitch {}, {} bits, tile {}) waits for its "
+                            "pipeline: only other layouts were drawn there (frame {}, {} so far)",
+                            address, layout->pitch, layout->num_bits, u32(layout->tile_mode), frame,
+                            n + 1);
+            }
+        }
         if (!entry) {
             note(0);
             if (OneOffTrackOn()) {
@@ -3348,9 +3385,17 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                              .number_format = u32(col_buf.GetNumberFmt()),
                              .tile = u32(col_buf.GetTileMode())};
             }
-            if (col_buf && regs.color_target_mask.GetMask(cb) != 0 &&
-                !drawn_lately(col_buf.Address())) {
-                return true;
+            if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                std::optional<VideoCore::ImageInfo> info;
+                if (same_layout) {
+                    info.emplace(col_buf, r.liverpool->DrawCbExtent(cb)); // FIX-GT7-131
+                }
+                layout = info ? &*info : nullptr;
+                const bool lately = drawn_lately(col_buf.Address());
+                layout = nullptr;
+                if (!lately) {
+                    return true;
+                }
             }
         }
     }
@@ -8691,6 +8736,51 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         WatchOneOffs(regs, false); // DIAG-GT7-008: it would have waited
     }
     if (!pipeline) {
+        // FIX-GT7-131: a draw into a colour layout no picture has, skipped all the same (its
+        // pipeline not ready within the frame's budget), leaves its target empty rather than
+        // missing: a later read of that layout would otherwise read guest memory. At a Scapes
+        // photo's first frames that was the scratch pool's other pictures (RGBA8 menu pictures read
+        // as RGBA16F: huge values, NaN) and the photo's average kept them to the end.
+        static const bool empty_target = [] {
+            const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+            return !(env && env[0] == '0');
+        }();
+        if (empty_target && regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (!col_buf || regs.color_target_mask.GetMask(cb) == 0) {
+                    continue;
+                }
+                const VideoCore::TextureCache::ImageDesc desc{col_buf,
+                                                              r.liverpool->DrawCbExtent(cb)};
+                const auto& info = desc.info;
+                if (info.num_samples != 1 ||
+                    registry->FindExisting(col_buf.Address(), [&](const Native::ImageEntry& e) {
+                        return !e.from_cpu && e.image != nullptr && e.info.pitch == info.pitch &&
+                               e.info.num_bits == info.num_bits &&
+                               e.info.tile_mode == info.tile_mode &&
+                               e.info.num_samples == info.num_samples;
+                    })) {
+                    continue;
+                }
+                Native::ImageEntry* const made = registry->Find(info, true, frame);
+                if (!made || made->write_version.load(std::memory_order_relaxed) != 0) {
+                    continue;
+                }
+                made->needs_upload.store(false, std::memory_order_relaxed);
+                made->force_upload.store(false, std::memory_order_relaxed);
+                made->rewrite = Native::ImageEntry::Rewrite::Clear;
+                made->rewrite_pattern = {0, 0};
+                made->rewrite_bytes = made->info.guest_size;
+                static std::atomic<u32> empty_logged{};
+                if (const u32 n = empty_logged++; n < 64 || n % 500 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-131: a draw into {:#x} {}x{} skipped without its pipeline: "
+                                "its target starts empty (frame {}, {} so far)",
+                                col_buf.Address(), info.size.width, info.size.height, frame, n + 1);
+                }
+            }
+        }
         ++stats.no_pipeline;
         return;
     }
