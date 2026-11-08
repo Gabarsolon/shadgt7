@@ -275,6 +275,43 @@ TEST(ImageMips, PaddedTargetsAreTheDepthOfFieldLevels) {
     EXPECT_EQ(DofTargetInfo(DofTargets[1]).MipOf(texture), -1);
 }
 
+// FIX-GT7-135: the Scapes salt flat's backdrop, a 6024x4016 RGBA16F texture of 5 levels (pitch
+// 8192, padded to powers of two), and the targets the game draws its levels 1-4 into at the
+// location's load, as the game binds them (address, extent, pitch).
+constexpr VAddr SaltFlat = 0x102c600000;
+struct SaltFlatTarget {
+    VAddr address;
+    u32 width, height, pitch;
+};
+constexpr SaltFlatTarget SaltFlatTargets[] = {
+    {0x103c600000, 3012, 2008, 4096},
+    {0x1040600000, 1506, 1004, 2048},
+    {0x1041600000, 753, 502, 1024},
+    {0x1041a00000, 376, 251, 512},
+};
+ImageInfo SaltFlatTexture() {
+    auto info = Color2D(SaltFlat, 6024, 4016, 5, Macro, vk::Format::eR16G16B16A16Sfloat, 64);
+    info.props.is_pow2 = true;
+    info.pitch = 8192;
+    info.UpdateSize();
+    return info;
+}
+
+TEST(ImageMips, SaltFlatLevelTargetsAreTheBackdropLevels) {
+    const auto texture = SaltFlatTexture();
+    EXPECT_EQ(texture.guest_size, 0x15500000u);
+    for (u32 i = 0; i < 4; ++i) {
+        const auto& t = SaltFlatTargets[i];
+        auto target = Color2D(t.address, t.width, t.height, 1, Macro,
+                              vk::Format::eR16G16B16A16Sfloat, 64);
+        target.pitch = t.pitch;
+        target.UpdateSize();
+        EXPECT_EQ(texture.guest_address + texture.mips_layout[i + 1].offset, t.address)
+            << "level " << i + 1;
+        EXPECT_EQ(target.MipOf(texture), static_cast<s32>(i + 1)) << "level " << i + 1;
+    }
+}
+
 TEST(ImageMips, PaddingDoesNotMakeAnyTargetALevel) {
     const auto texture = DofTexture(493);
     // Twice the level's height is past its padding.

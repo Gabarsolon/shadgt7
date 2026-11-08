@@ -3238,6 +3238,23 @@ std::chrono::steady_clock::time_point NativeRenderer::OneOffDeadline() {
     return std::chrono::steady_clock::now() + std::chrono::nanoseconds{left};
 }
 
+// FIX-GT7-135: a texture (several levels) one of whose levels 1 and up is this target.
+std::pair<VAddr, s32> NativeRenderer::TextureLevelOf(const VideoCore::ImageInfo& target) {
+    std::pair<VAddr, s32> found{0, -1};
+    registry->ForEachOverlapping(target.guest_address, target.guest_address + 1,
+                                 [&](Native::ImageEntry& e) {
+                                     if (found.second >= 1 || e.image == nullptr ||
+                                         e.info.resources.levels <= 1) {
+                                         return;
+                                     }
+                                     const Native::SourcePlace place = Native::PlaceOf(target, e.info);
+                                     if (place.mip >= 1) {
+                                         found = {e.info.guest_address, place.mip};
+                                     }
+                                 });
+    return found;
+}
+
 bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // FIX-198: GPU.compile_mode 2 (keep going) skips a draw while its new pipeline builds, so
     // the game never stops for a compile: what it draws shows a frame or so later, as it's drawn
@@ -3278,6 +3295,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         }
     };
     one_off_hits.clear(); // DIAG-GT7-008
+    one_off_texture_level = false; // FIX-GT7-135
     OneOffHit described{};
     // FIX-GT7-131: a colour target counts as drawn lately only through a picture of its own memory
     // layout (pitch, texel size, tiling, samples). Another layout at the same address (GT7's scratch
@@ -3298,6 +3316,22 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // layout no picture has still leaves its target empty (in Draw), which kept the photos clean.
     const bool same_layout = same_layout_on && !g_game_in_play.load(std::memory_order_relaxed);
     const VideoCore::ImageInfo* layout = nullptr;
+    // FIX-GT7-135: a colour target never drawn into that is a level (1 and up) of a texture the
+    // game samples is drawn once, when the game builds the texture's levels: skipped, the level
+    // stays empty for good, whatever PERF-GT7-023 learned of its kind. A Scapes location whose
+    // backdrop is a 6024x4016 RGBA16F texture of 5 levels (the salt flat) has its levels 1-4
+    // drawn at the load, each from the level above; on a PC whose races had taught that RGBA16F
+    // targets of 2048x1024, 1024x512 and 512x256 may be skipped (redrawn every frame there),
+    // levels 2-4 were skipped and stayed empty: the editor, which reads the smaller levels, showed
+    // the location at about an eighth of its brightness, the photo (level 0) did not. The harm
+    // was never learned: the texture reads its levels' memory, not those targets. Such a draw
+    // is not exempted by its kind and, out of play, waits whatever the budget; in play
+    // (FIX-GT7-109) it keeps the frame's budget. RYGT_NATIVE_TEXTURE_LEVEL_WAIT=0: as before.
+    static const bool texture_levels = [] {
+        const char* env = std::getenv("RYGT_NATIVE_TEXTURE_LEVEL_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    s32 target_cb = -1; // FIX-GT7-135: the colour buffer drawn_lately looks at (-1: depth)
     const auto drawn_lately = [&](VAddr address) {
         const Native::ImageEntry* entry = registry->FindExisting(
             address, [&](const Native::ImageEntry& e) {
@@ -3325,6 +3359,30 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                 described.address = address;
                 described.never = true;
                 one_off_hits.push_back(described);
+            }
+            if (texture_levels && target_cb >= 0) {
+                // The target's description is made here only, for a target never drawn into
+                // (out of play FIX-GT7-131 made it already), not for every draw without its
+                // pipeline.
+                std::optional<VideoCore::ImageInfo> made;
+                if (!layout) {
+                    made.emplace(regs.color_buffers[target_cb],
+                                 r.liverpool->DrawCbExtent(u32(target_cb)));
+                }
+                const VideoCore::ImageInfo& target = layout ? *layout : *made;
+                if (const auto [texture, mip] = TextureLevelOf(target); mip >= 1) {
+                    one_off_texture_level = true;
+                    static std::atomic<u32> level_logged{};
+                    if (const u32 n = level_logged++; n < 64 || n % 500 == 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "FIX-GT7-135: a draw into {:#x} {}x{}, level {} of the texture "
+                                    "at {:#x}, never drawn, waits for its pipeline (frame {}, {} "
+                                    "so far)",
+                                    address, target.size.width, target.size.height, mip, texture,
+                                    frame, n + 1);
+                    }
+                    return false; // FIX-GT7-135: whatever its kind
+                }
             }
             return OneOffExempt(described); // never drawn into; PERF-GT7-023: unless its kind
         }
@@ -3391,8 +3449,10 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                     info.emplace(col_buf, r.liverpool->DrawCbExtent(cb)); // FIX-GT7-131
                 }
                 layout = info ? &*info : nullptr;
+                target_cb = s32(cb); // FIX-GT7-135
                 const bool lately = drawn_lately(col_buf.Address());
                 layout = nullptr;
+                target_cb = -1;
                 if (!lately) {
                     return true;
                 }
@@ -8782,7 +8842,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }();
     const bool must_wait = !pipeline && DrawMustNotSkip(regs);
     // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
-    const bool harmful_wait = must_wait && OneOffKnownHarmful();
+    // FIX-GT7-135: so does a never-drawn level of a texture, out of play.
+    const bool harmful_wait =
+        must_wait && (OneOffKnownHarmful() ||
+                      (one_off_texture_level && !g_game_in_play.load(std::memory_order_relaxed)));
     if (must_wait && (harmful_wait || OneOffBudgetLeft())) {
         // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
         PhaseClock clock{stats.phase_ns[0]};

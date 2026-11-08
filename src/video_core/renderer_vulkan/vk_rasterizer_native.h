@@ -463,6 +463,10 @@ private:
         bool skipped = false; ///< PERF-GT7-023: every draw into it so far skipped, none waited
     };
     std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
+    /// FIX-GT7-135: the last DrawMustNotSkip waits for a never-drawn level of a texture.
+    bool one_off_texture_level = false;
+    /// FIX-GT7-135: the texture (address, level >= 1) whose level `target` is; {0, -1}: none.
+    std::pair<VAddr, s32> TextureLevelOf(const VideoCore::ImageInfo& target);
     /// FIX-GT7-102: time the current frame's draws waited for one-off pipelines; past the
     /// budget (RYGT_ONE_OFF_BUDGET_MS, 250 by default, 0 no limit) the frame's other one-off
     /// draws are skipped as other draws are, and still watched.
