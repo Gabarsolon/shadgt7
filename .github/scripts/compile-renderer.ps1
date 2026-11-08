@@ -36,7 +36,10 @@ $env:LIB = "$($builtins.DirectoryName);$env:LIB"
 Invoke-Checked 'cmake' @('-S', '.', '-B', 'Build/pr-compile', '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
     '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl', '-DCMAKE_LINKER=lld-link',
     '-DHAVE_ENDIAN_H=OFF', '-DSHADGT_RYTY_GPU=ON', '-DENABLE_DISCORD_RPC=ON')
-Invoke-Checked 'cmake' @('--build', 'Build/pr-compile', '--target', 'ryty_gpu', '--parallel', '2')
+# Match the renderer modules shipped by the RyGT7 Windows package adapter.
+Invoke-Checked 'cmake' @('--build', 'Build/pr-compile', '--target',
+    'ryty_gpu', 'ryty_audio3d', 'ryty_ajm', 'ryty_ngs2', 'ryty_zlib',
+    'ryty_discmap', 'ryty_screenshot', 'ryty_np', '--parallel', '2')
 if (@(Get-ChildItem 'Build/pr-compile' -Recurse -Filter libSceVideoOut.prx).Count -ne 1) {
     throw 'Expected exactly one renderer output'
 }

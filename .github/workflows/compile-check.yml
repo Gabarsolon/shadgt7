@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   renderer:
-    name: Compile Vulkan renderer
+    name: Compile renderer host libraries
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
