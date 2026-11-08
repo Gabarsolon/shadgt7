@@ -254,13 +254,15 @@ struct Info : InfoPersistent {
         TessellationDataConstantBuffer constants{};
     };
     std::optional<PinnedTessConstants> pinned_tess_constants;
-    /// FIX-GT7-124: set on a worker translating without pinned constants: constants that don't fit
-    /// the draw's registers (SwTessControlRuntimeInfo::FitsConstants) end the translation, with
-    /// tess_constants_stale set, instead of being translated.
+    /// FIX-GT7-124: set on a worker translating a program whose constants it can't pin yet:
+    /// constants that don't fit the draw (SwTessControlRuntimeInfo::FitsConstants,
+    /// SwTessEvalRuntimeInfo::FitsConstants) end the translation, with tess_constants_stale set,
+    /// instead of being translated.
     bool check_tess_constants{};
     bool tess_constants_stale{};
-    /// FIX-GT7-124: the constants the translation was made from, for its key.
-    std::optional<TessellationDataConstantBuffer> tess_constants_used;
+    /// FIX-GT7-124: the V# and constants the translation was made from, where it read them: its
+    /// key, and the manifest's record of its reads, are made from these.
+    std::optional<PinnedTessConstants> tess_constants_used;
 
     /// FIX-GT7-124: the tessellation constants V# at `dword_offset` of the table `ptr_base` points
     /// at (or of the user data registers), and its buffer, as guest memory holds them now.
@@ -299,11 +301,14 @@ struct Info : InfoPersistent {
         return pin;
     }
 
-    void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
+    /// The tessellation constants V# and buffer at tess_consts_ptr_base/dword_offset, with where
+    /// the V# was read: the pinned ones when they are for that V# (FIX-GT7-124), else from guest
+    /// memory.
+    PinnedTessConstants ReadTessConstantsAt() const {
         ASSERT(tess_consts_dword_offset >= 0); // We've already tracked the V# UD
+        const u32 ptr_base = static_cast<u32>(tess_consts_ptr_base);
         if (const auto& pin = pinned_tess_constants;
-            pin && pin->ptr_base == static_cast<u32>(tess_consts_ptr_base) &&
-            pin->dword_offset == tess_consts_dword_offset) {
+            pin && pin->ptr_base == ptr_base && pin->dword_offset == tess_consts_dword_offset) {
             // FIX-GT7-124. PERF-GT7-111: a recorded translation logs the reads it stands for, so
             // the manifest replays them in the same order.
             if (Common::GuestReadLog* log = Common::t_guest_read_log; log && !log->replay) {
@@ -313,15 +318,27 @@ struct Info : InfoPersistent {
                 log->Append(VAddr(pin->sharp.base_address), &pin->constants,
                             sizeof(pin->constants));
             }
-            tess_constants = pin->constants;
-            return;
+            return *pin;
         }
-        auto buf = ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(tess_consts_ptr_base),
-                                             static_cast<u32>(tess_consts_dword_offset));
-        VAddr tess_constants_addr = buf.base_address;
-        Common::CopyGuest(&tess_constants,
+        PinnedTessConstants read{.ptr_base = ptr_base, .dword_offset = tess_consts_dword_offset};
+        if (ptr_base != IR::NumScalarRegs) {
+            // Where ReadUdReg reads it.
+            u64 table;
+            std::memcpy(&table, &user_data[ptr_base], sizeof(table));
+            read.sharp_address =
+                (table & 0xFFFFFFFFFFFFULL) + u64(tess_consts_dword_offset) * sizeof(u32);
+        }
+        read.sharp =
+            ReadUdReg<AmdGpu::Buffer>(ptr_base, static_cast<u32>(tess_consts_dword_offset));
+        VAddr tess_constants_addr = read.sharp.base_address;
+        Common::CopyGuest(&read.constants,
                           reinterpret_cast<TessellationDataConstantBuffer*>(tess_constants_addr),
-                          sizeof(tess_constants));
+                          sizeof(read.constants));
+        return read;
+    }
+
+    void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
+        tess_constants = ReadTessConstantsAt().constants;
     }
 
     void Serialize(Serialization::Archive& ar) const;

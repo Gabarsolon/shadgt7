@@ -150,13 +150,15 @@ static void InitTessConstants(IR::ScalarReg sharp_ptr_base, s32 sharp_dword_offs
                               TessellationDataConstantBuffer& tess_constants) {
     info.tess_consts_ptr_base = sharp_ptr_base;
     info.tess_consts_dword_offset = sharp_dword_offset;
-    info.ReadTessConstantBuffer(tess_constants);
-    info.tess_constants_used = tess_constants; // FIX-GT7-124: its key is made from these
+    // FIX-GT7-124: its key, and the manifest's record of its reads, are made from these.
+    info.tess_constants_used = info.ReadTessConstantsAt();
+    tess_constants = info.tess_constants_used->constants;
     // FIX-GT7-124: read late on a worker, constants of another draw end the translation (the
     // worker knows where they are now, and the draw queues it again with its own).
-    if (info.check_tess_constants && !info.pinned_tess_constants &&
-        runtime_info.sw_stage == SwStage::TessellationControl &&
-        !runtime_info.sw.tcs.FitsConstants(tess_constants)) {
+    const bool fits = runtime_info.sw_stage == SwStage::TessellationControl
+                          ? runtime_info.sw.tcs.FitsConstants(tess_constants)
+                          : SwTessEvalRuntimeInfo::FitsConstants(tess_constants);
+    if (info.check_tess_constants && !fits) {
         info.tess_constants_stale = true;
         throw Common::RecoverableFailure("FIX-GT7-124: tessellation constants of another draw");
     }

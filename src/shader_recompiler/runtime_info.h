@@ -162,6 +162,16 @@ struct SwTessEvalRuntimeInfo {
     AmdGpu::TessellationPartitioning tess_partitioning;
 
     bool operator==(const SwTessEvalRuntimeInfo&) const noexcept = default;
+
+    /// FIX-GT7-124: whether tessellation constants can be a draw's for a domain shader, which
+    /// reads only the control point stride: its input is that many bytes of vec4s a control point,
+    /// within the 128 components NVIDIA and AMD take (the stride 0x3F800000 a late read could
+    /// find would declare 66 million). GT7's are 0x20 to 0x150 bytes (logs of 11-05 to 11-08).
+    static bool FitsConstants(const TessellationDataConstantBuffer& c) {
+        constexpr u32 MaxStride = 128 * sizeof(u32);
+        return c.hs_cp_stride != 0 && c.hs_cp_stride % 4 == 0 && c.hs_cp_stride <= MaxStride &&
+               c.num_patches != 0 && c.num_patches <= 255;
+    }
 };
 
 static constexpr auto GsMaxOutputStreams = 4u;

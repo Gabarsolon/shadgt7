@@ -604,6 +604,9 @@ private:
         /// known to be there); a translation without them that read another draw's ended
         /// (`tess_stale`), learning where they are (`tess_ptr_base`, `tess_dword_offset`).
         std::optional<Shader::Info::PinnedTessConstants> tess_constants;
+        /// FIX-GT7-124: the program's constants V# location was known when queued: pinned, or the
+        /// draw's own constants are already garbage (FIX-058) and are translated as before.
+        bool tess_location_known{};
         bool tess_stale{};
         u32 tess_ptr_base{};
         s32 tess_dword_offset{-1};

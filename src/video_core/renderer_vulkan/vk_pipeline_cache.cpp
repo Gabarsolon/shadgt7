@@ -432,17 +432,22 @@ private:
         if (n > 40 && n % 100 != 0) {
             return;
         }
-        const auto c = info.tess_constants_used.value_or(Shader::TessellationDataConstantBuffer{});
+        const auto c = info.tess_constants_used ? info.tess_constants_used->constants
+                                                : Shader::TessellationDataConstantBuffer{};
+        const bool hull = job.sw_stage == Shader::SwStage::TessellationControl;
         const auto& tcs = job.runtime_info.sw.tcs;
         LOG_WARNING(Render_Vulkan,
-                    "FIX-GT7-124: hs {:#x} read the tessellation constants of another draw {:.0f} "
+                    "FIX-GT7-124: {} {:#x} read the tessellation constants of another draw {:.0f} "
                     "ms after its draw (ls stride {:#x}, cp stride {:#x}, patches {:#x}, output "
-                    "base {:#x}; its registers: {} input control points, {} patches); queued "
-                    "again with its draw's ({} so far)",
-                    job.hash,
+                    "base {:#x}{}); its draw takes another translation, with its own when queued "
+                    "again ({} so far)",
+                    hull ? "hs" : "ds", job.hash,
                     std::chrono::duration<double, std::milli>(start - job.queued_at).count(),
                     c.ls_stride, c.hs_cp_stride, c.num_patches, c.hs_output_base,
-                    tcs.num_input_control_points, u32(tcs.num_patches), n);
+                    hull ? fmt::format("; its registers: {} input control points, {} patches",
+                                       tcs.num_input_control_points, u32(tcs.num_patches))
+                         : std::string{},
+                    n);
     }
 
     void Translate(TranslateJob& job, Shader::Pools& pools) {
@@ -455,7 +460,9 @@ private:
         auto info = std::make_unique<Shader::Info>(job.hw_stage, job.sw_stage, params);
         info->pinned_fetch_sharps = std::move(job.fetch_sharps); // FIX-GT7-054
         info->pinned_tess_constants = job.tess_constants;        // FIX-GT7-124
-        info->check_tess_constants = PinTessConstants() && !job.tess_constants;
+        // Checked only where they can't be pinned yet; a draw whose own constants are garbage
+        // (FIX-058) translates them as before instead of ending stale again and again.
+        info->check_tess_constants = PinTessConstants() && !job.tess_location_known;
         auto runtime_info = job.runtime_info;
         auto binding = job.start;
         const auto start = std::chrono::steady_clock::now();
@@ -475,6 +482,11 @@ private:
             const auto program = Shader::TranslateProgram(job.code, pools, *info, runtime_info,
                                                           profile);
             job.spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+            if (PinTessConstants() && info->tess_constants_used) {
+                // FIX-GT7-124: its key (the one recorded below, and the harvest's) from the
+                // constants it was made from, not from that memory as the game has it now.
+                info->pinned_tess_constants = info->tess_constants_used;
+            }
             if (record) {
                 // PERF-GT7-117 : the reads of its specialization too (vertex attributes,
                 // tessellation constants), which a pre-translation replays after the translation.
@@ -5506,6 +5518,7 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     if (PinTessConstants() &&
         (sw_stage == SwStage::TessellationControl || sw_stage == SwStage::TessellationEval)) {
         if (const auto location = KnownTessLocation(params.hash)) {
+            job->tess_location_known = true;
             job->tess_constants = Shader::Info::ReadTessConstants(
                 job->user_data, location->ptr_base, location->dword_offset);
             if (job->tess_constants && !TessConstantsInBounds(job->tess_constants->constants)) {
@@ -5739,20 +5752,18 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, bool budgeted) {
             return true;
         }
         translate_stats.translate_ms += job->translate_ms;
-        // FIX-GT7-124: the key from the tessellation constants its code was made from, not from
-        // that memory as the game has it now.
-        if (PinTessConstants() && tessellation && job->info->tess_constants_used &&
-            job->info->tess_consts_dword_offset >= 0) {
-            job->info->pinned_tess_constants = Shader::Info::PinnedTessConstants{
-                .ptr_base = static_cast<u32>(job->info->tess_consts_ptr_base),
-                .dword_offset = job->info->tess_consts_dword_offset,
-                .constants = *job->info->tess_constants_used,
-            };
+        // FIX-GT7-124: the key from the tessellation constants its code was made from (the worker
+        // pinned them), not from that memory as the game has it now.
+        if (PinTessConstants() && tessellation && job->info->tess_constants_used) {
+            job->info->pinned_tess_constants = job->info->tess_constants_used;
         }
         job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start);
-        // FIX-GT7-124: as the fetch V#s below: from here its constants are each draw's.
+        // FIX-GT7-124: as the fetch V#s below: from here its constants are each draw's, and a
+        // later translation from this Info would not inherit the worker's check.
         job->info->pinned_tess_constants.reset();
         job->info->tess_constants_used.reset();
+        job->info->check_tess_constants = false;
+        job->info->tess_constants_stale = false;
         // FIX-GT7-054: the key is made; from here this Info is matched against other draws.
         const bool pinned = !job->info->pinned_fetch_sharps.empty();
         job->info->pinned_fetch_sharps.clear();
