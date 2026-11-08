@@ -10169,10 +10169,31 @@ void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>*
 const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 bytes) {
     // NAT-134: a device buffer holding lo, hi, lo, hi... for fills, made once per pattern and
     // grown when a bigger picture needs it (only ever read afterwards).
+    // FIX-GT7-123: every pattern kept its buffer, the size of the largest picture filled with it,
+    // and a grown buffer's old one was never freed: in two races on 2026-11-08, 146 patterns held
+    // 298 buffers, 1,487 MB of video memory (146 of 8 MB, 147 of 2 MB), never given back. The most
+    // recently used patterns are kept, up to RYGT_NATIVE_FILL_PATTERNS (64; 0: every pattern keeps
+    // its buffer) and 256 MB; the others, and grown buffers' old ones (with 0 too), go once the
+    // GPU ran the list that last could read them.
+    static const u64 keep_count = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FILL_PATTERNS");
+        return env && *env ? u64{std::strtoull(env, nullptr, 10)} : u64{64};
+    }();
+    constexpr u64 KeepBytes = 256_MB;
     const u64 key = u64(lo) | (u64(hi) << 32);
-    auto& slot = fill_patterns[key];
-    if (slot && slot->Size() >= bytes) {
-        return slot.get();
+    FillPattern& slot = fill_patterns[key];
+    slot.used = ++pattern_clock;
+    if (slot.buffer && slot.buffer->Size() >= bytes) {
+        return slot.buffer.get();
+    }
+    // FIX-GT7-123: patterns let go lately, to count those made again soon after (more patterns in
+    // use than are kept: each fill then makes its buffer again).
+    static std::array<u64, 256> let_go{};
+    static size_t let_go_count = 0; // entries written (the ring holds the last 256)
+    static u64 made_again = 0;
+    if (const auto known = let_go.begin() + std::min(let_go_count, let_go.size());
+        !slot.buffer && std::find(let_go.begin(), known, key) != known) {
+        ++made_again;
     }
     const u64 size = std::max<u64>(Common::AlignUp(bytes, 64_KB), 1_MB);
     auto buffer = device->CreateBuffer({.size = size,
@@ -10181,7 +10202,11 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
                                         .memory = Native::Rhi::MemoryKind::DeviceLocal,
                                         .name = "native fill pattern"});
     if (!buffer) {
-        return slot.get();
+        if (!slot.buffer) {
+            fill_patterns.erase(key); // FIX-GT7-123: no empty slot left behind
+            return nullptr;
+        }
+        return slot.buffer.get();
     }
     Stream& s = Begin();
     EndRendering();
@@ -10216,11 +10241,40 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     }
     transfer_barrier();
     ++s.commands;
-    if (slot) {
-        retired_patterns.push_back(std::move(slot)); // still read by recorded copies
+    if (slot.buffer) {
+        // Copies recorded before may still read it: freed once this list ran (FIX-GT7-123).
+        pattern_bytes -= std::min(pattern_bytes, slot.buffer->Size());
+        s.keep.push_back(std::move(slot.buffer));
     }
-    slot = std::move(buffer);
-    return slot.get();
+    pattern_bytes += buffer->Size();
+    slot.buffer = std::move(buffer);
+    // FIX-GT7-123: the least recently used other patterns go past the count or the bytes.
+    static u64 dropped = 0;
+    while (keep_count != 0 && (fill_patterns.size() > keep_count || pattern_bytes > KeepBytes)) {
+        auto oldest = fill_patterns.end();
+        for (auto it = fill_patterns.begin(); it != fill_patterns.end(); ++it) {
+            if (it->first != key &&
+                (oldest == fill_patterns.end() || it->second.used < oldest->second.used)) {
+                oldest = it;
+            }
+        }
+        if (oldest == fill_patterns.end()) {
+            break;
+        }
+        if (oldest->second.buffer) {
+            pattern_bytes -= std::min(pattern_bytes, oldest->second.buffer->Size());
+            s.keep.push_back(std::move(oldest->second.buffer));
+        }
+        let_go[let_go_count++ % let_go.size()] = oldest->first;
+        fill_patterns.erase(oldest);
+        if (++dropped == 1 || dropped % 500 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-123: {} fill patterns let go so far ({} kept, {:.0f} MB; {} made "
+                        "again within 256 let go)",
+                        dropped, fill_patterns.size(), pattern_bytes / 1048576.0, made_again);
+        }
+    }
+    return slot.buffer.get();
 }
 
 bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows,
