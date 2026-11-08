@@ -425,9 +425,12 @@ private:
     /// the thread that builds them again in the background at start.
     std::filesystem::path WarmComputeDir() const;
     void WarmComputePipelines(std::stop_token stop);
-    void VerifyManifest();       ///< PERF-GT7-111
-    void PretranslateManifest(); ///< PERF-GT7-117
+    void VerifyManifest(std::stop_token stop);       ///< PERF-GT7-111
+    void PretranslateManifest(std::stop_token stop); ///< PERF-GT7-117
     bool pretranslate_wanted = false;
+    /// Stopped and joined first by the destructor: they read the cache, the store and the device.
+    std::jthread verify_thread;
+    std::jthread pretranslate_thread;
     std::jthread warm_compute_thread;
     u32 pipelines_at_driver_save{};
     std::chrono::steady_clock::time_point driver_cache_saved_at{};

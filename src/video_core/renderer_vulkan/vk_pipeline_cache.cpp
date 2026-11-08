@@ -1193,85 +1193,18 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     return info;
 }
 
-// PERF-GT7-037: GT7 uses the same few compute pipelines in every race, some of which take the
-// driver ~1 s to build (0x2f3cb32d18925709, 0xe1682ae083e54205), on the command thread while
-// the game waits for them: two frames of ~1 s in every race the driver's cache lacks them (after
-// a driver update, or a cleared cache). Each compute pipeline is kept once as a recipe, and
-// built again in the background at each start, the largest first (quick for those the driver
-// has).
-// RYGT_WARM_COMPUTE=0: neither.
-static bool WarmComputeOn() {
-    static const bool on = [] {
-        const char* env = std::getenv("RYGT_WARM_COMPUTE");
-        return !(env && env[0] == '0');
-    }();
-    return on;
+// A pause the destructor can cut short (the thread is joined with the cache).
+static void SleepUnlessStopped(std::stop_token stop, std::chrono::milliseconds total) {
+    using namespace std::chrono_literals;
+    for (auto left = total; left > 0ms && !stop.stop_requested(); left -= 100ms) {
+        std::this_thread::sleep_for(std::min(left, 100ms));
+    }
 }
 
-std::filesystem::path PipelineCache::WarmComputeDir() const {
-    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
-    // FIX-GT7-026: a folder per GPU and driver (the pipeline cache UUID changes with the
-    // driver): recipes hold the subgroup size and push descriptors of the device that made them,
-    // so another GPU's are never built here. Those of the folder itself (before) are left there.
-    const auto props = instance.GetPhysicalDevice().getProperties();
-    std::string uuid;
-    for (const u8 byte : props.pipelineCacheUUID) {
-        uuid += fmt::format("{:02x}", byte);
-    }
-    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           fmt::format("{}.warm_compute", serial) /
-           fmt::format("{:04x}-{:04x}-{}", props.vendorID, props.deviceID, uuid);
-}
-
-void PipelineCache::WarmComputePipelines(std::stop_token stop) {
-    Common::SetCurrentThreadName("shadGT:WarmCompute");
-    Common::PreferCompileCores();
-    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-    std::error_code ec;
-    // The largest SPIR-V first: the ones that take the driver longest (GT7's two of ~1 s are
-    // ~95 KB recipes, most others under half that). A race uses ~100 compute pipelines.
-    std::vector<std::pair<u64, std::filesystem::path>> sized;
-    for (const auto& entry : std::filesystem::directory_iterator(WarmComputeDir(), ec)) {
-        if (entry.path().extension() == ".bin" && sized.size() < 1024) {
-            std::error_code size_ec;
-            sized.emplace_back(entry.file_size(size_ec), entry.path());
-        }
-    }
-    std::ranges::sort(sized, std::greater{}, &std::pair<u64, std::filesystem::path>::first);
-    std::vector<std::filesystem::path> files;
-    for (auto& [size, path] : sized) {
-        files.push_back(std::move(path));
-    }
-    if (files.empty()) {
-        return;
-    }
-    u32 warmed = 0;
-    double total_ms = 0;
-    double longest_ms = 0;
-    for (const auto& file : files) {
-        if (stop.stop_requested()) {
-            return;
-        }
-        const auto start = std::chrono::steady_clock::now();
-        if (ComputePipeline::WarmFromRecipe(instance, *pipeline_cache, file)) {
-            const double ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - start)
-                                  .count();
-            ++warmed;
-            total_ms += ms;
-            longest_ms = std::max(longest_ms, ms);
-        }
-    }
-    LOG_INFO(Render_Vulkan,
-             "PERF-GT7-037: {} of {} compute pipelines built ahead in the background ({:.0f} ms, "
-             "the longest {:.0f} ms)",
-             warmed, files.size(), total_ms, longest_ms);
-}
-
-void PipelineCache::VerifyManifest() {
+void PipelineCache::VerifyManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:ManifestVerify");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-    std::this_thread::sleep_for(std::chrono::seconds{5});
+    SleepUnlessStopped(stop, std::chrono::seconds{5});
     Shader::Pools pools;
     u32 records = 0, same = 0, differ = 0, failed = 0, no_code = 0, with_misses = 0;
     u32 from_description = 0;
@@ -1285,6 +1218,7 @@ void PipelineCache::VerifyManifest() {
                   : g_capture_dir;
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(g_manifest_dir, ec)) {
+        if (stop.stop_requested()) break;
         if (entry.path().extension() != ".rec") continue;
         ManifestRecord r;
         if (!ReadManifestRecord(entry.path(), r) ||
@@ -1377,10 +1311,10 @@ void PipelineCache::VerifyManifest() {
 // store starts empty: SHD-010), from the local code, and stores them as a draw's translation
 // would be: the draws then find them as in a warm start instead of waiting for (or skipping on)
 // their translations. A record is stored only when every guest read replays as recorded.
-void PipelineCache::PretranslateManifest() {
+void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
-    std::this_thread::sleep_for(std::chrono::seconds{2});
-    if (!use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
+    SleepUnlessStopped(stop, std::chrono::seconds{2});
+    if (stop.stop_requested() || !use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
         LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
         return;
     }
@@ -1390,11 +1324,6 @@ void PipelineCache::PretranslateManifest() {
         if (entry.path().extension() == ".rec") files.push_back(entry.path());
     }
     std::sort(files.begin(), files.end());
-    // Records a program has (<hash>-<spv>.rec): the permutation indices it reserves.
-    std::unordered_map<u64, u32> records_of;
-    for (const auto& file : files) {
-        ++records_of[std::strtoull(file.stem().string().substr(0, 16).c_str(), nullptr, 16)];
-    }
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
@@ -1408,7 +1337,7 @@ void PipelineCache::PretranslateManifest() {
     const auto work = [&] {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         Shader::Pools pools;
-        for (size_t i = next++; i < files.size(); i = next++) {
+        for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
             ManifestRecord r;
             if (!ReadManifestRecord(files[i], r) ||
                 Shader::SwStage(r.sw_stage) == Shader::SwStage::Geometry) {
@@ -1422,18 +1351,6 @@ void PipelineCache::PretranslateManifest() {
                                  Storage::BlobType::ShaderMeta,
                                  fmt::format("{:#018x}", HashCombine(r.hash, u64{0})))) {
                     it->second.next_idx = ~0u; // the store has this program: left alone
-                } else if (added) {
-                    // Its indices are reserved under the lookup lock, unless the game already
-                    // uses the program: a translation of the command thread then writes past
-                    // them (stored_perm_end), never over a pre-translated one.
-                    std::scoped_lock lookup{lookup_mutex};
-                    if (program_cache.contains(r.hash)) {
-                        it->second.next_idx = ~0u;
-                        ++in_use;
-                        continue;
-                    }
-                    auto& end = stored_perm_end[r.hash];
-                    end = std::max<size_t>(end, records_of[r.hash]);
                 }
                 if (it->second.next_idx == ~0u) {
                     ++already;
@@ -1507,11 +1424,31 @@ void PipelineCache::PretranslateManifest() {
             }
             std::scoped_lock lk{mutex};
             auto& program = programs[r.hash];
+            if (program.next_idx == ~0u) {
+                ++in_use; // the game took the program up meanwhile: left alone from here
+                continue;
+            }
             if (std::ranges::find(program.specs, *spec) != program.specs.end()) {
                 ++duplicate;
                 continue;
             }
-            const u32 perm_idx = program.next_idx++;
+            u32 perm_idx = 0;
+            {
+                // The index is reserved under the lookup lock one record at a time, so the stored
+                // indices stay dense (a listing stops at a gap of eight) and a translation of the
+                // command thread goes past them (stored_perm_end), never over one. A program the
+                // game already uses is left alone: its listing was read, its indices are its own.
+                std::scoped_lock lookup{lookup_mutex};
+                if (program_cache.contains(r.hash)) {
+                    program.next_idx = ~0u;
+                    ++in_use;
+                    continue;
+                }
+                auto& end = stored_perm_end[r.hash];
+                perm_idx = u32(std::max<size_t>(end, program.next_idx));
+                end = perm_idx + 1;
+            }
+            program.next_idx = perm_idx + 1;
             RegisterShaderMeta(*info, spec->fetch_shader_data, *spec, HashCombine(r.hash, u64{perm_idx}),
                                perm_idx);
             RegisterShaderBinary(std::move(spv), r.hash, perm_idx);
@@ -1536,6 +1473,81 @@ void PipelineCache::PretranslateManifest() {
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
                 no_code.load(), failed.load(), in_use.load());
+}
+
+// PERF-GT7-037: GT7 uses the same few compute pipelines in every race, some of which take the
+// driver ~1 s to build (0x2f3cb32d18925709, 0xe1682ae083e54205), on the command thread while
+// the game waits for them: two frames of ~1 s in every race the driver's cache lacks them (after
+// a driver update, or a cleared cache). Each compute pipeline is kept once as a recipe, and
+// built again in the background at each start, the largest first (quick for those the driver
+// has).
+// RYGT_WARM_COMPUTE=0: neither.
+static bool WarmComputeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_WARM_COMPUTE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+std::filesystem::path PipelineCache::WarmComputeDir() const {
+    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    // FIX-GT7-026: a folder per GPU and driver (the pipeline cache UUID changes with the
+    // driver): recipes hold the subgroup size and push descriptors of the device that made them,
+    // so another GPU's are never built here. Those of the folder itself (before) are left there.
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    std::string uuid;
+    for (const u8 byte : props.pipelineCacheUUID) {
+        uuid += fmt::format("{:02x}", byte);
+    }
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           fmt::format("{}.warm_compute", serial) /
+           fmt::format("{:04x}-{:04x}-{}", props.vendorID, props.deviceID, uuid);
+}
+
+void PipelineCache::WarmComputePipelines(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:WarmCompute");
+    Common::PreferCompileCores();
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    std::error_code ec;
+    // The largest SPIR-V first: the ones that take the driver longest (GT7's two of ~1 s are
+    // ~95 KB recipes, most others under half that). A race uses ~100 compute pipelines.
+    std::vector<std::pair<u64, std::filesystem::path>> sized;
+    for (const auto& entry : std::filesystem::directory_iterator(WarmComputeDir(), ec)) {
+        if (entry.path().extension() == ".bin" && sized.size() < 1024) {
+            std::error_code size_ec;
+            sized.emplace_back(entry.file_size(size_ec), entry.path());
+        }
+    }
+    std::ranges::sort(sized, std::greater{}, &std::pair<u64, std::filesystem::path>::first);
+    std::vector<std::filesystem::path> files;
+    for (auto& [size, path] : sized) {
+        files.push_back(std::move(path));
+    }
+    if (files.empty()) {
+        return;
+    }
+    u32 warmed = 0;
+    double total_ms = 0;
+    double longest_ms = 0;
+    for (const auto& file : files) {
+        if (stop.stop_requested()) {
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (ComputePipeline::WarmFromRecipe(instance, *pipeline_cache, file)) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+            ++warmed;
+            total_ms += ms;
+            longest_ms = std::max(longest_ms, ms);
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "PERF-GT7-037: {} of {} compute pipelines built ahead in the background ({:.0f} ms, "
+             "the longest {:.0f} ms)",
+             warmed, files.size(), total_ms, longest_ms);
 }
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
@@ -1657,7 +1669,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
         const char* verify = std::getenv("RYGT_MANIFEST_VERIFY");
         if (verify && verify[0] == '1') {
-            std::thread([this] { VerifyManifest(); }).detach();
+            verify_thread = std::jthread([this](std::stop_token stop) { VerifyManifest(stop); });
         }
         const char* pretranslate = std::getenv("RYGT_MANIFEST_PRETRANSLATE");
         pretranslate_wanted = pretranslate && pretranslate[0] == '1';
@@ -1698,8 +1710,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         } else {
             Storage::DataBase::Instance().Open();
             use_stored_shaders = Storage::DataBase::Instance().IsOpened();
-            if (pretranslate_wanted && use_stored_shaders) {
-                std::thread([this] { PretranslateManifest(); }).detach(); // PERF-GT7-117
+            if (pretranslate_wanted && use_stored_shaders) { // PERF-GT7-117
+                pretranslate_thread =
+                    std::jthread([this](std::stop_token stop) { PretranslateManifest(stop); });
             }
             // D10: the old renderer's translations stand in while the new renderer's are built.
             // SHADGT_LEGACY_FALLBACK=0 turns it off.
@@ -1751,6 +1764,13 @@ PipelineCache::~PipelineCache() {
     if (warm_compute_thread.joinable()) { // PERF-GT7-037: before the caches go
         warm_compute_thread.request_stop();
         warm_compute_thread.join();
+    }
+    // PERF-GT7-111/117: they read the cache's tables, the store and the device.
+    for (std::jthread* thread : {&pretranslate_thread, &verify_thread}) {
+        if (thread->joinable()) {
+            thread->request_stop();
+            thread->join();
+        }
     }
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
