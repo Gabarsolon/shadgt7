@@ -3351,6 +3351,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
 }
 
 static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges();
+static bool InPerFrameMemory(VAddr address, u64 size);
 
 /// PERF-GT7-052 (RYGT_POLL_FRAME_TEXTURES=0: watched as before): a texture of 256 KB or less in a
 /// listed in-place range (GT7's per-frame memory) is checked each frame, not write-watched.
@@ -3367,11 +3368,14 @@ bool NativeRenderer::PolledFrameTexture(VAddr address, u64 size) {
             return true;
         }
     }
-    return false;
+    return InPerFrameMemory(address, size); // FIX-GT7-122: up to its end as seen
 }
 
 /// FIX-194: written ranges up to this size have their recently CPU-written pages written back.
 constexpr u64 MaxRegionWriteback = 4_MB;
+
+/// FIX-GT7-122: where RYGT_NATIVE_INPLACE_EXTRA's ranges start in InplaceRanges().
+static size_t g_inplace_extra_from = ~size_t{0};
 
 /// FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written ranges
 /// meeting one of these stay in guest memory too.
@@ -3390,6 +3394,9 @@ static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
             extra = "208000000+800000";
         }
         for (const char* source : {ranges, extra}) {
+            if (source == extra) {
+                g_inplace_extra_from = list.size(); // FIX-GT7-122
+            }
             for (const char* at = source; at && *at;) {
                 char* end = nullptr;
                 const VAddr begin = std::strtoull(at, &end, 16);
@@ -3405,6 +3412,150 @@ static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
         return list;
     }();
     return inplace_ranges;
+}
+
+// FIX-GT7-122: GT7's per-frame memory as listed: FIX-GT7-029's tail (the first range of
+// RYGT_NATIVE_INPLACE_EXTRA) and the listed ranges it continues ({0, 0}: no tail, or
+// RYGT_NATIVE_PERFRAME_GUARD=0). Its end moves: past the tail, to 0x209800000, on 2026-11-08, and
+// FIX-GT7-029's sequence came back: a compute write past the tail made a region, the unbounded
+// reads grew it over the per-frame memory, the regions there were refreshed a hundred times more
+// (2.8-4 s of the recorder's time in 10 s) and the game ran at 25 FPS until it was closed.
+static std::pair<VAddr, VAddr> PerFrameListed() {
+    static const std::pair<VAddr, VAddr> listed = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PERFRAME_GUARD");
+        const auto& ranges = InplaceRanges();
+        if ((env && env[0] == '0') || g_inplace_extra_from >= ranges.size()) {
+            return std::pair<VAddr, VAddr>{0, 0};
+        }
+        auto [begin, end] = ranges[g_inplace_extra_from];
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (const auto& [listed_begin, listed_end] : ranges) {
+                if (listed_end == begin && listed_begin < begin) {
+                    begin = listed_begin;
+                    grew = true;
+                }
+            }
+        }
+        return std::pair{begin, end};
+    }();
+    return listed;
+}
+
+/// FIX-GT7-122: the end of GT7's per-frame memory as seen so far (0: the listed end).
+static std::atomic<VAddr> g_per_frame_end{0};
+
+static VAddr PerFrameEnd() {
+    const VAddr end = g_per_frame_end.load(std::memory_order_relaxed);
+    return end != 0 ? end : PerFrameListed().second;
+}
+
+/// FIX-GT7-122: whether [address, address + size) is inside GT7's per-frame memory as seen.
+static bool InPerFrameMemory(VAddr address, u64 size) {
+    const VAddr begin = PerFrameListed().first;
+    return begin != 0 && address >= begin && address + size <= PerFrameEnd();
+}
+
+/// FIX-GT7-122: whether [address, address + size) meets a listed range or the per-frame memory.
+static bool ListedInPlace(VAddr address, u64 size) {
+    if (std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
+            return address < range.second && address + size > range.first;
+        })) {
+        return true;
+    }
+    const VAddr begin = PerFrameListed().first;
+    return begin != 0 && address < PerFrameEnd() && address + size > begin;
+}
+
+void NativeRenderer::NotePerFrameRange(VAddr address, u64 size) {
+    // The unbounded reads end where the per-frame memory does: one that starts in it and ends past
+    // its end shows how far it goes now.
+    const auto [begin, listed_end] = PerFrameListed();
+    const VAddr end = PerFrameEnd();
+    const VAddr range_end = address + size;
+    if (begin == 0 || address < begin || address >= end || range_end <= end) {
+        return;
+    }
+    if (range_end > listed_end + 64_MB || r.memory->MappedAreaEnd(address, range_end) < range_end) {
+        static std::atomic<u32> refused{};
+        if (refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-122: range {:#x}+{:#x} goes past GT7's per-frame memory "
+                        "({:#x}-{:#x}, listed to {:#x}) but is not taken as its end",
+                        address, size, begin, end, listed_end);
+        }
+        return;
+    }
+    g_per_frame_end.store(range_end, std::memory_order_relaxed);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-GT7-122: GT7's per-frame memory reaches {:#x} (listed to {:#x}): "
+                    "written ranges up to there stay in guest memory",
+                    range_end, listed_end);
+    }
+}
+
+void NativeRenderer::NotePerFrameRegion(const Region& region) {
+    // A region inside the per-frame memory (made before its end was known, or grown there from
+    // one made then) goes, with the other regions inside it: the ranges there are then bound in
+    // guest memory, as in listed ranges. Not while a draw or dispatch binds: an earlier binding
+    // of the same work would still name the dropped region's buffer and its writes would be lost
+    // (FIX-GT7-090's case); this one binds the region as before, and the regions go before the
+    // next work binds anything. A region reaching out of the per-frame memory stays (its bytes
+    // outside it exist only there).
+    const VAddr begin = PerFrameListed().first;
+    if (begin != 0 && region.begin >= begin && region.end <= PerFrameEnd()) {
+        per_frame_drop_due = true;
+    }
+}
+
+void NativeRenderer::DropDuePerFrameRegions() {
+    if (!per_frame_drop_due) {
+        return;
+    }
+    per_frame_drop_due = false;
+    const VAddr begin = PerFrameListed().first;
+    const VAddr end = PerFrameEnd();
+    // At most 32 drops a session (past that the regions stay, as before), one in 120 frames at
+    // most: a region made again at once (a write there that can't be bound in guest memory makes
+    // one) must not use them all up in a loop.
+    static u32 drops = 0; // the recorder, with `mutex` held
+    if (drops >= 32 || (drops != 0 && frame < per_frame_drop_frame + 120)) {
+        static bool logged_limit = false, logged_soon = false;
+        if (drops >= 32 && !logged_limit) {
+            logged_limit = true;
+            LOG_WARNING(Render_Vulkan, "FIX-GT7-122: regions in GT7's per-frame memory dropped 32 "
+                                       "times; they stay from now on");
+        } else if (drops < 32 && !logged_soon) {
+            logged_soon = true;
+            LOG_WARNING(Render_Vulkan, "FIX-GT7-122: a region in GT7's per-frame memory came back "
+                                       "within 120 frames of a drop; left until then");
+        }
+        return;
+    }
+    std::vector<std::pair<VAddr, VAddr>> inside;
+    for (const auto& [base, region] : regions) {
+        if (region.begin >= begin && region.end <= end) {
+            inside.emplace_back(region.begin, region.end);
+        }
+    }
+    if (inside.empty()) {
+        return;
+    }
+    ++drops;
+    per_frame_drop_frame = frame;
+    u32 dropped = 0;
+    for (const auto& [from, to] : inside) {
+        dropped += DropRegionsOver(from, to - from); // the region and the mirrors over it
+    }
+    ++buffer_generation;      // OPT-003
+    ++buffer_hard_generation; // PERF-GT7-047
+    LOG_WARNING(Render_Vulkan,
+                "FIX-GT7-122: {} regions in GT7's per-frame memory {:#x}-{:#x} dropped ({} with "
+                "the mirrors over them; one at {:#x}-{:#x}); {} times so far",
+                inside.size(), begin, end, dropped, inside.front().first, inside.front().second,
+                drops);
 }
 
 // FIX-GT7-034: a shader's write to a listed range that could not be compared stays in the region.
@@ -3899,8 +4050,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
                                                                             bool write,
                                                                             bool mirror) {
     last_bound = Bound::Region;
+    NotePerFrameRange(address, size); // FIX-GT7-122
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
+        NotePerFrameRegion(*region); // FIX-GT7-122: dropped before the next work binds
         if (address < region->begin || address + size > region->end) {
             region = MakeRegion(address, size, write);
         }
@@ -3925,9 +4078,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // FIX-150: in a region the CPU never saw them (no rain drops on the windshield); written ranges
     // there stay in guest memory.
     const VAddr inplace_from = InplaceFrom();
-    const bool listed_in_place = std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
-        return address < range.second && address + size > range.first;
-    });
+    const bool listed_in_place = ListedInPlace(address, size); // FIX-GT7-122: per-frame memory too
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
         if (Region* region = MakeRegion(address, size, true)) {
             ++stats.region_binds;
@@ -3969,6 +4120,18 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     }
     if (write) {
         if (Region* region = MakeRegion(address, size, true)) {
+            // FIX-GT7-122: a region in GT7's per-frame memory, where ranges should stay in guest
+            // memory (the next work drops it; other listed ranges get such regions at loads).
+            if (const VAddr pf = PerFrameListed().first;
+                pf != 0 && address < PerFrameEnd() && address + size > pf) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-122: written range {:#x}+{:#x} in GT7's per-frame memory "
+                                "is not in one imported view: a region holds it",
+                                address, size);
+                }
+            }
             ++stats.region_binds;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
@@ -4342,6 +4505,7 @@ void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stage
         const char* env = std::getenv("RYGT_NATIVE_STABLE_BINDINGS");
         return !(env && env[0] == '0');
     }();
+    DropDuePerFrameRegions(); // FIX-GT7-122: before this work binds anything
     for (u32 attempt = 0;; ++attempt) {
         const u64 taken_before = regions_taken_in;
         BindStages(stages, regs, compute, b);
