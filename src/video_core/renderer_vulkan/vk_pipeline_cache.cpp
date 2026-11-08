@@ -3578,27 +3578,49 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         // 19 ms: a race, not a 60 fps menu) they stay on their cores, and the compile pack's
         // start-up compile pauses.
         const auto totals = Common::GetGameFrameTotals();
+        const u64 draws = Common::GetWorkCounters().draws.load(std::memory_order_relaxed);
         if (c.backlog_window == std::chrono::steady_clock::time_point{}) {
             c.backlog_window = now;
             c.backlog_frames = totals.frames;
             c.backlog_us = totals.us;
+            c.backlog_draws = draws;
         } else if (now - c.backlog_window >= std::chrono::seconds{1}) {
             const u64 frames = totals.frames - c.backlog_frames;
             const double ms = frames ? double(totals.us - c.backlog_us) / 1000.0 / double(frames)
                                      : 1000.0;
+            const double draws_a_frame = frames ? double(draws - c.backlog_draws) / double(frames)
+                                                : 0.0;
             c.backlog_window = now;
             c.backlog_frames = totals.frames;
             c.backlog_us = totals.us;
+            c.backlog_draws = draws;
             const double fps = 1000.0 / std::max(ms, 0.001);
             // Out of play only at menu speed (under 17.5 ms a frame: races run at 19-26) or when
             // the game shows almost no frames (a load). Not "under 15 fps": a race start at
             // 60-80 ms a frame then let the compiles widen, which kept it there for seconds.
-            const bool play = fps >= 5.0 && (c.backlog_throttled ? ms > 17.5 : ms > 19.0);
+            // FIX-GT7-120: once in play, a heavy scene keeps it so at any speed. A race at
+            // 55-60 fps (16-19 ms a frame) went in and out of play every few seconds, and out of
+            // it the compiles of ~25 new pipelines took every core: a 417 ms frame in the race.
+            // Play is only entered by slow frames (a race starts at 30 Hz); a Monza race draws
+            // 1,900-6,000 times a frame (the fewest facing a barrier), a loading screen under 50:
+            // leaving a race goes through one, so the menus after it are out of play again and
+            // the start-up compile pack runs there. Menus that are never slow (1,400-1,900 draws
+            // on the main menu) never enter it.
+            // RYGT_PLAY_HOLD_DRAWS=<draws a frame> (1000), 0: frame time only, as before.
+            static const double hold_draws = [] {
+                const char* env = std::getenv("RYGT_PLAY_HOLD_DRAWS");
+                return env && *env ? std::strtod(env, nullptr) : 1000.0;
+            }();
+            const bool slow = c.backlog_throttled ? ms > 17.5 : ms > 19.0;
+            const bool held = c.backlog_throttled && hold_draws > 0.0 && draws_a_frame >= hold_draws;
+            const bool play = fps >= 5.0 && (slow || held);
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != c.backlog_throttled) {
                 c.backlog_throttled = play;
                 build_workers->SetInPlay(play);
-                LOG_WARNING(Render_Vulkan, "FIX-GT7-109: the game at {:.1f} ms a frame: {}", ms,
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-109: the game at {:.1f} ms a frame, {:.0f} draws a frame: {}",
+                            ms, draws_a_frame,
                             play ? "in play, compiles kept on their cores"
                                  : "not in play, compiles may widen");
             }

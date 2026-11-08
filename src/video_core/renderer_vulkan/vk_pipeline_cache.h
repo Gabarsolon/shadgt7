@@ -537,6 +537,7 @@ private:
         std::chrono::steady_clock::time_point backlog_window{};
         u64 backlog_frames = 0;
         u64 backlog_us = 0;
+        u64 backlog_draws = 0; ///< FIX-GT7-120: draws counted at the window's start
         std::chrono::steady_clock::time_point pace_start{};
         std::chrono::steady_clock::time_point stepped_since{};
         u64 pace_frames = 0;
