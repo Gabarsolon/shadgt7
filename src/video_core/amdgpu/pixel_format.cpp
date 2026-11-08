@@ -74,7 +74,8 @@ std::string_view NameOf(DataFormat fmt) {
     case DataFormat::FormatBc7:
         return "FormatBc7";
     default:
-        UNREACHABLE();
+        // FIX-GT7-126: no name (a garbage V#/T# format); the formatter prints the number.
+        return {};
     }
 }
 
@@ -107,7 +108,8 @@ std::string_view NameOf(NumberFormat fmt) {
     case NumberFormat::Ubscaled:
         return "Unscaled";
     default:
-        UNREACHABLE();
+        // FIX-GT7-126: as for DataFormat.
+        return {};
     }
 }
 

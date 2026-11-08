@@ -399,6 +399,8 @@ constexpr bool IsFmask(DataFormat format) {
     return format >= DataFormat::FormatFmask8_S2_F1 && format <= DataFormat::FormatFmask64_S16_F8;
 }
 
+/// FIX-GT7-126: empty for a value without a name instead of aborting. A shader translation
+/// formatting a garbage V#/T# format into its own error message lost that message.
 std::string_view NameOf(DataFormat fmt);
 std::string_view NameOf(NumberFormat fmt);
 
@@ -431,7 +433,11 @@ struct fmt::formatter<AmdGpu::DataFormat> {
         return ctx.begin();
     }
     auto format(AmdGpu::DataFormat fmt, format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", AmdGpu::NameOf(fmt));
+        const auto name = AmdGpu::NameOf(fmt);
+        if (name.empty()) {
+            return fmt::format_to(ctx.out(), "DataFormat({})", static_cast<u32>(fmt));
+        }
+        return fmt::format_to(ctx.out(), "{}", name);
     }
 };
 
@@ -441,6 +447,10 @@ struct fmt::formatter<AmdGpu::NumberFormat> {
         return ctx.begin();
     }
     auto format(AmdGpu::NumberFormat fmt, format_context& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", AmdGpu::NameOf(fmt));
+        const auto name = AmdGpu::NameOf(fmt);
+        if (name.empty()) {
+            return fmt::format_to(ctx.out(), "NumberFormat({})", static_cast<u32>(fmt));
+        }
+        return fmt::format_to(ctx.out(), "{}", name);
     }
 };
