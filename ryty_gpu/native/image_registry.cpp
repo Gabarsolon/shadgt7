@@ -732,12 +732,23 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
         return {0, 0, texture.size.width, texture.size.height};
     }
     // A mip or layer of the texture drawn on its own.
-    if (const s32 mip = target.MipOf(texture); mip >= 0) {
-        const s32 layer = target.SliceOf(texture, mip);
+    // FIX-GT7-134: also a target a little larger than the mip, within its padded size. GT7's
+    // depth of field (Scapes' editor and photos, background blurring) builds an 8-level pyramid
+    // drawing each level as its own target sized to its extent (345x248, 172x124, ...) while the
+    // texture that samples the pyramid is 690x493, 690x479 or 690x496 (levels 345x246, 172x123,
+    // ...): no level was found, the blurred levels read guest memory (zeros) and the blurred
+    // background came out black. The copy is the mip's size. RYGT_NATIVE_PADDED_MIPS=0: as before.
+    static const bool padded_mips = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PADDED_MIPS");
+        return !(env && env[0] == '0');
+    }();
+    if (const s32 mip = target.MipOf(texture, padded_mips); mip >= 0) {
+        const s32 layer = target.SliceOf(texture, mip, padded_mips);
         if (layer < 0 || u32(layer) >= std::max<u32>(texture.resources.layers, 1)) {
             return {};
         }
-        return {mip, layer, target.size.width, target.size.height};
+        return {mip, layer, std::min(target.size.width, std::max(texture.size.width >> mip, 1u)),
+                std::min(target.size.height, std::max(texture.size.height >> mip, 1u))};
     }
     // NAT-131: the texture is one layer (or mip) of the target: a face of a cube drawn as a
     // layered target, read on its own (GT Sport's environment cube, whose faces the cockpit's

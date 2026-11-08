@@ -216,3 +216,98 @@ TEST(ImageMips, OtherTargetsOverABlockTextureAreNotItsLevels) {
                                128);
     EXPECT_EQ(plain.BlockLevelOf(BlockTarget(ScapesPhoto, 2048, 1024, 2048)), -1);
 }
+
+// FIX-GT7-134: GT7's depth of field (Scapes' background blurring, photo 21:15) samples an 8-level
+// 690x493 B10G11R11 pyramid (pow2-padded, pitch 1024) whose levels it draws as targets sized to
+// their own extent: 690x496, 345x248, 172x124, ... (the log's NAT-041 lines), a little larger than
+// the texture's levels (345x246, 172x123, ...).
+namespace {
+constexpr VAddr DofPyramid = 0x100a230000;
+struct DofTarget {
+    VAddr address;
+    u32 width;
+    u32 height;
+    u32 pitch;
+    AmdGpu::TileMode tile_mode;
+};
+constexpr DofTarget DofTargets[] = {
+    {0x100a230000, 690, 496, 1024, Macro}, {0x100a430000, 345, 248, 512, Macro},
+    {0x100a4b0000, 172, 124, 256, Macro},  {0x100a4d0000, 86, 62, 128, Macro},
+    {0x100a4d8000, 43, 31, 64, Micro},     {0x100a4da000, 21, 15, 32, Micro},
+    {0x100a4da800, 10, 7, 16, Micro},      {0x100a4daa00, 5, 3, 8, Micro},
+};
+ImageInfo DofTexture(u32 height) {
+    auto info = Color2D(DofPyramid, 690, height, 8, Macro);
+    info.props.is_pow2 = true;
+    info.pitch = 1024;
+    info.UpdateSize();
+    return info;
+}
+ImageInfo DofTargetInfo(const DofTarget& t) {
+    auto info = Color2D(t.address, t.width, t.height, 1, t.tile_mode);
+    info.pitch = t.pitch;
+    info.UpdateSize();
+    return info;
+}
+} // namespace
+
+TEST(ImageMips, DepthOfFieldPyramidLevelsAreAtTheGameAddresses) {
+    const auto texture = DofTexture(493);
+    for (u32 mip = 0; mip < 8; ++mip) {
+        EXPECT_EQ(texture.guest_address + texture.mips_layout[mip].offset, DofTargets[mip].address)
+            << "mip " << mip;
+    }
+}
+
+TEST(ImageMips, PaddedTargetsAreTheDepthOfFieldLevels) {
+    for (const u32 height : {493u, 479u, 496u}) {
+        const auto texture = DofTexture(height);
+        for (u32 mip = 0; mip < 8; ++mip) {
+            const auto target = DofTargetInfo(DofTargets[mip]);
+            EXPECT_EQ(target.MipOf(texture, true), static_cast<s32>(mip))
+                << "height " << height << " mip " << mip;
+            EXPECT_EQ(target.SliceOf(texture, mip, true), 0)
+                << "height " << height << " mip " << mip;
+        }
+    }
+    // Without the padding rule, the larger level targets are not levels (as before).
+    const auto texture = DofTexture(493);
+    EXPECT_EQ(DofTargetInfo(DofTargets[1]).MipOf(texture), -1);
+}
+
+TEST(ImageMips, PaddingDoesNotMakeAnyTargetALevel) {
+    const auto texture = DofTexture(493);
+    // Twice the level's height is past its padding.
+    auto tall = DofTargets[1];
+    tall.height = 496;
+    EXPECT_EQ(DofTargetInfo(tall).MipOf(texture, true), -1);
+    // Another pitch at the level's address is another surface.
+    auto other_pitch = DofTargets[1];
+    other_pitch.pitch = 384;
+    EXPECT_EQ(DofTargetInfo(other_pitch).MipOf(texture, true), -1);
+    // Smaller than the level (345x246) is not the level either.
+    auto narrow = DofTargets[1];
+    narrow.width = 344;
+    narrow.height = 246;
+    EXPECT_EQ(DofTargetInfo(narrow).MipOf(texture, true), -1);
+    auto short_target = DofTargets[1];
+    short_target.width = 345;
+    short_target.height = 245;
+    EXPECT_EQ(DofTargetInfo(short_target).MipOf(texture, true), -1);
+    // Wider than the level's pitch is past its padding.
+    auto wide = DofTargets[1];
+    wide.width = 513;
+    EXPECT_EQ(DofTargetInfo(wide).MipOf(texture, true), -1);
+}
+
+TEST(ImageMips, PaddingIsForSingleLayerLevelsOnly) {
+    // The same pyramid with two layers: a padded target at level 1's address is not its slice
+    // (PlaceOf takes a level only through SliceOf).
+    auto texture = DofTexture(493);
+    texture.resources.layers = 2;
+    texture.UpdateSize();
+    auto t = DofTargets[1];
+    t.address = texture.guest_address + texture.mips_layout[1].offset;
+    EXPECT_EQ(DofTargetInfo(t).SliceOf(texture, 1, true), -1);
+}
+

@@ -191,7 +191,7 @@ void ImageInfo::UpdateSize() noexcept {
                      &guest_size, &micro_tiled_mips, mips_layout.data());
 }
 
-s32 ImageInfo::MipOf(const ImageInfo& info) const {
+s32 ImageInfo::MipOf(const ImageInfo& info, bool padded) const {
     if (!IsCompatible(info)) {
         return -1;
     }
@@ -248,7 +248,15 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     const auto this_w = std::max(size.width >> this_dim, 1u);
     const auto this_h = std::max(size.height >> this_dim, 1u);
     if ((this_w != mip_w) || (this_h != mip_h)) {
-        return -1;
+        // FIX-GT7-134: a target at the mip's address with its pitch, larger than the mip but
+        // within its padded size in memory, is that mip (the extra texels are its padding).
+        const auto& layout = info.mips_layout[mip];
+        const bool fits = padded && this_w >= mip_w && this_h >= mip_h &&
+                          this_w <= std::max<u32>(layout.pitch >> info_dim, 1u) &&
+                          this_h <= std::max<u32>(layout.height >> info_dim, 1u);
+        if (!fits) {
+            return -1;
+        }
     }
 
     const auto mip_d = std::max(info.size.depth >> mip, 1u);
@@ -306,7 +314,7 @@ s32 ImageInfo::BlockLevelOf(const ImageInfo& target) const {
     return -1;
 }
 
-s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
+s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip, bool padded) const {
     if (!IsCompatible(info)) {
         return -1;
     }
@@ -327,7 +335,14 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
     const auto this_h = std::max(size.height >> this_dim, 1u);
     const auto this_p = std::max(pitch >> this_dim, 1u);
     if ((this_w != mip_w) || (this_h != mip_h) || (this_p != mip_p)) {
-        return -1;
+        // FIX-GT7-134: a target at a single-layer mip's address, with its pitch, larger than the
+        // mip but within its padded size, is its only slice.
+        const bool fits =
+            padded && info.resources.layers <= 1 && this_p == mip_p && this_w >= mip_w &&
+            this_h >= mip_h &&
+            this_h <= std::max<u32>(info.mips_layout[mip].height >> info_dim, 1u) &&
+            guest_address == info.guest_address + info.mips_layout[mip].offset;
+        return fits ? 0 : -1;
     }
 
     // Check for size alignment.
