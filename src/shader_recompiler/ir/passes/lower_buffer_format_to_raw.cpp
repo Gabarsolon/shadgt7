@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -17,6 +19,53 @@ struct FormatInfo {
     AmdGpu::NumberConversion num_conversion;
     u32 num_components;
 };
+
+/// FIX-GT7-126: a data format LoadBufferFormat and StoreBufferFormat have no case for (format 15,
+/// the one 4-bit value buffers don't use) reads as a null buffer instead of failing the whole
+/// translation: GT7 leaves other data in descriptor slots it doesn't read. The key records the
+/// V#'s format (an instruction's is in the code), so a real format gets its own translation.
+/// RYGT_NULL_UNKNOWN_BUFFER_FORMAT=0: the translation fails, as before.
+static bool NullUnknownBufferFormat() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NULL_UNKNOWN_BUFFER_FORMAT");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+static bool IsLoweredBufferFormat(AmdGpu::DataFormat data_format) {
+    switch (data_format) {
+    case AmdGpu::DataFormat::FormatInvalid:
+    case AmdGpu::DataFormat::Format8:
+    case AmdGpu::DataFormat::Format8_8:
+    case AmdGpu::DataFormat::Format8_8_8_8:
+    case AmdGpu::DataFormat::Format16:
+    case AmdGpu::DataFormat::Format16_16:
+    case AmdGpu::DataFormat::Format10_11_11:
+    case AmdGpu::DataFormat::Format2_10_10_10:
+    case AmdGpu::DataFormat::Format16_16_16_16:
+    case AmdGpu::DataFormat::Format32:
+    case AmdGpu::DataFormat::Format32_32:
+    case AmdGpu::DataFormat::Format32_32_32:
+    case AmdGpu::DataFormat::Format32_32_32_32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void LogUnknownBufferFormat(const Info& info, u32 binding, AmdGpu::DataFormat data_format,
+                                   bool is_inst_typed) {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 32) {
+        return;
+    }
+    LOG_WARNING(Render_Recompiler,
+                "FIX-GT7-126: program {:#x}: buffer {} has data format {} ({}), read as a null "
+                "buffer",
+                info.pgm_hash, binding, static_cast<u32>(data_format),
+                is_inst_typed ? "the instruction's" : "the V#'s");
+}
 
 static bool IsBufferFormatLoad(const IR::Inst& inst) {
     return inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32;
@@ -212,8 +261,13 @@ static void LowerBufferFormatInst(IR::Block& block, IR::Inst& inst, Info& info) 
         .num_components = AmdGpu::NumComponents(data_format),
     };
 
-    if (data_format == AmdGpu::DataFormat::FormatInvalid) {
-        LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
+    const bool unknown_format = !IsLoweredBufferFormat(data_format) && NullUnknownBufferFormat();
+    if (data_format == AmdGpu::DataFormat::FormatInvalid || unknown_format) {
+        if (unknown_format) {
+            LogUnknownBufferFormat(info, inst.Arg(0).U32(), data_format, is_inst_typed);
+        } else {
+            LOG_WARNING(Render_Recompiler, "Skipping lowering for null buffer sharp");
+        }
         if (IsBufferFormatLoad(inst)) {
             inst.ReplaceUsesWithAndRemove(
                 ir.CompositeConstruct(ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f), ir.Imm32(0.f)));
