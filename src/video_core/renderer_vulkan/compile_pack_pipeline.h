@@ -56,7 +56,7 @@ struct In {
         return value;
     }
 };
-inline constexpr std::uint32_t Version = 2; // 2: the attachment sample counts
+inline constexpr std::uint32_t Version = 3; // 2: the attachment sample counts; 3: subgroup sizes
 } // namespace lib
 
 /// Serializes a library part's create info (pNext: the library info, then the rendering info).
@@ -100,19 +100,30 @@ bool SerializeLibrary(const vk::GraphicsPipelineCreateInfo& info, const LayoutDe
         o.Put(static_cast<std::uint32_t>(samples->depthStencilAttachmentSamples));
     }
     o.Put(static_cast<std::uint32_t>(static_cast<VkPipelineCreateFlags>(info.flags)));
-    // Stages: no pNext, no specialization, entry "main".
+    // Stages: entry "main", no specialization; pNext only AMD-301's required subgroup size.
     o.Put(info.stageCount);
     for (std::uint32_t i = 0; i < info.stageCount; ++i) {
         const auto& stage = info.pStages[i];
-        if (stage.pNext || (stage.pSpecializationInfo && !ignore_specialization) || !stage.pName ||
+        if ((stage.pSpecializationInfo && !ignore_specialization) || !stage.pName ||
             std::string_view{stage.pName} != "main" || stage.flags) {
             return false;
+        }
+        std::uint32_t subgroup = 0;
+        if (const auto* next = static_cast<const VkBaseInStructure*>(stage.pNext)) {
+            if (next->sType !=
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO ||
+                next->pNext) {
+                return false;
+            }
+            subgroup = reinterpret_cast<const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo*>(next)
+                           ->requiredSubgroupSize;
         }
         const std::vector<std::uint32_t> code = code_of(stage.module);
         if (code.empty()) {
             return false;
         }
         o.Put(static_cast<std::uint32_t>(stage.stage));
+        o.Put(subgroup);
         o.Put(static_cast<std::uint32_t>(code.size()));
         const auto* p = reinterpret_cast<const std::uint8_t*>(code.data());
         o.bytes.insert(o.bytes.end(), p, p + code.size() * sizeof(std::uint32_t));
@@ -220,7 +231,20 @@ bool SerializeLibrary(const vk::GraphicsPipelineCreateInfo& info, const LayoutDe
     o.Put(static_cast<std::uint8_t>(info.pDepthStencilState != nullptr));
     if (const auto* d = info.pDepthStencilState) {
         if (d->pNext || d->flags) return false;
-        o.Put(*d); // plain values only (no pointers): the whole structure, pNext null
+        // Field by field into a zeroed copy: the structure's padding (after sType) and its null
+        // pNext would otherwise enter the bytes, and the content hash that names the file.
+        VkPipelineDepthStencilStateCreateInfo copy{};
+        copy.sType = static_cast<VkStructureType>(d->sType);
+        copy.depthTestEnable = d->depthTestEnable;
+        copy.depthWriteEnable = d->depthWriteEnable;
+        copy.depthCompareOp = static_cast<VkCompareOp>(d->depthCompareOp);
+        copy.depthBoundsTestEnable = d->depthBoundsTestEnable;
+        copy.stencilTestEnable = d->stencilTestEnable;
+        copy.front = static_cast<const VkStencilOpState&>(d->front);
+        copy.back = static_cast<const VkStencilOpState&>(d->back);
+        copy.minDepthBounds = d->minDepthBounds;
+        copy.maxDepthBounds = d->maxDepthBounds;
+        o.Put(copy);
     }
     o.Put(static_cast<std::uint8_t>(info.pColorBlendState != nullptr));
     if (const auto* c = info.pColorBlendState) {
@@ -266,6 +290,7 @@ struct LibraryReplay {
     std::optional<VkAttachmentSampleCountInfoAMD> sample_counts;
     std::vector<VkSampleCountFlagBits> color_samples;
     std::vector<std::pair<VkShaderStageFlagBits, std::vector<std::uint32_t>>> stages;
+    std::vector<std::uint32_t> subgroups; ///< per stage, 0: none
     std::optional<VkPipelineVertexInputStateCreateInfo> vertex_input;
     std::vector<VkVertexInputBindingDescription> vertex_bindings;
     std::vector<VkVertexInputAttributeDescription> vertex_attributes;
@@ -315,6 +340,7 @@ inline bool DeserializeLibrary(const std::vector<std::uint8_t>& bytes, LibraryRe
     if (!in.ok || stage_count == 0 || stage_count > 5) return false;
     for (std::uint32_t i = 0; i < stage_count; ++i) {
         const auto stage = VkShaderStageFlagBits(in.Get<std::uint32_t>());
+        r.subgroups.push_back(in.Get<std::uint32_t>());
         const auto words = in.Get<std::uint32_t>();
         if (!in.ok || words > (in.size - in.at) / 4) return false;
         std::vector<std::uint32_t> code(words);

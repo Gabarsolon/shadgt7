@@ -1176,6 +1176,8 @@ static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
     const vk::Device device = instance.GetDevice();
     std::vector<vk::UniqueShaderModule> modules;
     std::vector<VkPipelineShaderStageCreateInfo> stages;
+    std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> subgroups(r.stages.size());
+    stages.reserve(r.stages.size());
     const VkSpecializationInfo* spec = nullptr;
     for (const auto& [bit, code] : r.stages) {
         auto [result, module] = device.createShaderModuleUnique(vk::ShaderModuleCreateInfo{
@@ -1185,8 +1187,14 @@ static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
         if (result != vk::Result::eSuccess) {
             return 0;
         }
+        const size_t index = stages.size();
+        subgroups[index] = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+            .requiredSubgroupSize = r.subgroups[index],
+        };
         stages.push_back(VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = r.subgroups[index] ? &subgroups[index] : nullptr, // AMD-301
             .stage = bit,
             .module = *module,
             .pName = "main",
@@ -1341,6 +1349,10 @@ void PipelineCache::CompilePackShaders(std::stop_token stop) {
             Common::AllowAllCores(); // FIX-GT7-107: every core but the owners'
             Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
             while (!stop.stop_requested()) {
+                // FIX-GT7-109: paused while the game is in play (a race).
+                while (g_game_in_play.load(std::memory_order_relaxed) && !stop.stop_requested()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                }
                 const size_t index = next.fetch_add(1, std::memory_order_relaxed);
                 if (index >= files.size()) {
                     break;
@@ -1383,7 +1395,9 @@ void PipelineCache::CompilePackShaders(std::stop_token stop) {
     }
     CompilePack::g_running.store(false, std::memory_order_release);
     if (libraries.load() != 0) {
-        SaveDriverCache(false); // the libraries are in the driver's cache: on disk now
+        // The libraries are in the driver's cache: the GPU thread's next MaybeSaveDriverCache
+        // writes it to disk (SaveDriverCache from here would race it for the writer thread).
+        driver_cache_save_requested.store(true, std::memory_order_release);
     }
     LOG_WARNING(Render_Vulkan,
                 "PERF-GT7-108: compile pack of {} recipes ({} of them pipeline libraries): {} "
@@ -1911,7 +1925,9 @@ void PipelineCache::MaybeSaveDriverCache() {
     // grows: every 45 s up to 256 MB, then 45 s more per further 256 MB (2 GB: every 6 min).
     const u64 size_mb = driver_cache_bytes.load(std::memory_order_relaxed) >> 20;
     const auto interval = 45s * std::max<u64>(1, (size_mb + 255) / 256);
-    if (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= interval) {
+    // PERF-GT7-108: once the compile pack's start-up compile asked for a save, at the next look.
+    if (driver_cache_save_requested.exchange(false, std::memory_order_acq_rel) ||
+        (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= interval)) {
         SaveDriverCache(false);
     }
     return;

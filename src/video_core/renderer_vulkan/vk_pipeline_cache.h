@@ -436,6 +436,9 @@ private:
     u32 pipelines_at_driver_save{};
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::atomic<bool> driver_cache_writing{}; // PERF-036
+    /// PERF-GT7-108: the compile pack's thread asks the GPU thread for a save (the writer thread
+    /// is the GPU thread's to join and replace).
+    std::atomic<bool> driver_cache_save_requested{};
     std::jthread driver_cache_writer;
     DriverCacheFile driver_cache_file; ///< FIX-GT7-025: the save the file holds
     /// FIX-217: pixel shaders (by code address) with a V_INTERP_MOV of a vertex's own value.
