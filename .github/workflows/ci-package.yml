@@ -1,0 +1,21 @@
+name: RyGT7 package for renderer changes
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renderer-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    uses: RyGT-Team/rygt7/.github/workflows/rygt7-ci.yml@main
+    with:
+      renderer_sha: ${{ github.sha }}
+    secrets:
+      GITLAB_PACKAGE_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}

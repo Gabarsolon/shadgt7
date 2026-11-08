@@ -1,13 +1,9 @@
 # SPDX-FileCopyrightText: 2024 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-name: Windows Build and Tests
+name: Legacy Windows Build and Tests (manual)
 
 on:
-  push:
-    paths-ignore: ["documents/**", "**/*.md"]
-  pull_request:
-    paths-ignore: ["documents/**", "**/*.md"]
   workflow_dispatch:
 
 permissions:
