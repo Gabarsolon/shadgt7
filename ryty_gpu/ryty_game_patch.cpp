@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 #include <windows.h>
+#include <intrin.h>
 #include <fmt/format.h>
 
 #include "common/diagnostics.h"
@@ -1937,6 +1938,457 @@ void InstallFatalErrorDiag(u8* base) {
 }
 } // namespace
 
+
+// PERF-GT7-113: GT7's file cipher. The game decrypts what it reads (ChaCha20: 20 rounds, a 32-bit
+// block counter in state word 12, 16 state words at +8 of the cipher object) one 64-byte block at
+// a time and XORs the keystream one byte at a time: while a race loads its file thread (FexpR)
+// spends ~65% of its time there (1.44 s frame after Enter on Monza: ~0.9 s of it). The same
+// cipher here makes 8 blocks at once (AVX2, or 4 with SSE) and XORs 8 bytes at a time, with the
+// same output and the same counter left in the object. Hooked where the default and the custom
+// seek paths join (the three instructions moved to the stub are position independent), so a
+// cipher object with its own block-step method still runs the game's code. Applied only when the
+// function's bytes are the expected ones and the self-test passes. RYGT_FAST_CIPHER=0: off.
+// RYGT_FAST_CIPHER_VERIFY=<n>: the first n calls also run the game's own code on a copy of the
+// data and compare. RYGT_DIAG_CIPHER=1: calls, MB and time a second on stderr.
+namespace Gt7Cipher {
+
+constexpr u64 kXor = 0x3326e10;         // void xor(Cipher* self, u8* data, s64 size, u64 offset)
+constexpr u64 kLoop = 0x3326f4b;        // keystream merge and the byte loop
+constexpr u64 kJoin = 0x3326e50;        // the block computation, after the seek
+constexpr u64 kResume = 0x3326e5f;      // after the three loads moved to the stub
+constexpr u64 kEpilogue = 0x3327092;    // stack check and return
+constexpr u64 kDefaultSeek = 0x2bec400; // vtable +0x8 that the code inlines
+constexpr u64 kDefaultNext = 0x2bec410; // vtable +0x10 that the code inlines
+
+constexpr u8 kEntryBytes[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83,
+    0xec, 0x48, 0x4c, 0x8b, 0x35, 0xb8, 0x7e, 0x24, 0x02, 0x4c, 0x8d, 0x0d, 0xd1, 0x55, 0x8c,
+    0xff, 0x49, 0x8b, 0x06, 0x48, 0x89, 0x45, 0xd0, 0x48, 0x89, 0xc8, 0x4c, 0x8b, 0x07, 0x48,
+    0xc1, 0xe8, 0x06, 0x4d, 0x8b, 0x40, 0x08, 0x4d, 0x39, 0xc8, 0x0f, 0x85, 0xa1, 0x02, 0x00,
+    0x00, 0x89, 0x47, 0x38, 0xc5, 0xfa, 0x6f, 0x47, 0x08, 0xc5, 0xfa, 0x6f, 0x4f, 0x18, 0xc5,
+    0xfa, 0x6f, 0x57, 0x28, 0xc5, 0xfa, 0x6f, 0x5f, 0x38, 0xc5, 0x7a, 0x6f, 0x0d, 0xa4, 0xb4,
+    0xc1, 0x00, 0xc5, 0x79, 0x6f, 0x15, 0x4c, 0x53, 0xc2, 0x00};
+constexpr u8 kLoopBytes[] = {
+    0xc5, 0xd9, 0xfe, 0xc0, 0x48, 0x85, 0xd2, 0xc5, 0xc9, 0xfe, 0xc9, 0xc5, 0xd1, 0xfe, 0xd2,
+    0xc5, 0xc1, 0xfe, 0xdb, 0xc5, 0xfa, 0x7f, 0x45, 0x90, 0xc5, 0xfa, 0x7f, 0x4d, 0xa0, 0xc5,
+    0xfa, 0x7f, 0x55, 0xb0, 0xc5, 0xfa, 0x7f, 0x5d, 0xc0, 0x0f, 0x8e, 0x1a, 0x01, 0x00, 0x00,
+    0x48, 0x01, 0xf2, 0x83, 0xe1, 0x3f, 0x4c, 0x8d, 0x3d, 0x8b, 0x54, 0x8c, 0xff, 0x8a, 0x44,
+    0x0d, 0x90, 0x30, 0x06, 0x48, 0x83, 0xf9, 0x3f, 0x0f, 0x83, 0x15, 0x01, 0x00, 0x00, 0x48,
+    0xff, 0xc1, 0x48, 0xff, 0xc6, 0x48, 0x39, 0xd6, 0x72, 0xe5, 0xe9, 0xed, 0x00, 0x00, 0x00};
+constexpr u8 kTailBytes[] = {
+    0x49, 0x8b, 0x06, 0x48, 0x3b, 0x45, 0xd0, 0x75, 0x4c, 0x48, 0x83, 0xc4, 0x48, 0x5b, 0x41,
+    0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3, 0x48, 0x8b, 0x07, 0x48, 0x8b, 0x40,
+    0x10, 0x4c, 0x39, 0xf8, 0x75, 0x5b, 0xff, 0x47, 0x38, 0xc5, 0xfa, 0x6f, 0x47, 0x08, 0xc5,
+    0xfa, 0x6f, 0x4f, 0x18, 0xc5, 0xfa, 0x6f, 0x57, 0x28, 0xc5, 0xfa, 0x6f, 0x5f, 0x38, 0xb8,
+    0x0a, 0x00, 0x00, 0x00, 0xc5, 0xf9, 0x6f, 0xfb, 0xc5, 0xf9, 0x6f, 0xea, 0xc5, 0xf9, 0x6f,
+    0xf1, 0xc5, 0xf9, 0x6f, 0xe0, 0xe9, 0xbe, 0xfe, 0xff, 0xff, 0xe8, 0xb4, 0x18, 0xa3, 0x00,
+    0x0f, 0x0b};
+
+using XorFn = void(PS4_SYSV_ABI*)(void*, u8*, s64, u64);
+XorFn g_original = nullptr;
+u64 g_default_seek = 0;
+bool g_avx2 = false;
+bool g_stats = false;
+std::atomic<s64> g_verify_left{0};
+std::atomic<u64> g_verify_same{0}, g_verify_differ{0}, g_verify_ns_original{0},
+    g_verify_ns_fast{0}, g_verify_bytes{0};
+thread_local bool t_in_original = false;
+std::atomic<u64> g_calls{0}, g_bytes{0}, g_ns{0}, g_last_report{0};
+
+#define RYGT_CHACHA_QR(a, b, c, d)                                                                 \
+    a += b;                                                                                        \
+    d ^= a;                                                                                        \
+    d = (d << 16) | (d >> 16);                                                                     \
+    c += d;                                                                                        \
+    b ^= c;                                                                                        \
+    b = (b << 12) | (b >> 20);                                                                     \
+    a += b;                                                                                        \
+    d ^= a;                                                                                        \
+    d = (d << 8) | (d >> 24);                                                                      \
+    c += d;                                                                                        \
+    b ^= c;                                                                                        \
+    b = (b << 7) | (b >> 25);
+
+#define RYGT_CHACHA_ROUNDS(x)                                                                      \
+    for (int round = 0; round < 10; ++round) {                                                     \
+        RYGT_CHACHA_QR(x[0], x[4], x[8], x[12])                                                    \
+        RYGT_CHACHA_QR(x[1], x[5], x[9], x[13])                                                    \
+        RYGT_CHACHA_QR(x[2], x[6], x[10], x[14])                                                   \
+        RYGT_CHACHA_QR(x[3], x[7], x[11], x[15])                                                   \
+        RYGT_CHACHA_QR(x[0], x[5], x[10], x[15])                                                   \
+        RYGT_CHACHA_QR(x[1], x[6], x[11], x[12])                                                   \
+        RYGT_CHACHA_QR(x[2], x[7], x[8], x[13])                                                    \
+        RYGT_CHACHA_QR(x[3], x[4], x[9], x[14])                                                    \
+    }
+
+// One block: the 16 words of the object with `counter` in word 12.
+void Block(const u32* state, u32 counter, u8* out) {
+    u32 s[16];
+    std::memcpy(s, state, sizeof(s));
+    s[12] = counter;
+    u32 x[16];
+    std::memcpy(x, s, sizeof(x));
+    RYGT_CHACHA_ROUNDS(x)
+    for (int j = 0; j < 16; ++j) {
+        x[j] += s[j];
+    }
+    std::memcpy(out, x, 64);
+}
+
+// N blocks with counters counter..counter+N-1 (32-bit wrap, like the game), one vector lane each.
+template <int N>
+[[gnu::always_inline]] inline void Blocks(const u32* state, u32 counter, u8* out) {
+    typedef u32 V __attribute__((vector_size(N * 4)));
+    V s[16], x[16];
+    for (int j = 0; j < 16; ++j) {
+        for (int lane = 0; lane < N; ++lane) {
+            s[j][lane] = state[j];
+        }
+    }
+    for (int lane = 0; lane < N; ++lane) {
+        s[12][lane] = counter + static_cast<u32>(lane);
+    }
+    for (int j = 0; j < 16; ++j) {
+        x[j] = s[j];
+    }
+    RYGT_CHACHA_ROUNDS(x)
+    u32 words[16][N];
+    for (int j = 0; j < 16; ++j) {
+        x[j] += s[j];
+        std::memcpy(words[j], &x[j], sizeof(words[j]));
+    }
+    u32* out32 = reinterpret_cast<u32*>(out);
+    for (int lane = 0; lane < N; ++lane) {
+        for (int j = 0; j < 16; ++j) {
+            out32[lane * 16 + j] = words[j][lane];
+        }
+    }
+}
+
+[[gnu::always_inline]] inline void XorBytes(u8* data, const u8* key, size_t size) {
+    size_t i = 0;
+    for (; i + 8 <= size; i += 8) {
+        u64 a, b;
+        std::memcpy(&a, data + i, 8);
+        std::memcpy(&b, key + i, 8);
+        a ^= b;
+        std::memcpy(data + i, &a, 8);
+    }
+    for (; i < size; ++i) {
+        data[i] ^= key[i];
+    }
+}
+
+// Whole groups of 8 (AVX2) or 4 blocks from `p`; returns the counter after them.
+__attribute__((target("avx2"))) u32 Wide8(const u32* state, u32 counter, u8*& p, u8* end) {
+    alignas(64) u8 key[512];
+    while (end - p >= 512) {
+        Blocks<8>(state, counter, key);
+        XorBytes(p, key, 512);
+        counter += 8;
+        p += 512;
+    }
+    return counter;
+}
+
+u32 Wide4(const u32* state, u32 counter, u8*& p, u8* end) {
+    alignas(64) u8 key[256];
+    while (end - p >= 256) {
+        Blocks<4>(state, counter, key);
+        XorBytes(p, key, 256);
+        counter += 4;
+        p += 256;
+    }
+    return counter;
+}
+
+// The game's function from its join point: word 12 already holds the block of `offset`.
+void Fast(u8* self, u8* data, s64 size, u64 offset) {
+    if (size <= 0) {
+        return;
+    }
+    u32* state = reinterpret_cast<u32*>(self + 8);
+    u32 counter = state[12];
+    alignas(64) u8 key[64];
+    u8* p = data;
+    u8* const end = data + size;
+    if (const u32 pos = static_cast<u32>(offset & 63)) {
+        Block(state, counter, key);
+        const size_t n = std::min<size_t>(64 - pos, static_cast<size_t>(end - p));
+        XorBytes(p, key + pos, n);
+        p += n;
+        if (pos + n == 64) {
+            ++counter;
+        }
+    }
+    counter = g_avx2 ? Wide8(state, counter, p, end) : Wide4(state, counter, p, end);
+    while (end - p >= 64) {
+        Block(state, counter, key);
+        XorBytes(p, key, 64);
+        ++counter;
+        p += 64;
+    }
+    if (p < end) {
+        Block(state, counter, key);
+        XorBytes(p, key, static_cast<size_t>(end - p));
+    }
+    state[12] = counter;
+}
+
+u64 NowNs() {
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    return static_cast<u64>(static_cast<double>(now.QuadPart) * 1e9 /
+                            static_cast<double>(frequency.QuadPart));
+}
+
+void Report() {
+    const u64 now = NowNs();
+    u64 last = g_last_report.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_last_report.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 1000000000ULL || !g_last_report.compare_exchange_strong(last, now)) {
+        return;
+    }
+    const u64 calls = g_calls.exchange(0), bytes = g_bytes.exchange(0), ns = g_ns.exchange(0);
+    if (calls) {
+        std::fprintf(stderr, "[cipher] PERF-GT7-113: %llu calls, %.1f MB, %.1f ms (%.0f MB/s)\n",
+                     static_cast<unsigned long long>(calls), bytes / 1048576.0, ns / 1e6,
+                     ns ? bytes / 1048576.0 / (ns / 1e9) : 0.0);
+    }
+}
+
+// Called by the stub; false: run the game's own code (the stub's fallback).
+bool PS4_SYSV_ABI Hook(u8* self, u8* data, s64 size, u64 offset) {
+    if (t_in_original) {
+        return false;
+    }
+    if (g_verify_left.load(std::memory_order_relaxed) > 0 && size > 0 &&
+        *reinterpret_cast<const u64*>(*reinterpret_cast<const u64*>(self) + 8) ==
+            g_default_seek &&
+        g_verify_left.fetch_sub(1) > 0) {
+        u32* state = reinterpret_cast<u32*>(self + 8);
+        const u32 counter = state[12];
+        std::vector<u8> copy(data, data + size);
+        const u64 t0 = NowNs();
+        t_in_original = true;
+        g_original(self, copy.data(), size, offset);
+        t_in_original = false;
+        const u64 t1 = NowNs();
+        const u32 counter_after = state[12];
+        state[12] = counter;
+        Fast(self, data, size, offset);
+        const u64 t2 = NowNs();
+        g_verify_ns_original += t1 - t0;
+        g_verify_ns_fast += t2 - t1;
+        g_verify_bytes += static_cast<u64>(size);
+        const bool same = std::memcmp(copy.data(), data, static_cast<size_t>(size)) == 0 &&
+                          state[12] == counter_after;
+        if (same) {
+            ++g_verify_same;
+        } else {
+            if (++g_verify_differ <= 10) {
+                std::fprintf(stderr,
+                             "[cipher] PERF-GT7-113: differs from the game's code (size %lld, "
+                             "offset %#llx, counter %u vs %u)\n",
+                             static_cast<long long>(size), static_cast<unsigned long long>(offset),
+                             state[12], counter_after);
+            }
+            std::memcpy(data, copy.data(), static_cast<size_t>(size)); // the game's result
+            state[12] = counter_after;
+        }
+        if (g_verify_left.load(std::memory_order_relaxed) <= 0) {
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true)) {
+                std::fprintf(stderr,
+                             "[cipher] PERF-GT7-113: verified %llu calls (%.1f MB): %llu same, "
+                             "%llu different; game's code %.1f ms, this one %.1f ms\n",
+                             static_cast<unsigned long long>(g_verify_same + g_verify_differ),
+                             g_verify_bytes / 1048576.0,
+                             static_cast<unsigned long long>(g_verify_same.load()),
+                             static_cast<unsigned long long>(g_verify_differ.load()),
+                             g_verify_ns_original / 1e6, g_verify_ns_fast / 1e6);
+            }
+        }
+        return true;
+    }
+    if (!g_stats) {
+        Fast(self, data, size, offset);
+        return true;
+    }
+    const u64 t0 = NowNs();
+    Fast(self, data, size, offset);
+    g_ns += NowNs() - t0;
+    ++g_calls;
+    g_bytes += size > 0 ? static_cast<u64>(size) : 0;
+    Report();
+    return true;
+}
+
+bool SelfTest() {
+    // RFC 8439 2.3.2: key 00..1f, nonce 00000009 0000004a 00000000, block count 1.
+    const u32 rfc[16] = {0x61707865, 0x3320646e, 0x79622d32, 0x6b206574, 0x03020100, 0x07060504,
+                         0x0b0a0908, 0x0f0e0d0c, 0x13121110, 0x17161514, 0x1b1a1918, 0x1f1e1d1c,
+                         0x00000001, 0x09000000, 0x4a000000, 0x00000000};
+    const u8 expected[16] = {0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15,
+                             0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20, 0x71, 0xc4};
+    u8 out[64];
+    Block(rfc, 1, out);
+    if (std::memcmp(out, expected, sizeof(expected)) != 0) {
+        return false;
+    }
+    // The wide paths against single blocks, across a counter wrap.
+    u32 state[16];
+    for (int j = 0; j < 16; ++j) {
+        state[j] = 0x9e3779b9u * static_cast<u32>(j + 1);
+    }
+    alignas(64) u8 one[64 * 8], wide[64 * 8];
+    const u32 start = 0xfffffffdu;
+    for (u32 b = 0; b < 8; ++b) {
+        Block(state, start + b, one + b * 64);
+    }
+    u8 data[64 * 8 + 37];
+    for (size_t i = 0; i < sizeof(data); ++i) {
+        data[i] = static_cast<u8>(i * 7);
+    }
+    std::memcpy(wide, data, sizeof(wide));
+    u8* p = wide;
+    const u32 next = g_avx2 ? Wide8(state, start, p, wide + 512) : Wide4(state, start, p, wide + 512);
+    if (p != wide + 512 || next != start + 8u) {
+        return false;
+    }
+    for (size_t i = 0; i < 512; ++i) {
+        if (wide[i] != static_cast<u8>(data[i] ^ one[i])) {
+            return false;
+        }
+    }
+    // Fast() from an unaligned offset: byte by byte like the game.
+    u8 object[8 + 64] = {};
+    std::memcpy(object + 8, state, 64);
+    const u64 offset = 64ull * 5 + 13;
+    reinterpret_cast<u32*>(object + 8)[12] = static_cast<u32>(offset >> 6);
+    u8 fast[sizeof(data)];
+    std::memcpy(fast, data, sizeof(data));
+    Fast(object, fast, sizeof(fast), offset);
+    u32 counter = static_cast<u32>(offset >> 6);
+    u8 key[64];
+    Block(state, counter, key);
+    u32 pos = static_cast<u32>(offset & 63);
+    for (size_t i = 0; i < sizeof(data); ++i) {
+        if (fast[i] != static_cast<u8>(data[i] ^ key[pos])) {
+            return false;
+        }
+        if (pos == 63) {
+            ++counter;
+            Block(state, counter, key);
+            pos = 0;
+        } else {
+            ++pos;
+        }
+    }
+    return reinterpret_cast<u32*>(object + 8)[12] == counter;
+}
+
+void Install(u8* base) {
+    const char* env = std::getenv("RYGT_FAST_CIPHER");
+    const bool asked = env && env[0];
+    if (asked && env[0] == '0') {
+        return;
+    }
+    u8* const entry = base + kXor + kTextRvaShift;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(entry, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+        std::memcmp(entry, kEntryBytes, sizeof(kEntryBytes)) != 0 ||
+        std::memcmp(base + kLoop + kTextRvaShift, kLoopBytes, sizeof(kLoopBytes)) != 0 ||
+        std::memcmp(base + kEpilogue + kTextRvaShift, kTailBytes, sizeof(kTailBytes)) != 0) {
+        if (asked) {
+            std::fprintf(stderr, "[patch] PERF-GT7-113: original bytes differ, not applied\n");
+        }
+        return;
+    }
+    int regs[4] = {};
+    __cpuidex(regs, 7, 0);
+    g_avx2 = (regs[1] & (1 << 5)) != 0;
+    if (const char* wide = std::getenv("RYGT_FAST_CIPHER_SSE"); wide && wide[0] == '1') {
+        g_avx2 = false;
+    }
+    if (!SelfTest()) {
+        std::fprintf(stderr, "[patch] PERF-GT7-113: self-test failed, not applied\n");
+        return;
+    }
+    u8* stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] PERF-GT7-113: no memory for the stub, not applied\n");
+        return;
+    }
+    g_original = reinterpret_cast<XorFn>(entry);
+    g_default_seek = reinterpret_cast<u64>(base + kDefaultSeek + kTextRvaShift);
+    const u64 default_next = reinterpret_cast<u64>(base + kDefaultNext + kTextRvaShift);
+    const u64 hook = reinterpret_cast<u64>(&Hook);
+    const u64 epilogue = reinterpret_cast<u64>(base + kEpilogue + kTextRvaShift);
+    const u64 resume = reinterpret_cast<u64>(base + kResume + kTextRvaShift);
+    std::vector<u8> code;
+    const auto bytes = [&](std::initializer_list<u8> list) { code.insert(code.end(), list); };
+    const auto imm64 = [&](u64 value) {
+        for (int i = 0; i < 8; ++i) code.push_back(static_cast<u8>(value >> (8 * i)));
+    };
+    bytes({0x4c, 0x8b, 0x17});       // mov r10, [rdi]          (vtable)
+    bytes({0x4d, 0x8b, 0x52, 0x10}); // mov r10, [r10 + 0x10]   (block step)
+    bytes({0x49, 0xbb});             // mov r11, default step
+    imm64(default_next);
+    bytes({0x4d, 0x39, 0xda}); // cmp r10, r11
+    bytes({0x75, 0x00});       // jne fallback (patched below)
+    const size_t jne_at = code.size() - 1;
+    bytes({0x57, 0x56, 0x52, 0x51}); // push rdi, rsi, rdx, rcx (rsp stays 16-aligned)
+    bytes({0x49, 0xbb});             // mov r11, Hook
+    imm64(hook);
+    bytes({0x41, 0xff, 0xd3});       // call r11
+    bytes({0x59, 0x5a, 0x5e, 0x5f}); // pop rcx, rdx, rsi, rdi
+    bytes({0x84, 0xc0});             // test al, al
+    bytes({0x74, 0x00});             // jz fallback (patched below)
+    const size_t jz_at = code.size() - 1;
+    bytes({0x49, 0xbb}); // mov r11, epilogue
+    imm64(epilogue);
+    bytes({0x41, 0xff, 0xe3}); // jmp r11
+    const size_t fallback = code.size();
+    bytes({0xc5, 0xfa, 0x6f, 0x47, 0x08}); // vmovdqu xmm0, [rdi + 0x08]  (moved from the game)
+    bytes({0xc5, 0xfa, 0x6f, 0x4f, 0x18}); // vmovdqu xmm1, [rdi + 0x18]
+    bytes({0xc5, 0xfa, 0x6f, 0x57, 0x28}); // vmovdqu xmm2, [rdi + 0x28]
+    bytes({0x49, 0xbb});                   // mov r11, resume
+    imm64(resume);
+    bytes({0x41, 0xff, 0xe3}); // jmp r11
+    code[jne_at] = static_cast<u8>(fallback - (jne_at + 1));
+    code[jz_at] = static_cast<u8>(fallback - (jz_at + 1));
+    std::memcpy(stub, code.data(), code.size());
+    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+
+    u8* const join = base + kJoin + kTextRvaShift;
+    u8 jump[15] = {0xff, 0x25, 0, 0, 0, 0}; // jmp [rip]; address; int3
+    std::memcpy(jump + 6, &stub, 8);
+    jump[14] = 0xcc;
+    DWORD old_protect = 0;
+    if (!VirtualProtect(join, sizeof(jump), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    std::memcpy(join, jump, sizeof(jump));
+    DWORD ignored = 0;
+    VirtualProtect(join, sizeof(jump), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), join, sizeof(jump));
+    if (const char* verify = std::getenv("RYGT_FAST_CIPHER_VERIFY"); verify && verify[0]) {
+        g_verify_left = std::strtoll(verify, nullptr, 0);
+    }
+    if (const char* stats = std::getenv("RYGT_DIAG_CIPHER"); stats && stats[0] == '1') {
+        g_stats = true;
+    }
+    std::fprintf(stderr, "[patch] PERF-GT7-113 fast file cipher applied (%s)\n",
+                 g_avx2 ? "AVX2, 8 blocks" : "SSE, 4 blocks");
+}
+
+} // namespace Gt7Cipher
+
 void RytyApplyGamePatches() {
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
@@ -1951,6 +2403,7 @@ void RytyApplyGamePatches() {
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
+    Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
