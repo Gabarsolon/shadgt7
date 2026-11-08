@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstdlib>
 #include <limits>
 #include "shader_recompiler/info.h"
@@ -248,6 +249,23 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     auto image = image_res.GetSharp(info);
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
+    if (image.GetViewType(image_res.is_array) == AmdGpu::ImageType::Color2DMsaaArray) {
+        // FIX-GT7-125: which programs read an MSAA array, and whether its T# looks like an image
+        // (sizes, samples, layers) or like data left in the slot. 20 lines, then one in 500.
+        static std::atomic<u32> logged{};
+        if (const u32 n = ++logged; n <= 20 || n % 500 == 0) {
+            LOG_WARNING(Render_Recompiler,
+                        "FIX-GT7-125: program {:#x} ({}) uses an MSAA array T# at {} with {}: "
+                        "address {:#x}, format {}/{}, {}x{}, {} samples, layers {}-{} of {}, "
+                        "pitch {}{} ({} so far)",
+                        info.pgm_hash, info.hw_stage, image_res.sharp_fetch.offsets[0],
+                        inst.GetOpcode(), image.Address(), u32(image.GetDataFmt()),
+                        u32(image.GetNumberFmt()), image.width + 1, image.height + 1,
+                        image.NumSamples(), u32(image.base_array), u32(image.last_array),
+                        image.depth + 1, image.Pitch(),
+                        MsaaArrayEnabled() ? "" : "; RYGT_MSAA_ARRAY_SAMPLE=0: not translated", n);
+        }
+    }
     // Port of xacidr4inx's reflection fix (RyGT 0066): keep integer accesses,
     // comparison/gather operations, and face-space offsets or gradients on their existing
     // array path. Ordinary fragment cube samples use the host cube sampler; the post-op
@@ -691,6 +709,18 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    // FIX-GT7-125: an MSAA array's address registers are a 2D array's (x, y, slice; 2D offsets
+    // and derivatives); it is read as multisampled below (is_msaa).
+    const auto layout_type = view_type == AmdGpu::ImageType::Color2DMsaaArray && MsaaArrayEnabled()
+                                 ? AmdGpu::ImageType::Color2DArray
+                                 : view_type;
+    // FIX-GT7-125: the program and the T#, for a type no case below handles.
+    const auto describe = [&] {
+        return fmt::format("program {:#x}, T# {:#x} type {} format {}/{} {}x{}x{} samples {}",
+                           info.pgm_hash, image.Address(), u32(image.GetType()),
+                           u32(image.GetDataFmt()), u32(image.GetNumberFmt()), image.width + 1,
+                           image.height + 1, image.depth + 1, image.NumSamples());
+    };
 
     IR::Inst* body1 = inst.Arg(2).Inst();
     IR::Inst* body2 = inst.Arg(3).Inst();
@@ -737,7 +767,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             return ir.BitFieldExtract(IR::U32{arg}, ir.Imm32(off), ir.Imm32(6), true);
         };
 
-        switch (view_type) {
+        switch (layout_type) {
         case AmdGpu::ImageType::Color1D:
         case AmdGpu::ImageType::Color1DArray:
             return read(0);
@@ -749,7 +779,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         case AmdGpu::ImageType::Color3D:
             return ir.CompositeConstruct(read(0), read(8), read(16));
         default:
-            UNREACHABLE();
+            UNREACHABLE_MSG("Image type {} for a sample offset ({})", view_type, describe());
         }
     }();
     const IR::F32 bias = inst_info.has_bias ? get_addr_reg(addr_reg++) : IR::F32{};
@@ -758,7 +788,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         if (!inst_info.has_derivatives) {
             return {};
         }
-        switch (view_type) {
+        switch (layout_type) {
         case AmdGpu::ImageType::Color1D:
         case AmdGpu::ImageType::Color1DArray:
             // du/dx, du/dy
@@ -780,7 +810,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
                     ir.CompositeConstruct(get_addr_reg(addr_reg - 3), get_addr_reg(addr_reg - 2),
                                           get_addr_reg(addr_reg - 1))};
         default:
-            UNREACHABLE();
+            UNREACHABLE_MSG("Image type {} for sample derivatives ({})", view_type, describe());
         }
     }();
 
@@ -805,8 +835,8 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
     const bool mip_unnormalized =
         mip_unnormalized_on && info.sw_stage == SwStage::TessellationControl;
     const auto is_slice = [&](u32 dim_idx) {
-        return (view_type == AmdGpu::ImageType::Color1DArray && dim_idx == 1) ||
-               (view_type == AmdGpu::ImageType::Color2DArray && dim_idx == 2);
+        return (layout_type == AmdGpu::ImageType::Color1DArray && dim_idx == 1) ||
+               (layout_type == AmdGpu::ImageType::Color2DArray && dim_idx == 2);
     };
     const u32 num_coords = view_type == AmdGpu::ImageType::Color1D ? 1u
                            : (view_type == AmdGpu::ImageType::Color1DArray ||
@@ -822,6 +852,10 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
     const auto get_coord = [&](u32 coord_idx, u32 dim_idx) -> IR::Value {
         const auto coord = get_addr_reg(coord_idx);
         if (is_msaa) {
+            if (is_slice(dim_idx)) {
+                // FIX-GT7-125: an MSAA array's layer, never scaled by a dimension.
+                return ir.ConvertFToU(32, ir.FPRoundEven(coord));
+            }
             // For MSAA images preserve the unnormalized coord or manually unnormalize it
             if (unnormalized) {
                 return ir.ConvertFToU(32, coord);
@@ -846,7 +880,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
 
     // Now we can load body components as noted in Table 8.9 Image Opcodes with Sampler
     const IR::Value coords = [&] -> IR::Value {
-        switch (view_type) {
+        switch (layout_type) {
         case AmdGpu::ImageType::Color1D: // x
             addr_reg = addr_reg + 1;
             return get_coord(addr_reg - 1, 0);
@@ -862,7 +896,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
                                          get_coord(addr_reg - 1, 2));
         default:
-            UNREACHABLE();
+            UNREACHABLE_MSG("Image type {} for sample coordinates ({})", view_type, describe());
         }
     }();
 

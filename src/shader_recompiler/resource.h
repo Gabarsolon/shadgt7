@@ -168,6 +168,25 @@ inline bool FMaskKeyEnabled() {
     return enabled;
 }
 
+/// FIX-GT7-125: an MSAA array T# (Color2DMsaaArray, kept by array instructions) is translated:
+/// samples and loads read it as a multisampled array, its size is queried without a level. The
+/// translation stopped at the image type before (no SPIR-V type, no sample coordinates for it),
+/// and GT7's draws with such a T# were queued again and again and never drawn (one failed
+/// translation every 2 s in quiet race stretches of 11-08). RYGT_MSAA_ARRAY_SAMPLE=0: as before.
+inline bool MsaaArrayEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_MSAA_ARRAY_SAMPLE");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+/// FIX-GT7-125: the multisampled view types the translation handles.
+inline bool IsMsaaView(AmdGpu::ImageType type) {
+    return type == AmdGpu::ImageType::Color2DMsaa ||
+           (type == AmdGpu::ImageType::Color2DMsaaArray && MsaaArrayEnabled());
+}
+
 enum class MipStorageFallbackMode : u16 {
     None,
     DynamicIndex,
