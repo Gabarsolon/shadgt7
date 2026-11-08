@@ -76,6 +76,9 @@ void SetCompileCatchUp(bool on);
 /// missing), compile work uses every core below normal priority, even while a thread builds a
 /// pipeline it waits for. Calls nest.
 void SetCompileBacklog(bool on);
+/// FIX-GT7-109: while the game is in a race, compile work never widens (waits, catch-ups and
+/// backlogs keep it on its cores).
+void SetCompileInPlay(bool on);
 /// PERF-GT7-032: compile work runs below normal priority now.
 bool CompileThreadsLow();
 

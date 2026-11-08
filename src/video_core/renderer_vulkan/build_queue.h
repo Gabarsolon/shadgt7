@@ -18,6 +18,11 @@ namespace Vulkan {
 /// FIX-GT7-100: pipeline builds queued or running, for the compile notice.
 inline std::atomic<u32> g_build_jobs{0};
 
+/// FIX-GT7-109: the game is in play (a race: slow frames for a second; FIX-GT7-120: kept by a
+/// heavy scene), as PipelineCache::UpdateCatchUp measures it. Compile work then stays on its
+/// cores at its usual width, and background compiles that read it pause.
+inline std::atomic<bool> g_game_in_play{false};
+
 /// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, the last
 /// one first; then FIX-GT7-009's screen ones (draws skipped again: each builds the one on screen
 /// skipped most) in order; then PERF-GT7-025's soon ones (draws that went on without their

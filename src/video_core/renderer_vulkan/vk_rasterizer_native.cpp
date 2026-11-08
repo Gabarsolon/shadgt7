@@ -12,6 +12,7 @@
 // barrier, and around dispatches and copies. Later versions record the game's render jobs on its
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
+#include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
@@ -3130,6 +3131,18 @@ std::string NativeRenderer::OneOffText() {
     return text;
 }
 
+// FIX-GT7-109: a frame's wait for one-off pipelines in play (0: as at loads).
+static u64 PlayBudgetNs() {
+    static const u64 ns = [] {
+        u64 ms = 12;
+        if (const char* env = std::getenv("RYGT_ONE_OFF_PLAY_BUDGET_MS"); env && *env) {
+            ms = std::strtoull(env, nullptr, 10);
+        }
+        return ms * 1000000ull;
+    }();
+    return ns;
+}
+
 bool NativeRenderer::OneOffBudgetLeft() {
     // FIX-GT7-102: on a first GT7 race load (every shader new) one frame lasted 185 s: about
     // 5,000 draws into ~20 new pictures waited for their pipelines (FIX-198), one after the
@@ -3139,7 +3152,7 @@ bool NativeRenderer::OneOffBudgetLeft() {
     // other one-off draws are skipped and show as their pipelines arrive, as in keep-going mode.
     // In play the pipelines are usually known and the budget is not reached.
     static const u64 budget_ns = [] {
-        u64 ms = 250;
+        u64 ms = 40; // FIX-GT7-109: 250 before, with waits as long as a compile
         if (const char* env = std::getenv("RYGT_ONE_OFF_BUDGET_MS"); env && *env) {
             ms = std::strtoull(env, nullptr, 10);
         }
@@ -3151,8 +3164,45 @@ bool NativeRenderer::OneOffBudgetLeft() {
     if (one_off_budget_frame != frame) {
         one_off_budget_frame = frame;
         one_off_wait_ns_frame = 0;
+        // FIX-GT7-109: in play (the game at 15 frames a second or more) a frame's one-off draws
+        // wait RYGT_ONE_OFF_PLAY_BUDGET_MS in all (12 by default), never for a whole compile:
+        // a new track's race start had frames of 400-940 ms (translations and pipelines of
+        // one-off pictures), races 60-120 ms ones. Loads (slow frames) keep the budget above.
+        // The game's own frame count, over half a second or more.
+        const auto now = std::chrono::steady_clock::now();
+        const u64 game_frames = Common::GetGameFrameTotals().frames;
+        if (one_off_rate_since == std::chrono::steady_clock::time_point{}) {
+            one_off_rate_since = now;
+            one_off_rate_frames = game_frames;
+        } else if (now - one_off_rate_since >= std::chrono::milliseconds{500}) {
+            const double seconds = std::chrono::duration<double>(now - one_off_rate_since).count();
+            // 15 frames a second, as FIX-GT7-109's race state: a slower PC races at 20-25.
+            one_off_interactive = double(game_frames - one_off_rate_frames) / seconds >= 15.0 ||
+                                  g_game_in_play.load(std::memory_order_relaxed);
+            one_off_rate_since = now;
+            one_off_rate_frames = game_frames;
+        }
     }
-    return one_off_wait_ns_frame < budget_ns;
+    return one_off_wait_ns_frame < (one_off_interactive ? PlayBudgetNs() : budget_ns);
+}
+
+std::chrono::steady_clock::time_point NativeRenderer::OneOffDeadline() {
+    // FIX-GT7-109: every wait ends at the frame's budget (in play or at a load), so no frame
+    // waits a whole compile (a race start had frames of 170-940 ms). RYGT_ONE_OFF_BUDGET_MS=0:
+    // unbounded at loads, as before FIX-GT7-102.
+    static const u64 load_ns = [] {
+        u64 ms = 40;
+        if (const char* env = std::getenv("RYGT_ONE_OFF_BUDGET_MS"); env && *env) {
+            ms = std::strtoull(env, nullptr, 10);
+        }
+        return ms * 1000000ull;
+    }();
+    const u64 budget = one_off_interactive ? PlayBudgetNs() : load_ns;
+    if (budget == 0) {
+        return std::chrono::steady_clock::time_point::max();
+    }
+    const u64 left = budget > one_off_wait_ns_frame ? budget - one_off_wait_ns_frame : 0;
+    return std::chrono::steady_clock::now() + std::chrono::nanoseconds{left};
 }
 
 bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
@@ -8385,12 +8435,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
         PhaseClock clock{stats.phase_ns[0]};
         const auto wait_start = std::chrono::steady_clock::now();
-        pipeline = r.AcquireGraphicsPipelineWaiting(params);
+        pipeline = r.AcquireGraphicsPipelineWaiting(params, OneOffDeadline()); // FIX-GT7-109
         one_off_wait_ns_frame += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - wait_start)
                                          .count()); // FIX-GT7-102
-        ++stats.one_off_waits;
-        WatchOneOffs(regs, false); // DIAG-GT7-008, PERF-GT7-023
+        if (pipeline) {
+            ++stats.one_off_waits;
+            WatchOneOffs(regs, false); // DIAG-GT7-008, PERF-GT7-023
+        } else {
+            ++stats.one_off_budget_skips; // FIX-GT7-109: not ready within the play budget
+            WatchOneOffs(regs, true);
+        }
     } else if (must_wait) {
         // FIX-GT7-102: this frame already waited its budget for one-off pipelines: skipped as
         // other draws are, and watched as a skip (it never makes its kind safe).

@@ -392,6 +392,7 @@ struct DriverCompileThreads {
     int waits = 0;
     int catch_up = 0;
     int backlog = 0; ///< FIX-GT7-106
+    bool in_play = false; ///< FIX-GT7-109
     int foreground = 0;
     bool applied_wide = false;
     bool applied_low = false;
@@ -431,7 +432,8 @@ void ApplyCompileState(DriverCompileThreads& d) {
     // FIX-GT7-106: a backlog of draws on screen: every core (FIX-GT7-107), foreground or not,
     // below normal priority: Monza's first race filled in at 7.7 pipelines a second, the same as at
     // normal priority. RYGT_COMPILE_BACKLOG_LOW=0: the driver threads' own priority.
-    const bool wide = d.waits > 0 || d.backlog > 0 || (d.catch_up > 0 && d.foreground == 0);
+    const bool wide = !d.in_play && // FIX-GT7-109
+                      (d.waits > 0 || d.backlog > 0 || (d.catch_up > 0 && d.foreground == 0));
     static const bool backlog_low = [] {
         const char* env = std::getenv("RYGT_COMPILE_BACKLOG_LOW");
         return !(env && env[0] == '0');
@@ -680,6 +682,13 @@ void SetCompileBacklog(bool on) {
     ApplyCompileState(d);
 }
 
+void SetCompileInPlay(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.in_play = on;
+    ApplyCompileState(d);
+}
+
 bool CompileThreadsLow() {
     // PERF-GT7-055 (RYGT_COMPILE_LOW=1): ApplyCompileState counts it in low_now under the mutex.
     return DriverThreads().low_now.load(std::memory_order_relaxed);
@@ -846,6 +855,8 @@ bool CompileCoresWide() {
 void SetCompileCatchUp(bool) {}
 
 void SetCompileBacklog(bool) {}
+
+void SetCompileInPlay(bool) {}
 
 bool CompileThreadsLow() {
     return false;
