@@ -58,6 +58,8 @@ class ImageRegistry;
 struct MadeImage;
 namespace Rhi {
 class Buffer;
+class Image;     // FIX-GT7-133
+class ImageView; // FIX-GT7-133
 class CommandList;
 class Device;
 class Pipeline;
@@ -1356,6 +1358,17 @@ private:
 
     /// CMASK / HTILE addresses the game cleared: the next pass into their target clears it.
     std::unordered_set<VAddr> cleared_meta;
+    /// FIX-GT7-133: a 1x1 depth image at 1.0 that stands in for an empty T# sampled with a
+    /// depth comparison (2D and 2D-array views), so that the sampler's border still applies.
+    std::unique_ptr<Native::Rhi::Image> depth_stand_in;
+    std::array<std::unique_ptr<Native::Rhi::ImageView>, 2> depth_stand_in_views;
+    std::array<std::atomic<VkImageView>, 2> depth_stand_in_handles{};
+    /// FIX-GT7-133: the stand-in's view (made, and the image cleared, on the recorder only when
+    /// `may_create`); none when off or not made yet.
+    vk::ImageView DepthStandIn(bool array, bool may_create);
+    /// FIX-GT7-133: RYGT_NATIVE_DEPTH_STAND_IN is not 0. A prepared draw that needs the stand-in
+    /// before the recorder made it goes to the recorder.
+    static bool DepthStandInOn();
     /// Color targets by their CMASK address, depth targets by their HTILE address (so a clear
     /// of the metadata can be told from a clear of a picture).
     std::unordered_set<VAddr> known_meta;

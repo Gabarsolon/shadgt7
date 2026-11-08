@@ -6691,8 +6691,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             }
         };
         const auto bind_null = [&](u32 reason) {
+            const vk::ImageView stand_in =
+                image_desc.is_depth && !storage && num_bindings == 1 && !cube_sampling
+                    ? DepthStandIn(image_desc.is_array, true) // FIX-GT7-133
+                    : vk::ImageView{};
             for (u32 i = 0; i < num_bindings; ++i) {
-                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+                b.images.push_back({VK_NULL_HANDLE, stand_in, vk::ImageLayout::eGeneral});
             }
             ++stats.null_images;
             ++stats.null_reasons[reason];
@@ -6948,6 +6952,81 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             .pImageInfo = &b.images.back(),
         });
     }
+}
+
+// FIX-GT7-133: an empty T# (address 0) sampled with a depth comparison was bound as a null
+// descriptor, which reads 0 whatever the sampler says, so every comparison failed: "in shadow".
+// On the console the texture unit still applies the sampler's addressing, and outside [0, 1] a
+// border-clamped sampler returns its border colour. GT7's Scapes backdrop shades the ground the
+// car's cascade doesn't cover with a fallback shadow map that is such an empty 1x1 T#, its matrix
+// putting every point far outside, under a white-bordered, less-equal sampler: lit on the console,
+// in full shadow here. All the ground around the car was about six times too dark (a pale
+// rectangle where the car's cascade lit it, a dark band where the ground ended). A 1x1 depth image
+// at the far depth (1.0: nothing in front, as an absent shadow map means) now stands in for such
+// T#s; at 0, the strip of ground the matrix puts inside [0, 1] stayed a thin dark line across the
+// road. RYGT_NATIVE_DEPTH_STAND_IN=0: null descriptors, as before.
+bool NativeRenderer::DepthStandInOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_DEPTH_STAND_IN");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
+    if (!DepthStandInOn()) {
+        return {};
+    }
+    const u32 i = array ? 1 : 0;
+    if (const VkImageView ready = depth_stand_in_handles[i].load(std::memory_order_acquire)) {
+        return vk::ImageView{ready};
+    }
+    if (!may_create) {
+        return {};
+    }
+    if (!depth_stand_in) {
+        depth_stand_in = device->CreateImage({
+            .dim = Native::Rhi::ImageDim::D2,
+            .format = Native::Rhi::FormatFromVk(VK_FORMAT_D32_SFLOAT),
+            .width = 1,
+            .height = 1,
+            .layers = 1,
+            .mips = 1,
+            .usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferDst,
+            .name = "native depth stand-in",
+        });
+        if (!depth_stand_in) {
+            return {};
+        }
+        Stream& s = Begin();
+        EndRendering();
+        device->RecordPendingImageInit(*s.list);
+        s.cmd.clearDepthStencilImage(
+            vk::Image{Handle<VkImage_T>(depth_stand_in->NativeHandle())}, vk::ImageLayout::eGeneral,
+            vk::ClearDepthStencilValue{1.0f, 0},
+            vk::ImageSubresourceRange{.aspectMask = vk::ImageAspectFlagBits::eDepth,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1});
+        GlobalBarrier();
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-133: a 1x1 depth image at 1.0 stands in for empty T#s "
+                    "sampled with a depth comparison (frame {})", frame);
+    }
+    auto& view = depth_stand_in_views[i];
+    if (!view) {
+        view = device->CreateImageView(
+            depth_stand_in.get(),
+            Native::Rhi::ImageViewDesc{.dim = array ? Native::Rhi::ViewDim::D2Array
+                                                    : Native::Rhi::ViewDim::D2,
+                                       .aspect = Native::Rhi::AspectDepth});
+        if (!view) {
+            return {};
+        }
+    }
+    const VkImageView handle = Handle<VkImageView_T>(view->NativeHandle());
+    depth_stand_in_handles[i].store(handle, std::memory_order_release);
+    return vk::ImageView{handle};
 }
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
@@ -10068,12 +10147,22 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             });
             binding.unified += num_bindings;
         };
+        // false: the draw goes to the recorder (FIX-GT7-133's stand-in not made yet).
         const auto bind_null = [&] {
+            const bool wants_stand_in =
+                image_desc.is_depth && !storage && num_bindings == 1 && !cube_sampling;
+            const vk::ImageView stand_in = wants_stand_in
+                                               ? DepthStandIn(image_desc.is_array, false)
+                                               : vk::ImageView{};
+            if (wants_stand_in && !stand_in && DepthStandInOn()) {
+                return false; // FIX-GT7-133: made and cleared on the recorder, which binds it
+            }
             for (u32 i = 0; i < num_bindings; ++i) {
-                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+                b.images.push_back({VK_NULL_HANDLE, stand_in, vk::ImageLayout::eGeneral});
             }
             ++p.null_images;
             add_write();
+            return true;
         };
         std::array<u64, 4> raw_sharp{};
         static_assert(sizeof(tsharp) == sizeof(raw_sharp));
@@ -10111,12 +10200,16 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined ||
             VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits()) !=
                 VideoCore::ImageDescriptorGeometryError::None) {
-            bind_null();
+            if (!bind_null()) {
+                return false;
+            }
             continue;
         }
         const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
         if (!r.IsMappedStart(desc.info.guest_address)) {
-            bind_null();
+            if (!bind_null()) {
+                return false;
+            }
             continue;
         }
         Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);
