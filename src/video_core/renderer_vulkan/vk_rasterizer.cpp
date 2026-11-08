@@ -1266,8 +1266,10 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
             return nullptr; // FIX-GT7-109
         }
     }
-    if (!found && bounded) {
-        return nullptr; // FIX-GT7-109: never a wait without a deadline in play
+    if (!found && bounded && unlocked) {
+        // FIX-GT7-109: never a wait without a deadline in play. (RYGT_ONE_OFF_UNLOCKED=0 waits
+        // under the lock as before, deadline or not: it never skipped a one-off draw.)
+        return nullptr;
     }
     if (!found) {
         std::scoped_lock lk{pipeline_cache.LookupMutex()};

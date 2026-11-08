@@ -1708,10 +1708,11 @@ bool PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& bu
         LOG_WARNING(Render_Vulkan,
                     "PERF-GT7-020: in {:.1f} s, {} draws into one-off targets waited for their "
                     "pipeline without the lookup lock ({:.1f} ms; {} built by the waiting thread); "
-                    "PERF-GT7-036: {} for their shaders ({:.1f} ms)",
+                    "PERF-GT7-036: {} for their shaders ({:.1f} ms); FIX-GT7-109: {} gave up at "
+                    "their frame's deadline",
                     (now_ms - since) / 1000.0, stats.waits.exchange(0), stats.wait_us.exchange(0) / 1000.0,
                     stats.built_here.exchange(0), stats.shader_waits.exchange(0),
-                    stats.shader_wait_us.exchange(0) / 1000.0);
+                    stats.shader_wait_us.exchange(0) / 1000.0, stats.budget_skips.exchange(0));
     }
     return true;
 }
@@ -3565,18 +3566,13 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         const char* env = std::getenv("RYGT_COMPILE_BACKLOG");
         return env && *env ? size_t(std::strtoull(env, nullptr, 10)) : size_t{256};
     }();
-    if (backlog_enter != 0) {
-        size_t backlog = 0;
-        {
-            std::scoped_lock lk2{on_screen_mutex};
-            backlog = on_screen.size();
-        }
-        bool want = backlog >= backlog_enter || (c.backlog && backlog > backlog_enter / 4);
-        // FIX-GT7-109: never in a race: with compiles on every core the game's and the
-        // renderer's threads shared their cores (frames of 60-120 ms, seconds under 30 fps,
-        // throttled at 30 ms a frame or not). In play (15 frames a second or more, each over
-        // 19 ms: a race, not a 60 fps menu) they stay on their cores, and the compile pack's
-        // start-up compile pauses.
+    // FIX-GT7-109: never in a race: with compiles on every core the game's and the
+    // renderer's threads shared their cores (frames of 60-120 ms, seconds under 30 fps,
+    // throttled at 30 ms a frame or not). In play (15 frames a second or more, each over
+    // 19 ms: a race, not a 60 fps menu) they stay on their cores, and background compiles
+    // that read g_game_in_play pause. Measured whatever RYGT_COMPILE_BACKLOG says: the play
+    // state also bounds the one-off waits and the width of the compiles.
+    {
         const auto totals = Common::GetGameFrameTotals();
         const u64 draws = Common::GetWorkCounters().draws.load(std::memory_order_relaxed);
         if (c.backlog_window == std::chrono::steady_clock::time_point{}) {
@@ -3625,7 +3621,15 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
                                  : "not in play, compiles may widen");
             }
         }
-        want = want && !c.backlog_throttled;
+    }
+    if (backlog_enter != 0) {
+        size_t backlog = 0;
+        {
+            std::scoped_lock lk2{on_screen_mutex};
+            backlog = on_screen.size();
+        }
+        const bool want = (backlog >= backlog_enter || (c.backlog && backlog > backlog_enter / 4)) &&
+                          !c.backlog_throttled; // FIX-GT7-109: never in play
         if (want != c.backlog) {
             c.backlog = want;
             build_workers->SetBacklog(want);
