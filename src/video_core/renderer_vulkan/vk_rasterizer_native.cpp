@@ -3291,6 +3291,27 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             }
             return OneOffExempt(described); // never drawn into; PERF-GT7-023: unless its kind
         }
+        // FIX-GT7-130: a picture a fill rewrote whole, with nothing drawn into it since: skipped,
+        // the draw would leave the fill (black), not the last frame's picture as a skip usually
+        // does. GT7's Scapes clear a work picture at a photo's last frame and draw the photo's
+        // result into it, once, before filtering it into the photo: with that draw's pipeline
+        // new, it was skipped and every first photo of a game came out black (the second, its
+        // pipeline built, did not). Such a draw waits as a one-off draw does, within its frame's
+        // budget (FIX-GT7-102/109). RYGT_NATIVE_WAIT_AFTER_FILL=0: as before.
+        static const bool after_fill = [] {
+            const char* env = std::getenv("RYGT_NATIVE_WAIT_AFTER_FILL");
+            return !(env && env[0] == '0');
+        }();
+        if (after_fill && registry->FilledWhole(address, entry->info.guest_size)) {
+            static std::atomic<u32> fill_logged{};
+            if (const u32 n = fill_logged++; n < 64 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-130: a draw into {:#x} {}x{}, filled whole and not drawn "
+                            "since, waits for its pipeline (frame {}, {} so far)",
+                            address, entry->info.size.width, entry->info.size.height, frame, n + 1);
+            }
+            return false;
+        }
         const u64 last = entry->written_frame.load(std::memory_order_relaxed);
         const u64 earlier =
             last < frame ? last : entry->written_frame_before.load(std::memory_order_relaxed);

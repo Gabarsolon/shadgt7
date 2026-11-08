@@ -1283,6 +1283,14 @@ void ImageRegistry::ForgetFills(VAddr address, u64 size) {
     }
 }
 
+bool ImageRegistry::FilledWhole(VAddr address, u64 size) {
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::scoped_lock lock{recent_fills_mutex};
+    return std::ranges::any_of(recent_fills, [&](const RecentFill& fill) {
+        return fill.end != 0 && fill.begin <= address && end <= fill.end;
+    });
+}
+
 void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     ForgetFills(address, size); // FIX-GT7-036
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
