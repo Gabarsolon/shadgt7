@@ -1,0 +1,31 @@
+name: Renderer PR compile check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-compile-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  renderer:
+    name: Compile Vulkan renderer
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Support long submodule paths
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Compile PR merge checkout
+        shell: pwsh
+        run: ./.github/scripts/compile-renderer.ps1
