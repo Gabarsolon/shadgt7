@@ -600,6 +600,16 @@ private:
         bool diag_ahead{};    ///< DIAG-GT7-073: queued by a read-ahead state
         std::chrono::steady_clock::time_point queued_at{};
         bool too_old{}; ///< FIX-GT7-052: dropped before a worker translated it
+        /// FIX-GT7-124: its tessellation constants as the draw had them (when the program's are
+        /// known to be there); a translation without them that read another draw's ended
+        /// (`tess_stale`), learning where they are (`tess_ptr_base`, `tess_dword_offset`).
+        std::optional<Shader::Info::PinnedTessConstants> tess_constants;
+        /// FIX-GT7-124: the program's constants V# location was known when queued: pinned, or the
+        /// draw's own constants are already garbage (FIX-058) and are translated as before.
+        bool tess_location_known{};
+        bool tess_stale{};
+        u32 tess_ptr_base{};
+        s32 tess_dword_offset{-1};
         /// Set when harvested: its specialization, and when it became ready.
         Shader::StageSpecialization spec;
         std::chrono::steady_clock::time_point ready_since{};
@@ -645,8 +655,18 @@ private:
         u64 waited_stage[8]{};
         double wait_ms_stage[8]{};
         u64 waited_writer{}, waited_forced{}, waited_shaders{}, waited_dropped{};
+        u64 tess_pinned{}; ///< FIX-GT7-124: queued with their draw's tessellation constants
+        u64 tess_stale{};  ///< FIX-GT7-124: ended on another draw's, queued again
         std::chrono::steady_clock::time_point since{};
     } translate_stats;
+    /// FIX-GT7-124 (lookup lock held): where a tessellation program reads its constants V#
+    /// (Info::tess_consts_ptr_base, tess_consts_dword_offset), from its translations.
+    struct TessLocation {
+        u32 ptr_base;
+        s32 dword_offset;
+    };
+    tsl::robin_map<u64, TessLocation> tess_locations;
+    std::optional<TessLocation> KnownTessLocation(u64 hash);
     std::unique_ptr<TranslateWorkers> translate_workers;
 
     /// PERF-GT7-019: the shader store's reads (a new program's stored permutations, then their

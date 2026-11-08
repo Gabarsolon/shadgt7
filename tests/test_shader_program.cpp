@@ -518,3 +518,244 @@ TEST(ShaderSpecialization, PackedInputsNeverStandForVertexAttributesReadFromMemo
     info.sw_stage = Shader::SwStage::TessellationControl;
     EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
 }
+
+// FIX-GT7-124: tessellation constants pinned as their draw had them.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
+namespace {
+
+Shader::SwTessControlRuntimeInfo TcsRegisters(u32 input_cp, u8 lds_emulation, u8 patches) {
+    Shader::SwTessControlRuntimeInfo tcs{};
+    tcs.num_input_control_points = input_cp;
+    tcs.lds_emulation = lds_emulation;
+    tcs.num_patches = patches;
+    return tcs;
+}
+
+Shader::TessellationDataConstantBuffer TessConstants(u32 ls_stride, u32 cp_stride, u32 patches,
+                                                     u32 output_base) {
+    Shader::TessellationDataConstantBuffer c{};
+    c.ls_stride = ls_stride;
+    c.hs_cp_stride = cp_stride;
+    c.num_patches = patches;
+    c.hs_output_base = output_base;
+    return c;
+}
+
+// Guest memory is at the guest's addresses, and a V#'s base address has 40 bits: a page below
+// 2^40 stands for it.
+u8* LowGuestPage() {
+    static u8* const page = []() -> u8* {
+        for (u64 hint = 0x2000000000ULL; hint < (1ULL << 40); hint += 0x1000000000ULL) {
+#ifdef _WIN32
+            void* p = VirtualAlloc(reinterpret_cast<void*>(hint), 0x10000, MEM_RESERVE | MEM_COMMIT,
+                                   PAGE_READWRITE);
+#else
+            void* p = mmap(reinterpret_cast<void*>(hint), 0x10000, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) {
+                p = nullptr;
+            }
+#endif
+            if (p && reinterpret_cast<u64>(p) + 0x10000 <= (1ULL << 40)) {
+                return static_cast<u8*>(p);
+            }
+        }
+        return nullptr;
+    }();
+    return page;
+}
+
+// A hull shader's constants V# at dword 16 of the table user data registers 2-3 point at, and
+// the constants it points at; returns them.
+Shader::TessellationDataConstantBuffer* PlaceTessConstants(
+    u8* page, std::array<u32, Shader::ShaderParams::NumShaderUserData>& user_data) {
+    auto* constants = reinterpret_cast<Shader::TessellationDataConstantBuffer*>(page + 0x100);
+    *constants = TessConstants(0x28, 0x30, 16, 0x280);
+    AmdGpu::Buffer sharp{};
+    sharp.base_address = reinterpret_cast<u64>(constants);
+    std::memcpy(page + 16 * 4, &sharp, sizeof(sharp));
+    std::memcpy(page + 20 * 4, &sharp, sizeof(sharp));
+    const u64 table = reinterpret_cast<u64>(page);
+    std::memcpy(&user_data[2], &table, sizeof(table));
+    return constants;
+}
+
+} // namespace
+
+// The constants of GT7's draws (DIAG-059 lines of the 11-05 to 11-08 logs, with their FIX-227
+// registers) are taken as their draws'.
+TEST(TessConstantsPin, ConstantsOfGt7DrawsFitTheirRegisters) {
+    EXPECT_TRUE(TcsRegisters(1, 2, 16).FitsConstants(TessConstants(0x28, 0x30, 16, 0x280)));
+    EXPECT_TRUE(TcsRegisters(22, 2, 11).FitsConstants(TessConstants(0x18, 0xb0, 11, 0x16b0)));
+    // Passing its inputs through: no output base.
+    EXPECT_TRUE(TcsRegisters(4, 2, 64).FitsConstants(TessConstants(0x24, 0x24, 64, 0)));
+    // Without the LDS emulation the registers' patches are not kept.
+    EXPECT_TRUE(TcsRegisters(1, 0, 0).FitsConstants(TessConstants(0x8, 0x30, 16, 0x80)));
+    // An 80-byte LS stride (FIX-GT7-119) is a draw's too.
+    EXPECT_TRUE(TcsRegisters(20, 2, 12).FitsConstants(TessConstants(80, 0xd0, 12, 20 * 80 * 12)));
+}
+
+// What workers read after GT7 wrote that memory again (11-08 logs) is not taken as a draw's.
+TEST(TessConstantsPin, ConstantsOfAnotherDrawDoNotFit) {
+    const auto regs = TcsRegisters(1, 2, 16);
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x3F800000, 0x30, 16, 0x280)));  // 1.0f
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x10028000, 0x1000e329, 0, 0))); // addresses
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0, 0, 0, 0))); // unmapped: zeros
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x2a, 0x30, 16, 0x2a0)));
+    // The same program's constants of a draw with other patches.
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x28, 0x30, 11, 0x1b8)));
+    // Another program's: sane, but not these registers'.
+    EXPECT_FALSE(TcsRegisters(22, 2, 11).FitsConstants(TessConstants(0x28, 0x30, 16, 0x280)));
+    EXPECT_FALSE(TcsRegisters(1, 0, 0).FitsConstants(TessConstants(0x18, 0xb0, 11, 0x16b0)));
+}
+
+TEST(TessConstantsPin, PinnedConstantsStandForMemoryWrittenAgain) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = PlaceTessConstants(page, user_data);
+    const auto pin = Shader::Info::ReadTessConstants(user_data, 2, 16);
+    ASSERT_TRUE(pin.has_value());
+    EXPECT_EQ(pin->sharp_address, reinterpret_cast<u64>(page) + 16 * 4);
+    EXPECT_EQ(pin->constants.ls_stride, 0x28u);
+    EXPECT_EQ(pin->constants.hs_output_base, 0x280u);
+
+    // The game writes that memory again for a later draw.
+    *constants = TessConstants(0x3F800000, 0x10028000, 0, 0);
+    Shader::Info info;
+    info.sw_stage = Shader::SwStage::TessellationControl;
+    info.user_data = user_data;
+    info.tess_consts_ptr_base = static_cast<Shader::IR::ScalarReg>(2);
+    info.tess_consts_dword_offset = 16;
+    Shader::TessellationDataConstantBuffer read{};
+    info.ReadTessConstantBuffer(read);
+    EXPECT_EQ(read.ls_stride, 0x3F800000u);
+    info.pinned_tess_constants = pin;
+    info.ReadTessConstantBuffer(read);
+    EXPECT_EQ(read.ls_stride, 0x28u);
+    EXPECT_EQ(read.hs_cp_stride, 0x30u);
+    EXPECT_EQ(read.hs_output_base, 0x280u);
+    // A pin made for another V# is not these constants.
+    info.tess_consts_dword_offset = 20;
+    info.ReadTessConstantBuffer(read);
+    EXPECT_EQ(read.ls_stride, 0x3F800000u);
+}
+
+TEST(TessConstantsPin, ReadsAVSharpInTheUserDataRegisters) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = reinterpret_cast<Shader::TessellationDataConstantBuffer*>(page + 0x200);
+    *constants = TessConstants(0x18, 0xb0, 11, 0x16b0);
+    AmdGpu::Buffer sharp{};
+    sharp.base_address = reinterpret_cast<u64>(constants);
+    std::memcpy(&user_data[4], &sharp, sizeof(sharp));
+    const u32 in_registers = static_cast<u32>(Shader::IR::NumScalarRegs);
+    const auto pin = Shader::Info::ReadTessConstants(user_data, in_registers, 4);
+    ASSERT_TRUE(pin.has_value());
+    EXPECT_EQ(pin->sharp_address, 0u);
+    EXPECT_EQ(pin->constants.hs_output_base, 0x16b0u);
+    // Past the registers, or no V#: nothing to pin.
+    EXPECT_FALSE(Shader::Info::ReadTessConstants(user_data, in_registers,
+                                                 static_cast<s32>(user_data.size()) - 3)
+                     .has_value());
+    EXPECT_FALSE(Shader::Info::ReadTessConstants(user_data, in_registers, 8).has_value());
+    EXPECT_FALSE(Shader::Info::ReadTessConstants(user_data, 2, -1).has_value());
+}
+
+// PERF-GT7-111: a recorded translation with pinned constants logs the reads they stand for, in
+// the order the unpinned reads come, so the manifest's replay gives the pinned constants.
+TEST(TessConstantsPin, PinnedReadsAreLoggedAsTheReadsTheyStandFor) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = PlaceTessConstants(page, user_data);
+    const auto pin = Shader::Info::ReadTessConstants(user_data, 2, 16);
+    ASSERT_TRUE(pin.has_value());
+    *constants = TessConstants(0x3F800000, 0x10028000, 0, 0);
+    Shader::Info info;
+    info.user_data = user_data;
+    info.tess_consts_ptr_base = static_cast<Shader::IR::ScalarReg>(2);
+    info.tess_consts_dword_offset = 16;
+    Shader::TessellationDataConstantBuffer read{};
+    Common::GuestReadLog unpinned, pinned;
+    Common::t_guest_read_log = &unpinned;
+    info.ReadTessConstantBuffer(read);
+    info.pinned_tess_constants = pin;
+    Common::t_guest_read_log = &pinned;
+    info.ReadTessConstantBuffer(read);
+    Common::t_guest_read_log = nullptr;
+    ASSERT_EQ(unpinned.spans.size(), 2u);
+    ASSERT_EQ(pinned.spans.size(), 2u);
+    for (size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(pinned.spans[i].address, unpinned.spans[i].address);
+        EXPECT_EQ(pinned.spans[i].size, unpinned.spans[i].size);
+    }
+    Common::GuestReadLog replay = pinned;
+    replay.replay = true;
+    info.pinned_tess_constants.reset();
+    Common::t_guest_read_log = &replay;
+    info.ReadTessConstantBuffer(read);
+    Common::t_guest_read_log = nullptr;
+    EXPECT_EQ(read.ls_stride, 0x28u);
+    EXPECT_EQ(replay.misses, 0u);
+}
+
+// A domain shader reads only the control point stride: GT7's (0x20 to 0x150 bytes) are taken, what
+// a late read finds (1.0f as the stride: 66 million vec4 inputs) is not.
+TEST(TessConstantsPin, DomainShaderConstantsFit) {
+    using Tes = Shader::SwTessEvalRuntimeInfo;
+    EXPECT_TRUE(Tes::FitsConstants(TessConstants(0x28, 0x30, 16, 0x280)));
+    EXPECT_TRUE(Tes::FitsConstants(TessConstants(0x20, 0x150, 8, 0x1400)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0x28, 0x3F800000, 16, 0x280)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0, 0, 0, 0)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0x28, 0x32, 16, 0x280)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0x28, 0x30, 0, 0x280)));
+}
+
+// The read a translation makes without a pin gives the V# with where it was read: pinned again
+// (the worker does, for its key and the manifest's record), it stands for the translation's own
+// read after the game wrote that memory again, at the same addresses.
+TEST(TessConstantsPin, ATranslationsOwnReadStandsForItsKey) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = PlaceTessConstants(page, user_data);
+    Shader::Info info;
+    info.user_data = user_data;
+    info.tess_consts_ptr_base = static_cast<Shader::IR::ScalarReg>(2);
+    info.tess_consts_dword_offset = 16;
+    Common::GuestReadLog translation;
+    Common::t_guest_read_log = &translation;
+    const auto used = info.ReadTessConstantsAt();
+    Common::t_guest_read_log = nullptr;
+    const auto expected = Shader::Info::ReadTessConstants(user_data, 2, 16);
+    ASSERT_TRUE(expected.has_value());
+    EXPECT_EQ(used.sharp_address, expected->sharp_address);
+    EXPECT_EQ(u64(used.sharp.base_address), u64(expected->sharp.base_address));
+    EXPECT_EQ(used.constants.ls_stride, 0x28u);
+    ASSERT_EQ(translation.spans.size(), 2u);
+
+    *constants = TessConstants(0x3F800000, 0x10028000, 0, 0);
+    info.pinned_tess_constants = used;
+    Common::GuestReadLog key;
+    Common::t_guest_read_log = &key;
+    Shader::TessellationDataConstantBuffer read{};
+    info.ReadTessConstantBuffer(read);
+    Common::t_guest_read_log = nullptr;
+    EXPECT_EQ(read.ls_stride, 0x28u);
+    ASSERT_EQ(key.spans.size(), 2u);
+    for (size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(key.spans[i].address, translation.spans[i].address);
+        EXPECT_EQ(key.spans[i].size, translation.spans[i].size);
+    }
+    EXPECT_EQ(0, std::memcmp(key.bytes.data(), translation.bytes.data(), key.bytes.size()));
+}
