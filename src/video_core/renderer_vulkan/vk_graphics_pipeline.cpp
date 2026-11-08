@@ -19,12 +19,16 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "common/elf_info.h"
+#include "common/singleton.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "video_core/renderer_vulkan/compile_pack.h"
+#include "video_core/renderer_vulkan/compile_pack_pipeline.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/shared_build_map.h"
 #include "video_core/renderer_vulkan/shader_object_cache.h"
@@ -1076,6 +1080,62 @@ GraphicsPipeline::GraphicsPipeline(
                 part_info.layout = *fragment_layout; // SHD-002
             }
         }
+        // PERF-GT7-108: a shader library the driver compiled, kept as a compile pack recipe.
+        const auto record_library = [&](size_t i) {
+            CompilePack::LayoutDesc layout{
+                .flags = static_cast<u32>(VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT),
+                .push_stages =
+                    static_cast<u32>(static_cast<VkShaderStageFlags>(push_constants.stageFlags)),
+                .push_size = push_constants.size,
+            };
+            const bool fragment = i == 2;
+            for (u32 set = 0; set < num_sets; ++set) { // as library_layout (SHD-002)
+                const bool fragment_set =
+                    set == Shader::Backend::StageSet(u32(Shader::SwStage::Fragment));
+                if (fragment_set != fragment || set_layout_hashes[set] == 0) {
+                    continue;
+                }
+                layout.sets.resize(set + 1);
+                CompilePack::SetLayout desc;
+                desc.flags = set == push_set
+                                 ? static_cast<u32>(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                                 : 0u;
+                for (const auto& binding : pack_bindings[set]) {
+                    if (binding.pImmutableSamplers) {
+                        return;
+                    }
+                    desc.bindings.push_back(
+                        {binding.binding, static_cast<u32>(binding.descriptorType),
+                         binding.descriptorCount,
+                         static_cast<u32>(static_cast<VkShaderStageFlags>(binding.stageFlags))});
+                }
+                layout.sets[set] = std::move(desc);
+            }
+            std::vector<u8> raw;
+            if (!CompilePack::SerializeLibrary(
+                    part_infos[i], layout, [](vk::ShaderModule m) { return ModuleCode(m); }, raw,
+                    false)) {
+                static std::atomic<u32> refused{};
+                if (++refused <= 5) {
+                    LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} library of {} not kept (state not known)",
+                             fragment ? "fragment" : "pre-raster", debug_str);
+                }
+                return;
+            }
+            static const auto pack_dir = CompilePack::Dir(
+                Common::FS::GetUserPath(Common::FS::PathType::CacheDir),
+                Common::Singleton<Common::ElfInfo>::Instance()->GameSerial(), instance.GetVendorID(),
+                instance.GetDeviceID());
+            const auto file =
+                pack_dir / fmt::format("lib-{:016x}.pack", XXH3_64bits(raw.data(), raw.size()));
+            std::error_code ec;
+            static std::atomic<u32> kept{};
+            if (!std::filesystem::exists(file, ec) && CompilePack::WriteLibraryFile(file, raw)) {
+                if (const u32 n = ++kept; n == 1 || n % 200 == 0) {
+                    LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} library recipes kept", n);
+                }
+            }
+        };
         const auto create_library = [&](size_t i) {
             BuildWatch part_watch{debug_str, i == 1 ? "pre-raster library"
                                              : i == 2 ? "fragment library"
@@ -1086,6 +1146,9 @@ GraphicsPipeline::GraphicsPipeline(
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
+            if ((i == 1 || i == 2) && CompilePack::RecordingOn()) {
+                record_library(i);
+            }
             return library;
         };
 
@@ -1528,6 +1591,54 @@ bool GraphicsPipeline::CreateShaderObjects(
                                 binary_hits.load(), compiled.load(), timed, total_ms / timed, max_ms);
                 }
             }
+            // PERF-GT7-108: a set the driver compiled from SPIR-V, kept as a compile pack recipe.
+            if (result == VK_SUCCESS && !from_binary && use_cache && CompilePack::RecordingOn()) {
+                static const auto pack_dir = CompilePack::Dir(
+                    Common::FS::GetUserPath(Common::FS::PathType::CacheDir),
+                    Common::Singleton<Common::ElfInfo>::Instance()->GameSerial(),
+                    instance.GetVendorID(), instance.GetDeviceID());
+                const auto pack_file = CompilePack::File(pack_dir, share_key);
+                std::error_code pack_ec;
+                if (!std::filesystem::exists(pack_file, pack_ec)) {
+                    CompilePack::Recipe recipe{
+                        .key = share_key,
+                        .flags = static_cast<u32>(static_cast<VkShaderCreateFlagsEXT>(flags)),
+                        .push_stages =
+                            static_cast<u32>(static_cast<VkShaderStageFlags>(push_constants.stageFlags)),
+                        .push_size = push_constants.size,
+                    };
+                    bool recordable = true;
+                    recipe.sets.resize(num_sets);
+                    for (u32 set = 0; set < num_sets; ++set) {
+                        recipe.sets[set].flags =
+                            set == push_set
+                                ? static_cast<u32>(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                                : 0u;
+                        for (const auto& binding : pack_bindings[set]) {
+                            recordable = recordable && binding.pImmutableSamplers == nullptr;
+                            recipe.sets[set].bindings.push_back(
+                                {binding.binding, static_cast<u32>(binding.descriptorType),
+                                 binding.descriptorCount,
+                                 static_cast<u32>(static_cast<VkShaderStageFlags>(binding.stageFlags))});
+                        }
+                    }
+                    for (const auto& info : create_infos) {
+                        auto& stage = recipe.stages.emplace_back();
+                        stage.stage = static_cast<u32>(info.stage);
+                        stage.next = static_cast<u32>(static_cast<VkShaderStageFlags>(info.nextStage));
+                        const auto* words = static_cast<const u32*>(info.pCode);
+                        stage.code.assign(words, words + info.codeSize / sizeof(u32));
+                    }
+                    static std::atomic<u32> recorded{};
+                    if (recordable && CompilePack::Write(pack_file, recipe)) {
+                        const u32 n = ++recorded;
+                        if (n == 1 || n % 500 == 0) {
+                            LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} compile pack recipes kept ({})",
+                                     n, pack_dir.string());
+                        }
+                    }
+                }
+            }
             if (result != VK_SUCCESS) {
                 static std::atomic<u32> logged{};
                 if (++logged <= 8) {
@@ -1808,6 +1919,11 @@ void GraphicsPipeline::BuildDescSetLayout() {
     const vk::Device device = instance.GetDevice();
     num_sets = 0;
     set_layout_hashes = {};
+    if (CompilePack::RecordingOn()) { // PERF-GT7-108
+        for (u32 set = 0; set < set_bindings.size(); ++set) {
+            pack_bindings[set].assign(set_bindings[set].begin(), set_bindings[set].end());
+        }
+    }
     for (u32 set = 0; set < set_bindings.size(); ++set) {
         auto& bindings = set_bindings[set];
         if (bindings.empty()) {

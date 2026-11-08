@@ -42,6 +42,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/read_ahead_states.h"
 #include "video_core/cache_storage.h"
+#include "video_core/renderer_vulkan/compile_pack.h"
+#include "video_core/renderer_vulkan/compile_pack_pipeline.h"
+#include "video_core/renderer_vulkan/shader_object_cache.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
@@ -1128,6 +1131,357 @@ void PipelineCache::WarmComputePipelines(std::stop_token stop) {
              warmed, files.size(), total_ms, longest_ms);
 }
 
+// PERF-GT7-108: builds one recipe's shader objects and writes them to the SO-009 cache file the
+// pipelines read (the same name: the share key with the driver version and device). False when
+// the driver refuses it.
+static bool BuildPackRecipe(const Instance& instance, const CompilePack::Recipe& recipe,
+                            const std::filesystem::path& cache_file) {
+    const vk::Device device = instance.GetDevice();
+    std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> layouts{};
+    std::vector<vk::UniqueDescriptorSetLayout> owned;
+    if (recipe.sets.size() > layouts.size()) {
+        return false;
+    }
+    for (size_t set = 0; set < recipe.sets.size(); ++set) {
+        std::vector<vk::DescriptorSetLayoutBinding> bindings;
+        for (const auto& b : recipe.sets[set].bindings) {
+            bindings.push_back({b.binding, static_cast<vk::DescriptorType>(b.type), b.count,
+                                vk::ShaderStageFlags{b.stages}, nullptr});
+        }
+        auto [result, layout] = device.createDescriptorSetLayoutUnique(
+            vk::DescriptorSetLayoutCreateInfo{
+                .flags = vk::DescriptorSetLayoutCreateFlags{recipe.sets[set].flags},
+                .bindingCount = static_cast<u32>(bindings.size()),
+                .pBindings = bindings.data(),
+            });
+        if (result != vk::Result::eSuccess) {
+            return false;
+        }
+        layouts[set] = *layout;
+        owned.push_back(std::move(layout));
+    }
+    const vk::PushConstantRange push_constants = {
+        .stageFlags = vk::ShaderStageFlags{recipe.push_stages},
+        .offset = 0,
+        .size = recipe.push_size,
+    };
+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size = {
+        .requiredSubgroupSize = 64,
+    };
+    const vk::ShaderStageFlags sized_stages = instance.RequiredSubgroupSizeStages();
+    std::vector<vk::ShaderCreateInfoEXT> infos;
+    for (const auto& stage : recipe.stages) {
+        const auto bit = static_cast<vk::ShaderStageFlagBits>(stage.stage);
+        infos.push_back(vk::ShaderCreateInfoEXT{
+            .pNext = instance.IsSubgroupSize64Supported() && (sized_stages & bit) ? &subgroup_size
+                                                                                  : nullptr,
+            .flags = vk::ShaderCreateFlagsEXT{recipe.flags},
+            .stage = bit,
+            .nextStage = vk::ShaderStageFlags{stage.next},
+            .codeType = vk::ShaderCodeTypeEXT::eSpirv,
+            .codeSize = stage.code.size() * sizeof(u32),
+            .pCode = stage.code.data(),
+            .pName = "main",
+            .setLayoutCount = static_cast<u32>(recipe.sets.size()),
+            .pSetLayouts = layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_constants,
+        });
+    }
+    std::vector<VkShaderEXT> created(infos.size());
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+        device, static_cast<u32>(infos.size()),
+        reinterpret_cast<const VkShaderCreateInfoEXT*>(infos.data()), nullptr, created.data());
+    bool ok = result == VK_SUCCESS;
+    std::vector<std::vector<u8>> binaries;
+    for (const VkShaderEXT shader : created) {
+        if (ok) {
+            size_t size = 0;
+            ok = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetShaderBinaryDataEXT(device, shader, &size,
+                                                                       nullptr) == VK_SUCCESS &&
+                 size != 0;
+            auto& data = binaries.emplace_back(size);
+            ok = ok && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetShaderBinaryDataEXT(
+                           device, shader, &size, data.data()) == VK_SUCCESS;
+        }
+    }
+    for (const VkShaderEXT shader : created) {
+        if (shader) {
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(device, shader, nullptr);
+        }
+    }
+    if (!ok) {
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(cache_file.parent_path(), ec);
+    auto temporary = cache_file;
+    temporary += fmt::format(".pack{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    if (std::FILE* file = std::fopen(temporary.string().c_str(), "wb")) {
+        ok = WriteShaderObjectBinaries(file, binaries);
+        ok = std::fclose(file) == 0 && ok;
+    } else {
+        ok = false;
+    }
+    if (ok) {
+        std::filesystem::rename(temporary, cache_file, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        std::filesystem::remove(temporary, ec);
+    }
+    return ok;
+}
+
+// PERF-GT7-108: replays one library recipe into the driver's VkPipelineCache (kept on disk at
+// exit). 1: compiled, 2: the driver had it (created in under 10 ms), 0: refused, -1: not
+// decodable (an older format).
+static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
+                            const std::vector<u8>& raw) {
+    CompilePack::LibraryReplay r;
+    if (!CompilePack::DeserializeLibrary(raw, r)) {
+        return -1;
+    }
+    const vk::Device device = instance.GetDevice();
+    std::vector<vk::UniqueShaderModule> modules;
+    std::vector<VkPipelineShaderStageCreateInfo> stages;
+    std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> subgroups(r.stages.size());
+    stages.reserve(r.stages.size());
+    const VkSpecializationInfo* spec = nullptr;
+    for (const auto& [bit, code] : r.stages) {
+        auto [result, module] = device.createShaderModuleUnique(vk::ShaderModuleCreateInfo{
+            .codeSize = code.size() * sizeof(u32),
+            .pCode = code.data(),
+        });
+        if (result != vk::Result::eSuccess) {
+            return 0;
+        }
+        const size_t index = stages.size();
+        subgroups[index] = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+            .requiredSubgroupSize = r.subgroups[index],
+        };
+        stages.push_back(VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = r.subgroups[index] ? &subgroups[index] : nullptr, // AMD-301
+            .stage = bit,
+            .module = *module,
+            .pName = "main",
+            .pSpecializationInfo = spec,
+        });
+        modules.push_back(std::move(module));
+    }
+    std::array<VkDescriptorSetLayout, Shader::Backend::MaxDescriptorSets> sets{};
+    std::vector<vk::UniqueDescriptorSetLayout> owned;
+    if (r.layout.sets.size() > sets.size()) {
+        return 0;
+    }
+    for (size_t s = 0; s < r.layout.sets.size(); ++s) {
+        if (!r.layout.sets[s]) {
+            continue;
+        }
+        std::vector<vk::DescriptorSetLayoutBinding> bindings;
+        for (const auto& b : r.layout.sets[s]->bindings) {
+            bindings.push_back({b.binding, static_cast<vk::DescriptorType>(b.type), b.count,
+                                vk::ShaderStageFlags{b.stages}, nullptr});
+        }
+        auto [result, layout] = device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlags{r.layout.sets[s]->flags},
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+        if (result != vk::Result::eSuccess) {
+            return 0;
+        }
+        sets[s] = *layout;
+        owned.push_back(std::move(layout));
+    }
+    const vk::PushConstantRange push = {
+        .stageFlags = vk::ShaderStageFlags{r.layout.push_stages},
+        .offset = 0,
+        .size = r.layout.push_size,
+    };
+    auto [layout_result, pipeline_layout] =
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .flags = vk::PipelineLayoutCreateFlags{r.layout.flags},
+            .setLayoutCount = static_cast<u32>(r.layout.sets.size()),
+            .pSetLayouts = reinterpret_cast<const vk::DescriptorSetLayout*>(sets.data()),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push,
+        });
+    if (layout_result != vk::Result::eSuccess) {
+        return 0;
+    }
+    r.rendering.colorAttachmentCount = static_cast<u32>(r.color_formats.size());
+    r.rendering.pColorAttachmentFormats = r.color_formats.data();
+    r.library.pNext = &r.rendering;
+    if (r.sample_counts) {
+        r.sample_counts->colorAttachmentCount = static_cast<u32>(r.color_samples.size());
+        r.sample_counts->pColorAttachmentSamples = r.color_samples.data();
+        r.rendering.pNext = &*r.sample_counts;
+    }
+    if (r.vertex_input) {
+        r.vertex_input->vertexBindingDescriptionCount = static_cast<u32>(r.vertex_bindings.size());
+        r.vertex_input->pVertexBindingDescriptions = r.vertex_bindings.data();
+        r.vertex_input->vertexAttributeDescriptionCount = static_cast<u32>(r.vertex_attributes.size());
+        r.vertex_input->pVertexAttributeDescriptions = r.vertex_attributes.data();
+    }
+    if (r.viewport && r.clip_control) {
+        r.viewport->pNext = &*r.clip_control;
+    }
+    if (r.raster) {
+        const void* head = nullptr;
+        for (auto it = r.raster_order.rbegin(); it != r.raster_order.rend(); ++it) {
+            if (*it == 1) {
+                r.provoking.pNext = head;
+                head = &r.provoking;
+            } else {
+                r.depth_clip.pNext = head;
+                head = &r.depth_clip;
+            }
+        }
+        r.raster->pNext = head;
+    }
+    if (r.multisample) {
+        r.multisample->pSampleMask = r.sample_mask.empty() ? nullptr : r.sample_mask.data();
+    }
+    if (r.color_blend) {
+        r.color_blend->attachmentCount = static_cast<u32>(r.blend_attachments.size());
+        r.color_blend->pAttachments = r.blend_attachments.data();
+    }
+    if (r.dynamic) {
+        r.dynamic->dynamicStateCount = static_cast<u32>(r.dynamic_states.size());
+        r.dynamic->pDynamicStates = r.dynamic_states.data();
+    }
+    const VkGraphicsPipelineCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &r.library,
+        .flags = r.flags,
+        .stageCount = static_cast<u32>(stages.size()),
+        .pStages = stages.data(),
+        .pVertexInputState = r.vertex_input ? &*r.vertex_input : nullptr,
+        .pInputAssemblyState = r.input_assembly ? &*r.input_assembly : nullptr,
+        .pTessellationState = r.tessellation ? &*r.tessellation : nullptr,
+        .pViewportState = r.viewport ? &*r.viewport : nullptr,
+        .pRasterizationState = r.raster ? &*r.raster : nullptr,
+        .pMultisampleState = r.multisample ? &*r.multisample : nullptr,
+        .pDepthStencilState = r.depth_stencil ? &*r.depth_stencil : nullptr,
+        .pColorBlendState = r.color_blend ? &*r.color_blend : nullptr,
+        .pDynamicState = r.dynamic ? &*r.dynamic : nullptr,
+        .layout = *pipeline_layout,
+        .basePipelineIndex = -1,
+    };
+    const auto start = std::chrono::steady_clock::now();
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateGraphicsPipelines(
+        device, static_cast<VkPipelineCache>(cache), 1, &info, nullptr, &pipeline);
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (pipeline) {
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyPipeline(device, pipeline, nullptr);
+    }
+    if (result != VK_SUCCESS) {
+        return 0;
+    }
+    return ms < 10.0 ? 2 : 1;
+}
+
+void PipelineCache::CompilePackShaders(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:CompilePack");
+    const auto cache_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
+    const auto dir = CompilePack::Dir(cache_dir,
+                                      Common::Singleton<Common::ElfInfo>::Instance()->GameSerial(),
+                                      instance.GetVendorID(), instance.GetDeviceID());
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.path().extension() == ".pack") {
+            files.push_back(entry.path());
+        }
+    }
+    if (files.empty()) {
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-108: no compile pack in {}", dir.string());
+        return;
+    }
+    CompilePack::g_done.store(0, std::memory_order_relaxed);
+    CompilePack::g_total.store(static_cast<u32>(files.size()), std::memory_order_relaxed);
+    CompilePack::g_running.store(true, std::memory_order_release);
+    const auto start = std::chrono::steady_clock::now();
+    std::atomic<size_t> next{0};
+    std::atomic<u32> built{0}, cached{0}, failed{0}, libraries{0};
+    const u32 cores = std::max(2u, std::thread::hardware_concurrency());
+    const u32 workers = std::clamp(cores - 2, 1u, 14u);
+    std::vector<std::thread> pool;
+    for (u32 w = 0; w < workers; ++w) {
+        pool.emplace_back([&, w] {
+            Common::SetCurrentThreadName(fmt::format("shadGT:CompilePack{}", w).c_str());
+            Common::AllowAllCores(); // FIX-GT7-107: every core but the owners'
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+            while (!stop.stop_requested()) {
+                // FIX-GT7-109: paused while the game is in play (a race).
+                while (g_game_in_play.load(std::memory_order_relaxed) && !stop.stop_requested()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                }
+                const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= files.size()) {
+                    break;
+                }
+                CompilePack::Recipe recipe;
+                if (files[index].filename().string().starts_with("lib-")) {
+                    std::vector<u8> raw;
+                    const bool readable = CompilePack::ReadLibraryFile(files[index], raw);
+                    const int outcome =
+                        readable ? BuildPackLibrary(instance, *pipeline_cache, raw) : 0;
+                    if (!readable || outcome < 0) {
+                        std::error_code remove_ec; // an older format or damaged: kept again when built
+                        std::filesystem::remove(files[index], remove_ec);
+                    }
+                    (outcome == 1 ? built : outcome == 2 ? cached : failed)++;
+                    ++libraries;
+                } else if (!CompilePack::Read(files[index], recipe)) {
+                    ++failed;
+                    std::error_code remove_ec; // an older format or damaged: kept again when built
+                    std::filesystem::remove(files[index], remove_ec);
+                } else {
+                    const auto cache_file =
+                        cache_dir / "shader_objects" /
+                        fmt::format("{:016x}.bin", recipe.key ^
+                                                       (u64(instance.GetDriverVersion()) << 32) ^
+                                                       instance.GetDeviceID());
+                    std::error_code exists_ec;
+                    if (std::filesystem::exists(cache_file, exists_ec)) {
+                        ++cached;
+                    } else if (BuildPackRecipe(instance, recipe, cache_file)) {
+                        ++built;
+                    } else {
+                        ++failed;
+                    }
+                }
+                const u32 done = CompilePack::g_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (done % 500 == 0) {
+                    LOG_INFO(Render_Vulkan, "PERF-GT7-108: compile pack {} of {}", done,
+                             files.size());
+                }
+            }
+        });
+    }
+    for (auto& thread : pool) {
+        thread.join();
+    }
+    CompilePack::g_running.store(false, std::memory_order_release);
+    if (libraries.load() != 0) {
+        // The libraries are in the driver's cache: the GPU thread's next MaybeSaveDriverCache
+        // writes it to disk (SaveDriverCache from here would race it for the writer thread).
+        driver_cache_save_requested.store(true, std::memory_order_release);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GT7-108: compile pack of {} recipes ({} of them pipeline libraries): {} "
+                "compiled, {} already in the cache, {} failed, in {:.1f} s on {} threads{}",
+                files.size(), libraries.load(), built.load(), cached.load(), failed.load(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                workers, stop.stop_requested() ? " (stopped)" : "");
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -1242,6 +1596,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         warm_compute_thread =
             std::jthread([this](std::stop_token stop) { WarmComputePipelines(stop); });
     }
+    static const bool so_cache = [] {
+        const char* env = std::getenv("RYGT_SO_CACHE");
+        return !(env && env[0] == '0');
+    }();
+    if (CompilePack::CompileOn() && so_cache && instance.IsShaderObjectEnabled()) { // PERF-GT7-108
+        compile_pack_thread =
+            std::jthread([this](std::stop_token stop) { CompilePackShaders(stop); });
+    }
     // PERF-032: the shader store: a program's stored translations are read when a draw first
     // uses it, and new translations are stored. -DisablePerf 47 leaves the store closed.
     // FIX-186 (RyGT): at any RAM setting. The launcher's 16 GB setting turns
@@ -1320,6 +1682,10 @@ PipelineCache::~PipelineCache() {
     {
         std::scoped_lock lk{g_exit_save_mutex}; // FIX-GT7-025: after an exit save in progress
         g_exit_save_cache.store(nullptr);       // FIX-GT7-023
+    }
+    if (compile_pack_thread.joinable()) { // PERF-GT7-108: before the device goes
+        compile_pack_thread.request_stop();
+        compile_pack_thread.join();
     }
     if (warm_compute_thread.joinable()) { // PERF-GT7-037: before the caches go
         warm_compute_thread.request_stop();
@@ -1638,7 +2004,9 @@ void PipelineCache::MaybeSaveDriverCache() {
     // grows: every 45 s up to 256 MB, then 45 s more per further 256 MB (2 GB: every 6 min).
     const u64 size_mb = driver_cache_bytes.load(std::memory_order_relaxed) >> 20;
     const auto interval = 45s * std::max<u64>(1, (size_mb + 255) / 256);
-    if (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= interval) {
+    // PERF-GT7-108: once the compile pack's start-up compile asked for a save, at the next look.
+    if (driver_cache_save_requested.exchange(false, std::memory_order_acq_rel) ||
+        (num_new_pipelines - pipelines_at_driver_save >= 32 && since >= interval)) {
         SaveDriverCache(false);
     }
     return;

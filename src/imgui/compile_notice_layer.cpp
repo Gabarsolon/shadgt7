@@ -15,6 +15,7 @@
 #include "imgui/compile_notice_layer.h"
 #include "imgui/imgui_layer.h"
 #include "video_core/renderer_vulkan/build_queue.h"
+#include "video_core/renderer_vulkan/compile_pack.h"
 
 namespace ImGui::CompileNotice {
 
@@ -70,7 +71,10 @@ CompileNoticeUI g_layer;
 
 void CompileNoticeUI::Draw() {
     const auto now = Clock::now();
-    if (!Stalled(now)) {
+    // PERF-GT7-108: the compile pack's start-up compile shows its progress while it runs.
+    const bool pack = Enabled() && Vulkan::CompilePack::g_running.load(std::memory_order_acquire);
+    const bool stalled = Stalled(now);
+    if (!stalled && !pack) {
         return;
     }
     const double stalled_s =
@@ -79,7 +83,11 @@ void CompileNoticeUI::Draw() {
             .count();
     const u32 jobs = Vulkan::g_build_jobs.load(std::memory_order_relaxed);
     char text[96];
-    if (jobs != 0) {
+    if (!stalled) {
+        std::snprintf(text, sizeof(text), "Compiling shader pack  %u / %u",
+                      Vulkan::CompilePack::g_done.load(std::memory_order_relaxed),
+                      Vulkan::CompilePack::g_total.load(std::memory_order_relaxed));
+    } else if (jobs != 0) {
         std::snprintf(text, sizeof(text), "Compiling shaders (%u)  %.0f s", jobs, stalled_s);
     } else {
         std::snprintf(text, sizeof(text), "Loading  %.0f s", stalled_s);
