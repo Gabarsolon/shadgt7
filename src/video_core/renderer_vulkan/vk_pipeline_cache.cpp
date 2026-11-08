@@ -298,6 +298,20 @@ private:
         std::scoped_lock lk{owner.prefetched_mutex};
         if (!owner.prefetched_modules.emplace(key, module).second) {
             owner.instance.GetDevice().destroyShaderModule(module);
+            return;
+        }
+        owner.prefetched_order.push_back(key);
+        // Bounded: the oldest modules no draw took yet go (a key taken already is just skipped).
+        while (owner.prefetched_modules.size() > MaxPrefetchedModules &&
+               !owner.prefetched_order.empty()) {
+            const u64 oldest = owner.prefetched_order.front();
+            owner.prefetched_order.pop_front();
+            if (const auto it = owner.prefetched_modules.find(oldest);
+                it != owner.prefetched_modules.end()) {
+                owner.instance.GetDevice().destroyShaderModule(it->second);
+                owner.prefetched_modules.erase(it);
+                ++owner.prefetched_evicted;
+            }
         }
     }
 
@@ -3721,8 +3735,8 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
             if (++prefetched % 500 == 0) {
                 LOG_WARNING(Render_Vulkan,
                             "PERF-GT7-118: {} stored modules made by the store readers ({} on "
-                            "this thread)",
-                            prefetched, loaded);
+                            "this thread; {} waiting, {} destroyed untaken)",
+                            prefetched, loaded, prefetched_modules.size(), prefetched_evicted);
             }
             return module;
         }

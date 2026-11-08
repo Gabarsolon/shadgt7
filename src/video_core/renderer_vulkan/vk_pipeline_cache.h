@@ -637,6 +637,12 @@ private:
     std::unique_ptr<StoreReaders> store_readers;
     std::mutex prefetched_mutex; ///< PERF-GT7-118
     std::unordered_map<u64, vk::ShaderModule> prefetched_modules; ///< by HashCombine(program, permutation)
+    /// The keys in the order they were made: past MaxPrefetchedModules waiting, the oldest is
+    /// destroyed (a stored permutation no draw matches would otherwise stay for the whole
+    /// session; the driver keeps a module's SPIR-V, ~160 KB each on average in GT7).
+    std::deque<u64> prefetched_order;
+    static constexpr size_t MaxPrefetchedModules = 1024;
+    u64 prefetched_evicted = 0; ///< under prefetched_mutex
 
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
