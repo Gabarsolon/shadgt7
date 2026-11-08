@@ -23,7 +23,11 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     // vertex, the reads use this stride too); 4 attributes was a leftover limit: GT7's hull
     // shaders of an 80-byte LS stride failed to translate at every race start (37 in 4 s on
     // Monza), their tessellated draws were never drawn and waited each frame.
-    ASSERT_MSG(num_attrs <= 8, "FIX-227: LS stride {} past 128 bytes a vertex", tcs.ls_stride);
+    // FIX-GT7-124: which program, and whether its constants were its draw's (pinned when queued).
+    ASSERT_MSG(num_attrs <= 8, "FIX-227: LS stride {} past 128 bytes a vertex (hs {:#x}, {})",
+               tcs.ls_stride, ctx.info.pgm_hash,
+               ctx.info.pinned_tess_constants ? "constants of its draw"
+                                              : "constants read at translation");
     const Id push_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
     const auto push_word = [&](u32 index) {
         return ctx.OpLoad(ctx.U32[1],

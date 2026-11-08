@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <unordered_map>
 #include "common/assert.h"
+#include "common/recoverable.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
@@ -150,6 +151,15 @@ static void InitTessConstants(IR::ScalarReg sharp_ptr_base, s32 sharp_dword_offs
     info.tess_consts_ptr_base = sharp_ptr_base;
     info.tess_consts_dword_offset = sharp_dword_offset;
     info.ReadTessConstantBuffer(tess_constants);
+    info.tess_constants_used = tess_constants; // FIX-GT7-124: its key is made from these
+    // FIX-GT7-124: read late on a worker, constants of another draw end the translation (the
+    // worker knows where they are now, and the draw queues it again with its own).
+    if (info.check_tess_constants && !info.pinned_tess_constants &&
+        runtime_info.sw_stage == SwStage::TessellationControl &&
+        !runtime_info.sw.tcs.FitsConstants(tess_constants)) {
+        info.tess_constants_stale = true;
+        throw Common::RecoverableFailure("FIX-GT7-124: tessellation constants of another draw");
+    }
     runtime_info.InitFromTessConstants(tess_constants);
     return;
 }

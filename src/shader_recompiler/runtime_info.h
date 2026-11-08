@@ -120,6 +120,25 @@ struct SwTessControlRuntimeInfo {
 
     bool operator==(const SwTessControlRuntimeInfo&) const = default;
 
+    /// FIX-GT7-124: whether tessellation constants can be those of the draw these registers come
+    /// from. The hull output base is the input control points times the LS stride times the
+    /// patches, or 0 when the hull shader passes its inputs through (GT7 logs of 11-05 to 11-08:
+    /// all 1,869 sets of sane constants); with the LDS emulation the patches are the registers'.
+    /// GT7 writes that memory again for later draws, and a translation made late read floats and
+    /// addresses there (LS strides of 1065353216, 0x10028000...).
+    bool FitsConstants(const TessellationDataConstantBuffer& c) const {
+        constexpr u32 Lds = 64 * 1024;
+        if (c.ls_stride == 0 || c.ls_stride % 4 != 0 || c.ls_stride > Lds || c.hs_cp_stride > Lds ||
+            c.num_patches == 0 || c.num_patches > 255 || c.hs_output_base > Lds) {
+            return false;
+        }
+        if (lds_emulation != 0 && c.num_patches != num_patches) {
+            return false;
+        }
+        return c.hs_output_base == 0 ||
+               u64(c.hs_output_base) == u64(num_input_control_points) * c.ls_stride * c.num_patches;
+    }
+
     // It might be possible for a non-passthrough TCS to have these conditions, in some dumb
     // situation. In that case, it should be fine to assume passthrough and declare some extra
     // output control points and attributes that shouldnt be read by the TES anyways

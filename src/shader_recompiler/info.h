@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <bitset>
+#include <optional>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -241,8 +242,80 @@ struct Info : InfoPersistent {
         }
     }
 
+    /// FIX-GT7-124: a translation on a worker reads its tessellation constants here: as its draw
+    /// had them, whenever translation and its key get to them. GT7 writes that memory again for
+    /// later draws, and since hull shader draws no longer wait for their translation
+    /// (PERF-GT7-114/115) the game is frames further when a worker reads it.
+    struct PinnedTessConstants {
+        u32 ptr_base{};
+        s32 dword_offset{-1};
+        VAddr sharp_address{}; ///< where the V# was read; 0: from the user data registers
+        AmdGpu::Buffer sharp{};
+        TessellationDataConstantBuffer constants{};
+    };
+    std::optional<PinnedTessConstants> pinned_tess_constants;
+    /// FIX-GT7-124: set on a worker translating without pinned constants: constants that don't fit
+    /// the draw's registers (SwTessControlRuntimeInfo::FitsConstants) end the translation, with
+    /// tess_constants_stale set, instead of being translated.
+    bool check_tess_constants{};
+    bool tess_constants_stale{};
+    /// FIX-GT7-124: the constants the translation was made from, for its key.
+    std::optional<TessellationDataConstantBuffer> tess_constants_used;
+
+    /// FIX-GT7-124: the tessellation constants V# at `dword_offset` of the table `ptr_base` points
+    /// at (or of the user data registers), and its buffer, as guest memory holds them now.
+    static std::optional<PinnedTessConstants> ReadTessConstants(std::span<const u32> user_data,
+                                                                u32 ptr_base, s32 dword_offset) {
+        if (dword_offset < 0) {
+            return std::nullopt;
+        }
+        PinnedTessConstants pin{.ptr_base = ptr_base, .dword_offset = dword_offset};
+        if (ptr_base == IR::NumScalarRegs) {
+            if (u64(dword_offset) * 4 + sizeof(pin.sharp) > user_data.size_bytes()) {
+                return std::nullopt;
+            }
+            std::memcpy(&pin.sharp, user_data.data() + dword_offset, sizeof(pin.sharp));
+        } else {
+            if (u64(ptr_base) + 2 > user_data.size()) {
+                return std::nullopt;
+            }
+            u64 table;
+            std::memcpy(&table, &user_data[ptr_base], sizeof(table));
+            table &= 0xFFFFFFFFFFFFULL;
+            if (table == 0) {
+                return std::nullopt;
+            }
+            // As ReadUdReg reads it.
+            pin.sharp_address = table + u64(dword_offset) * sizeof(u32);
+            Common::CopyGuest(&pin.sharp, reinterpret_cast<const void*>(pin.sharp_address),
+                              sizeof(pin.sharp));
+        }
+        const VAddr address = pin.sharp.base_address;
+        if (address == 0) {
+            return std::nullopt;
+        }
+        Common::CopyGuest(&pin.constants, reinterpret_cast<const void*>(address),
+                          sizeof(pin.constants));
+        return pin;
+    }
+
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
         ASSERT(tess_consts_dword_offset >= 0); // We've already tracked the V# UD
+        if (const auto& pin = pinned_tess_constants;
+            pin && pin->ptr_base == static_cast<u32>(tess_consts_ptr_base) &&
+            pin->dword_offset == tess_consts_dword_offset) {
+            // FIX-GT7-124. PERF-GT7-111: a recorded translation logs the reads it stands for, so
+            // the manifest replays them in the same order.
+            if (Common::GuestReadLog* log = Common::t_guest_read_log; log && !log->replay) {
+                if (pin->sharp_address != 0) {
+                    log->Append(pin->sharp_address, &pin->sharp, sizeof(pin->sharp));
+                }
+                log->Append(VAddr(pin->sharp.base_address), &pin->constants,
+                            sizeof(pin->constants));
+            }
+            tess_constants = pin->constants;
+            return;
+        }
         auto buf = ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(tess_consts_ptr_base),
                                              static_cast<u32>(tess_consts_dword_offset));
         VAddr tess_constants_addr = buf.base_address;
