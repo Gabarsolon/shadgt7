@@ -4133,10 +4133,16 @@ static HsWaitWindow& HsWindow() {
     return window;
 }
 
+bool PipelineCache::HullWaitBudgeted(SwStage sw_stage, const Shader::ShaderParams& params) {
+    // Under SHD-005's conditions: a draw skipped for its translation only makes sense where a
+    // draw without its pipeline is skipped too (AsyncPipelines), never for a forced or one-off wait.
+    return sw_stage == SwStage::TessellationControl && HsWaitBudget().count() > 0 && !force_wait &&
+           !wait_for_shaders && regs_override == nullptr && AsyncTranslation() &&
+           AsyncPipelines() && !DrawnOnce(params.hash);
+}
+
 bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderParams& params) {
-    if (sw_stage == SwStage::TessellationControl && HsWaitBudget().count() > 0 && !force_wait &&
-        !wait_for_shaders && regs_override == nullptr && AsyncTranslation() &&
-        !DrawnOnce(params.hash)) {
+    if (HullWaitBudgeted(sw_stage, params)) {
         auto& window = HsWindow();
         if (window.used >= HsWaitBudget()) {
             ++window.skipped;
@@ -4886,10 +4892,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     bool skip_wait = SkipTranslationWait(sw_stage, params); // SHD-005
     // PERF-GT7-115: a hull shader's wait is bounded by the window's budget; past it the draw is
     // skipped like a SHD-005 one.
-    const bool hs_budgeted = sw_stage == SwStage::TessellationControl &&
-                             HsWaitBudget().count() > 0 && !force_wait && !wait_for_shaders &&
-                             regs_override == nullptr && AsyncTranslation() &&
-                             !DrawnOnce(params.hash);
+    const bool hs_budgeted = HullWaitBudgeted(sw_stage, params);
     if (!HarvestTranslations(params.hash, regs_override == nullptr && !force_legacy && !skip_wait &&
                                               (!legacy_fallback || fallback_nested),
                              hs_budgeted)) {

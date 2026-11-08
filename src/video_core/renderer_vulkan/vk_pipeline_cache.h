@@ -484,6 +484,10 @@ private:
     /// SHD-005: a draw of a race skipped while its new shader translates on a worker, instead of
     /// the command thread waiting for the translation.
     bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
+    /// PERF-GT7-115: the draw's wait for its hull shader translation is bounded by the window's
+    /// budget (RYGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
+    /// or one-off wait).
+    bool HullWaitBudgeted(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
     bool translation_skipped{};
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
