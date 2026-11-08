@@ -259,7 +259,7 @@ private:
 // lookup that loads one (LoadStoredModule) finds it read once already.
 class PipelineCache::StoreReaders {
 public:
-    explicit StoreReaders(u32 count) {
+    StoreReaders(u32 count, PipelineCache& owner_) : owner{owner_} {
         for (u32 i = 0; i < count; ++i) {
             threads.emplace_back([this, i](std::stop_token stop) { Run(stop, i); });
         }
@@ -285,6 +285,54 @@ public:
     std::atomic<u64> files_read_ahead{};
 
 private:
+    // PERF-GT7-118: the module of a stored permutation, made here from the SPIR-V just read
+    // instead of on the command thread when a draw matches it: GT7's first race frame matched
+    // ~700 stored programs and opened, read and turned each one into a module there, one after
+    // another (~0.3 ms each). LoadStoredModule takes it; RYGT_PREFETCH_MODULES=0: as before.
+    void Prefetch(u64 key, const std::vector<u32>& words) {
+        static const bool enabled = [] {
+            const char* env = std::getenv("RYGT_PREFETCH_MODULES");
+            return !(env && env[0] == '0');
+        }();
+        if (!enabled || !IsCompleteSpirv(words)) {
+            return;
+        }
+        if (const auto emulation = FindFloatAtomicEmulation(words);
+            emulation != FloatAtomicEmulation::None &&
+            emulation != (Shader::Backend::SPIRV::FloatAtomicExact()
+                              ? FloatAtomicEmulation::OneAtomic
+                              : FloatAtomicEmulation::BothAtomics)) {
+            return; // FIX-GT7-011: translated again on the command thread
+        }
+        {
+            std::scoped_lock lk{owner.prefetched_mutex};
+            if (owner.prefetched_modules.contains(key)) {
+                return;
+            }
+        }
+        const auto module = CompileSPV(words, owner.instance.GetDevice(),
+                                       owner.instance.IsShaderObjectEnabled());
+        std::scoped_lock lk{owner.prefetched_mutex};
+        if (!owner.prefetched_modules.emplace(key, module).second) {
+            owner.instance.GetDevice().destroyShaderModule(module);
+            return;
+        }
+        owner.prefetched_order.push_back(key);
+        // Bounded: the oldest modules no draw took yet go (a key taken already is just skipped).
+        while (owner.prefetched_modules.size() > MaxPrefetchedModules &&
+               !owner.prefetched_order.empty()) {
+            const u64 oldest = owner.prefetched_order.front();
+            owner.prefetched_order.pop_front();
+            if (const auto it = owner.prefetched_modules.find(oldest);
+                it != owner.prefetched_modules.end()) {
+                owner.instance.GetDevice().destroyShaderModule(it->second);
+                owner.prefetched_modules.erase(it);
+                ++owner.prefetched_evicted;
+            }
+        }
+    }
+
+    PipelineCache& owner;
     // A program has ~1.4 stored permutations in GT7; more are rare and read when matched.
     static constexpr size_t MaxReadAhead = 8;
 
@@ -308,16 +356,19 @@ private:
                 queue.pop_front();
             }
             StoredListing listing = ReadStoredListing(job.pgm_hash);
-            std::vector<std::string> spv_names;
+            std::vector<std::pair<std::string, u64>> spv_names;
             for (const auto& entry : listing.entries) {
                 if (entry.has_spv && spv_names.size() < MaxReadAhead) {
-                    spv_names.push_back(fmt::format("{:#018x}_{}", job.pgm_hash, entry.perm_idx));
+                    spv_names.emplace_back(fmt::format("{:#018x}_{}", job.pgm_hash, entry.perm_idx),
+                                           HashCombine(job.pgm_hash, u64{entry.perm_idx}));
                 }
             }
             job.promise.set_value(std::move(listing));
-            for (const auto& name : spv_names) {
+            for (const auto& [name, key] : spv_names) {
+                words.clear();
                 Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, words);
                 files_read_ahead.fetch_add(1, std::memory_order_relaxed);
+                Prefetch(key, words);
             }
         }
     }
@@ -1244,7 +1295,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             // PERF-GT7-019 (RYGT_STORE_READERS=0: read on the GPU threads as before).
             const char* readers_env = std::getenv("RYGT_STORE_READERS");
             if (use_stored_shaders && !(readers_env && readers_env[0] == '0')) {
-                store_readers = std::make_unique<StoreReaders>(8);
+                store_readers = std::make_unique<StoreReaders>(8, *this);
                 store_stats.since = std::chrono::steady_clock::now();
             }
         }
@@ -1278,6 +1329,10 @@ PipelineCache::~PipelineCache() {
         liverpool->on_command_buffer_start = nullptr;
     }
     SaveDriverCache(true);
+    store_readers.reset(); // PERF-GT7-118: its threads make modules
+    for (const auto& [key, module] : prefetched_modules) {
+        instance.GetDevice().destroyShaderModule(module);
+    }
 }
 
 // FIX-165 (RyGT): the driver's pipeline cache file is off unless RYGT_DRIVER_CACHE=1. GT Sport's grew to
@@ -3830,6 +3885,23 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx) 
 vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
                                                  Storage::DataBase& store) {
     static u64 loaded = 0;
+    static u64 prefetched = 0;
+    if (&store == &Storage::DataBase::Instance()) {
+        // PERF-GT7-118: made by a store reader already.
+        std::scoped_lock lk{prefetched_mutex};
+        if (const auto it = prefetched_modules.find(HashCombine(pgm_hash, u64{perm_idx}));
+            it != prefetched_modules.end()) {
+            const auto module = it->second;
+            prefetched_modules.erase(it);
+            if (++prefetched % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-GT7-118: {} stored modules made by the store readers ({} on "
+                            "this thread; {} waiting, {} destroyed untaken)",
+                            prefetched, loaded, prefetched_modules.size(), prefetched_evicted);
+            }
+            return module;
+        }
+    }
     std::vector<u32> spv;
     store.Load(Storage::BlobType::ShaderBinary,
                                        fmt::format("{:#018x}_{}", pgm_hash, perm_idx), spv);
