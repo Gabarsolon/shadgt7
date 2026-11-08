@@ -1095,8 +1095,14 @@ private:
     bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows, u32 first_layers = 0);
     /// NAT-134: a device buffer holding the pattern (lo, hi, lo, hi...), at least `bytes` long.
     const Native::Rhi::Buffer* PatternBuffer(u32 lo, u32 hi, u64 bytes);
-    std::unordered_map<u64, std::unique_ptr<Native::Rhi::Buffer>> fill_patterns;
-    std::vector<std::unique_ptr<Native::Rhi::Buffer>> retired_patterns;
+    /// FIX-GT7-123: a pattern's buffer and when it was last asked for (pattern_clock).
+    struct FillPattern {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 used = 0;
+    };
+    std::unordered_map<u64, FillPattern> fill_patterns;
+    u64 pattern_clock = 0;
+    u64 pattern_bytes = 0; ///< FIX-GT7-123: the kept buffers' bytes
     /// NAT-120: GT Sport's fill shader (cs 0x8aa6e00c): its pattern and range, from the
     /// arguments it reads from memory.
     void ReadFillShader(const Shader::Info& cs, DrawBindings& b);
