@@ -630,6 +630,17 @@ private:
     void DropMirrors(VAddr address, u64 size);
     /// NAT-146, FIX-GT7-086: regions and mirrors over the range go (with `mutex` held); how many.
     u32 DropRegionsOver(VAddr address, u64 size);
+    /// FIX-GT7-122: a range starting in GT7's per-frame memory and ending past its known end
+    /// moves the end there (at most 64 MB past the listed end, through mapped memory).
+    void NotePerFrameRange(VAddr address, u64 size);
+    /// FIX-GT7-122: a region found inside GT7's per-frame memory: the regions there go before the
+    /// next draw or dispatch binds anything (DropDuePerFrameRegions), not while one binds.
+    void NotePerFrameRegion(const Region& region);
+    /// FIX-GT7-122: drops the regions inside the per-frame memory when NotePerFrameRegion asked
+    /// for it (with `mutex` held, before a draw's or dispatch's first binding).
+    void DropDuePerFrameRegions();
+    bool per_frame_drop_due = false; ///< FIX-GT7-122
+    u64 per_frame_drop_frame = 0;    ///< FIX-GT7-122: the frame of the last drop
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
     Bound last_bound = Bound::InPlace;
