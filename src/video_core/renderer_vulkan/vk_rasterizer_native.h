@@ -461,6 +461,20 @@ private:
         bool skipped = false; ///< PERF-GT7-023: every draw into it so far skipped, none waited
     };
     std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
+    /// FIX-GT7-102: time the current frame's draws waited for one-off pipelines; past the
+    /// budget (RYGT_ONE_OFF_BUDGET_MS, 250 by default, 0 no limit) the frame's other one-off
+    /// draws are skipped as other draws are, and still watched.
+    bool OneOffBudgetLeft();
+    /// FIX-GT7-109: the deadline of a one-off draw's wait (max: no bound).
+    std::chrono::steady_clock::time_point OneOffDeadline();
+    /// FIX-GT7-121: a picture of the last DrawMustNotSkip's hits is of a kind (or at a place)
+    /// already seen sampled before its redraw (PERF-GT7-023): its draw waits whatever the budget.
+    bool OneOffKnownHarmful() const;
+    std::chrono::steady_clock::time_point one_off_rate_since{};
+    u64 one_off_rate_frames = 0;
+    bool one_off_interactive = false;
+    u64 one_off_budget_frame = ~u64{0};
+    u64 one_off_wait_ns_frame = 0;
     std::unordered_map<VAddr, OneOffWatch> one_off_watch;
     struct {
         /// [never drawn, not lately][redrawn after 1, 2-4, 5-16, 17-64, 65-300 frames; sampled
@@ -1365,6 +1379,8 @@ private:
         u64 indirect_draws = 0, indirect_skipped = 0; ///< NAT-161: recorded, and not
         u64 one_off_waits = 0; ///< FIX-198: draws that waited for their new pipeline
         u64 one_off_exempt = 0; ///< PERF-GT7-023: draws into exempt pictures, skipped
+        u64 one_off_budget_skips = 0; ///< FIX-GT7-102: skipped once the frame's budget was spent
+        u64 one_off_harmful_waits = 0; ///< FIX-GT7-121: waited whatever the budget
         u64 writeback_befores = 0, precise_writebacks = 0; ///< FIX-203
         /// DIAG-188: a direct dispatch's recorder time by part (pipeline, bindings, images,
         /// barrier with write-backs, recording, notes), and the write-backs' share.

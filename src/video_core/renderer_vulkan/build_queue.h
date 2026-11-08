@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -13,6 +14,14 @@
 #include "common/types.h"
 
 namespace Vulkan {
+
+/// FIX-GT7-100: pipeline builds queued or running, for the compile notice.
+inline std::atomic<u32> g_build_jobs{0};
+
+/// FIX-GT7-109: the game is in play (a race: slow frames for a second; FIX-GT7-120: kept by a
+/// heavy scene), as PipelineCache::UpdateCatchUp measures it. Compile work then stays on its
+/// cores at its usual width, and background compiles that read it pause.
+inline std::atomic<bool> g_game_in_play{false};
 
 /// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, the last
 /// one first; then FIX-GT7-009's screen ones (draws skipped again: each builds the one on screen
@@ -43,6 +52,7 @@ public:
                 jobs.push_back(std::move(job));
             }
         }
+        g_build_jobs.fetch_add(1, std::memory_order_relaxed); // FIX-GT7-100
         cv.notify_one();
     }
 
@@ -81,6 +91,7 @@ public:
             std::scoped_lock lk{mutex};
             --running;
         }
+        g_build_jobs.fetch_sub(1, std::memory_order_relaxed); // FIX-GT7-100
         cv.notify_one();
     }
 

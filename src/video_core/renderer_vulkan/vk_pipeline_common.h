@@ -4,10 +4,14 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <string_view>
+#include <thread>
 
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 #include <boost/container/small_vector.hpp>
@@ -18,6 +22,24 @@ struct PushData;
 } // namespace Shader
 
 namespace Vulkan {
+
+/// FIX-GT7-101: a pipeline (or library) the driver failed to create is created again after a
+/// pause (0.2 s, doubling, six times) instead of ending the game at once. On a first GT7 race
+/// load up to 21 large compiles ran at once and the process committed 9.6 GB; players reported
+/// crashes during race loads, three tries before one got through (the cache kept what each try
+/// compiled). The failure and its code are logged; a seventh failure is left to the caller's check.
+template <typename Create>
+auto CreateWithRetries(const char* what, std::string_view name, Create&& create) {
+    auto result = create();
+    for (u32 attempt = 1; attempt <= 6 && result.result != vk::Result::eSuccess; ++attempt) {
+        const u32 pause_ms = 100u << attempt;
+        LOG_ERROR(Render_Vulkan, "FIX-GT7-101: {} {} failed ({}), trying again in {} ms ({} of 6)",
+                  what, name, vk::to_string(result.result), pause_ms, attempt);
+        std::this_thread::sleep_for(std::chrono::milliseconds{pause_ms});
+        result = create();
+    }
+    return result;
+}
 
 static constexpr auto AllGraphicsStageBits =
     vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eTessellationControl |

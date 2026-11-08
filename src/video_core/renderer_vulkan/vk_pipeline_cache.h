@@ -172,12 +172,16 @@ public:
     void SetShadersUnlocked(bool on) {
         shaders_unlocked = on;
     }
-    std::function<void()> TakeShaderWait();
+    /// FIX-GT7-109: the function waits until `deadline` at most; false when it gave up.
+    std::function<bool(std::chrono::steady_clock::time_point)> TakeShaderWait();
     /// PERF-GT7-020 (without the lookup lock): builds the pipeline here unless a worker started
     /// it, and returns once it is built. PERF-GT7-021: meanwhile more workers build at once, and
     /// the read-ahead states blocked by their shaders are evaluated again (the lock taken when
     /// free).
-    void FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build);
+    /// FIX-GT7-109: with a deadline, never built here: false when no worker had it ready by then
+    /// (it stays queued).
+    bool FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build,
+                             std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
 
     /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
     /// registers installed with Liverpool::SetThreadDrawState), or nullptr. Nothing is
@@ -528,6 +532,12 @@ private:
         u64 skipped = 0;
         // PERF-GT7-033: stepped back while the game runs slower than 30 fps.
         bool stepped_back = false;
+        bool backlog = false; ///< FIX-GT7-106: draws on screen waiting widen the compiles
+        bool backlog_throttled = false; ///< FIX-GT7-109: the game ran slower than 30 fps meanwhile
+        std::chrono::steady_clock::time_point backlog_window{};
+        u64 backlog_frames = 0;
+        u64 backlog_us = 0;
+        u64 backlog_draws = 0; ///< FIX-GT7-120: draws counted at the window's start
         std::chrono::steady_clock::time_point pace_start{};
         std::chrono::steady_clock::time_point stepped_since{};
         u64 pace_frames = 0;
@@ -547,6 +557,7 @@ private:
         std::atomic<s64> since_ms{};
         std::atomic<u64> shader_waits{};   ///< PERF-GT7-036
         std::atomic<u64> shader_wait_us{}; ///< PERF-GT7-036
+        std::atomic<u64> budget_skips{};   ///< FIX-GT7-109
     } unlocked_stats; ///< PERF-GT7-020
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a

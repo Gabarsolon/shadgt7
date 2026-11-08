@@ -72,6 +72,13 @@ bool CompileCoresWide();
 /// build), compile work uses every core below normal priority, taking the time the game's and the
 /// renderer's threads leave. Not while a draw waits for its pipeline. Calls nest.
 void SetCompileCatchUp(bool on);
+/// FIX-GT7-106: while many draws on screen wait for their pipelines (a first race: the world is
+/// missing), compile work uses every core below normal priority, even while a thread builds a
+/// pipeline it waits for. Calls nest.
+void SetCompileBacklog(bool on);
+/// FIX-GT7-109: while the game is in a race, compile work never widens (waits, catch-ups and
+/// backlogs keep it on its cores).
+void SetCompileInPlay(bool on);
 /// PERF-GT7-032: compile work runs below normal priority now.
 bool CompileThreadsLow();
 

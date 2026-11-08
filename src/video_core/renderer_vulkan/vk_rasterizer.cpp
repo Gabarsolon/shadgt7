@@ -1206,7 +1206,8 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 }
 
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
-    const DrawIndirectParams& params) {
+    const DrawIndirectParams& params, std::chrono::steady_clock::time_point deadline) {
+    const bool bounded = deadline != std::chrono::steady_clock::time_point::max(); // FIX-GT7-109
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     const GraphicsPipeline* pipeline = nullptr;
     // PERF-GT7-020: the draw's shaders are waited for under the lookup lock as before, its
@@ -1231,7 +1232,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
     bool found = false;
     for (u32 round = 0; unlocked && round < 8; ++round) {
         decltype(pipeline_cache.TakeSkippedBuild()) build;
-        std::function<void()> shader_wait;
+        std::function<bool(std::chrono::steady_clock::time_point)> shader_wait; // FIX-GT7-109
         {
             std::scoped_lock lk{pipeline_cache.LookupMutex()};
             pipeline_cache.SetWaitForShaders(true);
@@ -1253,13 +1254,22 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
             break;
         }
         if (shader_wait) {
-            shader_wait();
+            if (!shader_wait(deadline)) {
+                return nullptr; // FIX-GT7-109
+            }
             continue;
         }
         if (!build) {
             break;
         }
-        pipeline_cache.FinishBuildUnlocked(build);
+        if (!pipeline_cache.FinishBuildUnlocked(build, deadline)) {
+            return nullptr; // FIX-GT7-109
+        }
+    }
+    if (!found && bounded && unlocked) {
+        // FIX-GT7-109: never a wait without a deadline in play. (RYGT_ONE_OFF_UNLOCKED=0 waits
+        // under the lock as before, deadline or not: it never skipped a one-off draw.)
+        return nullptr;
     }
     if (!found) {
         std::scoped_lock lk{pipeline_cache.LookupMutex()};

@@ -414,6 +414,19 @@ public:
     static u32 UsualWidth() {
         return CompileConcurrency();
     }
+    /// FIX-GT7-109: builds at once in a race (RYGT_COMPILE_PLAY_WIDTH, 2 by default, at most the
+    /// usual width): with 4 the recorder's submits waited in the driver behind the compiles
+    /// (frames of 60-115 ms on a new track).
+    static u32 PlayWidth() {
+        static const u32 width = [] {
+            u32 n = 2;
+            if (const char* env = std::getenv("RYGT_COMPILE_PLAY_WIDTH"); env && *env) {
+                n = u32(std::strtoul(env, nullptr, 10));
+            }
+            return std::clamp(n, 1u, CompileConcurrency());
+        }();
+        return width;
+    }
     /// PERF-GT7-021: while a draw into a one-off target waits (the game stopped anyway), up to
     /// all but four hardware threads build at once instead of CompileConcurrency (4). Calls nest
     /// (two threads can wait at once).
@@ -427,6 +440,24 @@ public:
     }
     /// PERF-GT7-029: during a catch-up, 8 at a time on every core; PERF-GT7-032: below normal
     /// priority (RYGT_CATCH_UP_LOW=0: normal, as before).
+    /// FIX-GT7-109: in a race no more builds than usual run at once, whatever waits.
+    void SetInPlay(bool on) {
+        {
+            std::scoped_lock lk{extra_mutex};
+            in_play = on;
+            ApplyExtra();
+        }
+        Common::SetCompileInPlay(on);
+    }
+    /// FIX-GT7-106: many draws on screen wait for their pipelines.
+    void SetBacklog(bool on) {
+        {
+            std::scoped_lock lk{extra_mutex};
+            backlog = on;
+            ApplyExtra();
+        }
+        Common::SetCompileBacklog(on);
+    }
     void SetCatchUp(bool on) {
         {
             std::scoped_lock lk{extra_mutex};
@@ -458,7 +489,9 @@ private:
     void ApplyExtra() {
         const u32 widest = std::clamp(AllCores() > 4 ? AllCores() - 4 : 0u,
                                       CompileConcurrency(), 12u);
-        const u32 width = waiting > 0      ? widest
+        const u32 width = in_play          ? PlayWidth() // FIX-GT7-109
+                          : waiting > 0    ? widest
+                          : backlog        ? std::clamp(8u, CompileConcurrency(), widest)
                           : foreground > 0 ? CompileConcurrency()
                           : catch_up       ? std::clamp(8u, CompileConcurrency(), widest)
                                            : CompileConcurrency();
@@ -480,6 +513,8 @@ private:
     int waiting = 0;
     int foreground = 0;
     bool catch_up = false;
+    bool backlog = false; ///< FIX-GT7-106
+    bool in_play = false; ///< FIX-GT7-109
     u32 pace = 64; ///< PERF-GT7-034: no limit
 
     static u32 AllCores() {
@@ -528,7 +563,9 @@ private:
             // PERF-GT7-024: on a CPU with one kind of core a backlog stays on the compile cores
             // (in a race, compiles on every core slowed the game and the recorder by ~40%);
             // every core only while a draw waits for its pipeline.
-            const bool want_all = (backlog && Common::HybridCpu()) || Common::CompileCoresWide();
+            // FIX-GT7-109: never in a race, on hybrid CPUs (PERF-160's backlog) too.
+            const bool want_all = !g_game_in_play.load(std::memory_order_relaxed) &&
+                                  ((backlog && Common::HybridCpu()) || Common::CompileCoresWide());
             if (want_all != all_cores) {
                 all_cores = want_all;
                 if (all_cores) {
@@ -1603,8 +1640,28 @@ void PipelineCache::FinishBuild(PipelineBuild& build, bool draw_waits) {
     build.done.wait();
 }
 
-void PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build) {
+bool PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build,
+                                        std::chrono::steady_clock::time_point deadline) {
     const auto start = std::chrono::steady_clock::now();
+    if (deadline != std::chrono::steady_clock::time_point::max()) {
+        // FIX-GT7-109: a frame of the game in play waits a few ms at most: a worker builds it
+        // (urgent), never this thread (a compile takes up to a second), and no more workers run
+        // meanwhile (they would take the game's cores).
+        while (!build->started.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+            if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds{2}) {
+                break;
+            }
+        }
+        const bool ready = build->started.load() &&
+                           build->done.wait_until(deadline) == std::future_status::ready;
+        if (!ready) {
+            unlocked_stats.budget_skips.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        FinishBuild(*build);
+        return true;
+    }
     // PERF-GT7-021: while this draw waits, more workers build at once (one takes this build,
     // urgent, at once), and the read-ahead states blocked by their shaders are evaluated again
     // so the next draws' pipelines start too. Built here only when no worker took it.
@@ -1651,11 +1708,13 @@ void PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& bu
         LOG_WARNING(Render_Vulkan,
                     "PERF-GT7-020: in {:.1f} s, {} draws into one-off targets waited for their "
                     "pipeline without the lookup lock ({:.1f} ms; {} built by the waiting thread); "
-                    "PERF-GT7-036: {} for their shaders ({:.1f} ms)",
+                    "PERF-GT7-036: {} for their shaders ({:.1f} ms); FIX-GT7-109: {} gave up at "
+                    "their frame's deadline",
                     (now_ms - since) / 1000.0, stats.waits.exchange(0), stats.wait_us.exchange(0) / 1000.0,
                     stats.built_here.exchange(0), stats.shader_waits.exchange(0),
-                    stats.shader_wait_us.exchange(0) / 1000.0);
+                    stats.shader_wait_us.exchange(0) / 1000.0, stats.budget_skips.exchange(0));
     }
+    return true;
 }
 
 void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind) {
@@ -3496,6 +3555,91 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
                         catch_up_bumped.exchange(0), c.step_backs, c.stepped_seconds);
         }
     }
+    // FIX-GT7-106: while many draws on screen wait for their pipelines
+    // (a first GT7 race: ~1,600, the road side, trees and sky missing for minutes), compiles use
+    // every core, 8 at a time, below normal priority, until few are left. On 3 cores the world
+    // filled in at ~3.5 pipelines a second; on every core at ~7 (the game ~40 fps instead of ~55
+    // meanwhile, a half-empty scene either way). PERF-GT7-029's catch-up stopped after a second
+    // there: it counts only some skips, and a build a thread waits for on itself narrowed it.
+    // RYGT_COMPILE_BACKLOG=<n>: from n draws (256 by default, off below n / 4), 0 never.
+    static const size_t backlog_enter = [] {
+        const char* env = std::getenv("RYGT_COMPILE_BACKLOG");
+        return env && *env ? size_t(std::strtoull(env, nullptr, 10)) : size_t{256};
+    }();
+    // FIX-GT7-109: never in a race: with compiles on every core the game's and the
+    // renderer's threads shared their cores (frames of 60-120 ms, seconds under 30 fps,
+    // throttled at 30 ms a frame or not). In play (15 frames a second or more, each over
+    // 19 ms: a race, not a 60 fps menu) they stay on their cores, and background compiles
+    // that read g_game_in_play pause. Measured whatever RYGT_COMPILE_BACKLOG says: the play
+    // state also bounds the one-off waits and the width of the compiles.
+    {
+        const auto totals = Common::GetGameFrameTotals();
+        const u64 draws = Common::GetWorkCounters().draws.load(std::memory_order_relaxed);
+        if (c.backlog_window == std::chrono::steady_clock::time_point{}) {
+            c.backlog_window = now;
+            c.backlog_frames = totals.frames;
+            c.backlog_us = totals.us;
+            c.backlog_draws = draws;
+        } else if (now - c.backlog_window >= std::chrono::seconds{1}) {
+            const u64 frames = totals.frames - c.backlog_frames;
+            const double ms = frames ? double(totals.us - c.backlog_us) / 1000.0 / double(frames)
+                                     : 1000.0;
+            const double draws_a_frame = frames ? double(draws - c.backlog_draws) / double(frames)
+                                                : 0.0;
+            c.backlog_window = now;
+            c.backlog_frames = totals.frames;
+            c.backlog_us = totals.us;
+            c.backlog_draws = draws;
+            const double fps = 1000.0 / std::max(ms, 0.001);
+            // Out of play only at menu speed (under 17.5 ms a frame: races run at 19-26) or when
+            // the game shows almost no frames (a load). Not "under 15 fps": a race start at
+            // 60-80 ms a frame then let the compiles widen, which kept it there for seconds.
+            // FIX-GT7-120: once in play, a heavy scene keeps it so at any speed. A race at
+            // 55-60 fps (16-19 ms a frame) went in and out of play every few seconds, and out of
+            // it the compiles of ~25 new pipelines took every core: a 417 ms frame in the race.
+            // Play is only entered by slow frames (a race starts at 30 Hz); a Monza race draws
+            // 1,900-6,000 times a frame (the fewest facing a barrier), a loading screen under 50:
+            // leaving a race goes through one, so the menus after it are out of play again and
+            // the start-up compile pack runs there. Menus that are never slow (1,400-1,900 draws
+            // on the main menu) never enter it.
+            // RYGT_PLAY_HOLD_DRAWS=<draws a frame> (1000), 0: frame time only, as before.
+            static const double hold_draws = [] {
+                const char* env = std::getenv("RYGT_PLAY_HOLD_DRAWS");
+                return env && *env ? std::strtod(env, nullptr) : 1000.0;
+            }();
+            const bool slow = c.backlog_throttled ? ms > 17.5 : ms > 19.0;
+            const bool held = c.backlog_throttled && hold_draws > 0.0 && draws_a_frame >= hold_draws;
+            const bool play = fps >= 5.0 && (slow || held);
+            g_game_in_play.store(play, std::memory_order_relaxed);
+            if (play != c.backlog_throttled) {
+                c.backlog_throttled = play;
+                build_workers->SetInPlay(play);
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-109: the game at {:.1f} ms a frame, {:.0f} draws a frame: {}",
+                            ms, draws_a_frame,
+                            play ? "in play, compiles kept on their cores"
+                                 : "not in play, compiles may widen");
+            }
+        }
+    }
+    if (backlog_enter != 0) {
+        size_t backlog = 0;
+        {
+            std::scoped_lock lk2{on_screen_mutex};
+            backlog = on_screen.size();
+        }
+        const bool want = (backlog >= backlog_enter || (c.backlog && backlog > backlog_enter / 4)) &&
+                          !c.backlog_throttled; // FIX-GT7-109: never in play
+        if (want != c.backlog) {
+            c.backlog = want;
+            build_workers->SetBacklog(want);
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-106: {} draws on screen wait for their pipelines: compiles {}",
+                        backlog,
+                        want ? "on every core, 8 at a time, below normal priority"
+                             : "back to their cores");
+        }
+    }
     // PERF-GT7-033, PERF-GT7-034: the background compiles follow the game's frame rate.
     // Each second the game takes more than 34 ms a frame on average (one frame of 66 ms in a
     // second already makes 34.4), they take one step back: a catch-up goes back to the usual
@@ -4333,18 +4477,22 @@ void PipelineCache::NoteUnlockedShaderWait(u64 hash) {
     }
 }
 
-std::function<void()> PipelineCache::TakeShaderWait() {
+std::function<bool(std::chrono::steady_clock::time_point)> PipelineCache::TakeShaderWait() {
     if (skipped_translations.empty()) {
         return {};
     }
-    return [this, jobs = std::move(skipped_translations)] {
+    return [this, jobs = std::move(skipped_translations)](std::chrono::steady_clock::time_point deadline) {
         // As HarvestTranslations: the game never sees a PS4 wait for a shader.
         Common::GuestClock::CompilePause hold;
         const auto start = std::chrono::steady_clock::now();
         for (const auto& job : jobs) {
             RYDIAG_SCOPE(ShaderCompile, job->hash);
             std::unique_lock lk{job->mutex};
-            job->cv.wait(lk, [&] { return job->done.load(); });
+            if (deadline == std::chrono::steady_clock::time_point::max()) {
+                job->cv.wait(lk, [&] { return job->done.load(); });
+            } else if (!job->cv.wait_until(lk, deadline, [&] { return job->done.load(); })) {
+                return false; // FIX-GT7-109: the frame's budget is spent
+            }
         }
         unlocked_stats.shader_waits.fetch_add(1, std::memory_order_relaxed);
         unlocked_stats.shader_wait_us.fetch_add(
@@ -4352,6 +4500,7 @@ std::function<void()> PipelineCache::TakeShaderWait() {
                     std::chrono::steady_clock::now() - start)
                     .count()),
             std::memory_order_relaxed);
+        return true;
     };
 }
 
