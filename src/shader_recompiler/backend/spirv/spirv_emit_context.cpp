@@ -1143,12 +1143,26 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2DMsaa:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, true, sampled, format);
+    case AmdGpu::ImageType::Color2DMsaaArray:
+        if (!MsaaArrayEnabled()) {
+            break;
+        }
+        // FIX-GT7-125: a multisampled array; a storage one needs ImageMSArray.
+        if (sampled == 2) {
+            ctx.AddCapability(spv::Capability::ImageMSArray);
+        }
+        return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, true, sampled, format);
     case AmdGpu::ImageType::Color3D:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim3D, false, false, false, sampled, format);
     default:
         break;
     }
-    UNREACHABLE_MSG("Invalid texture type {}", type);
+    // FIX-GT7-125: which program and T#.
+    UNREACHABLE_MSG("Invalid texture type {} (program {:#x}, T# {:#x} format {}/{} {}x{}, {} "
+                    "samples)",
+                    type, ctx.info.pgm_hash, image.Address(), u32(image.GetDataFmt()),
+                    u32(image.GetNumberFmt()), image.width + 1, image.height + 1,
+                    image.NumSamples());
 }
 
 void EmitContext::DefineImagesAndSamplers() {
