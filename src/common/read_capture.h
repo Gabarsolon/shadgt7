@@ -122,8 +122,55 @@ bool GuardedCopy(void* dest, const void* source, size_t size);
 namespace Common {
 #endif
 
+/// PERF-GT7-111 (TEST): the guest reads of one shader translation, in order: recorded for the
+/// precompile manifest, or replayed when the translation is made again without the game.
+struct GuestReadLog {
+    struct Span {
+        VAddr address;
+        u32 size;
+        u32 offset;
+    };
+    std::vector<Span> spans;
+    std::vector<u8> bytes;
+    bool replay = false;
+    size_t next = 0;
+    u32 misses = 0;
+    void Append(VAddr address, const void* data, size_t size) {
+        spans.push_back({address, static_cast<u32>(size), static_cast<u32>(bytes.size())});
+        const auto* p = static_cast<const u8*>(data);
+        bytes.insert(bytes.end(), p, p + size);
+    }
+    /// Replay: the next span if it is this read, else zeros (counted).
+    void Take(VAddr address, void* dest, size_t size) {
+        if (next < spans.size() && spans[next].address == address && spans[next].size == size) {
+            std::memcpy(dest, bytes.data() + spans[next].offset, size);
+            ++next;
+            return;
+        }
+        std::memset(dest, 0, size);
+        ++misses;
+    }
+};
+extern thread_local GuestReadLog* t_guest_read_log;
+inline constexpr VAddr FlatBufReadTag = ~VAddr{0}; ///< the SRT walker's output
+
+inline void CopyGuestRaw(void* dest, const void* source, size_t size);
+
 /// Copies guest memory, taking the bytes from the current thread's capture where it has them.
 inline void CopyGuest(void* dest, const void* source, size_t size) {
+    if (GuestReadLog* log = t_guest_read_log) [[unlikely]] {
+        if (log->replay) {
+            log->Take(reinterpret_cast<VAddr>(source), dest, size);
+        } else {
+            CopyGuestRaw(dest, source, size);
+            log->Append(reinterpret_cast<VAddr>(source), dest, size);
+        }
+        return;
+    }
+    CopyGuestRaw(dest, source, size);
+}
+
+inline void CopyGuestRaw(void* dest, const void* source, size_t size) {
     if (const ReadCapture* capture = t_read_capture) [[unlikely]] {
         capture->Copy(reinterpret_cast<VAddr>(source), static_cast<u8*>(dest), size,
                       [](VAddr address, u8* to, u64 n) {

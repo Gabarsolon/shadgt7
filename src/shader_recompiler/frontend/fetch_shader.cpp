@@ -43,9 +43,15 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+thread_local const FetchOverride* t_fetch_override = nullptr; // PERF-GT7-111 (TEST)
+
 bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
     if (!info.has_fetch_shader) {
         return false;
+    }
+    if (const FetchOverride* o = t_fetch_override) [[unlikely]] {
+        out_fetch_data = o->data;
+        return o->ok;
     }
 
     out_fetch_data.attributes.clear();

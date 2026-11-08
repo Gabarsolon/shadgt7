@@ -429,6 +429,12 @@ private:
     /// the thread that builds them again in the background at start.
     std::filesystem::path WarmComputeDir() const;
     void WarmComputePipelines(std::stop_token stop);
+    void VerifyManifest(std::stop_token stop);       ///< PERF-GT7-111
+    void PretranslateManifest(std::stop_token stop); ///< PERF-GT7-117
+    bool pretranslate_wanted = false;
+    /// Stopped and joined first by the destructor: they read the cache, the store and the device.
+    std::jthread verify_thread;
+    std::jthread pretranslate_thread;
     std::jthread warm_compute_thread;
     /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1).
     void CompilePackShaders(std::stop_token stop);

@@ -177,7 +177,13 @@ struct Info : InfoPersistent {
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
         const u32* base = user_data.data();
-        if (ptr_index != IR::NumScalarRegs) {
+        if (ptr_index == IR::NumScalarRegs) {
+            // PERF-GT7-111 (TEST): a sharp in the user registers is not a guest read; its host
+            // address changes from one translation to the next, so it stays out of the read log.
+            std::memcpy(&data, base + dword_offset, sizeof(T));
+            return data;
+        }
+        {
             std::memcpy(&base, &user_data[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
@@ -217,9 +223,21 @@ struct Info : InfoPersistent {
         flattened_ud_src.assign(srt_info.flattened_bufsize_dw, 0);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+        // PERF-GT7-111 (TEST): the walker reads guest memory itself: its output is logged, and
+        // replayed without the game.
+        Common::GuestReadLog* log = Common::t_guest_read_log;
+        if (log && log->replay) {
+            log->Take(Common::FlatBufReadTag, flattened_ud_buf.data(),
+                      flattened_ud_buf.size() * sizeof(u32));
+            return;
+        }
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data(),
                                  flattened_ud_src.data());
+        }
+        if (log) {
+            log->Append(Common::FlatBufReadTag, flattened_ud_buf.data(),
+                        flattened_ud_buf.size() * sizeof(u32));
         }
     }
 
