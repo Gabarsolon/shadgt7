@@ -12038,7 +12038,22 @@ void NativeRenderer::EvictImages() {
         if (entry.kept.load(std::memory_order_relaxed)) {
             return true;
         }
-        if (entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60 ||
+        // NEO-GT7-010: a volume (a 3D picture) the GPU baked stays whatever its time in use: GT7
+        // bakes its 64x64x64 colour-grading LUT once (cs 0x5da04de1, at 0x1009c00000) in the
+        // menus, samples it for under a second, then draws no 3D scene for two seconds; it was
+        // dropped, the tonemap read the guest memory's bytes instead and the PS4 Pro mode's scene
+        // stayed black for the rest of the session. Scratch-pool pictures are 2D. In the PS4 Pro
+        // mode only, so the base PS4 mode keeps its behaviour: RYGT_NATIVE_KEEP_VOLUMES=1 keeps
+        // them in every mode, =0 in none (as before).
+        static const bool keep_volumes = [] {
+            const char* env = std::getenv("RYGT_NATIVE_KEEP_VOLUMES");
+            if (env && env[0] == '0') {
+                return false;
+            }
+            return (env && env[0] == '1') || Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        }();
+        const bool volume = keep_volumes && entry.info.type == AmdGpu::ImageType::Color3D;
+        if ((!volume && entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60) ||
             kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
             return false;
         }
@@ -12609,15 +12624,27 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
     }();
     Native::ImageEntry* corner_of = nullptr;
-    if (!entry && neo_display_crop) {
+    if (neo_display_crop) {
         corner_of =
             registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
                 return !candidate.from_cpu && !candidate.info.props.is_depth && candidate.image &&
                        candidate.info.num_bits == info.num_bits &&
                        candidate.info.num_samples == 1 &&
                        candidate.info.size.width >= info.size.width &&
-                       candidate.info.size.height >= info.size.height;
+                       candidate.info.size.height >= info.size.height &&
+                       (candidate.info.size.width > info.size.width ||
+                        candidate.info.size.height > info.size.height);
             });
+        // NEO-GT7-009: an image of the display's size at the address (the copy's destination
+        // below, a render target since the first copy) is shown as it is only when it holds a
+        // newer picture than the larger one. Looked up only when none existed, the corner was
+        // copied until that destination was in use again; then the last copied frame stayed on
+        // screen: the race ran behind the frozen loading screen. Write versions share one clock.
+        if (corner_of && entry &&
+            entry->write_version.load(std::memory_order_relaxed) >=
+                corner_of->write_version.load(std::memory_order_relaxed)) {
+            corner_of = nullptr;
+        }
     }
     if (!entry) {
         static std::atomic<u32> logged{};
