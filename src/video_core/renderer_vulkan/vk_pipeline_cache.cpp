@@ -2147,6 +2147,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             return !instance.IsAmdRx7000();
         }(),
+        // FIX-GT7-138: RYGT_MED3_NAN=0 turns the rule off. Shaders already in the store keep the
+        // rule they were translated with: compare in a store of their own (RYGT_SHADER_STORE_TAG).
+        .med3_nan_rule = [] {
+            const char* env = std::getenv("RYGT_MED3_NAN");
+            return !(env && env[0] == '0');
+        }(),
         .supports_quad_derivatives = instance_.IsQuadDerivativesSupported(), // AMD-306
         .vertex_order_check = instance_.IsVertexOrderCheckEnabled(),        // AMD-307
         // AMD-315: on AMD's explicit vertex path a V_INTERP_MOV makes the whole attribute
