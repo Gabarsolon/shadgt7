@@ -191,7 +191,7 @@ void ImageInfo::UpdateSize() noexcept {
                      &guest_size, &micro_tiled_mips, mips_layout.data());
 }
 
-s32 ImageInfo::MipOf(const ImageInfo& info) const {
+s32 ImageInfo::MipOf(const ImageInfo& info, bool padded) const {
     if (!IsCompatible(info)) {
         return -1;
     }
@@ -248,7 +248,15 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     const auto this_w = std::max(size.width >> this_dim, 1u);
     const auto this_h = std::max(size.height >> this_dim, 1u);
     if ((this_w != mip_w) || (this_h != mip_h)) {
-        return -1;
+        // FIX-GT7-134: a target at the mip's address with its pitch, larger than the mip but
+        // within its padded size in memory, is that mip (the extra texels are its padding).
+        const auto& layout = info.mips_layout[mip];
+        const bool fits = padded && this_w >= mip_w && this_h >= mip_h &&
+                          this_w <= std::max<u32>(layout.pitch >> info_dim, 1u) &&
+                          this_h <= std::max<u32>(layout.height >> info_dim, 1u);
+        if (!fits) {
+            return -1;
+        }
     }
 
     const auto mip_d = std::max(info.size.depth >> mip, 1u);
@@ -266,7 +274,47 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     return mip;
 }
 
-s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
+s32 ImageInfo::BlockLevelOf(const ImageInfo& target) const {
+    if (!props.is_block || target.props.is_block || props.is_depth || target.props.is_depth ||
+        target.num_bits != num_bits || num_samples != 1 || target.num_samples != 1 ||
+        target.resources.levels != 1 || target.resources.layers != 1 || resources.layers != 1 ||
+        size.depth != 1 || target.size.depth != 1 || type != AmdGpu::ImageType::Color2D ||
+        target.type != AmdGpu::ImageType::Color2D || target.bank_swizzle != bank_swizzle ||
+        target.alt_tile != alt_tile) {
+        return -1;
+    }
+    const u32 levels = std::min<u32>(std::max<u32>(resources.levels, 1), MAX_MIPS);
+    for (u32 mip = 0; mip < levels; ++mip) {
+        const MipInfo& layout = mips_layout[mip];
+        if (target.guest_address != guest_address + layout.offset) {
+            continue;
+        }
+        if (target.array_mode != array_mode || target.tile_mode != tile_mode) {
+            // FIX-039: a level stored micro-tiled, written with the 1D mode of its micro tiling.
+            const bool micro_tiled_mip = (micro_tiled_mips >> mip) & 1;
+            const bool same_micro_tiling =
+                !AmdGpu::IsMacroTiled(target.array_mode) &&
+                AmdGpu::GetMicroTileThickness(target.array_mode) ==
+                    std::min(AmdGpu::GetMicroTileThickness(array_mode), 4u) &&
+                AmdGpu::GetMicroTileMode(target.tile_mode) == AmdGpu::GetMicroTileMode(tile_mode);
+            if (!micro_tiled_mip || !same_micro_tiling) {
+                return -1;
+            }
+        }
+        // ComputeImageSize keeps a block level's pitch in texels (its blocks times 4).
+        const u32 block_pitch = std::max<u32>(layout.pitch / 4, 1);
+        const u32 blocks_w = (std::max(size.width >> mip, 1u) + 3) / 4;
+        const u32 blocks_h = (std::max(size.height >> mip, 1u) + 3) / 4;
+        if (target.pitch != block_pitch || target.size.width < blocks_w ||
+            target.size.height < blocks_h) {
+            return -1;
+        }
+        return static_cast<s32>(mip);
+    }
+    return -1;
+}
+
+s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip, bool padded) const {
     if (!IsCompatible(info)) {
         return -1;
     }
@@ -287,7 +335,14 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
     const auto this_h = std::max(size.height >> this_dim, 1u);
     const auto this_p = std::max(pitch >> this_dim, 1u);
     if ((this_w != mip_w) || (this_h != mip_h) || (this_p != mip_p)) {
-        return -1;
+        // FIX-GT7-134: a target at a single-layer mip's address, with its pitch, larger than the
+        // mip but within its padded size, is its only slice.
+        const bool fits =
+            padded && info.resources.layers <= 1 && this_p == mip_p && this_w >= mip_w &&
+            this_h >= mip_h &&
+            this_h <= std::max<u32>(info.mips_layout[mip].height >> info_dim, 1u) &&
+            guest_address == info.guest_address + info.mips_layout[mip].offset;
+        return fits ? 0 : -1;
     }
 
     // Check for size alignment.

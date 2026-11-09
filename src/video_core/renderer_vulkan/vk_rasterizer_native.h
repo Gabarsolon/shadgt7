@@ -58,6 +58,8 @@ class ImageRegistry;
 struct MadeImage;
 namespace Rhi {
 class Buffer;
+class Image;     // FIX-GT7-133
+class ImageView; // FIX-GT7-133
 class CommandList;
 class Device;
 class Pipeline;
@@ -461,6 +463,10 @@ private:
         bool skipped = false; ///< PERF-GT7-023: every draw into it so far skipped, none waited
     };
     std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
+    /// FIX-GT7-135: the last DrawMustNotSkip waits for a never-drawn level of a texture.
+    bool one_off_texture_level = false;
+    /// FIX-GT7-135: the texture (address, level >= 1) whose level `target` is; {0, -1}: none.
+    std::pair<VAddr, s32> TextureLevelOf(const VideoCore::ImageInfo& target);
     /// FIX-GT7-102: time the current frame's draws waited for one-off pipelines; past the
     /// budget (RYGT_ONE_OFF_BUDGET_MS, 250 by default, 0 no limit) the frame's other one-off
     /// draws are skipped as other draws are, and still watched.
@@ -1356,6 +1362,17 @@ private:
 
     /// CMASK / HTILE addresses the game cleared: the next pass into their target clears it.
     std::unordered_set<VAddr> cleared_meta;
+    /// FIX-GT7-133: a 1x1 depth image at 1.0 that stands in for an empty T# sampled with a
+    /// depth comparison (2D and 2D-array views), so that the sampler's border still applies.
+    std::unique_ptr<Native::Rhi::Image> depth_stand_in;
+    std::array<std::unique_ptr<Native::Rhi::ImageView>, 2> depth_stand_in_views;
+    std::array<std::atomic<VkImageView>, 2> depth_stand_in_handles{};
+    /// FIX-GT7-133: the stand-in's view (made, and the image cleared, on the recorder only when
+    /// `may_create`); none when off or not made yet.
+    vk::ImageView DepthStandIn(bool array, bool may_create);
+    /// FIX-GT7-133: RYGT_NATIVE_DEPTH_STAND_IN is not 0. A prepared draw that needs the stand-in
+    /// before the recorder made it goes to the recorder.
+    static bool DepthStandInOn();
     /// Color targets by their CMASK address, depth targets by their HTILE address (so a clear
     /// of the metadata can be told from a clear of a picture).
     std::unordered_set<VAddr> known_meta;

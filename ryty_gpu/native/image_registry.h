@@ -60,6 +60,9 @@ struct SourcePlace {
     /// NAT-131: where in the target the picture comes from (a layer of a layered target).
     s32 src_mip = 0;
     s32 src_layer = 0;
+    /// FIX-GT7-127: the target holds one texel per block of this block-compressed texture; width
+    /// and height count blocks.
+    bool blocks = false;
 };
 
 class ImageEntry;
@@ -309,6 +312,9 @@ public:
     void CpuWrite(VAddr address, u64 size, u64 exact);
     /// FIX-GT7-036: what wrote over these bytes ends the fills remembered there.
     void ForgetFills(VAddr address, u64 size);
+    /// FIX-GT7-130: whether a fill remembered since (nothing wrote there after it) covers
+    /// [address, address + size) whole.
+    bool FilledWhole(VAddr address, u64 size);
     /// NAT-109: the addresses holding the most images (address, count), for reports.
     std::vector<std::pair<VAddr, u32>> Crowded(u32 count);
 

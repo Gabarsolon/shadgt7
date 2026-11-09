@@ -654,6 +654,38 @@ ImageEntry* ImageRegistry::FindExisting(VAddr address,
 }
 
 SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture) {
+    // FIX-GT7-127: a level of a block-compressed texture written by the GPU as one uncompressed
+    // texel per block. GT7's Scapes compress their HDR photo (6024x4016) to BC6H in a compute
+    // shader that binds each level as an R32G32B32A32Uint storage image over the level's padded
+    // area (2048x1024 for level 0, at the texture's address; 1024x512 for level 1, at its offset),
+    // and the scene samples the BC6H texture. Without a place the texture read guest memory,
+    // which only the GPU had written: zeros, a black background in the editor and in every photo.
+    // The copy then counts in source texels, one per block (Vulkan's rule between compressed and
+    // uncompressed formats). RYGT_NATIVE_BLOCK_TARGETS=0: as before.
+    if (texture.props.is_block && !target.props.is_block) {
+        static const bool block_targets = [] {
+            const char* env = std::getenv("RYGT_NATIVE_BLOCK_TARGETS");
+            return !(env && env[0] == '0');
+        }();
+        const s32 mip = block_targets ? texture.BlockLevelOf(target) : -1;
+        if (mip < 0) {
+            return {};
+        }
+        SourcePlace place{mip, 0, (std::max(texture.size.width >> mip, 1u) + 3) / 4,
+                          (std::max(texture.size.height >> mip, 1u) + 3) / 4};
+        place.blocks = true;
+        static std::atomic<u32> logged{};
+        if (logged++ < 16) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-GT7-127: texture {:#x} {}x{} {} level {} made of target {:#x} {}x{} {} "
+                     "({}x{} blocks)",
+                     texture.guest_address, texture.size.width, texture.size.height,
+                     vk::to_string(texture.pixel_format), mip, target.guest_address,
+                     target.size.width, target.size.height, vk::to_string(target.pixel_format),
+                     place.width, place.height);
+        }
+        return place;
+    }
     if (target.props.is_depth || texture.props.is_depth || target.props.is_block ||
         texture.props.is_block || target.num_bits != texture.num_bits ||
         target.props.is_bgr_packed_float != texture.props.is_bgr_packed_float ||
@@ -700,12 +732,23 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
         return {0, 0, texture.size.width, texture.size.height};
     }
     // A mip or layer of the texture drawn on its own.
-    if (const s32 mip = target.MipOf(texture); mip >= 0) {
-        const s32 layer = target.SliceOf(texture, mip);
+    // FIX-GT7-134: also a target a little larger than the mip, within its padded size. GT7's
+    // depth of field (Scapes' editor and photos, background blurring) builds an 8-level pyramid
+    // drawing each level as its own target sized to its extent (345x248, 172x124, ...) while the
+    // texture that samples the pyramid is 690x493, 690x479 or 690x496 (levels 345x246, 172x123,
+    // ...): no level was found, the blurred levels read guest memory (zeros) and the blurred
+    // background came out black. The copy is the mip's size. RYGT_NATIVE_PADDED_MIPS=0: as before.
+    static const bool padded_mips = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PADDED_MIPS");
+        return !(env && env[0] == '0');
+    }();
+    if (const s32 mip = target.MipOf(texture, padded_mips); mip >= 0) {
+        const s32 layer = target.SliceOf(texture, mip, padded_mips);
         if (layer < 0 || u32(layer) >= std::max<u32>(texture.resources.layers, 1)) {
             return {};
         }
-        return {mip, layer, target.size.width, target.size.height};
+        return {mip, layer, std::min(target.size.width, std::max(texture.size.width >> mip, 1u)),
+                std::min(target.size.height, std::max(texture.size.height >> mip, 1u))};
     }
     // NAT-131: the texture is one layer (or mip) of the target: a face of a cube drawn as a
     // layered target, read on its own (GT Sport's environment cube, whose faces the cockpit's
@@ -1249,6 +1292,14 @@ void ImageRegistry::ForgetFills(VAddr address, u64 size) {
             fill.end = 0;
         }
     }
+}
+
+bool ImageRegistry::FilledWhole(VAddr address, u64 size) {
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::scoped_lock lock{recent_fills_mutex};
+    return std::ranges::any_of(recent_fills, [&](const RecentFill& fill) {
+        return fill.end != 0 && fill.begin <= address && end <= fill.end;
+    });
 }
 
 void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {

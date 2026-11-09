@@ -3238,6 +3238,23 @@ std::chrono::steady_clock::time_point NativeRenderer::OneOffDeadline() {
     return std::chrono::steady_clock::now() + std::chrono::nanoseconds{left};
 }
 
+// FIX-GT7-135: a texture (several levels) one of whose levels 1 and up is this target.
+std::pair<VAddr, s32> NativeRenderer::TextureLevelOf(const VideoCore::ImageInfo& target) {
+    std::pair<VAddr, s32> found{0, -1};
+    registry->ForEachOverlapping(target.guest_address, target.guest_address + 1,
+                                 [&](Native::ImageEntry& e) {
+                                     if (found.second >= 1 || e.image == nullptr ||
+                                         e.info.resources.levels <= 1) {
+                                         return;
+                                     }
+                                     const Native::SourcePlace place = Native::PlaceOf(target, e.info);
+                                     if (place.mip >= 1) {
+                                         found = {e.info.guest_address, place.mip};
+                                     }
+                                 });
+    return found;
+}
+
 bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // FIX-198: GPU.compile_mode 2 (keep going) skips a draw while its new pipeline builds, so
     // the game never stops for a compile: what it draws shows a frame or so later, as it's drawn
@@ -3278,10 +3295,64 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         }
     };
     one_off_hits.clear(); // DIAG-GT7-008
+    one_off_texture_level = false; // FIX-GT7-135
     OneOffHit described{};
+    // FIX-GT7-131: a colour target counts as drawn lately only through a picture of its own memory
+    // layout (pitch, texel size, tiling, samples). Another layout at the same address (GT7's scratch
+    // pool holds a 1920x2160 menu backdrop, a pitch of 2048, where Scapes put a photo's 1920x1080
+    // work picture, a pitch of 1920) made a draw into a layout never drawn skippable: at a photo's
+    // first frames the work picture's draw was skipped for its new pipeline, the frames' average
+    // read the pool's memory instead (small RGBA8 menu pictures read as RGBA16F: huge values, NaN)
+    // and kept them to the end: noise blocks in every first photo. RYGT_NATIVE_ONE_OFF_LAYOUT=0:
+    // any picture at the address, as before.
+    static const bool same_layout_on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+        return !(env && env[0] == '0');
+    }();
+    // Out of play only (FIX-GT7-109): in a Monza race the rule made draws into GT7's scratch pool
+    // (0x100a0b0000, other layouts drawn there every frame) wait for new pipelines: 40-60 ms
+    // frames, and a 1.36 s one where FIX-GT7-121 knew the kind as harmful and the wait had no
+    // bound. In play another layout at the address counts again, as before; a draw skipped into a
+    // layout no picture has still leaves its target empty (in Draw), which kept the photos clean.
+    const bool same_layout = same_layout_on && !g_game_in_play.load(std::memory_order_relaxed);
+    const VideoCore::ImageInfo* layout = nullptr;
+    // FIX-GT7-135: a colour target never drawn into that is a level (1 and up) of a texture the
+    // game samples is drawn once, when the game builds the texture's levels: skipped, the level
+    // stays empty for good, whatever PERF-GT7-023 learned of its kind. A Scapes location whose
+    // backdrop is a 6024x4016 RGBA16F texture of 5 levels (the salt flat) has its levels 1-4
+    // drawn at the load, each from the level above; on a PC whose races had taught that RGBA16F
+    // targets of 2048x1024, 1024x512 and 512x256 may be skipped (redrawn every frame there),
+    // levels 2-4 were skipped and stayed empty: the editor, which reads the smaller levels, showed
+    // the location at about an eighth of its brightness, the photo (level 0) did not. The harm
+    // was never learned: the texture reads its levels' memory, not those targets. Such a draw
+    // is not exempted by its kind and, out of play, waits whatever the budget; in play
+    // (FIX-GT7-109) it keeps the frame's budget. RYGT_NATIVE_TEXTURE_LEVEL_WAIT=0: as before.
+    static const bool texture_levels = [] {
+        const char* env = std::getenv("RYGT_NATIVE_TEXTURE_LEVEL_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    s32 target_cb = -1; // FIX-GT7-135: the colour buffer drawn_lately looks at (-1: depth)
     const auto drawn_lately = [&](VAddr address) {
         const Native::ImageEntry* entry = registry->FindExisting(
-            address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
+            address, [&](const Native::ImageEntry& e) {
+                return !e.from_cpu && e.image != nullptr &&
+                       (!layout || (e.info.pitch == layout->pitch &&
+                                    e.info.num_bits == layout->num_bits &&
+                                    e.info.tile_mode == layout->tile_mode &&
+                                    e.info.num_samples == layout->num_samples));
+            });
+        if (!entry && layout && registry->FindExisting(address, [](const Native::ImageEntry& e) {
+                return !e.from_cpu && e.image != nullptr;
+            })) {
+            static std::atomic<u32> layout_logged{};
+            if (const u32 n = layout_logged++; n < 64 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-131: a draw into {:#x} (pitch {}, {} bits, tile {}) waits for its "
+                            "pipeline: only other layouts were drawn there (frame {}, {} so far)",
+                            address, layout->pitch, layout->num_bits, u32(layout->tile_mode), frame,
+                            n + 1);
+            }
+        }
         if (!entry) {
             note(0);
             if (OneOffTrackOn()) {
@@ -3289,7 +3360,52 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                 described.never = true;
                 one_off_hits.push_back(described);
             }
+            if (texture_levels && target_cb >= 0) {
+                // The target's description is made here only, for a target never drawn into
+                // (out of play FIX-GT7-131 made it already), not for every draw without its
+                // pipeline.
+                std::optional<VideoCore::ImageInfo> made;
+                if (!layout) {
+                    made.emplace(regs.color_buffers[target_cb],
+                                 r.liverpool->DrawCbExtent(u32(target_cb)));
+                }
+                const VideoCore::ImageInfo& target = layout ? *layout : *made;
+                if (const auto [texture, mip] = TextureLevelOf(target); mip >= 1) {
+                    one_off_texture_level = true;
+                    static std::atomic<u32> level_logged{};
+                    if (const u32 n = level_logged++; n < 64 || n % 500 == 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "FIX-GT7-135: a draw into {:#x} {}x{}, level {} of the texture "
+                                    "at {:#x}, never drawn, waits for its pipeline (frame {}, {} "
+                                    "so far)",
+                                    address, target.size.width, target.size.height, mip, texture,
+                                    frame, n + 1);
+                    }
+                    return false; // FIX-GT7-135: whatever its kind
+                }
+            }
             return OneOffExempt(described); // never drawn into; PERF-GT7-023: unless its kind
+        }
+        // FIX-GT7-130: a picture a fill rewrote whole, with nothing drawn into it since: skipped,
+        // the draw would leave the fill (black), not the last frame's picture as a skip usually
+        // does. GT7's Scapes clear a work picture at a photo's last frame and draw the photo's
+        // result into it, once, before filtering it into the photo: with that draw's pipeline
+        // new, it was skipped and every first photo of a game came out black (the second, its
+        // pipeline built, did not). Such a draw waits as a one-off draw does, within its frame's
+        // budget (FIX-GT7-102/109). RYGT_NATIVE_WAIT_AFTER_FILL=0: as before.
+        static const bool after_fill = [] {
+            const char* env = std::getenv("RYGT_NATIVE_WAIT_AFTER_FILL");
+            return !(env && env[0] == '0');
+        }();
+        if (after_fill && registry->FilledWhole(address, entry->info.guest_size)) {
+            static std::atomic<u32> fill_logged{};
+            if (const u32 n = fill_logged++; n < 64 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-130: a draw into {:#x} {}x{}, filled whole and not drawn "
+                            "since, waits for its pipeline (frame {}, {} so far)",
+                            address, entry->info.size.width, entry->info.size.height, frame, n + 1);
+            }
+            return false;
         }
         const u64 last = entry->written_frame.load(std::memory_order_relaxed);
         const u64 earlier =
@@ -3327,9 +3443,19 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                              .number_format = u32(col_buf.GetNumberFmt()),
                              .tile = u32(col_buf.GetTileMode())};
             }
-            if (col_buf && regs.color_target_mask.GetMask(cb) != 0 &&
-                !drawn_lately(col_buf.Address())) {
-                return true;
+            if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                std::optional<VideoCore::ImageInfo> info;
+                if (same_layout) {
+                    info.emplace(col_buf, r.liverpool->DrawCbExtent(cb)); // FIX-GT7-131
+                }
+                layout = info ? &*info : nullptr;
+                target_cb = s32(cb); // FIX-GT7-135
+                const bool lately = drawn_lately(col_buf.Address());
+                layout = nullptr;
+                target_cb = -1;
+                if (!lately) {
+                    return true;
+                }
             }
         }
     }
@@ -6625,8 +6751,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             }
         };
         const auto bind_null = [&](u32 reason) {
+            const vk::ImageView stand_in =
+                image_desc.is_depth && !storage && num_bindings == 1 && !cube_sampling
+                    ? DepthStandIn(image_desc.is_array, true) // FIX-GT7-133
+                    : vk::ImageView{};
             for (u32 i = 0; i < num_bindings; ++i) {
-                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+                b.images.push_back({VK_NULL_HANDLE, stand_in, vk::ImageLayout::eGeneral});
             }
             ++stats.null_images;
             ++stats.null_reasons[reason];
@@ -6882,6 +7012,81 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             .pImageInfo = &b.images.back(),
         });
     }
+}
+
+// FIX-GT7-133: an empty T# (address 0) sampled with a depth comparison was bound as a null
+// descriptor, which reads 0 whatever the sampler says, so every comparison failed: "in shadow".
+// On the console the texture unit still applies the sampler's addressing, and outside [0, 1] a
+// border-clamped sampler returns its border colour. GT7's Scapes backdrop shades the ground the
+// car's cascade doesn't cover with a fallback shadow map that is such an empty 1x1 T#, its matrix
+// putting every point far outside, under a white-bordered, less-equal sampler: lit on the console,
+// in full shadow here. All the ground around the car was about six times too dark (a pale
+// rectangle where the car's cascade lit it, a dark band where the ground ended). A 1x1 depth image
+// at the far depth (1.0: nothing in front, as an absent shadow map means) now stands in for such
+// T#s; at 0, the strip of ground the matrix puts inside [0, 1] stayed a thin dark line across the
+// road. RYGT_NATIVE_DEPTH_STAND_IN=0: null descriptors, as before.
+bool NativeRenderer::DepthStandInOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_DEPTH_STAND_IN");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
+    if (!DepthStandInOn()) {
+        return {};
+    }
+    const u32 i = array ? 1 : 0;
+    if (const VkImageView ready = depth_stand_in_handles[i].load(std::memory_order_acquire)) {
+        return vk::ImageView{ready};
+    }
+    if (!may_create) {
+        return {};
+    }
+    if (!depth_stand_in) {
+        depth_stand_in = device->CreateImage({
+            .dim = Native::Rhi::ImageDim::D2,
+            .format = Native::Rhi::FormatFromVk(VK_FORMAT_D32_SFLOAT),
+            .width = 1,
+            .height = 1,
+            .layers = 1,
+            .mips = 1,
+            .usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferDst,
+            .name = "native depth stand-in",
+        });
+        if (!depth_stand_in) {
+            return {};
+        }
+        Stream& s = Begin();
+        EndRendering();
+        device->RecordPendingImageInit(*s.list);
+        s.cmd.clearDepthStencilImage(
+            vk::Image{Handle<VkImage_T>(depth_stand_in->NativeHandle())}, vk::ImageLayout::eGeneral,
+            vk::ClearDepthStencilValue{1.0f, 0},
+            vk::ImageSubresourceRange{.aspectMask = vk::ImageAspectFlagBits::eDepth,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1});
+        GlobalBarrier();
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-133: a 1x1 depth image at 1.0 stands in for empty T#s "
+                    "sampled with a depth comparison (frame {})", frame);
+    }
+    auto& view = depth_stand_in_views[i];
+    if (!view) {
+        view = device->CreateImageView(
+            depth_stand_in.get(),
+            Native::Rhi::ImageViewDesc{.dim = array ? Native::Rhi::ViewDim::D2Array
+                                                    : Native::Rhi::ViewDim::D2,
+                                       .aspect = Native::Rhi::AspectDepth});
+        if (!view) {
+            return {};
+        }
+    }
+    const VkImageView handle = Handle<VkImageView_T>(view->NativeHandle());
+    depth_stand_in_handles[i].store(handle, std::memory_order_release);
+    return vk::ImageView{handle};
 }
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
@@ -7923,11 +8128,17 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     const vk::Image dst{Handle<VkImage_T>(texture.image->NativeHandle())};
     for (const auto& pick : picks) {
         const auto& place = pick.place;
+        // FIX-GT7-127: into a block-compressed texture from a target of one texel per block, the
+        // extent counts the source's texels (Vulkan's rule between compressed and uncompressed
+        // formats): the level's blocks.
+        const u32 block_dim = place.blocks ? 4u : 1u;
         const u32 width = std::min(
-            {place.width, std::max(texture.info.size.width >> place.mip, 1u),
+            {place.width,
+             (std::max(texture.info.size.width >> place.mip, 1u) + block_dim - 1) / block_dim,
              std::max(pick.source->info.size.width >> place.src_mip, 1u)});
         const u32 height = std::min(
-            {place.height, std::max(texture.info.size.height >> place.mip, 1u),
+            {place.height,
+             (std::max(texture.info.size.height >> place.mip, 1u) + block_dim - 1) / block_dim,
              std::max(pick.source->info.size.height >> place.src_mip, 1u)});
         // NAT-125: a layered target (a cube's faces drawn in one pass, the layer from the
         // vertex shader) gives all its layers; NAT-131: from the layer the texture starts at.
@@ -7962,7 +8173,9 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         }
         const u32 src_mips = std::max<u32>(pick.source->image->Desc().mips, 1u);
         const u32 dst_mips = std::max<u32>(texture.image->Desc().mips, 1u);
-        for (u32 m = 1; whole && u32(place.src_mip) + m < src_mips && u32(place.mip) + m < dst_mips;
+        // Not for FIX-GT7-127's blocks: each level has its own target.
+        for (u32 m = 1; whole && !place.blocks && u32(place.src_mip) + m < src_mips &&
+                        u32(place.mip) + m < dst_mips;
              ++m) {
             vk::ImageCopy mip = region;
             mip.srcSubresource.mipLevel = u32(place.src_mip) + m;
@@ -8629,7 +8842,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }();
     const bool must_wait = !pipeline && DrawMustNotSkip(regs);
     // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
-    const bool harmful_wait = must_wait && OneOffKnownHarmful();
+    // FIX-GT7-135: so does a never-drawn level of a texture, out of play.
+    const bool harmful_wait =
+        must_wait && (OneOffKnownHarmful() ||
+                      (one_off_texture_level && !g_game_in_play.load(std::memory_order_relaxed)));
     if (must_wait && (harmful_wait || OneOffBudgetLeft())) {
         // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
         PhaseClock clock{stats.phase_ns[0]};
@@ -8662,6 +8878,51 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         WatchOneOffs(regs, false); // DIAG-GT7-008: it would have waited
     }
     if (!pipeline) {
+        // FIX-GT7-131: a draw into a colour layout no picture has, skipped all the same (its
+        // pipeline not ready within the frame's budget), leaves its target empty rather than
+        // missing: a later read of that layout would otherwise read guest memory. At a Scapes
+        // photo's first frames that was the scratch pool's other pictures (RGBA8 menu pictures read
+        // as RGBA16F: huge values, NaN) and the photo's average kept them to the end.
+        static const bool empty_target = [] {
+            const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+            return !(env && env[0] == '0');
+        }();
+        if (empty_target && regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (!col_buf || regs.color_target_mask.GetMask(cb) == 0) {
+                    continue;
+                }
+                const VideoCore::TextureCache::ImageDesc desc{col_buf,
+                                                              r.liverpool->DrawCbExtent(cb)};
+                const auto& info = desc.info;
+                if (info.num_samples != 1 ||
+                    registry->FindExisting(col_buf.Address(), [&](const Native::ImageEntry& e) {
+                        return !e.from_cpu && e.image != nullptr && e.info.pitch == info.pitch &&
+                               e.info.num_bits == info.num_bits &&
+                               e.info.tile_mode == info.tile_mode &&
+                               e.info.num_samples == info.num_samples;
+                    })) {
+                    continue;
+                }
+                Native::ImageEntry* const made = registry->Find(info, true, frame);
+                if (!made || made->write_version.load(std::memory_order_relaxed) != 0) {
+                    continue;
+                }
+                made->needs_upload.store(false, std::memory_order_relaxed);
+                made->force_upload.store(false, std::memory_order_relaxed);
+                made->rewrite = Native::ImageEntry::Rewrite::Clear;
+                made->rewrite_pattern = {0, 0};
+                made->rewrite_bytes = made->info.guest_size;
+                static std::atomic<u32> empty_logged{};
+                if (const u32 n = empty_logged++; n < 64 || n % 500 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-131: a draw into {:#x} {}x{} skipped without its pipeline: "
+                                "its target starts empty (frame {}, {} so far)",
+                                col_buf.Address(), info.size.width, info.size.height, frame, n + 1);
+                }
+            }
+        }
         ++stats.no_pipeline;
         return;
     }
@@ -9949,12 +10210,22 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             });
             binding.unified += num_bindings;
         };
+        // false: the draw goes to the recorder (FIX-GT7-133's stand-in not made yet).
         const auto bind_null = [&] {
+            const bool wants_stand_in =
+                image_desc.is_depth && !storage && num_bindings == 1 && !cube_sampling;
+            const vk::ImageView stand_in = wants_stand_in
+                                               ? DepthStandIn(image_desc.is_array, false)
+                                               : vk::ImageView{};
+            if (wants_stand_in && !stand_in && DepthStandInOn()) {
+                return false; // FIX-GT7-133: made and cleared on the recorder, which binds it
+            }
             for (u32 i = 0; i < num_bindings; ++i) {
-                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+                b.images.push_back({VK_NULL_HANDLE, stand_in, vk::ImageLayout::eGeneral});
             }
             ++p.null_images;
             add_write();
+            return true;
         };
         std::array<u64, 4> raw_sharp{};
         static_assert(sizeof(tsharp) == sizeof(raw_sharp));
@@ -9992,12 +10263,16 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined ||
             VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits()) !=
                 VideoCore::ImageDescriptorGeometryError::None) {
-            bind_null();
+            if (!bind_null()) {
+                return false;
+            }
             continue;
         }
         const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
         if (!r.IsMappedStart(desc.info.guest_address)) {
-            bind_null();
+            if (!bind_null()) {
+                return false;
+            }
             continue;
         }
         Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);

@@ -54,8 +54,16 @@ struct ImageInfo {
         return Extent2D{pitch >> dim, size.height >> dim};
     }
 
-    s32 MipOf(const ImageInfo& info) const;
-    s32 SliceOf(const ImageInfo& info, s32 mip) const;
+    /// FIX-GT7-134: `padded`: this image may be larger than the mip, within the mip's padded size
+    /// in memory (a target the game sized to its own extent over the mip's area).
+    s32 MipOf(const ImageInfo& info, bool padded = false) const;
+    /// FIX-GT7-134: `padded` as for MipOf (a single-layer mip only).
+    s32 SliceOf(const ImageInfo& info, s32 mip, bool padded = false) const;
+
+    /// FIX-GT7-127: the level of this block-compressed image that `target` holds as one texel per
+    /// block (a compute shader writing the compressed blocks through an uncompressed image over
+    /// the level's padded area, at the level's address), or -1.
+    s32 BlockLevelOf(const ImageInfo& target) const;
 
     bool IsCompatible(const ImageInfo& info) const;
 
