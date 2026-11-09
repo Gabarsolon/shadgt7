@@ -6192,6 +6192,35 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             LOG_INFO(Render_Vulkan, "FIX-190: {}_{:#x} turns every lane on inside a branch",
                      hw_stage, params.hash);
         }
+        // NEO-GT7-007: PS4 Pro programs with SDWA compares or selections, stored before they
+        // were translated (only Pro code has SDWA, so the base mode never looks). Like the fixes
+        // above, only for a store other builds may have filled (RYGT_KEEP_SHADER_CACHE=1, builds
+        // without a commit): a player's store is cleared by SHD-010 at each new renderer.
+        static const bool neo = Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        if (neo) {
+            const auto use = Shader::NeoCodeCensus(params.code);
+            if (use.sdwa_compares_to_sgpr + use.sdwa_selects != 0) {
+                needed_fixes |= 2048u;
+            }
+        }
+    }
+    // NEO-GT7-008 (diagnosis, RYGT_NEO_CENSUS=1): the PS4 Pro encodings each program uses, at
+    // its first use; DPP and the MIMG G16/A16/D16 bits are not translated yet.
+    static const bool neo_census = [] {
+        const char* env = std::getenv("RYGT_NEO_CENSUS");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && env && env[0] == '1';
+    }();
+    if (neo_census && first_use) {
+        const auto use = Shader::NeoCodeCensus(params.code);
+        if (use.sdwa_compares_to_sgpr + use.sdwa_selects + use.dpp + use.mimg_g16 + use.mimg_a16 +
+                use.mimg_d16 !=
+            0) {
+            LOG_WARNING(Render_Vulkan,
+                        "NEO-GT7-008: {}_{:#x} uses SDWA compares to SGPRs {}, SDWA selections {}, "
+                        "DPP {}, MIMG G16 {} A16 {} D16 {}",
+                        hw_stage, params.hash, use.sdwa_compares_to_sgpr, use.sdwa_selects,
+                        use.dpp, use.mimg_g16, use.mimg_a16, use.mimg_d16);
+        }
     }
     const auto known = needed_fixes != 0 ? else_scope_fixed.find(params.hash)
                                           : else_scope_fixed.end(); // PERF-GT7-058

@@ -106,6 +106,40 @@ std::string ListGcnCode(std::span<const u32> code) {
     return out;
 }
 
+NeoCodeUse NeoCodeCensus(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    NeoCodeUse use{};
+    const auto sub_dword = [](SdwaSelector sel) {
+        return sel != SdwaSelector::Invalid && sel != SdwaSelector::Dword;
+    };
+    size_t at = 0; // dwords
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.encoding == InstEncoding::VOPC && inst.dst[1].field != OperandField::VccLo) {
+            ++use.sdwa_compares_to_sgpr; // only SDWA gives a VOPC another destination
+        }
+        if (sub_dword(inst.src[0].sdwa_sel) || sub_dword(inst.src[1].sdwa_sel) ||
+            sub_dword(inst.dst[0].sdwa_sel)) {
+            ++use.sdwa_selects;
+        }
+        if (inst.src[0].dpp.has_value()) {
+            ++use.dpp;
+        }
+        if (inst.encoding == InstEncoding::MIMG && at + 1 < code.size()) {
+            use.mimg_g16 += code[at] & 1u;
+            use.mimg_a16 += (code[at + 1] >> 30) & 1u;
+            use.mimg_d16 += (code[at + 1] >> 31) & 1u;
+        }
+        at += inst.length / sizeof(u32);
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return use;
+}
+
 bool HasLaneReads(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
