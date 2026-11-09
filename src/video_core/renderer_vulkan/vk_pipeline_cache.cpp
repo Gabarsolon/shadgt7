@@ -2220,6 +2220,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (CompilePack::CompileOn() && so_cache && instance.IsShaderObjectEnabled()) { // PERF-GT7-108
         compile_pack_thread =
             std::jthread([this](std::stop_token stop) { CompilePackShaders(stop); });
+    } else if (CompilePack::CompileOn()) {
+        // FIX-GT7-136: the pack's recipes are shader object sets, and SPIR-V is kept only with
+        // shader objects on; with pipelines (AMD's default) there is nothing to compile.
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-108: the compile pack needs shader objects (see "
+                                   "SO-001; RYGT_SHADER_OBJECT=1 on AMD{}): no start-up compile",
+                    so_cache ? "" : "; RYGT_SO_CACHE not 0");
     }
     // PERF-032: the shader store: a program's stored translations are read when a draw first
     // uses it, and new translations are stored. -DisablePerf 47 leaves the store closed.
