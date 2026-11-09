@@ -76,24 +76,33 @@ Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
     return ctx.OpNMax(ctx.F32[1], a, ctx.OpNMax(ctx.F32[1], b, c));
 }
 
+// FIX-215: GCN MED3 with a quiet NaN operand returns the minimum of the numeric operands; `med`
+// is the result without a NaN. (Without SignedZeroInfNanPreserve the driver may fold the test
+// away: then the result is `med`, as before.)
+static Id Med3WithNanCase(EmitContext& ctx, Id a, Id b, Id c, Id med) {
+    const Id any_nan{ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
+        ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
+    const Id nan_result{ctx.OpNMin(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), c)};
+    return ctx.OpSelect(ctx.F32[1], any_nan, nan_result, med);
+}
+
 Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
     if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
         return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
     }
     if (ctx.profile.supports_trinary_minmax) {
-        // FIX-215: GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
-        // SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined; GT Sport's
-        // (65000, NaN, 0) HDR clamp then drew white car materials and too much bloom on Radeons,
-        // so the NaN case is selected explicitly.
-        const Id any_nan{ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
-            ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
-        const Id nan_result{
-            ctx.OpNMin(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), c)};
-        return ctx.OpSelect(ctx.F32[1], any_nan, nan_result,
-                            ctx.OpFMid3AMD(ctx.F32[1], a, b, c));
+        // FIX-215: SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined;
+        // GT Sport's (65000, NaN, 0) HDR clamp then drew white car materials and too much bloom
+        // on Radeons, so the NaN case is selected explicitly.
+        return Med3WithNanCase(ctx, a, b, c, ctx.OpFMid3AMD(ctx.F32[1], a, b, c));
     }
     const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
-    return ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx);
+    const Id med{ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx)};
+    // FIX-GT7-138 (Profile::med3_nan_rule, RYGT_MED3_NAN=0 turns it off): the same NaN case on
+    // GPUs without the trinary extension (NVIDIA, Intel). NMin/NMax drop a NaN operand, so the
+    // formula above gives GT7's (65000, NaN, 0) HDR clamp 65000 where GCN gives 0: pure white
+    // lines along building and sign edges, white flashes on car bodies, and their glow.
+    return ctx.profile.med3_nan_rule ? Med3WithNanCase(ctx, a, b, c, med) : med;
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
