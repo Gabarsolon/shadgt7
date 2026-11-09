@@ -835,3 +835,76 @@ TEST_F(GcnTest, floor_f64_literal_is_high_dword) {
     EXPECT_EQ(*result_lo, 0U);
     EXPECT_EQ(*result_hi, 0xc0080000U);
 }
+
+// NEO-GT7-007: PS4 Pro (Neo) SDWA. The second dword of a VOP1/VOP2: src0 [7:0], dst_sel [10:8],
+// dst_unused [12:11], src0_sel [18:16], src0_sext [19], s0 [23], src1_sel [26:24], s1 [31]; of a
+// VOPC: src0 [7:0], sdst [14:8], sd [15], then the same source fields.
+namespace {
+constexpr u32 SdwaByte1 = 1;
+constexpr u32 SdwaWord1 = 5;
+constexpr u32 SdwaDword = 6;
+constexpr u32 SdwaPad = 0;
+constexpr u32 SdwaPreserve = 2;
+
+u64 SdwaMovV0(u32 src_vgpr, u32 src_sel, bool sext, u32 dst_sel, u32 dst_unused) {
+    const u64 first = VOP1(OpcodeVOP1::V_MOV_B32, VOperand8::V0, SOperand9::Sdwa).Get();
+    const u32 sdwa = src_vgpr | (dst_sel << 8) | (dst_unused << 11) | (src_sel << 16) |
+                     (u32(sext) << 19) | (SdwaDword << 24);
+    return (first & 0xFFFFFFFFull) | (u64{sdwa} << 32);
+}
+} // Anonymous namespace
+
+TEST_F(GcnTest, sdwa_compare_writes_its_sgpr_pair) {
+    auto runner = gcn_test::Runner::instance().value();
+    // v_cmp_eq_u32_sdwa s[2:3], v0, v1 (sd set), then v_cndmask_b32 v0, 0, 1, s[2:3]. Before the
+    // fix the mask went to VCC and s[2:3] kept the input's bits.
+    const u32 cmp = (0b0111110u << 25) | (u32(Shader::Gcn::OpcodeVOPC::V_CMP_EQ_U32) << 17) |
+                    (1u << 9) | 0xF9u;
+    const u32 cmp_sdwa = 0u | (2u << 8) | (1u << 15) | (SdwaDword << 16) | (SdwaDword << 24);
+    const std::array<u64, 2> instructions{
+        u64{cmp} | (u64{cmp_sdwa} << 32),
+        VOP3A(OpcodeVOP3::V_CNDMASK_B32, VOperand8::V0, SOperand9::Const0, SOperand9::Const1,
+              SOperand9::S2)
+            .Get(),
+    };
+    const auto spirv = TranslateToSpirv(instructions);
+
+    const auto equal = runner->run<u32>(spirv, std::array{5U, 5U, 0U, 0U});
+    ASSERT_TRUE(equal.has_value());
+    EXPECT_EQ(*equal, 1U);
+
+    const auto different = runner->run<u32>(spirv, std::array{5U, 6U, 0xFFFFFFFFU, 0xFFFFFFFFU});
+    ASSERT_TRUE(different.has_value());
+    EXPECT_EQ(*different, 0U);
+}
+
+TEST_F(GcnTest, sdwa_source_word1) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(SdwaMovV0(1, SdwaWord1, false, SdwaDword, SdwaPad));
+    const auto result = runner->run<u32>(spirv, std::array{0U, 0xABCD1234U, 0U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0xABCDU);
+}
+
+TEST_F(GcnTest, sdwa_source_byte1_sign_extended) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(SdwaMovV0(1, SdwaByte1, true, SdwaDword, SdwaPad));
+    const auto result = runner->run<u32>(spirv, std::array{0U, 0x00008000U, 0U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0xFFFFFF80U);
+}
+
+TEST_F(GcnTest, sdwa_destination_word1_preserve_and_pad) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto preserve =
+        runner->run<u32>(TranslateToSpirv(SdwaMovV0(1, SdwaDword, false, SdwaWord1, SdwaPreserve)),
+                         std::array{0x11112222U, 0x00003333U, 0U, 0U});
+    ASSERT_TRUE(preserve.has_value());
+    EXPECT_EQ(*preserve, 0x33332222U);
+
+    const auto pad =
+        runner->run<u32>(TranslateToSpirv(SdwaMovV0(1, SdwaDword, false, SdwaWord1, SdwaPad)),
+                         std::array{0x11112222U, 0x00003333U, 0U, 0U});
+    ASSERT_TRUE(pad.has_value());
+    EXPECT_EQ(*pad, 0x33330000U);
+}
