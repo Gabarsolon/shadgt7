@@ -111,6 +111,17 @@ public:
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;
     }
+
+    /// FIX-GT7-139: drops the part of a debt (a negative total wait) beyond `max_debt`: that
+    /// time is not made up. Returns the time dropped.
+    std::chrono::nanoseconds LimitDebt(std::chrono::nanoseconds max_debt) {
+        const auto dropped = -max_debt - total_wait;
+        if (dropped.count() <= 0) {
+            return std::chrono::nanoseconds{0};
+        }
+        total_wait = -max_debt;
+        return dropped;
+    }
 };
 
 std::string GetCurrentThreadName();
