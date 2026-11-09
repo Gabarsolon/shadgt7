@@ -33,6 +33,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
@@ -1255,6 +1256,36 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
+        // NEO-GT7-005: in the PS4 Pro mode, a draw rasterizing more samples (its depth's) than
+        // one of its colour targets has fragments runs its pixel shader once per pixel, where
+        // Vulkan requires it: VK_NV_framebuffer_mixed_samples (per-sample shading with fewer
+        // colour samples lost the GPU, writing to address 0). VK_AMD_mixed_attachment_samples
+        // has no such rule: AMD keeps the shader as it is. RYGT_NEO_PIXEL_RATE=0: as before.
+        static const bool neo_pixel_rate = [] {
+            const char* env = std::getenv("RYGT_NEO_PIXEL_RATE");
+            return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+        }();
+        if (neo_pixel_rate && instance.IsMixedDepthSamplesSupported() &&
+            !instance.IsMixedAnySamplesSupported()) {
+            const u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            bool fewer = false;
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    fewer |= col_buf.NumSamples() < raster;
+                }
+            }
+            if (fewer) {
+                info.hw.fs.mrtz_mask |= Shader::HwFragmentRuntimeInfo::MrtzPixelRate;
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GT7-005: pixel shader at {:#x} runs once per pixel: {} "
+                                "raster samples, fewer colour fragments (mixed samples)",
+                                regs.ps_program.Address<VAddr>(), raster);
+                }
+            }
+        }
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =

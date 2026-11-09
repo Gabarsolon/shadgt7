@@ -333,12 +333,14 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
             ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
             ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
-        if (info.loads.Get(IR::Attribute::SampleIndex) ||
-            runtime_info.hw.fs.addr_flags.linear_sample_ena ||
-            runtime_info.hw.fs.addr_flags.persp_sample_ena ||
-            (!profile.supports_amd_shader_explicit_vertex_parameter &&
-             profile.supports_fragment_shader_barycentric &&
-             info.loads.Get(IR::Attribute::BaryCoordSmoothSample))) {
+        // NEO-GT7-005: a shader that runs once per pixel declares no per-sample input at all.
+        if (!runtime_info.hw.fs.PixelRate() &&
+            (info.loads.Get(IR::Attribute::SampleIndex) ||
+             runtime_info.hw.fs.addr_flags.linear_sample_ena ||
+             runtime_info.hw.fs.addr_flags.persp_sample_ena ||
+             (!profile.supports_amd_shader_explicit_vertex_parameter &&
+              profile.supports_fragment_shader_barycentric &&
+              info.loads.Get(IR::Attribute::BaryCoordSmoothSample)))) {
             ctx.AddCapability(spv::Capability::SampleRateShading);
         }
         if (info.loads.GetAny(IR::Attribute::RenderTargetIndex)) {

@@ -446,7 +446,10 @@ void EmitContext::DefineInputs() {
             output_layer = DefineVariable(U32[1], spv::BuiltIn::Layer, spv::StorageClass::Input);
             Decorate(output_layer, spv::Decoration::Flat);
         }
-        if (info.loads.Get(IR::Attribute::SampleIndex)) {
+        // NEO-GT7-005: a shader that runs once per pixel reads sample 0 (EmitGetAttributeU32)
+        // and declares no SampleId, which would make it run per sample.
+        const bool pixel_rate = runtime_info.hw.fs.PixelRate();
+        if (info.loads.Get(IR::Attribute::SampleIndex) && !pixel_rate) {
             sample_index = DefineVariable(U32[1], spv::BuiltIn::SampleId, spv::StorageClass::Input);
             Decorate(sample_index, spv::Decoration::Flat);
         }
@@ -486,7 +489,19 @@ void EmitContext::DefineInputs() {
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample)) {
-            if (profile.supports_amd_shader_explicit_vertex_parameter) {
+            if (pixel_rate) {
+                // NEO-GT7-005: the sample's barycentrics are the pixel centre's.
+                if (profile.supports_amd_shader_explicit_vertex_parameter) {
+                    if (!ValidId(bary_coord_smooth)) {
+                        bary_coord_smooth = DefineVariable(
+                            F32[2], spv::BuiltIn::BaryCoordSmoothAMD, spv::StorageClass::Input);
+                    }
+                    bary_coord_smooth_sample = bary_coord_smooth;
+                } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
+                    bary_coord = DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR,
+                                                spv::StorageClass::Input);
+                }
+            } else if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordSmoothSampleAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
@@ -512,7 +527,14 @@ void EmitContext::DefineInputs() {
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordNoPerspSample)) {
-            if (profile.supports_amd_shader_explicit_vertex_parameter) {
+            if (pixel_rate && profile.supports_amd_shader_explicit_vertex_parameter) {
+                // NEO-GT7-005: the pixel centre's (the KHR path below has no Sample decoration).
+                if (!ValidId(bary_coord_nopersp)) {
+                    bary_coord_nopersp = DefineVariable(F32[2], spv::BuiltIn::BaryCoordNoPerspAMD,
+                                                        spv::StorageClass::Input);
+                }
+                bary_coord_nopersp_sample = bary_coord_nopersp;
+            } else if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_nopersp_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordNoPerspSampleAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
@@ -552,7 +574,8 @@ void EmitContext::DefineInputs() {
                 Decorate(attr_id, primary == Qualifier::Flat ? spv::Decoration::Flat
                                                              : spv::Decoration::NoPerspective);
             }
-            if (auxiliary != Qualifier::None) {
+            // NEO-GT7-005: once per pixel, a sample-interpolated input is read at the centre.
+            if (auxiliary != Qualifier::None && !(pixel_rate && auxiliary == Qualifier::Sample)) {
                 Decorate(attr_id, auxiliary == Qualifier::Centroid ? spv::Decoration::Centroid
                                                                    : spv::Decoration::Sample);
             }
