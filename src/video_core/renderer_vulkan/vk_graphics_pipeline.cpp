@@ -1146,7 +1146,10 @@ GraphicsPipeline::GraphicsPipeline(
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
-            if ((i == 1 || i == 2) && CompilePack::RecordingOn()) {
+            // FIX-GT7-136: a library recipe holds its stages' SPIR-V, kept only with shader
+            // objects on (without them every recipe was refused as "state not known").
+            if ((i == 1 || i == 2) && CompilePack::RecordingOn() &&
+                instance.IsShaderObjectEnabled()) {
                 record_library(i);
             }
             return library;

@@ -436,7 +436,8 @@ private:
     std::jthread verify_thread;
     std::jthread pretranslate_thread;
     std::jthread warm_compute_thread;
-    /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1).
+    /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1, with shader
+    /// objects only, off by default on AMD since FIX-GT7-136).
     void CompilePackShaders(std::stop_token stop);
     std::jthread compile_pack_thread;
     u32 pipelines_at_driver_save{};
