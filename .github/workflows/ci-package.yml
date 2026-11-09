@@ -1,4 +1,4 @@
-name: RyGT7 package for renderer changes
+name: RyGT7 CI artifacts for renderer changes
 
 on:
   push:
@@ -17,5 +17,3 @@ jobs:
     uses: RyGT-Team/rygt7/.github/workflows/rygt7-ci.yml@main
     with:
       renderer_sha: ${{ github.sha }}
-    secrets:
-      GITLAB_PACKAGE_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}
