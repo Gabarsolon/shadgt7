@@ -57,6 +57,10 @@ public:
         return external_memory_host;
     }
 
+    bool IsHdrMetadataSupported() const {
+        return hdr_metadata;
+    }
+
     vk::Device GetDevice() const {
         return *device;
     }
@@ -660,6 +664,7 @@ private:
     bool image_load_store_lod{};
     bool amd_gcn_shader{};
     bool external_memory_host{}; // P1
+    bool hdr_metadata{};
     bool amd_shader_trinary_minmax{};
     bool nv_framebuffer_mixed_samples{};
     bool amd_mixed_attachment_samples{};

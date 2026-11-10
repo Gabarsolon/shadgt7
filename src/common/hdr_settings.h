@@ -21,6 +21,8 @@ namespace Common::Hdr {
 struct OutputSettings {
     float gain = 1.0f;
     float peak_nits = 0.0f;
+    float metadata_nits = 0.0f;
+    float metadata_fall_nits = 400.0f;
 };
 
 inline double Number(const nlohmann::json& object, const char* key, double fallback) {
@@ -58,6 +60,11 @@ inline OutputSettings ParseOutputSettings(std::string_view text) {
     const auto& gpu = document["GPU"];
     settings.gain = static_cast<float>(std::clamp(Number(gpu, "hdr_gain", 1.0), 0.1, 8.0));
     settings.peak_nits = static_cast<float>(std::clamp(Number(gpu, "hdr_peak_nits", 0.0), 0.0, 10000.0));
+    const double metadata = Number(gpu, "hdr_metadata_nits", 0.0);
+    settings.metadata_nits = metadata > 0.0 ? static_cast<float>(std::clamp(metadata, 100.0, 10000.0)) : 0.0f;
+    settings.metadata_fall_nits = static_cast<float>(std::clamp(
+        Number(gpu, "hdr_metadata_fall_nits", 400.0), 1.0,
+        settings.metadata_nits > 0.0f ? double(settings.metadata_nits) : 10000.0));
     return settings;
 }
 

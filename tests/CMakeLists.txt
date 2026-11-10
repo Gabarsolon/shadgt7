@@ -28,6 +28,11 @@ target_include_directories(shadps4_ryty_config_test PRIVATE ${CMAKE_SOURCE_DIR}/
 target_link_libraries(shadps4_ryty_config_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers)
 gtest_discover_tests(shadps4_ryty_config_test)
 
+add_executable(shadps4_hdr_settings_test test_hdr_settings.cpp)
+target_include_directories(shadps4_hdr_settings_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_hdr_settings_test PRIVATE GTest::gtest_main nlohmann_json::nlohmann_json)
+gtest_discover_tests(shadps4_hdr_settings_test)
+
 add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp)
 target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)

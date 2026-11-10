@@ -382,6 +382,9 @@ bool Instance::CreateDevice() {
     };
 
     // Required
+    // Optional HDR metadata needs the extension enabled, not just a global entry point.
+    // SDR-only users retain the original device-extension selection.
+    hdr_metadata = EmulatorSettings.IsHdrAllowed() && add_extension(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),

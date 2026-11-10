@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <limits>
 #include "common/assert.h"
+#include "common/hdr_settings.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #ifdef RYTY_GPU
@@ -95,6 +96,28 @@ void Swapchain::Create(u32 width_, u32 height_) {
         ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                    vk::to_string(swapchain_result));
         swapchain = chain;
+    }
+
+    if (needs_hdr && swapchain) {
+        const auto settings = Common::Hdr::ReadOutputSettings();
+        if (settings.metadata_nits > 0.0f) {
+            if (instance.IsHdrMetadataSupported() && VULKAN_HPP_DEFAULT_DISPATCHER.vkSetHdrMetadataEXT) {
+                vk::HdrMetadataEXT metadata{};
+                metadata.displayPrimaryRed = vk::XYColorEXT{0.708f, 0.292f};
+                metadata.displayPrimaryGreen = vk::XYColorEXT{0.170f, 0.797f};
+                metadata.displayPrimaryBlue = vk::XYColorEXT{0.131f, 0.046f};
+                metadata.whitePoint = vk::XYColorEXT{0.3127f, 0.3290f};
+                metadata.maxLuminance = settings.metadata_nits;
+                metadata.minLuminance = 0.0005f;
+                metadata.maxContentLightLevel = settings.metadata_nits;
+                metadata.maxFrameAverageLightLevel = settings.metadata_fall_nits;
+                instance.GetDevice().setHdrMetadataEXT(swapchain, metadata);
+                LOG_INFO(Render_Vulkan, "HDR10 metadata: peak {} nits, frame average {} nits",
+                         settings.metadata_nits, settings.metadata_fall_nits);
+            } else {
+                LOG_WARNING(Render_Vulkan, "HDR10 metadata requested but VK_EXT_hdr_metadata is unavailable");
+            }
+        }
     }
 
     SetupImages();
