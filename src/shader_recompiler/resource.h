@@ -341,6 +341,8 @@ struct PushData {
     /// mask's place (only draws whose mask is all ones use it), so the push block keeps its size
     /// and every cached pipeline stays valid.
     static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
+    /// GPU.hd_ui: only fragment shaders that read the fragment coordinate have this member.
+    static constexpr u32 NativeFragCoordScaleIndex = 11;
 
     float xoffset;
     float yoffset;
@@ -349,13 +351,17 @@ struct PushData {
     /// Each stage has its own range (Backend::StageBufferOffsetBase).
     std::array<u8, 96> buf_offsets;
     std::array<u32, 2> quad_sample_mask{~0u, ~0u};
+    /// GPU.hd_ui: converts the output pixel coordinates of a draw that renders at the window size
+    /// back to guest pixels. Every other draw keeps the identity.
+    std::array<float, 2> native_frag_coord_scale{1.f, 1.f};
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
         buf_offsets[binding] = offset;
     }
 };
-static_assert(offsetof(PushData, quad_sample_mask) == 112 && sizeof(PushData) == 120);
+static_assert(offsetof(PushData, quad_sample_mask) == 112 &&
+              offsetof(PushData, native_frag_coord_scale) == 120 && sizeof(PushData) == 128);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/hd_ui_options.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -934,11 +935,20 @@ void EmitContext::DefineOutputs() {
 }
 
 void EmitContext::DefinePushDataBlock() {
+    // GPU.hd_ui: a fragment shader that reads the fragment coordinate scales it from the push
+    // block. Every other shader, and every shader with the setting off, keeps the original block.
+    native_frag_coord_scale =
+        Common::HdUiRequested() && sw_stage == SwStage::Fragment &&
+        (info.loads.GetAny(IR::Attribute::FragCoord) || runtime_info.hw.fs.quad_sample_mask ||
+         (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
+          !profile.supports_amd_shader_explicit_vertex_parameter));
     // Create push constants block for instance steps rates
-    const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[4],
-                        U32[4], U32[4], U32[2]),
-             "AuxData")};
+    std::vector<Id> members{F32[1], F32[1], F32[1], F32[1], U32[4], U32[4],
+                            U32[4], U32[4], U32[4], U32[4], U32[2]};
+    if (native_frag_coord_scale) {
+        members.push_back(F32[2]);
+    }
+    const Id struct_type{Name(TypeStruct(members), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
@@ -951,6 +961,11 @@ void EmitContext::DefinePushDataBlock() {
     MemberName(struct_type, PushData::BufOffsetIndex + 4, "buf_offsets4");
     MemberName(struct_type, PushData::BufOffsetIndex + 5, "buf_offsets5");
     MemberName(struct_type, PushData::QuadSampleMaskIndex, "quad_sample_mask");
+    if (native_frag_coord_scale) {
+        MemberName(struct_type, PushData::NativeFragCoordScaleIndex, "native_frag_coord_scale");
+        MemberDecorate(struct_type, PushData::NativeFragCoordScaleIndex, spv::Decoration::Offset,
+                       120U);
+    }
     MemberDecorate(struct_type, PushData::XOffsetIndex, spv::Decoration::Offset, 0U);
     MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
     MemberDecorate(struct_type, PushData::XScaleIndex, spv::Decoration::Offset, 8U);

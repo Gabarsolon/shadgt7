@@ -261,6 +261,7 @@ public:
     Id vertex_index{};
     Id instance_id{};
     Id push_data_block{};
+    bool native_frag_coord_scale{}; ///< GPU.hd_ui: push_data_block has native_frag_coord_scale
     Id base_vertex{};
     Id base_instance{};
     Id frag_coord{};

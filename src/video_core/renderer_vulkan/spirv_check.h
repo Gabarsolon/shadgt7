@@ -45,6 +45,35 @@ inline bool IsCompleteSpirv(std::span<const u32> words) {
 /// results are selected or merged as integers. Words of a whole module (IsCompleteSpirv).
 enum class FloatAtomicEmulation { None, BothAtomics, OneAtomic };
 
+/// GPU.hd_ui: whether a stored fragment module reads the fragment coordinate without the push
+/// block member that scales it (translated before the setting was on). Checks the decorations,
+/// not the debug names, which tools may strip.
+inline bool NeedsNativeFragCoordScale(std::span<const u32> words) {
+    constexpr u32 HeaderWords = 5;
+    constexpr u32 OpDecorate = 71;
+    constexpr u32 OpMemberDecorate = 72;
+    constexpr u32 DecorationBuiltIn = 11;
+    constexpr u32 DecorationOffset = 35;
+    constexpr u32 BuiltInFragCoord = 15;
+    constexpr u32 ScaleMember = 11;
+    constexpr u32 ScaleOffset = 120;
+    bool frag_coord = false;
+    bool scale_member = false;
+    for (size_t at = HeaderWords; at < words.size();) {
+        const u32 count = words[at] >> 16;
+        if (count == 0 || count > words.size() - at) {
+            return false; // the caller checks that the module is complete
+        }
+        const u32 op = words[at] & 0xffff;
+        frag_coord |= op == OpDecorate && count == 4 && words[at + 2] == DecorationBuiltIn &&
+                      words[at + 3] == BuiltInFragCoord;
+        scale_member |= op == OpMemberDecorate && count == 5 && words[at + 2] == ScaleMember &&
+                        words[at + 3] == DecorationOffset && words[at + 4] == ScaleOffset;
+        at += count;
+    }
+    return frag_coord && !scale_member;
+}
+
 inline FloatAtomicEmulation FindFloatAtomicEmulation(std::span<const u32> words) {
     constexpr u32 HeaderWords = 5;
     constexpr u32 OpImageTexelPointer = 60, OpBitcast = 124, OpSelect = 169, OpPhi = 245;
