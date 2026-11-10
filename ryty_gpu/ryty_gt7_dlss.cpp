@@ -1,0 +1,1211 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "ryty_gpu/ryty_gt7_dlss.h"
+
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <string>
+#include <half.hpp>
+#include <vk_mem_alloc.h>
+#include "common/logging/log.h"
+#include "common/sharp_options.h"
+#include "core/emulator_settings.h"
+#include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_gt7_dlss_merge_spv.h"
+#include "ryty_gpu/ryty_gt7_dlss_motion_spv.h"
+#include "ryty_gpu/ryty_gt7_dlss_swap_spv.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/image.h"
+
+namespace Vulkan {
+namespace {
+using namespace Gt7Temporal;
+void Barrier(vk::CommandBuffer cmd, vk::Image image, vk::ImageAspectFlags aspects,
+             vk::ImageLayout from, vk::ImageLayout to) {
+    const vk::ImageMemoryBarrier2 b{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = from == vk::ImageLayout::eUndefined
+                             ? vk::AccessFlags2{}
+                             : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = from,
+        .newLayout = to,
+        .image = image,
+        .subresourceRange = {.aspectMask = aspects, .levelCount = 1, .layerCount = 1}};
+    cmd.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+}
+struct Texture {
+    VideoCore::UniqueImage image;
+    vk::UniqueImageView view;
+    vk::Format format{};
+    vk::Extent2D size{};
+    vk::ImageAspectFlags aspects{vk::ImageAspectFlagBits::eColor};
+    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+    bool usage_storage{};
+    RytyDlssG::TemporalImage Descriptor() const {
+        return {image, *view, format, size};
+    }
+    void Transit(vk::CommandBuffer cmd, vk::ImageLayout next) {
+        Barrier(cmd, image, aspects, layout, next);
+        layout = next;
+    }
+    bool Create(const Instance& gpu, vk::Format fmt, vk::Extent2D extent,
+                vk::ImageAspectFlags aspect, vk::ImageUsageFlags extra = {}) {
+        if (image && format == fmt && size == extent && aspects == aspect)
+            return true;
+        view.reset();
+        image.Destroy();
+        image = VideoCore::UniqueImage{gpu.GetDevice(), gpu.GetAllocator()};
+        image.device = gpu.GetDevice();
+        const vk::ImageCreateInfo info{.imageType = vk::ImageType::e2D,
+                                       .format = fmt,
+                                       .extent = {extent.width, extent.height, 1},
+                                       .mipLevels = 1,
+                                       .arrayLayers = 1,
+                                       .samples = vk::SampleCountFlagBits::e1,
+                                       .usage = vk::ImageUsageFlagBits::eSampled |
+                                                vk::ImageUsageFlagBits::eTransferSrc |
+                                                vk::ImageUsageFlagBits::eTransferDst | extra};
+        const auto raw = static_cast<VkImageCreateInfo>(info);
+        const VmaAllocationCreateInfo alloc{.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+                                            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VkImage handle{};
+        VmaAllocation memory{};
+        VmaAllocationInfo allocated{};
+        if (vmaCreateImage(gpu.GetAllocator(), &raw, &alloc, &handle, &memory, &allocated) !=
+            VK_SUCCESS)
+            return false;
+        image.image = handle;
+        image.allocation = memory;
+        image.image_ci = info;
+        image.size_bytes = allocated.size;
+        auto v = gpu.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = fmt,
+            .subresourceRange = {.aspectMask = aspect & ~vk::ImageAspectFlagBits::eStencil,
+                                 .levelCount = 1,
+                                 .layerCount = 1}});
+        if (v.result != vk::Result::eSuccess) {
+            image.Destroy();
+            return false;
+        }
+        view = std::move(v.value);
+        format = fmt;
+        size = extent;
+        aspects = aspect;
+        layout = vk::ImageLayout::eUndefined;
+        usage_storage = bool(extra & vk::ImageUsageFlagBits::eStorage);
+        return true;
+    }
+    void Copy(vk::CommandBuffer cmd, const Gt7DlssPass::Input& source) {
+        Barrier(cmd, source.image, source.aspects, vk::ImageLayout::eGeneral,
+                vk::ImageLayout::eTransferSrcOptimal);
+        Transit(cmd, vk::ImageLayout::eTransferDstOptimal);
+        const auto aspect = aspects & ~vk::ImageAspectFlagBits::eStencil;
+        cmd.copyImage(source.image, vk::ImageLayout::eTransferSrcOptimal, image,
+                      vk::ImageLayout::eTransferDstOptimal,
+                      vk::ImageCopy{.srcSubresource = {aspect, 0, 0, 1},
+                                    .dstSubresource = {aspect, 0, 0, 1},
+                                    .extent = {size.width, size.height, 1}});
+        Barrier(cmd, source.image, source.aspects, vk::ImageLayout::eTransferSrcOptimal,
+                vk::ImageLayout::eGeneral);
+        Transit(cmd, vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+};
+struct Probe {
+    VmaAllocator allocator{};
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    void* mapped{};
+    u64 tick{}, frame{}, epoch{};
+    std::array<float, 2> correction{}, jitter{};
+    bool inverted{};
+    vk::Extent2D size{};
+    ~Probe() {
+        if (buffer)
+            vmaDestroyBuffer(allocator, buffer, allocation);
+    }
+};
+constexpr unsigned ProbeTiles = 9;
+constexpr unsigned ProbeBytes = ProbeTiles * 512;
+void Blit(vk::CommandBuffer cmd, vk::Image source, vk::Extent2D in,
+          vk::Image target, vk::Extent2D out) {
+    const vk::ImageBlit region{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffsets = std::array{vk::Offset3D{}, vk::Offset3D{int(in.width), int(in.height), 1}},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffsets = std::array{vk::Offset3D{}, vk::Offset3D{int(out.width), int(out.height), 1}}};
+    cmd.blitImage(source, vk::ImageLayout::eTransferSrcOptimal, target,
+                  vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
+}
+} // namespace
+
+struct Gt7DlssPass::Impl {
+    const Instance& gpu;
+    Scheduler& scheduler;
+    struct Slot {
+        Texture color, depth, motion, branch, output, scene, ref;
+        vk::UniqueImageView color_read, scene_read;
+        std::vector<vk::UniqueImageView> merge_views; // native views of this frame's resyncs
+        u64 tick{}, frame = ~u64{};
+    };
+    std::vector<std::unique_ptr<Slot>> slots;
+    Slot* current{};
+    std::vector<std::unique_ptr<Probe>> probes;
+    unsigned fallback_lines{};
+    u64 scene_key{}, epoch{}, last_taa = ~u64{}, taa_draws{},
+                              qualified_draws{}, captures{}, evaluations{}, successes{},
+                              numeric_passes{}, numeric_failures{};
+    bool epoch_pending = true;
+    std::string qualification_reason = "no-full-scene-TAA", epoch_reason = "first-scene";
+    std::map<std::string, u64> fallbacks, resets;
+    std::map<std::string, u64> fallback_frames, fallback_last_frame, logged_fallback_frames;
+    std::array<u64, 3> present_frames{}, logged_present_frames{};
+    u64 present_frame = ~u64{}, present_flips{}, logged_present_flips{};
+    u64 reset_requests{}, logged_reset_requests{}, unchanged_reuse{}, logged_unchanged_reuse{};
+    int present_mode = -1;
+    u64 spatial_grants{}, spatial_denials{}, logged_spatial_grants{}, logged_spatial_denials{};
+    vk::ComponentMapping consumer_mapping{};
+    struct BufferWrite {
+        VAddr address;
+        u64 size, version;
+        bool exact;
+    };
+    struct UploadProof {
+        VAddr address;
+        u64 size, version, image;
+        u32 count;
+    };
+    std::vector<BufferWrite> buffer_writes;
+    std::map<const void *, UploadProof> uploaded;
+    u64 buffer_frame = ~u64{};
+    bool buffer_overflow{};
+    std::chrono::steady_clock::time_point last_probe{}, last_evaluate_log{},
+        last_summary = std::chrono::steady_clock::now();
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout pipeline_layout;
+    vk::UniquePipeline motion_pipeline, swap_pipeline;
+    vk::Extent2D input{}, output{};
+    bool supported{}, branch_ready{}, attempted{}, camera_valid{}, numeric_valid{};
+    bool reconstructed{}, scene_dirty{}, display_hdr{};
+    u64 injected{}, scene_resyncs{}, scene_replays{}, composites{};
+    Input native_scene{};
+    u64 captured = ~u64{}, evaluated = ~u64{}, camera_sequence{}, scene_version{},
+        display_version{};
+    VAddr display_address{};
+    const void* scene_identity{};
+    std::array<const void*, 2> history_pair{};
+    Camera camera{}, previous{};
+    std::array<float, 29> constants{};
+    History history;
+    std::chrono::steady_clock::time_point last_success{};
+    // Detail-preserving resync (ryty_gt7_dlss_merge.comp).
+    vk::UniqueDescriptorSetLayout merge_set_layout;
+    vk::UniquePipelineLayout merge_layout;
+    std::array<vk::UniquePipeline, 2> merge_pipeline;
+    vk::UniqueSampler merge_sampler;
+    u64 resync_merged{}, resync_replaced{}, resync_bypassed{}, last_dirty_ps{};
+    std::map<u64, u64> dirty_writers; // pixel shader hash -> resyncs it caused
+    // GPU time of the SDK evaluation (timestamp queries around slEvaluateFeature).
+    static constexpr unsigned TimeSlots = 8;
+    struct TimeSlot {
+        u64 tick{};
+        bool pending{};
+    };
+    vk::UniqueQueryPool time_pool;
+    std::array<TimeSlot, TimeSlots> time_slots{};
+    bool time_failed{};
+    double eval_ms_last{}, eval_ms_sum{}, eval_ms_max{};
+    u64 eval_ms_count{};
+    // What the last evaluation used, for the GT7-DLSS line.
+    struct LastEval {
+        float jitter_x{}, jitter_y{}, c20{}, c21{};
+        bool reset{}, ok{};
+        const char* reset_reason = "none";
+        vk::Format depth_format{}, color_format{};
+        bool depth_aspect{}, inverted{};
+        float near_plane{}, far_plane{}, fov{}, mvec_scale{};
+        u64 frame{};
+    } last_eval;
+    struct Window {
+        u64 evaluations{}, successes{}, injected{}, merged{}, replaced{}, bypassed{}, replays{},
+            fallbacks{}, captures{};
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    } window;
+    Impl(const Instance& i, Scheduler& s) : gpu{i}, scheduler{s} {}
+    int BeginTime(vk::CommandBuffer cmd) {
+        if (time_failed)
+            return -1;
+        if (!time_pool) {
+            auto pool = gpu.GetDevice().createQueryPoolUnique(vk::QueryPoolCreateInfo{
+                .queryType = vk::QueryType::eTimestamp, .queryCount = TimeSlots * 2});
+            if (pool.result != vk::Result::eSuccess) {
+                time_failed = true;
+                return -1;
+            }
+            time_pool = std::move(pool.value);
+        }
+        for (unsigned i = 0; i < TimeSlots; ++i) {
+            if (time_slots[i].pending)
+                continue;
+            cmd.resetQueryPool(*time_pool, i * 2, 2);
+            cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *time_pool, i * 2);
+            return int(i);
+        }
+        return -1; // all slots still waiting for the GPU: skip this sample
+    }
+    void EndTime(vk::CommandBuffer cmd, int slot) {
+        if (slot < 0)
+            return;
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *time_pool, unsigned(slot) * 2 + 1);
+        time_slots[slot] = {scheduler.CurrentTick(), true};
+    }
+    void CollectTime() {
+        if (!time_pool)
+            return;
+        const double period_ms = double(gpu.GetImageLimits().timestampPeriod) / 1e6;
+        for (unsigned i = 0; i < TimeSlots; ++i) {
+            if (!time_slots[i].pending || !scheduler.IsFree(time_slots[i].tick))
+                continue;
+            std::array<u64, 2> stamps{};
+            const vk::Result result = gpu.GetDevice().getQueryPoolResults(
+                *time_pool, i * 2, 2, sizeof(stamps), stamps.data(), sizeof(u64),
+                vk::QueryResultFlagBits::e64);
+            if (result == vk::Result::eNotReady)
+                continue;
+            time_slots[i].pending = false;
+            if (result != vk::Result::eSuccess || stamps[1] < stamps[0])
+                continue;
+            eval_ms_last = double(stamps[1] - stamps[0]) * period_ms;
+            eval_ms_sum += eval_ms_last;
+            eval_ms_max = std::max(eval_ms_max, eval_ms_last);
+            ++eval_ms_count;
+        }
+    }
+    // The detail-preserving resync. False: the caller falls back to the old replace.
+    bool MergeScene(vk::CommandBuffer cmd, const Input& native) {
+        const auto scene_format = current->scene.format;
+        const int variant = scene_format == vk::Format::eR16G16B16A16Sfloat ? 0
+                            : scene_format == vk::Format::eB10G11R11UfloatPack32 ? 1 : -1;
+        if (variant < 0 || native.format != scene_format || !(current->scene.usage_storage))
+            return false;
+        const auto device = gpu.GetDevice();
+        if (!merge_layout) {
+            const std::array<vk::DescriptorSetLayoutBinding, 3> bindings{{
+                {0, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+                {1, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
+                {2, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute}}};
+            auto set = device.createDescriptorSetLayoutUnique(
+                {.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+                 .bindingCount = u32(bindings.size()), .pBindings = bindings.data()});
+            if (set.result != vk::Result::eSuccess)
+                return false;
+            merge_set_layout = std::move(set.value);
+            const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, 8};
+            auto layout = device.createPipelineLayoutUnique({.setLayoutCount = 1,
+                .pSetLayouts = &merge_set_layout.get(), .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &push});
+            if (layout.result != vk::Result::eSuccess)
+                return false;
+            merge_layout = std::move(layout.value);
+            auto sampler = device.createSamplerUnique(vk::SamplerCreateInfo{
+                .magFilter = vk::Filter::eLinear, .minFilter = vk::Filter::eLinear,
+                .mipmapMode = vk::SamplerMipmapMode::eNearest,
+                .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+                .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+                .addressModeW = vk::SamplerAddressMode::eClampToEdge, .maxLod = 0.f});
+            if (sampler.result != vk::Result::eSuccess)
+                return false;
+            merge_sampler = std::move(sampler.value);
+        }
+        if (!merge_pipeline[variant]) {
+            const auto* code = variant ? GT7_TDLSS_MERGE_R11G11B10_SPV : GT7_TDLSS_MERGE_RGBA16F_SPV;
+            const size_t bytes = variant ? sizeof(GT7_TDLSS_MERGE_R11G11B10_SPV)
+                                         : sizeof(GT7_TDLSS_MERGE_RGBA16F_SPV);
+            auto module = device.createShaderModuleUnique({.codeSize = bytes, .pCode = code});
+            if (module.result != vk::Result::eSuccess)
+                return false;
+            auto pipeline = device.createComputePipelineUnique(
+                {}, vk::ComputePipelineCreateInfo{
+                        .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                                  .module = *module.value, .pName = "main"},
+                        .layout = *merge_layout});
+            if (pipeline.result != vk::Result::eSuccess)
+                return false;
+            merge_pipeline[variant] = std::move(pipeline.value);
+        }
+        if (!current->ref.Create(gpu, scene_format, input, vk::ImageAspectFlagBits::eColor))
+            return false;
+        auto native_view = device.createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = native.image, .viewType = vk::ImageViewType::e2D, .format = native.format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+        if (native_view.result != vk::Result::eSuccess)
+            return false;
+        // The reference: the owned scene scaled down the way the native mirror was, so
+        // (native - reference) is exactly what the unreplayed writer changed.
+        current->scene.Transit(cmd, vk::ImageLayout::eTransferSrcOptimal);
+        current->ref.Transit(cmd, vk::ImageLayout::eTransferDstOptimal);
+        Blit(cmd, current->scene.image, output, current->ref.image, input);
+        current->ref.Transit(cmd, vk::ImageLayout::eShaderReadOnlyOptimal);
+        current->scene.Transit(cmd, vk::ImageLayout::eGeneral);
+        Barrier(cmd, native.image, native.aspects, vk::ImageLayout::eGeneral,
+                vk::ImageLayout::eGeneral);
+        const vk::DescriptorImageInfo owned_info{.imageView = *current->scene.view,
+                                                 .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo native_info{.sampler = *merge_sampler,
+            .imageView = *native_view.value, .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo ref_info{.sampler = *merge_sampler,
+            .imageView = *current->ref.view, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+        const std::array<vk::WriteDescriptorSet, 3> writes{{
+            {.dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &owned_info},
+            {.dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &native_info},
+            {.dstBinding = 2, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &ref_info}}};
+        const auto& options = Common::Sharp::Get();
+        const std::array<float, 2> limits{options.merge_lo, std::max(options.merge_hi, options.merge_lo + .01f)};
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *merge_pipeline[variant]);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *merge_layout, 0, writes);
+        cmd.pushConstants(*merge_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(limits),
+                          limits.data());
+        cmd.dispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);
+        Barrier(cmd, current->scene.image, current->scene.aspects, vk::ImageLayout::eGeneral,
+                vk::ImageLayout::eGeneral);
+        current->merge_views.push_back(std::move(native_view.value));
+        current->tick = scheduler.CurrentTick();
+        scheduler.GetDynamicState().Invalidate();
+        return true;
+    }
+    bool Normalize(vk::CommandBuffer cmd) {
+        if (!motion_pipeline) {
+            const auto device = gpu.GetDevice();
+            const vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eStorageImage, 1,
+                                                         vk::ShaderStageFlagBits::eCompute};
+            auto set = device.createDescriptorSetLayoutUnique(
+                {.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+                 .bindingCount = 1,
+                 .pBindings = &binding});
+            if (set.result != vk::Result::eSuccess)
+                return false;
+            set_layout = std::move(set.value);
+            const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, 8};
+            auto layout = device.createPipelineLayoutUnique({.setLayoutCount = 1,
+                                                             .pSetLayouts = &set_layout.get(),
+                                                             .pushConstantRangeCount = 1,
+                                                             .pPushConstantRanges = &push});
+            if (layout.result != vk::Result::eSuccess)
+                return false;
+            pipeline_layout = std::move(layout.value);
+            auto module = device.createShaderModuleUnique(
+                {.codeSize = sizeof(GT7_TDLSS_MOTION_SPV), .pCode = GT7_TDLSS_MOTION_SPV});
+            if (module.result != vk::Result::eSuccess)
+                return false;
+            auto pipeline = device.createComputePipelineUnique(
+                {},
+                vk::ComputePipelineCreateInfo{.stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                                                        .module = *module.value,
+                                                        .pName = "main"},
+                                              .layout = *pipeline_layout});
+            if (pipeline.result != vk::Result::eSuccess)
+                return false;
+            motion_pipeline = std::move(pipeline.value);
+        }
+        current->motion.Transit(cmd, vk::ImageLayout::eGeneral);
+        const vk::DescriptorImageInfo image{.imageView = *current->motion.view,
+                                            .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::WriteDescriptorSet write{.dstBinding = 0,
+                                           .descriptorCount = 1,
+                                           .descriptorType = vk::DescriptorType::eStorageImage,
+                                           .pImageInfo = &image};
+        const std::array<float, 2> correction{constants[20] * Config().motion_jitter,
+                                              constants[21] * Config().motion_jitter};
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_pipeline);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0, write);
+        cmd.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                          sizeof(correction), correction.data());
+        cmd.dispatch((input.width + 7) / 8, (input.height + 7) / 8, 1);
+        current->motion.Transit(cmd, vk::ImageLayout::eShaderReadOnlyOptimal);
+        return true;
+    }
+    void ProbeInputs(vk::CommandBuffer cmd, u64 frame) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!camera_valid || probes.size() >= 2 ||
+            (last_probe.time_since_epoch().count() && now - last_probe < std::chrono::seconds(1)))
+            return;
+        last_probe = now;
+        auto p = std::make_unique<Probe>();
+        p->allocator = gpu.GetAllocator();
+        const VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, ProbeBytes,
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo alloc{.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+        VmaAllocationInfo allocated{};
+        if (vmaCreateBuffer(p->allocator, &info, &alloc, &p->buffer, &p->allocation, &allocated) !=
+            VK_SUCCESS)
+            return;
+        p->mapped = allocated.pMappedData;
+        p->frame = frame;
+        p->epoch = epoch;
+        p->tick = scheduler.CurrentTick();
+        p->size = input;
+        p->correction = {constants[20] * Config().motion_jitter,
+                         constants[21] * Config().motion_jitter};
+        p->jitter = {-constants[20] * constants[14], -constants[21] * constants[15]};
+        p->inverted = camera.lens.inverted;
+        for (auto* texture : {&current->depth, &current->motion})
+            texture->Transit(cmd, vk::ImageLayout::eTransferSrcOptimal);
+        for (unsigned tile = 0; tile < ProbeTiles; ++tile) {
+            const vk::Offset3D at{int(input.width * (.2f + .3f * (tile % 3))) - 4,
+                                  int(input.height * (.25f + .275f * (tile / 3))) - 4, 0};
+            for (unsigned role = 0; role < 2; ++role) {
+                auto& t = role == 0 ? current->depth : current->motion;
+                const vk::BufferImageCopy region{
+                    .bufferOffset = (tile * 2 + role) * 256u,
+                    .imageSubresource = {t.aspects & ~vk::ImageAspectFlagBits::eStencil, 0, 0, 1},
+                    .imageOffset = at,
+                    .imageExtent = {8, 8, 1}};
+                cmd.copyImageToBuffer(t.image, vk::ImageLayout::eTransferSrcOptimal, p->buffer,
+                                      region);
+            }
+        }
+        for (auto* texture : {&current->depth, &current->motion})
+            texture->Transit(cmd, vk::ImageLayout::eShaderReadOnlyOptimal);
+        const vk::BufferMemoryBarrier2 host{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                                            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                                            .buffer = p->buffer,
+                                            .offset = 0,
+                                            .size = ProbeBytes};
+        cmd.pipelineBarrier2(
+            vk::DependencyInfo{.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host});
+        probes.push_back(std::move(p));
+    }
+};
+
+Gt7DlssPass::Gt7DlssPass(const Instance& i, Scheduler& s) : impl{std::make_unique<Impl>(i, s)} {
+    const auto& c = Config();
+    LOG_INFO(Render_Vulkan,
+             "GT7-DLSS: temporal reconstruction armed (jitterSign=({}, {}) mvecMultiplier={} "
+             "motionJitter={})",
+             c.jitter_sign_x, c.jitter_sign_y, c.mvec_scale, c.motion_jitter);
+}
+Gt7DlssPass::~Gt7DlssPass() {
+    // Resize/reuse and destruction are all timeline based. No device-idle wait.
+    if (impl)
+        impl->scheduler.DeferOperation([retired = std::move(impl)] {});
+}
+void Gt7DlssPass::SetDisplay(vk::Extent2D input, vk::Extent2D output, bool hdr) {
+    auto& p = *impl;
+    Common::Sharp::SetScale(input.width, output.width,
+                            EmulatorSettings.IsDlssEnabled() && RytyDlss::CanScale(input, output));
+    // Display PQ is produced by the game composite AFTER linear scene reconstruction.
+    const bool supported = output.width >= input.width && output.height >= input.height &&
+                           input.width && input.height && output.width <= 8192 &&
+                           output.height <= 8192;
+    if (p.input != input || p.output != output || p.supported != supported || p.display_hdr != hdr) {
+        Invalidate(p.display_hdr != hdr ? "display-encoding-change" : "scene-output-resize");
+        p.captured = ~u64{};
+        SceneEpoch("scene-output-resize");
+        LOG_INFO(Render_Vulkan,
+                 "GT7-DLSS: display {}x{} output {}x{} displayPQ={} temporalAllowed={}", input.width,
+                 input.height, output.width, output.height, hdr, supported);
+    }
+    p.input = input;
+    p.output = output;
+    p.supported = supported;
+    p.display_hdr = hdr;
+}
+void Gt7DlssPass::Invalidate(const char* reason) {
+    ++impl->resets[reason];
+    impl->history.Invalidate(reason);
+    if (std::string_view(reason) == "TAA-initialize" ||
+        std::string_view(reason) == "game-history-replaced-or-cleared")
+        SceneEpoch(reason);
+    impl->branch_ready = false;
+    impl->scene_identity = nullptr;
+}
+void Gt7DlssPass::Fallback(u64 frame, const char* reason, bool invalidate) {
+    if (invalidate)
+        Invalidate(reason);
+    ++impl->fallbacks[reason];
+    const auto previous = impl->fallback_last_frame.find(reason);
+    if (previous == impl->fallback_last_frame.end() || previous->second != frame) {
+        impl->fallback_last_frame[reason] = frame;
+        ++impl->fallback_frames[reason];
+    }
+    impl->qualification_reason = reason;
+    if (Common::Sharp::Get().dlss_log &&
+        (impl->fallback_lines++ < 64 || impl->fallback_lines % 240 == 0))
+        LOG_INFO(Render_Vulkan,
+                 "GT7-DLSS fallback frame={} reason={} nativeResultKept=1 sceneInjected={}", frame,
+                 reason, Reconstructed(frame));
+}
+std::string_view Gt7DlssPass::QualificationReason() const {
+    return impl->qualification_reason;
+}
+void Gt7DlssPass::SceneEpoch(const char *reason) {
+    auto &p = *impl;
+    p.epoch_pending = true;
+    p.numeric_valid = false;
+    p.qualification_reason = reason;
+    p.epoch_reason = reason;
+    p.branch_ready = false;
+    p.scene_identity = nullptr;
+}
+void Gt7DlssPass::NoteDraw(u64 frame, bool taa, bool full_scene, u64 scene_key) {
+    auto &p = *impl;
+    if (taa) {
+        ++p.taa_draws;
+        if (full_scene) {
+            if (p.scene_key != scene_key) {
+                SceneEpoch("scene-resources-change");
+                p.scene_key = scene_key;
+            }
+            if (p.last_taa == ~u64{} || frame > p.last_taa + 2)
+                SceneEpoch("full-scene-TAA-gap");
+            if (p.epoch_pending) {
+                ++p.epoch;
+                p.epoch_pending = false;
+                p.last_probe = {};
+                p.history.Invalidate("new-scene-epoch");
+                ++p.resets["new-scene-epoch"];
+                if (Common::Sharp::Get().dlss_log)
+                    LOG_INFO(Render_Vulkan, "GT7-DLSS epoch={} frame={} reason={}", p.epoch,
+                             frame, p.epoch_reason);
+            }
+            p.last_taa = frame;
+        }
+    }
+}
+void Gt7DlssPass::ConsumerMapping(vk::ComponentMapping mapping) {
+    impl->consumer_mapping = mapping;
+}
+void Gt7DlssPass::NoteBufferWrite(u64 frame, VAddr address, u64 size, u64 version, bool exact) {
+    if (!Config().enabled || !size || address > std::numeric_limits<VAddr>::max() - size)
+        return;
+    auto &p = *impl;
+    if (p.buffer_frame != frame) {
+        p.buffer_frame = frame;
+        p.buffer_writes.clear();
+        p.uploaded.clear();
+        p.buffer_overflow = false;
+    }
+    // Any later overlapping write revokes an earlier upload's proof.
+    std::erase_if(p.uploaded, [&](const auto &pair) {
+        const auto &u = pair.second;
+        return address < u.address + u.size && u.address < address + size;
+    });
+    if (p.buffer_writes.size() >= 4096)
+        p.buffer_overflow = true;
+    if (p.buffer_overflow) {
+        p.uploaded.clear();
+        return;
+    }
+    p.buffer_writes.push_back({address, size, version, exact});
+}
+void Gt7DlssPass::NoteUpload(const void *identity, VAddr address, u64 size, u64 frame, u32 kind,
+                             u32 count, u64 image) {
+    auto &p = *impl;
+    RevokeUpload(identity);
+    // Kinds 1..3 read GPU memory in command order. Kind 4 is a CPU snapshot.
+    if (!Config().enabled || p.buffer_frame != frame || p.buffer_overflow || kind < 1 || kind > 3 ||
+        p.uploaded.size() >= 4096 || !size || address > std::numeric_limits<VAddr>::max() - size)
+        return;
+    for (auto it = p.buffer_writes.rbegin(); it != p.buffer_writes.rend(); ++it) {
+        if (it->address >= address + size || address >= it->address + it->size)
+            continue;
+        // Match native GpuWrote's whole-image upload rule. A newer partial or
+        // oversized unbounded storage write cannot inherit an older full proof.
+        if (WholeBufferProducer(address, size, it->address, it->size, it->exact))
+            p.uploaded[identity] = {address, size, it->version, image, count};
+        return;
+    }
+}
+u64 Gt7DlssPass::UploadedVersion(const void *identity, u64 frame, u32 count, u64 image) const {
+    const auto &p = *impl;
+    const auto found = p.uploaded.find(identity);
+    return p.buffer_frame == frame && found != p.uploaded.end() && found->second.count == count && found->second.image == image
+               ? found->second.version
+               : 0;
+}
+void Gt7DlssPass::RevokeUpload(const void *identity) {
+    impl->uploaded.erase(identity);
+    if (identity == impl->scene_identity)
+        impl->scene_dirty = true;
+}
+void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array<Input, 4>& sources,
+                          Input history_output, Input scene_output) {
+    auto& p = *impl;
+    if (!Config().enabled)
+        return;
+    Poll(); // retire asynchronous validation before this frame's reconstruction
+    if (p.captured == frame) {
+        Fallback(frame, "multiple-main-TAA-draws");
+        return;
+    }
+    if (!p.supported || !ProvenSchema(ps) ||
+        !Constants(m.words, p.input.width, p.input.height)) {
+        Fallback(frame, "unsupported-display-schema-or-region");
+        return;
+    }
+    if (p.display_hdr && sources[2].format != vk::Format::eB10G11R11UfloatPack32 &&
+        sources[2].format != vk::Format::eR16G16B16A16Sfloat) {
+        Fallback(frame, "HDR-requires-linear-float-scene");
+        return;
+    }
+    const auto blit = vk::FormatFeatureFlagBits2::eBlitSrc | vk::FormatFeatureFlagBits2::eBlitDst |
+                      vk::FormatFeatureFlagBits2::eSampledImageFilterLinear;
+    if (!p.gpu.IsFormatSupported(scene_output.format, blit) ||
+        !p.gpu.IsFormatSupported(vk::Format::eR16G16B16A16Sfloat, blit)) {
+        Fallback(frame, "unsupported-HDR-scene-blit-format");
+        return;
+    }
+    // TAA MRT0 is history, MRT1 is resolved scene. Only this schema may accumulate.
+    if (!scene_output.image || scene_output.format != sources[2].format ||
+        history_output.format != vk::Format::eR16G16B16A16Sfloat ||
+        sources[3].format != vk::Format::eR16G16B16A16Sfloat || scene_output.size != p.input ||
+        history_output.size != p.input || sources[1].format != vk::Format::eR16G16Sfloat ||
+        (sources[0].format != vk::Format::eD32Sfloat &&
+         sources[0].format != vk::Format::eD32SfloatS8Uint &&
+         sources[0].format != vk::Format::eR32Sfloat)) {
+        Fallback(frame, "missing-MRT1-or-input-format");
+        return;
+    }
+    const bool depth_aspect = bool(sources[0].aspects & vk::ImageAspectFlagBits::eDepth);
+    if (depth_aspect != (sources[0].format != vk::Format::eR32Sfloat)) {
+        Fallback(frame, "depth-format-aspect-mismatch");
+        return;
+    }
+    for (const auto& s : sources) {
+        if (!s.image || !s.version || s.size != p.input || s.image == scene_output.image ||
+            s.image == history_output.image) {
+            Fallback(frame, "input-alias-stale-or-extent");
+            return;
+        }
+    }
+    const auto camera = Config().enabled ? MatchCamera(m.words, p.camera_sequence) : std::nullopt;
+    p.camera_valid = camera.has_value();
+    if (!camera) {
+        Fallback(frame, "camera-snapshot-missing-or-ambiguous");
+        return;
+    }
+    p.camera_sequence = camera->sequence;
+    const bool pair_changed =
+        p.history_pair[0] && !((p.history_pair[0] == sources[3].identity &&
+                                p.history_pair[1] == history_output.identity) ||
+                               (p.history_pair[1] == sources[3].identity &&
+                                p.history_pair[0] == history_output.identity));
+    if (pair_changed)
+        SceneEpoch("game-history-pair-change");
+    Impl::Slot* slot{};
+    for (auto& candidate : p.slots)
+        if (candidate.get() != p.current && p.scheduler.IsFree(candidate->tick)) {
+            slot = candidate.get();
+            break;
+        }
+    if (!slot && p.slots.size() < 8) {
+        p.slots.push_back(std::make_unique<Impl::Slot>());
+        slot = p.slots.back().get();
+    }
+    if (!slot) {
+        Fallback(frame, "owned-frame-ring-busy");
+        return;
+    }
+    slot->scene_read.reset();
+    slot->color_read.reset(); // the slot's previous timeline tick has retired
+    slot->merge_views.clear();
+    if (!slot->color.Create(p.gpu, sources[2].format, p.input, sources[2].aspects) ||
+        !slot->depth.Create(p.gpu, sources[0].format, p.input, sources[0].aspects) ||
+        !slot->motion.Create(p.gpu, sources[1].format, p.input, sources[1].aspects,
+                             vk::ImageUsageFlagBits::eStorage) ||
+        !slot->output.Create(p.gpu, vk::Format::eR16G16B16A16Sfloat, p.output,
+                             vk::ImageAspectFlagBits::eColor, vk::ImageUsageFlagBits::eStorage)) {
+        Fallback(frame, "owned-image-allocation");
+        return;
+    }
+    vk::ImageUsageFlags scene_usage = vk::ImageUsageFlagBits::eColorAttachment;
+    if (Common::Sharp::Get().resync_merge &&
+        (scene_output.format == vk::Format::eR16G16B16A16Sfloat ||
+         scene_output.format == vk::Format::eB10G11R11UfloatPack32) &&
+        p.gpu.IsFormatSupported(scene_output.format, vk::FormatFeatureFlagBits2::eStorageImage))
+        scene_usage |= vk::ImageUsageFlagBits::eStorage; // MergeScene reads and writes it
+    if (!slot->scene.Create(p.gpu, scene_output.format, p.output,
+                            vk::ImageAspectFlagBits::eColor, scene_usage)) {
+        Fallback(frame, "owned-HDR-scene-allocation");
+        return;
+    }
+    // DLSS sees semantic RGB, while the scene proxy keeps the game's MRT storage mapping.
+    auto input_view = p.gpu.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
+        .image = slot->color.image, .viewType = vk::ImageViewType::e2D,
+        .format = slot->color.format, .components = sources[2].mapping,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+    if (input_view.result != vk::Result::eSuccess) {
+        Fallback(frame, "HDR-input-view-allocation");
+        return;
+    }
+    slot->color_read = std::move(input_view.value);
+    if (p.current && (p.current->color.format != sources[2].format ||
+                      p.current->depth.format != sources[0].format)) {
+        p.history.Invalidate("input-format-change");
+        SceneEpoch("input-format-change");
+    }
+    p.current = slot;
+    slot->frame = frame;
+    slot->tick = p.scheduler.CurrentTick();
+    p.constants = m.words;
+    p.camera = camera.value_or(Camera{});
+    p.captured = frame;
+    p.branch_ready = false;
+    p.attempted = false;
+    p.reconstructed = p.scene_dirty = false;
+    p.native_scene = scene_output;
+    p.native_scene.mapping = sources[2].mapping;
+    p.scene_identity = scene_output.identity;
+    p.scene_version = scene_output.version;
+    p.history.GamePair(reinterpret_cast<uint64_t>(sources[3].identity),
+                       reinterpret_cast<uint64_t>(history_output.identity));
+    p.history_pair = {sources[3].identity, history_output.identity};
+    const auto cmd = p.scheduler.DirectCommandBuffer();
+    slot->color.Copy(cmd, sources[2]);
+    slot->depth.Copy(cmd, sources[0]);
+    slot->motion.Copy(cmd, sources[1]);
+    ++p.captures;
+    if (p.numeric_valid)
+        ++p.qualified_draws;
+    p.qualification_reason = p.numeric_valid ? "qualified" : "waiting-for-input-probe";
+    p.ProbeInputs(cmd, frame); // independent of the downstream graph
+    const auto reconstructed = Reconstruct(cmd, frame);
+    if (reconstructed != Result::Success)
+        return;
+    // Swizzle the owned RGBA output back to the proven MRT1 storage convention.
+    // The SDK has already consumed it; its internal history is not this surface.
+    if (sources[2].mapping.r == vk::ComponentSwizzle::eB) {
+        if (!p.swap_pipeline) {
+            const auto device = p.gpu.GetDevice();
+            auto module = device.createShaderModuleUnique(
+                {.codeSize = sizeof(GT7_TDLSS_SWAP_SPV), .pCode = GT7_TDLSS_SWAP_SPV});
+            if (module.result != vk::Result::eSuccess) {
+                Fallback(frame, "HDR-swizzle-module");
+                return;
+            }
+            auto pipeline = device.createComputePipelineUnique({}, vk::ComputePipelineCreateInfo{
+                .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = *module.value, .pName = "main"},
+                .layout = *p.pipeline_layout});
+            if (pipeline.result != vk::Result::eSuccess) {
+                Fallback(frame, "HDR-swizzle-pipeline");
+                return;
+            }
+            p.swap_pipeline = std::move(pipeline.value);
+        }
+        p.current->output.Transit(cmd, vk::ImageLayout::eGeneral);
+        const vk::DescriptorImageInfo image{.imageView = *p.current->output.view,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+        const vk::WriteDescriptorSet write{.dstBinding = 0, .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &image};
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *p.swap_pipeline);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *p.pipeline_layout, 0, write);
+        cmd.dispatch((p.output.width + 7) / 8, (p.output.height + 7) / 8, 1);
+    }
+    p.current->output.Transit(cmd, vk::ImageLayout::eTransferSrcOptimal);
+    p.current->scene.Transit(cmd, vk::ImageLayout::eTransferDstOptimal);
+    Blit(cmd, p.current->output.image, p.output, p.current->scene.image, p.output);
+    p.current->scene.Transit(cmd, vk::ImageLayout::eGeneral);
+    p.reconstructed = true;
+    FinishSceneWrite(cmd, frame, scene_output);
+    ++p.injected;
+    if (Common::Sharp::Get().dlss_log && (p.injected <= 16 || frame % 240 == 0))
+        LOG_INFO(Render_Vulkan, "GT7-DLSS scene-inject frame={} native={}x{} owned={}x{}", frame,
+                 p.input.width, p.input.height, p.output.width, p.output.height);
+}
+bool Gt7DlssPass::HasScene(u64 frame, const void* identity, u64 version) const {
+    return Reconstructed(frame) && !impl->scene_dirty && impl->scene_identity == identity &&
+           impl->scene_version == version;
+}
+bool Gt7DlssPass::Reconstructed(u64 frame) const {
+    return impl->current && impl->captured == frame && impl->reconstructed;
+}
+bool Gt7DlssPass::OwnsScene(u64 frame, const void* identity) const {
+    return Reconstructed(frame) && impl->scene_identity == identity;
+}
+vk::Extent2D Gt7DlssPass::SceneExtent() const { return impl->output; }
+void Gt7DlssPass::SceneVersion(u64 version) {
+    impl->scene_version = version;
+    impl->native_scene.version = version;
+    impl->scene_dirty = false;
+}
+void Gt7DlssPass::SyncScene(vk::CommandBuffer cmd, u64 frame, Input native) {
+    auto& p = *impl;
+    if (!Reconstructed(frame) || native.identity != p.scene_identity || !native.image ||
+        native.image != p.native_scene.image ||
+        native.format != p.native_scene.format || native.size != p.input)
+        return;
+    if (!p.scene_dirty && native.version == p.scene_version)
+        return;
+    // An un-replayed native writer changed the 1080p scene. Never reuse an earlier HDR version.
+    // Merge (default): keep the reconstructed detail and apply only what the writer changed.
+    // Replace: the old behaviour, the upscaled native scene wins everywhere (loses detail).
+    ++p.dirty_writers[p.last_dirty_ps];
+    const bool merged = Common::Sharp::Get().resync_merge && p.MergeScene(cmd, native);
+    if (!merged) {
+        Barrier(cmd, native.image, native.aspects, vk::ImageLayout::eGeneral,
+                vk::ImageLayout::eTransferSrcOptimal);
+        p.current->scene.Transit(cmd, vk::ImageLayout::eTransferDstOptimal);
+        Blit(cmd, native.image, native.size, p.current->scene.image, p.output);
+        Barrier(cmd, native.image, native.aspects, vk::ImageLayout::eTransferSrcOptimal,
+                vk::ImageLayout::eGeneral);
+        p.current->scene.Transit(cmd, vk::ImageLayout::eGeneral);
+        ++p.resync_replaced;
+    } else {
+        ++p.resync_merged;
+    }
+    ++p.scene_resyncs;
+    if (Common::Sharp::Get().dlss_log && (p.scene_resyncs <= 16 || frame % 240 == 0))
+        LOG_INFO(Render_Vulkan, "GT7-DLSS scene-resync frame={} lastWriterPs={:#x} mode={}", frame,
+                 p.last_dirty_ps, merged ? "merge" : "replace");
+    SceneVersion(native.version);
+}
+vk::ImageView Gt7DlssPass::SceneTarget(u64 frame, const void* identity, u64 version) const {
+    return HasScene(frame, identity, version) ? *impl->current->scene.view : vk::ImageView{};
+}
+void Gt7DlssPass::FinishSceneWrite(vk::CommandBuffer cmd, u64 frame, Input native, bool replay) {
+    auto& p = *impl;
+    if (!Reconstructed(frame) || native.identity != p.scene_identity ||
+        native.image != p.native_scene.image || native.format != p.native_scene.format ||
+        native.size != p.input)
+        return;
+    p.current->scene.Transit(cmd, vk::ImageLayout::eTransferSrcOptimal);
+    Barrier(cmd, native.image, native.aspects, vk::ImageLayout::eGeneral,
+            vk::ImageLayout::eTransferDstOptimal);
+    Blit(cmd, p.current->scene.image, p.output, native.image, native.size);
+    Barrier(cmd, native.image, native.aspects, vk::ImageLayout::eTransferDstOptimal,
+            vk::ImageLayout::eGeneral);
+    p.current->scene.Transit(cmd, vk::ImageLayout::eGeneral);
+    SceneVersion(native.version);
+    p.scene_replays += replay;
+    p.current->tick = p.scheduler.CurrentTick();
+}
+vk::ImageView Gt7DlssPass::BeginBranch(vk::CommandBuffer cmd, u64 frame, VAddr display, u64 version,
+                                       vk::Format format) {
+    auto& p = *impl;
+    if (!Reconstructed(frame) || p.scene_dirty || p.branch_ready ||
+        (format != vk::Format::eA2B10G10R10UnormPack32 && format != vk::Format::eR8G8B8A8Unorm &&
+         format != vk::Format::eB8G8R8A8Unorm))
+        return {};
+    if (!p.current->branch.Create(p.gpu, format, p.output, vk::ImageAspectFlagBits::eColor,
+                                  vk::ImageUsageFlagBits::eColorAttachment)) {
+        Fallback(frame, "scene-branch-allocation");
+        return {};
+    }
+    auto view = p.gpu.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
+        .image = p.current->scene.image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = p.current->scene.format,
+        .components = p.consumer_mapping,
+        .subresourceRange = {
+            .aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1}});
+    if (view.result != vk::Result::eSuccess) {
+        Fallback(frame, "owned-consumer-view-allocation");
+        return {};
+    }
+    p.current->scene_read = std::move(view.value);
+    p.current->branch.Transit(cmd, vk::ImageLayout::eGeneral);
+    p.current->scene.Transit(cmd, vk::ImageLayout::eGeneral);
+    p.display_address = display;
+    p.display_version = version;
+    p.current->tick = p.scheduler.CurrentTick();
+    return *p.current->branch.view;
+}
+vk::ImageView Gt7DlssPass::ColorView() const {
+    return impl->current ? *impl->current->scene_read : vk::ImageView{};
+}
+void Gt7DlssPass::FinishBranch(vk::CommandBuffer cmd, u64 frame) {
+    if (impl->captured == frame) {
+        impl->branch_ready = true;
+        ++impl->composites;
+        if (Common::Sharp::Get().dlss_log && (impl->composites <= 16 || frame % 240 == 0))
+            LOG_INFO(Render_Vulkan, "GT7-DLSS scene-composite frame={} output={}x{}", frame,
+                     impl->output.width, impl->output.height);
+    }
+}
+Gt7DlssPass::Result Gt7DlssPass::Evaluate(vk::CommandBuffer cmd, u64 frame, VAddr display,
+                                          u64 version, vk::Extent2D output) {
+    auto& p = *impl;
+    if (p.branch_ready && p.captured == frame && p.display_address == display &&
+        p.display_version == version && p.output == output && p.reconstructed) {
+        p.current->branch.Transit(cmd, vk::ImageLayout::eGeneral);
+        return Result::Success; // SR already ran before post-FX. This is only presentation.
+    }
+    // UI can flip without rendering another 3D scene. Reuse only the exact last
+    // display version and clean owned scene, never a stale pose after a write/cut.
+    static const bool reuse_unchanged = [] {
+        const char* value = std::getenv("RYGT_DLSS_REUSE_UNCHANGED");
+        return !(value && value[0] == '0');
+    }();
+    if (reuse_unchanged && p.current && p.branch_ready && p.reconstructed &&
+        p.captured < frame && p.scene_identity && !p.scene_dirty && !p.history.pending &&
+        p.display_address == display && p.display_version == version && p.output == output) {
+        p.current->branch.Transit(cmd, vk::ImageLayout::eGeneral);
+        p.current->tick = std::max(p.current->tick, p.scheduler.CurrentTick());
+        p.history.Commit(frame, p.camera.identity); // no intervening scene update was lost
+        ++p.unchanged_reuse;
+        return Result::Success;
+    }
+    // Presentation failure cannot invalidate a successfully evaluated history:
+    // its reconstructed scene was already consumed by the native post graph.
+    Fallback(frame, p.attempted && p.captured == frame ? "post-scene-composite-unavailable"
+                                                     : "no-reconstructed-scene-this-frame",
+             !Reconstructed(frame));
+    // Viewport 1 can reconstruct the final native scene when viewport 2 succeeded
+    // but its high-resolution composite was unavailable. A failed SDK evaluation
+    // may have recorded partial commands: retain the native fallback in that case.
+    const bool sdk_failed = p.attempted && p.captured == frame &&
+                            (p.last_eval.frame != frame || !p.last_eval.ok);
+    if (!sdk_failed && p.attempted && p.captured == frame && p.last_eval.ok) {
+        if (RytyDlss::PermitSpatialFallback(frame)) ++p.spatial_grants;
+        else ++p.spatial_denials;
+    }
+    return sdk_failed ? Result::Failed : Result::Unavailable;
+}
+Gt7DlssPass::Result Gt7DlssPass::Reconstruct(vk::CommandBuffer cmd, u64 frame) {
+    auto& p = *impl;
+    if (p.evaluated == frame)
+        return p.attempted ? Result::Failed : Result::Unavailable;
+    if (!RytyDlss::TemporalSupports(p.input, p.output)) {
+        Fallback(frame, "backend-ratio-or-FG-unavailable");
+        return Result::Unavailable;
+    }
+    if (!p.numeric_valid) {
+        Fallback(frame, "waiting-for-asynchronous-input-validation");
+        return Result::Unavailable;
+    }
+    p.evaluated = frame;
+    if (!p.Normalize(cmd)) {
+        Fallback(frame, "motion-normalization-pipeline");
+        return Result::Unavailable;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const float ms = p.last_success.time_since_epoch().count()
+                         ? std::chrono::duration<float, std::milli>(now - p.last_success).count()
+                         : 16.667f;
+    const char* reset = p.history.Reason(frame, p.camera.identity, ms);
+    if (!reset)
+        reset = CameraCut(p.camera.projection, p.camera.view, p.previous.projection, p.previous.view);
+    p.current->color.Transit(cmd, vk::ImageLayout::eShaderReadOnlyOptimal);
+    p.current->output.Transit(cmd, vk::ImageLayout::eGeneral);
+    const auto& cfg = Config();
+    const auto jitter = RasterJitter(p.constants, cfg.jitter_sign_x, cfg.jitter_sign_y);
+    RytyDlssG::TemporalFrame f{.frame = frame,
+                               .color = p.current->color.Descriptor(),
+                               .depth = p.current->depth.Descriptor(),
+                               .motion = p.current->motion.Descriptor(),
+                               .output = p.current->output.Descriptor(),
+                               .camera = p.camera,
+                               .previous_projection =
+                                   reset ? p.camera.projection : p.previous.projection,
+                               .previous_view = reset ? p.camera.view : p.previous.view,
+                               .jitter_x = jitter[0],
+                               .jitter_y = jitter[1],
+                               .mvec_scale = cfg.mvec_scale,
+                               .frame_ms = std::max(ms, .01f),
+                               .reset = reset != nullptr,
+                               .hdr = true};
+    f.color.view = *p.current->color_read;
+    if (reset) {
+        ++p.resets[reset];
+        ++p.reset_requests;
+    }
+    ++p.evaluations;
+    p.attempted = true;
+    p.current->tick = p.scheduler.CurrentTick();
+    const int time_slot = p.BeginTime(cmd);
+    const bool ok = RytyDlss::EvaluateTemporal(cmd, f);
+    p.EndTime(cmd, time_slot);
+    if (!ok && time_slot >= 0)
+        p.time_slots[time_slot].pending = false; // nothing was recorded between the stamps
+    p.last_eval = {f.jitter_x, f.jitter_y, p.constants[20], p.constants[21], f.reset, ok,
+                   reset ? reset : "none", p.current->depth.format, p.current->color.format,
+                   bool(p.current->depth.aspects & vk::ImageAspectFlagBits::eDepth),
+                   p.camera.lens.inverted, p.camera.lens.near_plane, p.camera.lens.far_plane,
+                   p.camera.lens.fov, f.mvec_scale, frame};
+    p.scheduler.GetDynamicState().Invalidate();
+    if (Common::Sharp::Get().dlss_log && (p.evaluations <= 16 || !ok) &&
+        now - p.last_evaluate_log >= std::chrono::seconds(1)) {
+        p.last_evaluate_log = now;
+        LOG_INFO(Render_Vulkan,
+                 "GT7-DLSS evaluate frame={} input={}x{} output={}x{} jitter=({}, {}) reset={} "
+                 "reason={} success={}",
+                 frame, p.input.width, p.input.height, p.output.width, p.output.height,
+                 f.jitter_x, f.jitter_y, f.reset, reset ? reset : "none", ok);
+    }
+    if (!ok) {
+        Fallback(frame, "failed-evaluation");
+        return Result::Failed;
+    }
+    if (++p.successes == 1)
+        LOG_INFO(Render_Vulkan, "GT7-DLSS: temporal reconstruction running, {}x{} to {}x{}",
+                 p.input.width, p.input.height, p.output.width, p.output.height);
+    Common::Sharp::temporal_mip_latched.store(true, std::memory_order_relaxed);
+    p.qualification_reason = "qualified";
+    p.history.Commit(frame, p.camera.identity);
+    p.previous = p.camera;
+    p.last_success = now;
+    return Result::Success;
+}
+RytyDlssG::TemporalImage Gt7DlssPass::Output() const {
+    return impl->current->branch.Descriptor();
+}
+RytyDlssG::TemporalImage Gt7DlssPass::OutputForPresent(vk::CommandBuffer cmd) {
+    impl->current->branch.Transit(cmd, vk::ImageLayout::eShaderReadOnlyOptimal);
+    impl->current->tick = impl->scheduler.CurrentTick();
+    return Output();
+}
+void Gt7DlssPass::NoteWrite(const void* identity, u64 ps) {
+    auto& p = *impl;
+    RevokeUpload(identity);
+    if (!TaaHash(ps) && !InitializeHash(ps) &&
+        (identity == p.history_pair[0] || identity == p.history_pair[1]))
+        Invalidate("game-history-replaced-or-cleared");
+    if (identity == p.scene_identity && !TaaHash(ps)) {
+        p.scene_dirty = true;
+        p.last_dirty_ps = ps;
+    }
+}
+
+
+
+
+void Gt7DlssPass::NotePresentation(u64 frame, bool temporal, bool spatial) {
+    auto& p = *impl;
+    if (p.present_frame == frame) return; // first eligible scene handoff, once per frame
+    p.present_frame = frame;
+    const int mode = temporal ? 0 : spatial ? 1 : 2;
+    if (p.present_mode >= 0 && mode != p.present_mode) ++p.present_flips;
+    p.present_mode = mode;
+    ++p.present_frames[mode];
+}
+
+void Gt7DlssPass::Poll() {
+    auto& p = *impl;
+    p.CollectTime();
+    for (auto it = p.probes.begin(); it != p.probes.end();) {
+        auto& probe = **it;
+        if (!p.scheduler.IsFree(probe.tick)) {
+            ++it;
+            continue;
+        }
+        vmaInvalidateAllocation(probe.allocator, probe.allocation, 0, VK_WHOLE_SIZE);
+        const auto* bytes = static_cast<const u8*>(probe.mapped);
+        unsigned geometry = 0, usable_motion = 0;
+        bool sane = true;
+        for (unsigned tile = 0; tile < ProbeTiles; ++tile) {
+            float lo = 1e30f, hi = -1e30f;
+            double sum = 0, mx = 0, my = 0;
+            unsigned finite = 0, sentinel = 0, clear = 0, motion_finite = 0;
+            float min_x = 1e30f, max_x = -1e30f, min_y = 1e30f, max_y = -1e30f;
+            for (unsigned i = 0; i < 64; ++i) {
+                float depth;
+                std::memcpy(&depth, bytes + tile * 512 + i * 4, 4);
+                if (std::isfinite(depth)) {
+                    lo = std::min(lo, depth);
+                    hi = std::max(hi, depth);
+                    sum += depth;
+                    ++finite;
+                    clear += depth == (probe.inverted ? 0.f : 1.f);
+                }
+                half_float::half v[2];
+                std::memcpy(v, bytes + tile * 512 + 256 + i * 4, 4);
+                const float x = float(v[0]), y = float(v[1]);
+                sentinel += x <= -1000 || y <= -1000;
+                if (std::isfinite(x) && std::isfinite(y) && std::abs(x) < 4 && std::abs(y) < 4) {
+                    mx += x;
+                    my += y;
+                    ++motion_finite;
+                    if (std::isfinite(depth) && depth > 0 && depth < 1) {
+                        ++usable_motion;
+                    }
+                    min_x = std::min(min_x, x);
+                    max_x = std::max(max_x, x);
+                    min_y = std::min(min_y, y);
+                    max_y = std::max(max_y, y);
+                }
+            }
+            sane &= finite == 64 && lo >= 0 && hi <= 1;
+            geometry += finite - clear;
+            // Sky/clear samples may legitimately have no vectors. Require motion
+            // coverage on actual geometry across the grid, not in every 8x8 tile.
+        }
+        if (probe.size == p.input && probe.epoch == p.epoch && !p.epoch_pending &&
+            p.last_taa != ~u64{} && probe.frame <= p.last_taa && p.last_taa - probe.frame <= 120) {
+            const auto verdict = QualifyProbe(sane, geometry, usable_motion);
+            if (verdict == ProbeResult::InvalidDepth || verdict == ProbeResult::InvalidMotion) {
+                p.numeric_valid = false;
+                Invalidate(verdict == ProbeResult::InvalidDepth ? "invalid-depth-or-motion-statistics"
+                                                               : "insufficient-geometry-motion");
+            } else if (verdict == ProbeResult::Qualified) {
+                p.numeric_valid = true;
+            } // all-clear / tiny geometry: inconclusive; keep prior qualification
+            if (p.numeric_valid)
+                ++p.numeric_passes;
+            else if (!sane || geometry >= 16)
+                ++p.numeric_failures;
+            p.qualification_reason = p.numeric_valid ? "qualified"
+                                     : !sane ? "invalid-depth-or-motion-statistics"
+                                     : geometry < 16 ? "empty-probe-grid-retry"
+                                                     : "insufficient-geometry-motion";
+        }
+        it = p.probes.erase(it);
+    }
+    // One status line a second, only with GPU.dlss_log (default off).
+    const auto now = std::chrono::steady_clock::now();
+    if (Common::Sharp::Get().dlss_log && Config().enabled &&
+        now - p.window.start >= std::chrono::seconds(1)) {
+        auto& w = p.window;
+        const u64 evaluations = p.evaluations - w.evaluations, successes = p.successes - w.successes,
+                  captures = p.captures - w.captures, merged = p.resync_merged - w.merged,
+                  replaced = p.resync_replaced - w.replaced;
+        u64 fallbacks = 0;
+        for (const auto& [reason, count] : p.fallbacks)
+            fallbacks += count;
+        const u64 falls = fallbacks - w.fallbacks;
+        w.start = now;
+        w.evaluations = p.evaluations;
+        w.successes = p.successes;
+        w.captures = p.captures;
+        w.merged = p.resync_merged;
+        w.replaced = p.resync_replaced;
+        w.fallbacks = fallbacks;
+        const auto report = RytyDlssG::LastTemporalReport();
+        const double mean_ms = p.eval_ms_count ? p.eval_ms_sum / double(p.eval_ms_count) : 0.0;
+        std::array<u64, 3> paths{};
+        for (u32 i = 0; i < paths.size(); ++i) {
+            paths[i] = p.present_frames[i] - p.logged_present_frames[i];
+            p.logged_present_frames[i] = p.present_frames[i];
+        }
+        LOG_INFO(Render_Vulkan,
+                 "GT7-DLSS 1s: eval={}/{} captures={} fallbacks={} reason={} render={}x{} "
+                 "out={}x{} mode={} preset={}->{} gpuMs={:.2f} (max {:.2f}) mip={:.2f} "
+                 "sharpen={:.0f}% resync merge={} replace={} present temporal={} spatial={} "
+                 "native={} reuse={}",
+                 successes, evaluations, captures, falls, p.qualification_reason, p.input.width,
+                 p.input.height, p.output.width, p.output.height, report.mode_name,
+                 report.preset_requested, report.preset_sent, mean_ms, p.eval_ms_max,
+                 Common::Sharp::ResolutionBias(), Common::Sharp::sharpen_percent.load(), merged,
+                 replaced, paths[0], paths[1], paths[2],
+                 p.unchanged_reuse - p.logged_unchanged_reuse);
+        p.logged_unchanged_reuse = p.unchanged_reuse;
+        p.eval_ms_sum = p.eval_ms_max = 0.0;
+        p.eval_ms_count = 0;
+    }
+}
+} // namespace Vulkan

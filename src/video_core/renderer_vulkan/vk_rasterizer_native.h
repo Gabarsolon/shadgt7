@@ -26,6 +26,7 @@
 #include "common/diagnostics.h"
 #include "common/types.h"
 #include "ryty_gpu/native/same_texel.h"
+#include "ryty_gpu/ryty_gt7_dlss.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -197,6 +198,7 @@ private:
 
     /// The bindings of one draw or dispatch.
     struct DrawBindings {
+        std::optional<Gt7DlssPass::Metadata> temporal; ///< the game's TAA constants (GPU.temporal_dlss)
         Pipeline::DescriptorWrites writes;
         Pipeline::WriteSets write_sets; ///< SHD-002: the set of each write
         boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffers;
@@ -738,6 +740,17 @@ private:
     void FinishUiTargets(const Targets& targets);
     void PrepareMapIcons(const Targets& targets, const GraphicsPipeline& pipeline,
                          const AmdGpu::Regs& regs, DrawBindings& b);
+    /// GPU.temporal_dlss (vk_gt7_temporal.inl): the freshness of a native picture, the capture of
+    /// the game's TAA inputs, the scene binding of the post chain, and the draw notes.
+    u64 TemporalInputVersion(const Native::ImageEntry& entry, u64 scene_frame);
+    void CaptureTemporalInputs(const AmdGpu::Regs&, const GraphicsPipeline&, const Targets&,
+                               const DrawBindings&);
+    vk::DescriptorImageInfo* TemporalSceneBinding(const AmdGpu::Regs&, const GraphicsPipeline&,
+                                                  const Targets&, DrawBindings&);
+    void NoteTemporalDraw(const AmdGpu::Regs&, const GraphicsPipeline*, const Targets*,
+                          const DrawBindings*, const char*);
+    std::unique_ptr<Gt7DlssPass> temporal_dlss;
+    u64 temporal_write_ps = 0;
     void ResolveUiDisplay(VAddr address, bool keep);
     void SyncUiReads(std::span<const Shader::Info* const> stages);
     void SyncUiRange(VAddr address, u64 size, bool keep);

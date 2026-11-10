@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/renderer_vulkan/vk_ui_hires_depth.h"
+#include "ryty_gpu/ryty_gt7_dlss.h"
 #include "ryty_gpu/ryty_upscale.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
 
@@ -560,6 +561,7 @@ std::pair<vk::Buffer, u64> NativeRenderer::UploadBytes(u32 slot, const void* dat
 }
 
 void NativeRenderer::DrawBindings::Clear() {
+    temporal.reset();
     writes.clear();
     write_sets.clear();
     buffers.clear();
@@ -599,7 +601,11 @@ static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAdd
 }
 
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
-    device = Native::Rhi::CreateVulkanDevice(r.instance);
+    // GPU.temporal_dlss shows the reconstructed scene through the HD UI proxy: no proxy, no pass.
+    if (Gt7Temporal::Config().enabled && UiHires::Enabled()) {
+        temporal_dlss = std::make_unique<Gt7DlssPass>(r.instance, r.scheduler);
+    }
+    device =Native::Rhi::CreateVulkanDevice(r.instance);
     ASSERT_MSG(device, "NAT-100: no native device");
     const VkSemaphore semaphore = r.scheduler.GetWorkSemaphore()->Handle();
     timeline = device->ImportFence(reinterpret_cast<u64>(semaphore));
@@ -2017,9 +2023,26 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
     }
     if (uploads) {
         GlobalBarrier(); // NAT-107: uploads read guest memory as earlier GPU work left it
+        // GPU.temporal_dlss: an upload of a GPU-written buffer is a proof of freshness.
+        std::vector<std::pair<const Native::ImageEntry*, u32>> temporal_uploads;
+        if (temporal_dlss) {
+            for (const auto* entry : bound) {
+                if (entry) {
+                    temporal_uploads.emplace_back(entry, entry->total_uploads.load());
+                }
+            }
+        }
         registry->RecordUploads(
             *s.list, std::span<Native::ImageEntry* const>{
                          const_cast<Native::ImageEntry* const*>(bound.data()), bound.size()});
+        for (const auto& [entry, before] : temporal_uploads) {
+            const u32 count = entry->total_uploads.load();
+            if (count != before && !entry->needs_upload.load() && !entry->reused.load()) {
+                temporal_dlss->NoteUpload(entry, entry->info.guest_address, entry->info.guest_size,
+                                          frame, entry->upload_kind, count,
+                                          entry->image->NativeHandle());
+            }
+        }
         s.pipeline = vk::Pipeline{}; // the uploads bind their own pipelines
         s.so_known = false; // SO-010
         ForgetBindings(s);            // OPT-014: and their own bindings
@@ -4659,6 +4682,10 @@ void NativeRenderer::SyncUiRange(VAddr address, u64 size, bool keep) {
     }
 }
 
+// GPU.temporal_dlss: capturing the game's TAA inputs, their freshness, and the scene binding of
+// the game's post chain.
+#include "video_core/renderer_vulkan/vk_gt7_temporal.inl"
+
 void NativeRenderer::FinishUiTargets(const Targets& targets) {
     if (!targets.ui_depth_proxy && !targets.ui_auxiliary_mask) {
         return;
@@ -7203,7 +7230,27 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         }
                     }
                 }
-                if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                // GPU.temporal_dlss: the game's TAA constants (the camera, jitter and
+                // extent) are read now, not when the draw is replayed.
+                std::optional<Gt7DlssPass::Metadata> temporal_snapshot;
+                if (temporal_dlss && stage.sw_stage == Shader::SwStage::Fragment &&
+                    Gt7Temporal::TaaHash(stage.pgm_hash) && !desc.is_written && size >= 116 &&
+                    size <= 4096 && !RegionOver(base, size)) {
+                    Gt7DlssPass::Metadata snapshot;
+                    snapshot.address = base;
+                    snapshot.bytes.resize(size);
+                    if (Core::RytyMemory::GuardedCopy(snapshot.bytes.data(),
+                                                      reinterpret_cast<const void*>(base), size)) {
+                        std::memcpy(snapshot.words.data(), snapshot.bytes.data(), 116);
+                        temporal_snapshot = std::move(snapshot);
+                    }
+                }
+                if (temporal_snapshot) {
+                    const auto [buffer, offset, data] = Allocate(u32(size), alignment);
+                    std::memcpy(data, temporal_snapshot->bytes.data(), size);
+                    info = {buffer, offset, size};
+                    b.temporal = std::move(temporal_snapshot);
+                } else if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
                     !mirror_bound && !in_view &&
                     (desc.is_written || size > SnapshotBelow()) && // FIX-170
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
@@ -8479,6 +8526,9 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
     if (!entry) {
         return;
     }
+    if (temporal_dlss) {
+        temporal_dlss->NoteWrite(entry, temporal_write_ps);
+    }
     auto* written = const_cast<Native::ImageEntry*>(entry);
     const u64 previous = written->write_version.load(std::memory_order_relaxed);
     const u64 version = at != 0 ? at : ++write_clock;
@@ -8881,6 +8931,9 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
                         vk::to_string(pick.source->info.pixel_format), pick.version, own,
                         place.mip, place.layer);
         }
+    }
+    if (temporal_dlss) {
+        temporal_dlss->RevokeUpload(&texture);
     }
     s.written.push_back(&texture); // read after the next barrier
     if (traced) {
@@ -9829,6 +9882,62 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         b.push.native_frag_coord_scale = {inv_scale, inv_scale};
         Begin();
     }
+    // GPU.temporal_dlss: reconcile the native scene's versions after uploads, copies and unknown
+    // writers. Most post passes read the 1080p copy, which was reconstructed before the blur;
+    // the final tonemap samples the owned output-size scene instead.
+    if (temporal_dlss) {
+        RytyDlss::BeginNativeFrame(frame);
+        if (temporal_dlss->Reconstructed(frame)) {
+            for (const auto* sampled : b.sampled) {
+                if (sampled && sampled->image && !sampled->reused.load() &&
+                    temporal_dlss->OwnsScene(frame, sampled) &&
+                    !temporal_dlss->HasScene(frame, sampled, sampled->write_version.load())) {
+                    Splice();
+                    r.scheduler.EndRendering();
+                    temporal_dlss->SyncScene(r.scheduler.DirectCommandBuffer(), frame,
+                                             TemporalNativeImage(*sampled, registry->Generation()));
+                }
+            }
+        }
+    }
+    vk::DescriptorImageInfo* temporal_scene_binding =
+        temporal_dlss && !indirect && !hud_black_state
+            ? TemporalSceneBinding(regs, *pipeline, targets, b)
+            : nullptr;
+    // Replay full-size scene writes with unchanged shaders, resources and blending. Interpolated
+    // game pixel coordinates survive the viewport scaling. FragCoord, side effects, indirect
+    // draws and unknown vertex conventions are rejected.
+    vk::ImageView temporal_post_target{};
+    if (temporal_dlss && !indirect && !hud_black_state && targets.colors[0] && !targets.depth &&
+        targets.state.num_color_attachments == 1 &&
+        targets.color_formats[0] == targets.colors[0]->info.pixel_format && b.stored.empty() &&
+        !b.writes_buffers && regs.num_indices <= 6 &&
+        std::ranges::none_of(b.sampled,
+                             [&](const auto* image) {
+                                 // No replay may read its own already modified native destination.
+                                 return image &&
+                                        image->info.guest_address <
+                                            targets.colors[0]->info.guest_address +
+                                                targets.colors[0]->info.guest_size &&
+                                        targets.colors[0]->info.guest_address <
+                                            image->info.guest_address + image->info.guest_size;
+                             }) &&
+        regs.num_instances.NumInstances() == 1 && targets.color_ranges[0].mip == 0 &&
+        targets.color_ranges[0].layer == 0) {
+        const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        if (fs && vs && (vs->pgm_hash == 0x3863962b || vs->pgm_hash == 0xc830abbf) &&
+            !fs->loads.GetAny(Shader::IR::Attribute::FragCoord) &&
+            std::abs(regs.viewports[0].xscale * 2) == 1920 &&
+            std::abs(regs.viewports[0].yscale * 2) == 1080 && regs.viewports[0].xoffset == 960 &&
+            regs.viewports[0].yoffset == 540) {
+            temporal_post_target = temporal_dlss->SceneTarget(
+                frame, targets.colors[0], targets.colors[0]->write_version.load());
+        }
+    }
+    if (temporal_dlss) {
+        Begin(); // the reconcile above may have ended the open list
+    }
     SnapProgramMips(pipeline->GetStages(), b); // DIAG-234 (diagnosis)
     PhaseClock record_clock{stats.phase_ns[7]};
     {
@@ -10273,6 +10382,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     {
         PhaseClock part{stats.record_ns[7]};
+        const auto* temporal_fragment = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        temporal_write_ps = temporal_dlss && temporal_fragment ? temporal_fragment->pgm_hash : 0;
         // NoteWrites may queue CPU readback of attachments. Publish native MRT pixels first.
         if (targets.ui_auxiliary_mask) {
             FinishUiTargets(targets);
@@ -10291,6 +10402,77 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 proxy.depth->version = targets.depth->write_version.load();
             }
         }
+        temporal_write_ps = 0;
+    }
+    if (temporal_dlss) {
+        NoteTemporalDraw(regs, pipeline, &targets, &b, "executed");
+        const bool temporal_full_scissor =
+            targets.colors[0] && s.dynamic.scissors.size() == 1 &&
+            s.dynamic.scissors[0].offset == vk::Offset2D{0, 0} &&
+            s.dynamic.scissors[0].extent == vk::Extent2D{targets.colors[0]->info.size.width,
+                                                        targets.colors[0]->info.size.height};
+        const auto replay_scaled = [&](auto replay) {
+            const auto extent = temporal_dlss->SceneExtent();
+            replay.width = extent.width;
+            replay.height = extent.height;
+            Begin();
+            BeginRendering(replay);
+            bind_state();
+            auto viewports = s.dynamic.viewports;
+            const float sx = float(extent.width) / 1920;
+            const float sy = float(extent.height) / 1080;
+            for (auto& v : viewports) {
+                v.x *= sx;
+                v.y *= sy;
+                v.width *= sx;
+                v.height *= sy;
+            }
+            s.cmd.setViewport(0, {u32(viewports.size()), viewports.data()});
+            const vk::Rect2D scissor{{0, 0}, extent};
+            s.cmd.setScissor(0, scissor);
+            record_draw();
+            EndRendering();
+            Splice();
+            s.dynamic.Invalidate(); // raw viewport/scissor commands changed the actual state
+        };
+        if (temporal_post_target && temporal_full_scissor) {
+            Splice();
+            r.scheduler.EndRendering();
+            auto replay = targets.state;
+            replay.color_attachments[0].image_view = temporal_post_target;
+            replay.color_attachments[0].image_layout = vk::ImageLayout::eGeneral;
+            replay.color_attachments[0].is_clear = false; // keep the output-size base for blending
+            replay_scaled(replay);
+            temporal_dlss->FinishSceneWrite(
+                r.scheduler.DirectCommandBuffer(), frame,
+                TemporalNativeImage(*targets.colors[0], registry->Generation()), true);
+            temporal_write_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)]->pgm_hash;
+            Written(targets.colors[0]); // publish the mirror copy as a new native version
+            temporal_write_ps = 0;
+            temporal_dlss->SceneVersion(targets.colors[0]->write_version.load());
+        }
+        if (temporal_scene_binding && temporal_full_scissor) {
+            Splice();
+            r.scheduler.EndRendering();
+            const auto* display = targets.colors[0];
+            const auto branch = temporal_dlss->BeginBranch(
+                r.scheduler.DirectCommandBuffer(), frame, display->info.guest_address,
+                display->write_version.load(), targets.color_formats[0]);
+            if (branch) {
+                const auto saved = *temporal_scene_binding;
+                temporal_scene_binding->imageView = temporal_dlss->ColorView();
+                temporal_scene_binding->imageLayout = vk::ImageLayout::eGeneral;
+                auto replay = targets.state;
+                replay.color_attachments[0].image_view = branch;
+                replay.color_attachments[0].image_layout = vk::ImageLayout::eGeneral;
+                replay.color_attachments[0].is_clear = true;
+                replay.color_attachments[0].clear_value = {};
+                replay_scaled(replay);
+                *temporal_scene_binding = saved;
+                temporal_dlss->FinishBranch(r.scheduler.DirectCommandBuffer(), frame);
+            }
+        }
+        CaptureTemporalInputs(regs, *pipeline, targets, b);
     }
     if (!targets.ui_auxiliary_mask) {
         FinishUiTargets(targets); // Preserve depth-only timing.
@@ -10866,8 +11048,24 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                     region_over = RegionOver(base, size) != nullptr;
                 }
                 p.buffer_ranges.emplace_back(base, base + size);
-                if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) && !region_over &&
-                    direct->EnsureImported(base, size)) {
+                std::optional<Gt7DlssPass::Metadata> temporal_snapshot;
+                if (temporal_dlss && stage.sw_stage == Shader::SwStage::Fragment &&
+                    Gt7Temporal::TaaHash(stage.pgm_hash) && !desc.is_written && size >= 116 &&
+                    size <= 4096 && !region_over) {
+                    Gt7DlssPass::Metadata snapshot;
+                    snapshot.address = base;
+                    snapshot.bytes.resize(size);
+                    if (Core::RytyMemory::GuardedCopy(snapshot.bytes.data(),
+                                                      reinterpret_cast<const void*>(base), size)) {
+                        std::memcpy(snapshot.words.data(), snapshot.bytes.data(), 116);
+                        temporal_snapshot = std::move(snapshot);
+                    }
+                }
+                if (temporal_snapshot) {
+                    info = upload(temporal_snapshot->bytes.data(), u32(size));
+                    b.temporal = std::move(temporal_snapshot);
+                } else if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                           !region_over && direct->EnsureImported(base, size)) {
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
                 } else if (const auto found = JobGuestBuffer(base, size, desc.is_written, p)) {
                     const u64 aligned = Common::AlignDown(found->second, alignment);
@@ -11302,6 +11500,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
 void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                               bool exact) {
     const u64 clock = ++write_clock; // NAT-148: when the memory was rewritten
+    if (temporal_dlss) {
+        temporal_dlss->NoteBufferWrite(frame, address, size, clock, exact);
+    }
     registry->GpuWrote(address, size, pattern, exact, frame, clock);
     // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
     const auto it = stencil_owners.find(address);

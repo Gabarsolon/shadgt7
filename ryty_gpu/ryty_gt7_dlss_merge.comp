@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+// GT7-TDLSS detail-preserving resync. An unreplayed native writer changed the 1080p scene
+// after temporal DLSS reconstructed it at the output size. Plain resync replaces the owned
+// picture with the upscaled native one and loses the reconstructed detail everywhere.
+// Here only what the writer CHANGED is applied: owned + up(native - reference), where
+// reference is the owned scene scaled down exactly as the mirror was. Where the change is
+// large relative to the picture (opaque overdraw) the upscaled native picture wins.
+layout(local_size_x=8,local_size_y=8) in;
+#ifdef FMT_R11G11B10
+layout(set=0,binding=0,r11f_g11f_b10f) uniform image2D owned;
+#else
+layout(set=0,binding=0,rgba16f) uniform image2D owned;
+#endif
+layout(set=0,binding=1) uniform sampler2D native_tex;
+layout(set=0,binding=2) uniform sampler2D ref_tex;
+layout(push_constant) uniform P { float lo; float hi; } k;
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size=imageSize(owned);
+    if(any(greaterThanEqual(p,size))) return;
+    vec2 uv=(vec2(p)+0.5)/vec2(size);
+    vec4 o=imageLoad(owned,p);
+    vec4 n=textureLod(native_tex,uv,0.0);
+    vec4 r=textureLod(ref_tex,uv,0.0);
+    vec3 d=n.rgb-r.rgb;
+    float amount=max(abs(d.r),max(abs(d.g),abs(d.b)));
+    float level=max(max(r.r,max(r.g,r.b)),max(n.r,max(n.g,n.b)));
+    float w=smoothstep(k.lo,k.hi,amount/(max(level,0.0)+0.02));
+    vec3 res=mix(o.rgb+d,n.rgb,w);
+    if(any(isnan(res))||any(isinf(res))) res=n.rgb;
+    imageStore(owned,p,vec4(max(res,vec3(0.0)),mix(o.a,n.a,w)));
+}

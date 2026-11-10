@@ -464,4 +464,5 @@ void Pass::CreateImages(Img& img) const {
 } // namespace Vulkan::RytyDlss
 
 // The temporal DLSS units are part of this translation unit (ryty_gpu is a single target).
+#include "ryty_gpu/ryty_gt7_dlss.cpp"
 #include "ryty_gpu/ryty_gt7_dlss_camera.cpp"

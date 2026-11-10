@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,rg16f) uniform image2D motion;
+layout(push_constant) uniform Transform { vec2 correction; } transform;
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(p,imageSize(motion)))) return;
+    vec2 v=imageLoad(motion,p).xy;
+    bool invalid=any(isnan(v)) || any(isinf(v)) || any(lessThanEqual(v,vec2(-1000))) || any(greaterThan(abs(v),vec2(4)));
+    // A sentinel must never become a huge displacement. Preserve original game data.
+    imageStore(motion,p,vec4(invalid ? vec2(0) : v+transform.correction,0,0));
+}

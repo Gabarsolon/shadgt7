@@ -104,6 +104,9 @@ inline std::atomic<float> resolution_bias{0.0f};
 /// momentary presentation gap (menus), or the samplers would change every second.
 inline std::atomic<bool> temporal_mip_latched{false};
 
+/// GPU.dlss_sharpening as last read (percent), for the status line.
+inline std::atomic<float> sharpen_percent{0.0f};
+
 inline void SetScale(unsigned render, unsigned display, bool active) {
     // NVIDIA's DLSS guide: texture bias = native bias + log2(render / display) - 1 + epsilon.
     const float ratio = active && Get().auto_mip && render && display > render
