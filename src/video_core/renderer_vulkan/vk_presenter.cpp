@@ -1265,8 +1265,9 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     // NAT-100: the picture native mode drew at the display buffer, through the same host passes.
     const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
     const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
-    const auto display =
-        native.FindDisplay(desc.info, view_format, {expected_frame_width, expected_frame_height});
+    const auto display = native.FindDisplay(
+        desc.info, view_format, {expected_frame_width, expected_frame_height},
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
     if (!display) {
         return PrepareBlankFrame(false);
     }

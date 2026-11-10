@@ -5008,7 +5008,9 @@ void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             }
             UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(),
                                    vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
-                                   view, view_info.format, proxy, !proxy.native_dirty);
+                                   view, view_info.format, proxy, !proxy.native_dirty,
+                                   temporal_dlss.get(), frame, entry->info.guest_address,
+                                   entry->write_version.load());
         }
         // Allocate all auxiliary views before redirecting any attachment. Failed creation
         // takes one coherent native draw, with a rejoin on the next supported display draw.
@@ -13403,7 +13405,8 @@ void NativeRenderer::Splice() {
 
 std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCore::ImageInfo& info,
                                                                    vk::Format view_format,
-                                                                   vk::Extent2D window) {
+                                                                   vk::Extent2D window,
+                                                                   bool hdr_encoded) {
     std::scoped_lock lock{mutex};
     if (InPlaceSampled()) {
         for (u32 i = 0; i < in_place.pages.size(); ++i) {
@@ -13572,6 +13575,24 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
                     entry->info.size.width, entry->info.size.height};
+    const auto temporal_target = RytyUpscale::Target({display.width, display.height}, window);
+    if (temporal_dlss) {
+        RytyDlss::BeginNativeFrame(frame - 1);
+        temporal_dlss->Poll();
+        // A scene with no UI drawn over it: the game's post chain already ran on the owned scene,
+        // so the proxy shows the reconstruction like any other frame.
+        auto& ui = UiHires::Get();
+        std::scoped_lock ui_lock{ui.mutex};
+        const auto it = ui.proxies.find(info.guest_address);
+        if (it != ui.proxies.end() && it->second.phase == UiHires::Phase::Scene &&
+            it->second.size == temporal_target &&
+            UiHires::CreateImages(r.instance, it->second, entry->info.pixel_format)) {
+            UiHires::UpscaleNative(r.instance, r.scheduler.DirectCommandBuffer(), display.image,
+                                   view, view_format, it->second, !it->second.native_dirty,
+                                   temporal_dlss.get(), frame - 1, info.guest_address,
+                                   entry->write_version.load());
+        }
+    }
     // GPU.hd_ui: the proxy (scene scaled, UI at the output size) replaces the display picture.
     if (const auto shown = UiHires::TakeFrame(
             r.instance, r.scheduler.DirectCommandBuffer(), info.guest_address,
@@ -13580,6 +13601,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.image)) {
         display.output_view = shown->view;
         display.output_size = shown->size;
+    }
+    if (temporal_dlss) {
+        temporal_dlss->SetDisplay({display.width, display.height}, temporal_target, hdr_encoded);
     }
     // GT7-UW: the HUD drawn into this display in the frame just finished (frame counted it).
     if (HudSplitOn()) {

@@ -30,6 +30,7 @@
 #include "common/hd_ui_options.h"
 #include "common/logging/log.h"
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_gt7_dlss.h"
 #include "ryty_gpu/ryty_ui_cache_hires.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -408,12 +409,49 @@ inline vk::ImageBlit2 NativeBlit(vk::Extent2D from, vk::Extent2D to) {
 }
 
 /// The scene composite in the native display image (general layout) becomes the proxy's
-/// picture: DLSS to the output size, or a linear blit. `allow_dlss` is off for a picture that
-/// has UI in it already.
+/// picture: the game's reconstructed scene (GPU.temporal_dlss, `temporal`), else DLSS to the
+/// output size, else a linear blit. `allow_dlss` is off for a picture that has UI in it already.
 inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::Image image,
                           vk::ImageView view, vk::Format format, Proxy& proxy,
-                          bool allow_dlss = true) {
-    const bool dlss = allow_dlss && !proxy.dlss_failed &&
+                          bool allow_dlss = true, Gt7DlssPass* temporal = nullptr, u64 frame = 0,
+                          VAddr address = 0, u64 version = 0) {
+    // The claim epoch of a frame that has no draw with a TAA scene (presentation only).
+    if (temporal) {
+        RytyDlss::BeginNativeFrame(frame);
+    }
+    auto result = Gt7DlssPass::Result::Unavailable;
+    if (allow_dlss && temporal) {
+        result = temporal->Evaluate(cmd, frame, address, version, proxy.size);
+        if (result == Gt7DlssPass::Result::Success) {
+            // The output of the game's post chain, replayed at the output size, before the UI.
+            const auto output = temporal->Output();
+            NativeBarrier(cmd, output.image, vk::ImageLayout::eGeneral,
+                          vk::ImageLayout::eTransferSrcOptimal);
+            ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferDstOptimal,
+                         vk::PipelineStageFlagBits2::eTransfer,
+                         vk::AccessFlagBits2::eTransferWrite);
+            const auto region = NativeBlit(output.size, proxy.size);
+            cmd.blitImage2(vk::BlitImageInfo2{
+                .srcImage = output.image,
+                .srcImageLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .dstImage = proxy.image,
+                .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
+                .regionCount = 1,
+                .pRegions = &region,
+                .filter = vk::Filter::eNearest,
+            });
+            NativeBarrier(cmd, output.image, vk::ImageLayout::eTransferSrcOptimal,
+                          vk::ImageLayout::eGeneral);
+            ProxyBarrier(cmd, proxy, vk::ImageLayout::eGeneral, DrawStages, DrawAccess);
+            proxy.dlss_used = true;
+            temporal->NotePresentation(frame, true, false);
+            proxy.phase = Phase::Ui;
+            return;
+        }
+    }
+    // A failed SDK evaluation keeps the native scale. A successful temporal evaluation whose
+    // final composite is not available may use the independent spatial context.
+    const bool dlss = allow_dlss && result != Gt7DlssPass::Result::Failed && !proxy.dlss_failed &&
                       RytyDlss::CanScale(proxy.native, proxy.size) && CreateScaled(instance, proxy);
     const auto input_layout =
         dlss ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eTransferSrcOptimal;
@@ -425,6 +463,9 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
         NativeBarrier(cmd, image, input_layout, vk::ImageLayout::eTransferSrcOptimal);
     }
     proxy.dlss_used = scaled;
+    if (allow_dlss && temporal) {
+        temporal->NotePresentation(frame, false, scaled);
+    }
     ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferDstOptimal,
                  vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
     const auto region = NativeBlit(scaled ? proxy.size : proxy.native, proxy.size);

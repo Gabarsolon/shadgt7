@@ -508,8 +508,9 @@ void Gt7DlssPass::SetDisplay(vk::Extent2D input, vk::Extent2D output, bool hdr) 
     auto& p = *impl;
     Common::Sharp::SetScale(input.width, output.width,
                             EmulatorSettings.IsDlssEnabled() && RytyDlss::CanScale(input, output));
-    // Display PQ is produced by the game composite AFTER linear scene reconstruction.
-    const bool supported = output.width >= input.width && output.height >= input.height &&
+    // Display PQ is produced by the game composite AFTER linear scene reconstruction. The scene
+    // is shown through the HD UI proxy, which only exists for an output bigger than the display.
+    const bool supported = output.width > input.width && output.height > input.height &&
                            input.width && input.height && output.width <= 8192 &&
                            output.height <= 8192;
     if (p.input != input || p.output != output || p.supported != supported || p.display_hdr != hdr) {

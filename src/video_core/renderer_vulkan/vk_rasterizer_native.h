@@ -136,8 +136,10 @@ public:
         vk::Extent2D output_size{};
     };
     /// `window` is the size the presenter's frame has (GPU.hd_ui sizes its proxy from it).
+    /// `hdr_encoded`: the display buffer holds PQ, which the game's composite produces after the
+    /// scene (GPU.temporal_dlss reconstructs linear scenes only).
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
-                                       vk::Extent2D window);
+                                       vk::Extent2D window, bool hdr_encoded = false);
 
     /// NAT-116: saves the render targets noted while the rasterizer collected a frame.
     void DumpFrame(const std::filesystem::path& dir);
