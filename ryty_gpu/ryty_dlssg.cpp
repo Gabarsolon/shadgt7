@@ -737,6 +737,12 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         options.outputWidth = output_size.width;
         options.outputHeight = output_size.height;
         options.colorBuffersHDR = sl::Boolean::eFalse;
+        // Keep the tested menu fallback's options when temporal SR owns this scene path.
+        // A purely spatial run retains upstream's original settings.
+        if (Gt7Temporal::Config().enabled) {
+            options.useAutoExposure = sl::Boolean::eTrue;
+            SharpOptions(options, false);
+        }
         const sl::Result set = g_sl.dlss_set_options(viewport, options);
         if (set != sl::Result::eOk) {
             LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline refused the options (result {})",

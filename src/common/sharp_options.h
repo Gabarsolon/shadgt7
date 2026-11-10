@@ -72,6 +72,7 @@ inline bool Flag(const char* key, const char* env, bool fallback) {
 }
 
 struct Settings {
+    float texture_bias = Number("texture_lod_bias", "RYGT_TEXTURE_LOD_BIAS", 0, -16, 16);
     /// GPU.dlss_auto_mip_bias: the texture bias that follows the DLSS scale (default on).
     bool auto_mip = Flag("dlss_auto_mip_bias", "RYGT_DLSS_AUTO_MIP_BIAS", true);
     /// GPU.dlss_mip_extra: the extra term of the bias. Default: -1 with temporal DLSS.

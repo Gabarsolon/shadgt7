@@ -48,6 +48,7 @@
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "common/ryty_config.h"
+#include "common/sharp_options.h"
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
 #undef near
 #undef far
@@ -1308,7 +1309,8 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
     // nothing in a shadow test.
     static const float texture_lod_bias = [this] {
         const char* env = std::getenv("RYGT_TEXTURE_LOD_BIAS");
-        const float bias = env && *env ? std::strtof(env, nullptr) : 0.0f;
+        const float bias = Gt7Temporal::Config().enabled ? Common::Sharp::Get().texture_bias
+                                                       : env && *env ? std::strtof(env, nullptr) : 0.0f;
         if (!std::isfinite(bias) || bias == 0.0f) {
             return 0.0f;
         }

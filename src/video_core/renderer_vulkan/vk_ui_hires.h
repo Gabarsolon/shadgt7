@@ -93,6 +93,7 @@ struct Proxy {
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     Phase phase = Phase::Idle;
     bool dlss_failed = false;
+    u32 dlss_retry_after = 0;
     bool dlss_used = false;
     std::shared_ptr<HostPasses::SceneSharpenPass> scene_sharpen; ///< GPU.dlss_sharpening
     bool native_stale = false; ///< the proxy got draws the display buffer has not
@@ -445,6 +446,10 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
         RytyDlss::BeginNativeFrame(frame);
     }
     auto result = Gt7DlssPass::Result::Unavailable;
+    if (allow_dlss && temporal && proxy.dlss_failed && proxy.dlss_retry_after &&
+        --proxy.dlss_retry_after == 0) {
+        proxy.dlss_failed = false;
+    }
     if (allow_dlss && temporal) {
         result = temporal->Evaluate(cmd, frame, address, version, proxy.size);
         if (result == Gt7DlssPass::Result::Success) {
@@ -486,6 +491,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
                                                     proxy.scaled, *proxy.scaled_view, proxy.size);
     if (dlss && !scaled) {
         proxy.dlss_failed = true;
+        if (temporal) proxy.dlss_retry_after = 120;
         NativeBarrier(cmd, image, input_layout, vk::ImageLayout::eTransferSrcOptimal);
     }
     proxy.dlss_used = scaled;
