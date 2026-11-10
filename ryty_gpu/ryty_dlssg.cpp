@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <tuple>
 #include <string>
 #include <utility>
 #include <vector>
@@ -605,10 +606,61 @@ sl::DLSSMode PreferredMode() {
     }
 }
 
+// Result 39 reports a successful evaluation that exceeded the VRAM budget. Its output
+// and resource transitions are valid; treating it as an error disables SR until a resize.
+bool EvaluationSucceeded(sl::Result result) {
+    if (result == sl::Result::eWarnOutOfVRAM) {
+        static auto next = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next) {
+            next = now + std::chrono::seconds(5);
+            LOG_WARNING(Render_Vulkan, "GT7-DLSS: evaluation completed over VRAM budget; "
+                        "keeping reconstructed output (result 39)");
+        }
+        return true;
+    }
+    return result == sl::Result::eOk;
+}
+
+// Both successes and unsupported modes are cached. All callers hold g_sl.mutex.
+// FindMode is used several times for the same temporal frame; a single-entry spatial
+// cache does not protect these calls from repeatedly querying a deprecated mode.
+bool OptimalSettings(const sl::DLSSOptions& options, sl::DLSSOptimalSettings& settings) {
+    if (!options.outputWidth || !options.outputHeight || options.mode == sl::DLSSMode::eOff) {
+        return false;
+    }
+    using Key = std::tuple<int, unsigned, unsigned, int>;
+    const Key key{int(options.mode), options.outputWidth, options.outputHeight,
+                  int(PresetFor(options))};
+    struct Entry {
+        Key key;
+        sl::DLSSOptimalSettings settings;
+        bool valid;
+    };
+    static std::vector<Entry> cache;
+    for (const auto& entry : cache) {
+        if (entry.key == key) {
+            settings = entry.settings;
+            return entry.valid;
+        }
+    }
+    sl::DLSSOptimalSettings value{};
+    const auto result = g_sl.dlss_get_optimal(options, value);
+    const bool valid = result == sl::Result::eOk && value.optimalRenderWidth &&
+                       value.optimalRenderHeight && value.renderWidthMax && value.renderHeightMax;
+    if (cache.size() == 64) {
+        cache.erase(cache.begin());
+    }
+    cache.push_back({key, value, valid});
+    settings = value;
+    return valid;
+}
+
 // The DLSS quality mode whose render size range holds input for output, or -1: the chosen
 // quality's mode when it fits, else the first that does.
 int FindMode(vk::Extent2D input, vk::Extent2D output) {
-    if (input.width > output.width || input.height > output.height) {
+    if (!input.width || !input.height || !output.width || !output.height ||
+        input.width > output.width || input.height > output.height) {
         return -1;
     }
     static constexpr sl::DLSSMode all[] = {
@@ -620,14 +672,21 @@ int FindMode(vk::Extent2D input, vk::Extent2D output) {
     if (const sl::DLSSMode preferred = PreferredMode(); preferred != sl::DLSSMode::eOff) {
         modes.push_back(preferred);
     }
-    modes.insert(modes.end(), std::begin(all), std::end(all));
+    for (const auto mode : all) {
+        if (std::ranges::find(modes, mode) == modes.end()) {
+            modes.push_back(mode);
+        }
+    }
     for (const sl::DLSSMode mode : modes) {
+        if (mode == sl::DLSSMode::eDLAA && input != output) {
+            continue;
+        }
         sl::DLSSOptions options{};
         options.mode = mode;
         options.outputWidth = output.width;
         options.outputHeight = output.height;
         sl::DLSSOptimalSettings settings{};
-        if (g_sl.dlss_get_optimal(options, settings) != sl::Result::eOk) {
+        if (!OptimalSettings(options, settings)) {
             continue;
         }
         const bool fits = input.width >= settings.renderWidthMin &&
@@ -746,7 +805,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     const sl::BaseStructure* inputs[] = {&viewport};
     const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *frame, inputs,
                                             static_cast<u32>(std::size(inputs)), command_buffer);
-    if (result != sl::Result::eOk) {
+    if (!EvaluationSucceeded(result)) {
         LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline's DLSS failed (result {})",
                   static_cast<int>(result));
         return false;
@@ -817,7 +876,7 @@ bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& f) {
         r.pre_exposure = options.preExposure;
         r.exposure_scale = options.exposureScale;
         sl::DLSSOptimalSettings optimal{};
-        if (g_sl.dlss_get_optimal(options, optimal) == sl::Result::eOk) {
+        if (OptimalSettings(options, optimal)) {
             r.optimal_w = float(optimal.optimalRenderWidth);
             r.optimal_h = float(optimal.optimalRenderHeight);
         }
@@ -879,7 +938,7 @@ bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& f) {
         return false;
     const sl::BaseStructure* inputs[]{&viewport};
     const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *token, inputs, 1, command);
-    if (result != sl::Result::eOk)
+    if (!EvaluationSucceeded(result))
         LOG_WARNING(Render_Vulkan, "GT7-DLSS backend frame={} token={} result={}", f.frame,
                     g_sl.frame_index, int(result));
     return result == sl::Result::eOk;
