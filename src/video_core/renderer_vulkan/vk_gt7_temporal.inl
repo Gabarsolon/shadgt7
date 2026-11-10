@@ -102,6 +102,23 @@ void NativeRenderer::CaptureTemporalInputs(const AmdGpu::Regs& regs,
     const auto* vs = pipeline.GetStages()[u32(Shader::SwStage::Vertex)];
     if (!fs || !Gt7Temporal::TaaHash(fs->pgm_hash))
         return;
+    // Qualification failures below describe the main scene only. GT7 also runs TAA
+    // for small views; its attachment/constant contract must not invalidate our main history.
+    const auto& scene_viewport = regs.viewports[0];
+    if (!Gt7Temporal::MainScene(targets.state.width, targets.state.height,
+            std::abs(scene_viewport.xscale * 2), std::abs(scene_viewport.yscale * 2),
+            scene_viewport.xoffset, scene_viewport.yoffset)) {
+        if (Common::Sharp::Diagnostics()) {
+            static std::set<std::tuple<u64, u32, u32>> seen;
+            if (seen.size() < 16 && seen.emplace(fs->pgm_hash, targets.state.width,
+                                               targets.state.height).second) {
+                LOG_WARNING(Render_Vulkan, "GT7-DLSS subview: ps={:#x} raster={}x{} "
+                            "MRT={} mainHistoryKept=1", fs->pgm_hash, targets.state.width,
+                            targets.state.height, targets.state.num_color_attachments);
+            }
+        }
+        return;
+    }
     const auto fail = [&](const char* reason) {
         temporal_dlss->Fallback(frame, reason);
         if (Common::Sharp::Get().dlss_log || Common::Sharp::Diagnostics()) {

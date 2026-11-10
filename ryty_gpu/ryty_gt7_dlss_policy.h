@@ -55,6 +55,14 @@ inline bool Invert(const Matrix& a, Matrix& result) {
         }
     return true;
 }
+// Only this view is reconstructed. A thumbnail or split viewport must not discard a
+// main scene that was already reconstructed earlier in the same guest frame.
+inline bool MainScene(unsigned width, unsigned height, float viewport_width,
+                      float viewport_height, float xoffset, float yoffset) {
+    return width == 1920 && height == 1080 && viewport_width == 1920 &&
+           viewport_height == 1080 && xoffset == 960 && yoffset == 540;
+}
+
 inline bool TaaHash(uint64_t hash) {
     switch (hash) {
     case 0xcfa125dd:
