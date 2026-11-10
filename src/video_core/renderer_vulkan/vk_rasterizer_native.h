@@ -736,6 +736,8 @@ private:
     void PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline,
                          const AmdGpu::Regs& regs);
     void FinishUiTargets(const Targets& targets);
+    void PrepareMapIcons(const Targets& targets, const GraphicsPipeline& pipeline,
+                         const AmdGpu::Regs& regs, DrawBindings& b);
     void ResolveUiDisplay(VAddr address, bool keep);
     void SyncUiReads(std::span<const Shader::Info* const> stages);
     void SyncUiRange(VAddr address, u64 size, bool keep);

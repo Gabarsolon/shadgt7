@@ -83,6 +83,14 @@ void RytyWatchDump(std::string label);                                          
 
 namespace {
 
+// GPU.hd_ui: the town map's sprite programs (vertex, pixel), seen in the map's frames. They are
+// sprite programs, not widget identities: PrepareMapIcons restricts the change further by the
+// target, the texture and the descriptor shape. Never the scene composite.
+constexpr bool MapSprite(u64 vs, u64 ps) {
+    return (vs == 0xfa3f5430 && ps == 0xba262d29) || (vs == 0x4759c020 && ps == 0x7e93b16a);
+}
+static_assert(MapSprite(0x4759c020, 0x7e93b16a) && !MapSprite(0x3863962b, 0xdf75f23b));
+
 std::pair<u32, u64> DiagnosticPassOptions(u64 frame) {
     static const char* path = Common::DiagEnv("RYGT_DIAG_PASS_FILE");
     static u64 last_frame = ~u64{0};
@@ -4621,6 +4629,77 @@ void NativeRenderer::FinishUiTargets(const Targets& targets) {
     // NoteWrites advances this version even for read-only attachment use. Our cached depth
     // includes that draw; any later native writer advances it again and forces a new up-copy.
     proxy.depth->version = targets.depth->write_version.load(std::memory_order_relaxed);
+}
+
+// GPU.hd_ui: a map icon is a sprite that samples a small picture with a mip chain, and the guest
+// sampler picks a smaller mip than the icon's size on the screen needs once the UI draws at the
+// window size. Such a draw into a proxy samples the picture's base level instead. The picture
+// is the game's own asset, a view of its first level, and the filter, clamp, border and texel
+// coordinates of the guest's sampler are kept.
+void NativeRenderer::PrepareMapIcons(const Targets& targets, const GraphicsPipeline& pipeline,
+                                     const AmdGpu::Regs& regs, DrawBindings& b) {
+    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    const auto* vs = pipeline.GetStages()[u32(Shader::SwStage::Vertex)];
+    if (!fs || !vs || !MapSprite(vs->pgm_hash, fs->pgm_hash)) {
+        return;
+    }
+    const auto* target = targets.colors[0];
+    if (!target || !UiHires::KnownAddress(target->info.guest_address) ||
+        UiHires::Get().scale <= 1.f) {
+        return;
+    }
+    const Native::ImageEntry* source = b.sampled.size() == 1 ? b.sampled[0] : nullptr;
+    if (targets.ui_side_effects || targets.ui_color_feedback || targets.ui_depth_feedback ||
+        b.writes_buffers || !b.stored.empty() || !b.gpu_writes.empty()) {
+        return;
+    }
+    if (fs->images.size() != 1 || fs->samplers.size() != 1 || !source ||
+        fs->images[0].is_written || fs->samplers[0].is_depth) {
+        return;
+    }
+    // A picture the game uploaded, 16 to 512 pixels wide and high, never a rendered one.
+    if (!source->from_cpu || source->info.props.is_depth || source->info.size.width < 16 ||
+        source->info.size.width > 512 || source->info.size.height < 16 ||
+        source->info.size.height > 512) {
+        return;
+    }
+    const auto format = static_cast<vk::Format>(source->image->Desc().format);
+    const bool color = format == vk::Format::eBc7UnormBlock ||
+                       format == vk::Format::eBc7SrgbBlock ||
+                       format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eR8G8B8A8Srgb;
+    const auto tsharp = fs->images[0].GetSharp(*fs);
+    auto ssharp = fs->samplers[0].GetSharp(*fs);
+    if (!color || tsharp.GetType() != AmdGpu::ImageType::Color2D || tsharp.base_level != 0 ||
+        tsharp.min_lod != 0 || tsharp.base_array != 0 || tsharp.last_array != 0 ||
+        source->image->Desc().samples != 1) {
+        return;
+    }
+    // Nothing to recover without a mip chain, and nothing to sample without a valid sampler.
+    if (tsharp.last_level == 0 || source->info.resources.levels <= 1) {
+        return;
+    }
+    if (!ssharp.Valid() || (ssharp.border_color_type == AmdGpu::BorderColor::Custom &&
+                            regs.ta_bc_base.Address() == 0)) {
+        return;
+    }
+    ssharp.min_lod.Assign(0);
+    ssharp.max_lod.Assign(0);
+    ssharp.lod_bias.Assign(0);
+    ssharp.mip_filter.Assign(AmdGpu::MipFilter::None);
+    const u32 set = Shader::Backend::StageSet(u32(Shader::SwStage::Fragment));
+    for (size_t i = 0; i < b.writes.size(); ++i) {
+        const auto& write = b.writes[i];
+        if (i >= b.write_sets.size() || b.write_sets[i] != set ||
+            write.descriptorType != vk::DescriptorType::eSampler || write.descriptorCount != 1 ||
+            !write.pImageInfo) {
+            continue;
+        }
+        const auto slot = write.pImageInfo - b.images.data();
+        if (slot < 0 || size_t(slot) >= b.images.size()) {
+            continue;
+        }
+        b.images[slot].sampler = SamplerFor(ssharp, regs.ta_bc_base, false);
+    }
 }
 
 void NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline,
@@ -9680,6 +9759,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                         std::ranges::any_of(b.stored, aliases);
         }
         PrepareUiTarget(targets, *pipeline, regs);
+        PrepareMapIcons(targets, *pipeline, regs, b);
         // Bindings may have been prepared or reused before the target was redirected: assign the
         // coordinate scale on every draw. Native and offscreen draws keep the identity.
         const float ui_scale = UiHires::Get().scale;
