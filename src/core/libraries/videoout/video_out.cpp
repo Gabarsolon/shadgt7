@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #ifdef RYTY_GPU
 #include "core/file_format/psf.h"
+#include "ryty_gpu/ryty_gt7_hdr_status.h"
 #endif
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -42,8 +43,12 @@ static bool GameSupportsHdr() {
             }
             return game_info.GetPSFAttributes().support_hdr.Value() != 0;
         }();
+        RytySetGt7HdrStatusCompatibility(supported);
         return supported;
     }
+#endif
+#ifdef RYTY_GPU
+    RytySetGt7HdrStatusCompatibility(false);
 #endif
     return game_info.GetPSFAttributes().support_hdr.Value() != 0;
 }
@@ -403,7 +408,13 @@ void PaceFlipSubmit() {
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
     s32 handle, SceVideoOutDeviceCapabilityInfo* pDeviceCapabilityInfo) {
     pDeviceCapabilityInfo->capability = 0;
-    if (presenter->IsHDRSupported()) {
+    const bool hdr_available = presenter->IsHDRSupported();
+#ifdef RYTY_GPU
+    if (!hdr_available) {
+        RytySetGt7HdrStatusCompatibility(false);
+    }
+#endif
+    if (hdr_available) {
         if (GameSupportsHdr()) {
             pDeviceCapabilityInfo->capability |= ORBIS_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ;
         }

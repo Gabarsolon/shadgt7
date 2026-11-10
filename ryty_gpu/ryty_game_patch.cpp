@@ -9,6 +9,7 @@
 // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
 
 #include <cstdio>
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <atomic>
@@ -25,6 +26,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
 #include "common/ryty_config.h"
@@ -32,7 +34,9 @@
 #include "common/types.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
+#include "core/file_format/psf.h"
 #include "input/trigger_feedback.h"
+#include "ryty_gpu/ryty_gt7_hdr_status.h"
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -441,6 +445,8 @@ bool RedirectCall(u8* base, u8* stub, u64 call_rva, u64 target_rva, void* hook, 
                  static_cast<unsigned long long>(call_rva));
     return true;
 }
+
+#include "ryty_gpu/ryty_gt7_hdr_status.inl"
 
 void InstallLewisChallenge(u8* base) {
     const char* env = std::getenv("RYGT_LEWIS");
@@ -2389,7 +2395,12 @@ void Install(u8* base) {
 
 } // namespace Gt7Cipher
 
+void RytySetGt7HdrStatusCompatibility(bool available) {
+    Gt7HdrStatus::g_available.store(available, std::memory_order_relaxed);
+}
+
 void RytyApplyGamePatches() {
+    Gt7HdrStatus::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
