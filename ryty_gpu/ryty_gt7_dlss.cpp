@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "ryty_gpu/ryty_gt7_dlss.h"
+#include "ryty_gpu/ryty_gt7_dlss_diagnostic.h"
 
 #include <array>
 #include <bit>
@@ -187,12 +188,28 @@ struct SharpReadback {
     VkBuffer buffer{};
     VmaAllocation allocation{};
     void* mapped{};
-    u64 bytes{}, tick{}, frame{};
+    u64 bytes{}, allocated_bytes{}, tick{}, frame{};
+    unsigned bundle{};
     std::string name, metadata;
     ~SharpReadback() {
         if (buffer) vmaDestroyBuffer(allocator, buffer, allocation);
     }
 };
+
+static void ReportDiagnosticIo(bool success, unsigned bundle, std::string_view detail,
+                               std::uint64_t value) noexcept {
+    try {
+        if (success) {
+            LOG_WARNING(Render_Vulkan, "GT7-DLSS dump-retired: bundle={} file={} bytes={}", bundle,
+                        detail, value);
+        } else {
+            LOG_WARNING(Render_Vulkan, "GT7-DLSS dump-aborted: bundle={} reason={} error={}",
+                        bundle, detail, value);
+        }
+    } catch (...) {
+        // Diagnostics cannot propagate a logging/allocation failure into the renderer.
+    }
+}
 
 struct Gt7DlssPass::Impl {
     const Instance& gpu;
@@ -241,6 +258,25 @@ struct Gt7DlssPass::Impl {
     }
     std::vector<std::unique_ptr<Probe>> probes;
     std::vector<std::unique_ptr<SharpReadback>> sharp_readbacks;
+    std::unique_ptr<Gt7Diagnostic::Writer> dump_io;
+    bool dump_io_tried{};
+    unsigned dump_skipped{};
+    bool DumpActive(u64 frame) const noexcept {
+        return dump_io && dump_frame == frame && !dump_io->Failed(dump_id);
+    }
+    void AbortDump(std::string_view reason) noexcept {
+        if (dump_io)
+            dump_io->Fail(dump_id, reason);
+        dump_frame = ~u64{};
+        dump_armed = false;
+    }
+    bool QueueText(std::string name, std::string text) noexcept {
+        if (dump_io && dump_io->Enqueue({dump_id, std::move(name), std::move(text)}))
+            return true;
+        AbortDump("metadata queue");
+        return false;
+    }
+
     bool dump_armed{};
     unsigned dump_id{};
     u64 dump_frame = ~u64{}, dump_bytes{}, dump_resync = ~u64{};
@@ -380,55 +416,90 @@ struct Gt7DlssPass::Impl {
     }
     void QueueDump(vk::CommandBuffer cmd, u64 frame, const char* role, vk::Image image,
                    vk::ImageAspectFlags aspects, vk::ImageLayout layout, vk::Format format,
-                   vk::Extent2D size, const char* note) {
-        const unsigned texel = TexelBytes(format);
-        if (!image || !texel || !size.width || !size.height) {
-            LOG_WARNING(Render_Vulkan, "GT7-DLSS dump skipped role={} format={}", role,
-                        vk::to_string(format));
+                   vk::Extent2D size, const char* note) noexcept {
+        if (!DumpActive(frame))
             return;
+        try {
+            const std::string label = role ? role : "unnamed";
+            const unsigned texel = TexelBytes(format);
+            const auto remaining = Gt7Diagnostic::MaxBundleBytes - dump_bytes;
+            const auto bytes =
+                Gt7Diagnostic::ReadbackBytes(size.width, size.height, texel, remaining);
+            const auto copy_aspect = aspects & ~vk::ImageAspectFlagBits::eStencil;
+            if (!cmd || !image || !bytes || layout == vk::ImageLayout::eUndefined ||
+                (copy_aspect != vk::ImageAspectFlagBits::eColor &&
+                 copy_aspect != vk::ImageAspectFlagBits::eDepth)) {
+                if (dump_skipped++ < 8)
+                    LOG_WARNING(Render_Vulkan,
+                                "GT7-DLSS dump-skipped: bundle={} role={} "
+                                "reason=unavailable-plane-or-limit",
+                                dump_id, label);
+                return;
+            }
+            // Complete all potentially allocating CPU work before recording GPU references.
+            sharp_readbacks.reserve(sharp_readbacks.size() + 1);
+            auto rb = std::make_unique<SharpReadback>();
+            rb->allocator = gpu.GetAllocator();
+            rb->bytes = *bytes;
+            rb->bundle = dump_id;
+            const VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0,
+                                          rb->bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            const VmaAllocationCreateInfo alloc{.flags =
+                                                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                                    VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+            VmaAllocationInfo allocated{};
+            if (vmaCreateBuffer(rb->allocator, &info, &alloc, &rb->buffer, &rb->allocation,
+                                &allocated) != VK_SUCCESS ||
+                !rb->buffer || !rb->allocation) {
+                AbortDump("readback allocation");
+                return;
+            }
+            rb->mapped = allocated.pMappedData;
+            rb->allocated_bytes = allocated.size;
+            if (!Gt7Diagnostic::MappedSpan(rb->mapped, rb->bytes, rb->allocated_bytes)) {
+                AbortDump("readback mapping");
+                return;
+            }
+            rb->frame = frame;
+            rb->name = fmt::format("dlss-{:02}-f{}-{}-{}x{}", dump_id, frame, label, size.width,
+                                   size.height);
+            const nlohmann::json metadata{
+                {"bundle", dump_id},      {"frame", frame},
+                {"role", label},          {"width", size.width},
+                {"height", size.height},  {"format", vk::to_string(format)},
+                {"bytesPerPixel", texel}, {"rowPitch", size.width * texel},
+                {"littleEndian", true},   {"note", note ? std::string(note) : std::string{}}};
+            rb->metadata = metadata.dump(2);
+            rb->tick = scheduler.CurrentTick();
+            auto* pending = rb.get();
+            sharp_readbacks.push_back(std::move(rb));
+            dump_bytes += *bytes;
+            // Keep the buffer until this tick completes even if a later bundle step fails.
+            Barrier(cmd, image, aspects, layout, vk::ImageLayout::eTransferSrcOptimal);
+            cmd.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, pending->buffer,
+                                  vk::BufferImageCopy{.imageSubresource = {copy_aspect, 0, 0, 1},
+                                                      .imageExtent = {size.width, size.height, 1}});
+            Barrier(cmd, image, aspects, vk::ImageLayout::eTransferSrcOptimal, layout);
+            const vk::BufferMemoryBarrier2 host{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                .buffer = pending->buffer,
+                .offset = 0,
+                .size = pending->bytes};
+            cmd.pipelineBarrier2({.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host});
+        } catch (...) {
+            AbortDump("readback preparation");
         }
-        auto rb = std::make_unique<SharpReadback>();
-        rb->allocator = gpu.GetAllocator();
-        rb->bytes = u64(size.width) * size.height * texel;
-        if (dump_bytes + rb->bytes > 256ull * 1024 * 1024)
-            return;
-        const VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, rb->bytes,
-                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-        const VmaAllocationCreateInfo alloc{.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                                            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
-        VmaAllocationInfo allocated{};
-        if (vmaCreateBuffer(rb->allocator, &info, &alloc, &rb->buffer, &rb->allocation, &allocated) != VK_SUCCESS)
-            return;
-        dump_bytes += rb->bytes;
-        rb->mapped = allocated.pMappedData;
-        rb->frame = frame;
-        rb->name = fmt::format("dlss-{:02}-f{}-{}-{}x{}", dump_id, frame, role, size.width, size.height);
-        const nlohmann::json metadata{
-            {"bundle", dump_id}, {"frame", frame}, {"role", role}, {"width", size.width},
-            {"height", size.height}, {"format", vk::to_string(format)}, {"bytesPerPixel", texel},
-            {"rowPitch", size.width * texel}, {"littleEndian", true}, {"note", note}};
-        rb->metadata = metadata.dump(2);
-        const auto copy_aspect = aspects & ~vk::ImageAspectFlagBits::eStencil;
-        Barrier(cmd, image, aspects, layout, vk::ImageLayout::eTransferSrcOptimal);
-        cmd.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, rb->buffer,
-                              vk::BufferImageCopy{.imageSubresource = {copy_aspect, 0, 0, 1},
-                                                  .imageExtent = {size.width, size.height, 1}});
-        Barrier(cmd, image, aspects, vk::ImageLayout::eTransferSrcOptimal, layout);
-        const vk::BufferMemoryBarrier2 host{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                                            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                                            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
-                                            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
-                                            .buffer = rb->buffer, .offset = 0, .size = rb->bytes};
-        cmd.pipelineBarrier2({.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host});
-        rb->tick = scheduler.CurrentTick();
-        sharp_readbacks.push_back(std::move(rb));
     }
     // The detail-preserving resync. False: the caller falls back to the old replace.
     bool MergeScene(vk::CommandBuffer cmd, const Input& native) {
         const auto scene_format = current->scene.format;
-        const int variant = scene_format == vk::Format::eR16G16B16A16Sfloat ? 0
-                            : scene_format == vk::Format::eB10G11R11UfloatPack32 ? 1 : -1;
+        const int variant = scene_format == vk::Format::eR16G16B16A16Sfloat      ? 0
+                            : scene_format == vk::Format::eB10G11R11UfloatPack32 ? 1
+                                                                                 : -1;
         if (variant < 0 || native.format != scene_format || !(current->scene.usage_storage))
             return false;
         const auto device = gpu.GetDevice();
@@ -946,7 +1017,7 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
     DiagnosticImage(cmd, frame, sources[0], "depth");
     DiagnosticImage(cmd, frame, sources[1], "motion-raw");
     DiagnosticImage(cmd, frame, scene_output, "taa-native");
-    if (p.dump_frame == frame && previous_slot && previous_slot->frame + 1 == frame &&
+    if (p.DumpActive(frame) && previous_slot && previous_slot->frame + 1 == frame &&
         previous_slot->color.size == p.input && previous_slot->color.format == slot->color.format &&
         previous_mapping == sources[2].mapping) {
         p.QueueDump(cmd, frame, "previous-color-in", previous_slot->color.image,
@@ -959,7 +1030,7 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
     p.qualification_reason = p.numeric_valid ? "qualified" : "waiting-for-input-probe";
     p.ProbeInputs(cmd, frame); // independent of the downstream graph
     const auto reconstructed = Reconstruct(cmd, frame);
-    if (p.dump_frame == frame && reconstructed == Result::Success) {
+    if (p.DumpActive(frame) && reconstructed == Result::Success) {
         p.QueueDump(cmd, frame, "dlss-out", p.current->output.image,
             p.current->output.aspects, p.current->output.layout,
             p.current->output.format, p.output, "semantic RGB before native storage mapping");
@@ -1034,7 +1105,7 @@ void Gt7DlssPass::SyncScene(vk::CommandBuffer cmd, u64 frame, Input native) {
     // An un-replayed native writer changed the 1080p scene. Never reuse an earlier HDR version.
     // Merge (default): keep the reconstructed detail and apply only what the writer changed.
     // Replace: the old behaviour, the upscaled native scene wins everywhere (loses detail).
-    const bool dump = p.dump_frame == frame && p.dump_resync != frame;
+    const bool dump = p.DumpActive(frame) && p.dump_resync != frame;
     if (dump) {
         p.dump_resync = frame;
         p.QueueDump(cmd, frame, "resync-owned-before", p.current->scene.image,
@@ -1129,7 +1200,7 @@ vk::ImageView Gt7DlssPass::ColorView() const {
 void Gt7DlssPass::FinishBranch(vk::CommandBuffer cmd, u64 frame) {
     if (impl->captured == frame) {
         impl->branch_ready = true;
-        if (impl->dump_frame == frame) impl->QueueDump(impl->scheduler.DirectCommandBuffer(), frame,
+        if (impl->DumpActive(frame)) impl->QueueDump(impl->scheduler.DirectCommandBuffer(), frame,
             "post-chain", impl->current->branch.image, impl->current->branch.aspects,
             impl->current->branch.layout, impl->current->branch.format,
             impl->output, "game post chain, display encoded, before sharpening/UI");
@@ -1195,7 +1266,7 @@ Gt7DlssPass::Result Gt7DlssPass::Reconstruct(vk::CommandBuffer cmd, u64 frame) {
         Fallback(frame, "motion-normalization-pipeline");
         return Result::Unavailable;
     }
-    if (p.dump_frame == frame) p.QueueDump(cmd, frame, "motion-corrected", p.current->motion.image,
+    if (p.DumpActive(frame)) p.QueueDump(cmd, frame, "motion-corrected", p.current->motion.image,
         p.current->motion.aspects, p.current->motion.layout, p.current->motion.format,
         p.input, "exact motion vectors tagged to DLSS after sentinel/jitter normalization");
     const auto now = std::chrono::steady_clock::now();
@@ -1300,82 +1371,114 @@ void Gt7DlssPass::NotePresentation(u64 frame, bool temporal, bool spatial) {
 }
 
 bool Gt7DlssPass::WantsDiagnosticDraws(u64 frame) const {
-    return Common::Sharp::Diagnostics() && (impl->dump_armed || impl->dump_frame == frame);
+    return Common::Sharp::Diagnostics() && impl->dump_io &&
+           (impl->dump_armed || impl->DumpActive(frame));
+}
+
+void Gt7DlssPass::AbortDiagnostic(const char* reason) noexcept {
+    if (impl && Common::Sharp::Diagnostics())
+        impl->AbortDump(reason ? reason : "diagnostic error");
 }
 
 void Gt7DlssPass::DiagnosticDraw(u64 frame, const std::string& state, bool geometry, bool motion) {
-    if (!WantsDiagnosticDraws(frame)) return;
-    auto& p = *impl;
-    if (p.dump_trace_frame != frame) {
-        p.dump_trace_frame = frame;
-        p.dump_draw_state.clear();
-        p.dump_draws = p.dump_geometry = p.dump_missing_motion = 0;
-    }
-    ++p.dump_draws;
-    if (geometry) {
-        ++p.dump_geometry;
-        p.dump_missing_motion += !motion;
-    }
-    if (p.dump_draw_state.size() + state.size() + 40 <= 2 * 1024 * 1024) {
-        p.dump_draw_state += fmt::format("draw={} {}\n", p.dump_draws, state);
+    if (!WantsDiagnosticDraws(frame))
+        return;
+    try {
+        auto& p = *impl;
+        if (p.dump_trace_frame != frame) {
+            p.dump_trace_frame = frame;
+            p.dump_draw_state.clear();
+            p.dump_draws = p.dump_geometry = p.dump_missing_motion = 0;
+        }
+        ++p.dump_draws;
+        if (geometry) {
+            ++p.dump_geometry;
+            p.dump_missing_motion += !motion;
+        }
+        if (p.dump_draw_state.size() + state.size() + 40 <= 2 * 1024 * 1024) {
+            p.dump_draw_state += fmt::format("draw={} {}\n", p.dump_draws, state);
+        }
+    } catch (...) {
+        impl->AbortDump("draw metadata");
     }
 }
 
-void Gt7DlssPass::DiagnosticImage(vk::CommandBuffer cmd, u64 frame, Input image,
-                                      const char* role) {
-    if (!Common::Sharp::Diagnostics()) return;
-    auto& p = *impl;
-    const bool starting = p.dump_armed;
-    if (starting) {
-        p.dump_armed = false;
-        p.dump_frame = frame;
-        p.dump_bytes = 0;
-        ++p.dump_id;
-        LOG_WARNING(Render_Vulkan, "GT7-DLSS dump: bundle={} frame={} dir={}",
-                    p.dump_id, frame, DiagnosticDirectory().string());
-    }
-    if (p.dump_frame != frame) return;
-    if (starting || std::string_view(role) == "final-scene") {
-        const nlohmann::json metadata{
-            {"bundle", p.dump_id}, {"frame", frame}, {"capturedFrame", p.captured},
-            {"evaluatedFrame", p.evaluated}, {"lastTaa", p.last_taa},
-            {"reason", p.qualification_reason}, {"numericValid", p.numeric_valid},
-            {"reconstructed", Reconstructed(frame)},
-            {"sdkSuccess", p.last_eval.frame == frame && p.last_eval.ok},
-            {"temporalCapturedThisFrame", p.captured == frame},
-            {"temporalEvaluatedThisFrame", p.last_eval.frame == frame},
-            {"presentationPath", p.present_frame != frame ? "pending" :
-                p.present_mode == 0 ? "temporal" : p.present_mode == 1 ? "spatial" : "native"},
-            {"sdkFrame", p.last_eval.frame}, {"constants", p.constants},
-            {"jitterPixels", RasterJitter(p.constants)},
-            {"mvecScale", {-.5f * Config().mvec_scale, .5f * Config().mvec_scale}},
-            {"projection", p.camera.projection}, {"view", p.camera.view},
-            {"mip", Common::Sharp::ResolutionBias()}, {"displayPQ", p.display_hdr},
-            {"historyPending", p.history.pending != nullptr},
-            {"historyResetReason", p.history.pending ? nlohmann::json(p.history.pending)
-                                                     : nlohmann::json(nullptr)},
-            {"depthInverted", p.camera.lens.inverted},
-            {"preExposure", Common::Sharp::Get().pre_exposure},
-            {"exposureScale", Common::Sharp::Get().exposure_scale}, {"autoExposure", true},
-            {"colorViewSwizzle", {int(p.native_scene.mapping.r), int(p.native_scene.mapping.g),
-                                  int(p.native_scene.mapping.b), int(p.native_scene.mapping.a)}},
-            {"draws", p.dump_draws}, {"geometryDepthDraws", p.dump_geometry},
-            {"geometryWithoutMotionTarget", p.dump_missing_motion}};
-        std::error_code error;
-        std::filesystem::create_directories(DiagnosticDirectory(), error);
-        std::ofstream(DiagnosticDirectory() / fmt::format("dlss-{:02}-f{}-frame.json", p.dump_id, frame))
-            << metadata.dump(2);
-        if (p.dump_trace_frame == frame) {
-            std::ofstream(DiagnosticDirectory() / fmt::format("dlss-{:02}-f{}-draws.txt", p.dump_id, frame))
-                << p.dump_draw_state;
+void Gt7DlssPass::DiagnosticImage(vk::CommandBuffer cmd, u64 frame, Input image, const char* role) {
+    if (!Common::Sharp::Diagnostics())
+        return;
+    if (!impl->dump_io)
+        return;
+    try {
+        auto& p = *impl;
+        const bool starting = p.dump_armed;
+        if (starting) {
+            p.dump_armed = false;
+            p.dump_frame = frame;
+            p.dump_bytes = 0;
+            p.dump_skipped = 0;
+            ++p.dump_id;
+            LOG_WARNING(Render_Vulkan, "GT7-DLSS dump: bundle={} frame={} dir={}", p.dump_id, frame,
+                        DiagnosticDirectory().string());
         }
-        if (!starting) LOG_WARNING(Render_Vulkan,
-            "GT7-DLSS cockpit-evidence: frame={} draws={} geometry={} withoutMotionTarget={} "
-            "(not proof of missing per-pixel velocity)", frame, p.dump_draws,
-            p.dump_geometry, p.dump_missing_motion);
+        if (!p.DumpActive(frame))
+            return;
+        if (starting || (role && std::string_view(role) == "final-scene")) {
+            const nlohmann::json metadata{
+                {"bundle", p.dump_id},
+                {"frame", frame},
+                {"capturedFrame", p.captured},
+                {"evaluatedFrame", p.evaluated},
+                {"lastTaa", p.last_taa},
+                {"reason", p.qualification_reason},
+                {"numericValid", p.numeric_valid},
+                {"reconstructed", Reconstructed(frame)},
+                {"sdkSuccess", p.last_eval.frame == frame && p.last_eval.ok},
+                {"temporalCapturedThisFrame", p.captured == frame},
+                {"temporalEvaluatedThisFrame", p.last_eval.frame == frame},
+                {"presentationPath", p.present_frame != frame ? "pending"
+                                     : p.present_mode == 0    ? "temporal"
+                                     : p.present_mode == 1    ? "spatial"
+                                                              : "native"},
+                {"sdkFrame", p.last_eval.frame},
+                {"constants", p.constants},
+                {"jitterPixels", RasterJitter(p.constants)},
+                {"mvecScale", {-.5f * Config().mvec_scale, .5f * Config().mvec_scale}},
+                {"projection", p.camera.projection},
+                {"view", p.camera.view},
+                {"mip", Common::Sharp::ResolutionBias()},
+                {"displayPQ", p.display_hdr},
+                {"historyPending", p.history.pending != nullptr},
+                {"historyResetReason",
+                 p.history.pending ? nlohmann::json(p.history.pending) : nlohmann::json(nullptr)},
+                {"depthInverted", p.camera.lens.inverted},
+                {"preExposure", Common::Sharp::Get().pre_exposure},
+                {"exposureScale", Common::Sharp::Get().exposure_scale},
+                {"autoExposure", true},
+                {"colorViewSwizzle",
+                 {int(p.native_scene.mapping.r), int(p.native_scene.mapping.g),
+                  int(p.native_scene.mapping.b), int(p.native_scene.mapping.a)}},
+                {"draws", p.dump_draws},
+                {"geometryDepthDraws", p.dump_geometry},
+                {"geometryWithoutMotionTarget", p.dump_missing_motion}};
+            if (!p.QueueText(fmt::format("dlss-{:02}-f{}-frame.json", p.dump_id, frame),
+                             metadata.dump(2)))
+                return;
+            if (p.dump_trace_frame == frame &&
+                !p.QueueText(fmt::format("dlss-{:02}-f{}-draws.txt", p.dump_id, frame),
+                             p.dump_draw_state))
+                return;
+            if (!starting)
+                LOG_WARNING(Render_Vulkan,
+                            "GT7-DLSS cockpit-evidence: frame={} draws={} geometry={} "
+                            "withoutMotionTarget={} "
+                            "(not proof of missing per-pixel velocity)",
+                            frame, p.dump_draws, p.dump_geometry, p.dump_missing_motion);
+        }
+        p.QueueDump(cmd, frame, role, image.image, image.aspects, vk::ImageLayout::eGeneral,
+                    image.format, image.size, "raw storage channels; scene before UI");
+    } catch (...) {
+        impl->AbortDump("frame metadata");
     }
-    p.QueueDump(cmd, frame, role, image.image, image.aspects, vk::ImageLayout::eGeneral,
-                image.format, image.size, "raw storage channels; scene before UI");
 }
 
 void Gt7DlssPass::Poll() {
@@ -1383,28 +1486,53 @@ void Gt7DlssPass::Poll() {
     p.CollectTime();
     p.TrimSlots();
     if (Common::Sharp::Diagnostics()) {
-        static auto next = std::chrono::steady_clock::time_point{};
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= next && p.dump_id < 3 && !p.dump_armed) {
-            next = now + std::chrono::milliseconds(500);
-            std::error_code error;
-            const auto trigger = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dlss.now";
-            if (std::filesystem::is_regular_file(trigger, error) &&
-                std::filesystem::remove(trigger, error)) p.dump_armed = true;
-        }
-        for (auto it = p.sharp_readbacks.begin(); it != p.sharp_readbacks.end();) {
-            auto& rb = **it;
-            if (!p.scheduler.IsFree(rb.tick)) { ++it; continue; }
-            vmaInvalidateAllocation(rb.allocator, rb.allocation, 0, VK_WHOLE_SIZE);
-            const auto directory = DiagnosticDirectory();
-            std::error_code error;
-            std::filesystem::create_directories(directory, error);
-            std::ofstream data(directory / (rb.name + ".bin"), std::ios::binary);
-            data.write(static_cast<const char*>(rb.mapped), std::streamsize(rb.bytes));
-            std::ofstream(directory / (rb.name + ".json")) << rb.metadata;
-            LOG_WARNING(Render_Vulkan, "GT7-DLSS dump-retired: frame={} role={} bytes={} ok={}",
-                        rb.frame, rb.name, rb.bytes, bool(data));
-            it = p.sharp_readbacks.erase(it);
+        try {
+            if (!p.dump_io_tried) {
+                p.dump_io_tried = true;
+                p.dump_io = std::make_unique<Gt7Diagnostic::Writer>(
+                    DiagnosticDirectory(),
+                    Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dlss.now",
+                    &ReportDiagnosticIo);
+            }
+            if (p.dump_io && p.dump_io->TakeRequest())
+                p.dump_armed = true;
+            for (auto it = p.sharp_readbacks.begin(); it != p.sharp_readbacks.end();) {
+                if (!*it) {
+                    it = p.sharp_readbacks.erase(it);
+                    continue;
+                }
+                if (!p.scheduler.IsFree((*it)->tick)) {
+                    ++it;
+                    continue;
+                }
+                auto retired = std::move(*it);
+                it = p.sharp_readbacks.erase(it);
+                if (!p.dump_io || p.dump_io->Failed(retired->bundle))
+                    continue;
+                if (!Gt7Diagnostic::MappedSpan(retired->mapped, retired->bytes,
+                                               retired->allocated_bytes) ||
+                    vmaInvalidateAllocation(retired->allocator, retired->allocation, 0,
+                                            VK_WHOLE_SIZE) != VK_SUCCESS) {
+                    p.dump_io->Fail(retired->bundle, "retired readback mapping or invalidation");
+                    continue;
+                }
+                // Shared ownership hands a retired mapping to the file thread without copying
+                // a whole image on the recorder. VMA uses internal synchronization here.
+                auto owner = std::shared_ptr<SharpReadback>(std::move(retired));
+                Gt7Diagnostic::Write binary{owner->bundle, owner->name + ".bin", {},
+                                            owner,         owner->mapped,        owner->bytes};
+                Gt7Diagnostic::Write metadata{owner->bundle, owner->name + ".json",
+                                              owner->metadata};
+                if (!p.dump_io->Enqueue(std::move(metadata)) ||
+                    !p.dump_io->Enqueue(std::move(binary))) {
+                    p.dump_io->Fail(owner->bundle, "retired output queue");
+                }
+            }
+        } catch (...) {
+            if (p.dump_io)
+                p.AbortDump("diagnostic polling");
+            else
+                ReportDiagnosticIo(false, 0, "writer initialization", 0);
         }
     }
     for (auto it = p.probes.begin(); it != p.probes.end();) {

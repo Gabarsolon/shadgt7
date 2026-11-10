@@ -51,6 +51,7 @@ public:
     // RYGT_DLSS_DIAG=1 + user/log/dlss.now: one scene, even without an admitted TAA pass.
     void DiagnosticImage(vk::CommandBuffer, u64 frame, Input image, const char* role);
     bool WantsDiagnosticDraws(u64 frame) const;
+    void AbortDiagnostic(const char* reason) noexcept;
     void DiagnosticDraw(u64 frame, const std::string& state, bool geometry, bool motion);
 
 
