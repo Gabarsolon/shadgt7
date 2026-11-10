@@ -41,6 +41,7 @@
 #include "core/file_format/psf.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/gt7_preset_options.h"
+#include "ryty_gpu/ryty_gt7_dlss_camera.h"
 #include "ryty_gpu/ryty_gt7_hdr_status.h"
 #include "ryty_gpu/native/entry_hook.h"
 #include "ryty_gpu/ryty_ui_cache_hires.h"
@@ -2586,6 +2587,7 @@ void Install(u8* base) {
 } // namespace Gt7Presets
 
 void RytyApplyGamePatches() {
+    Vulkan::Gt7Temporal::InstallCameraHook();
     Gt7HdrStatus::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     Gt7Presets::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GT7-014
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));

@@ -5,6 +5,7 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "ryty_gpu/ryty_gt7_dlss_camera.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
 
@@ -51,6 +52,36 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
              vk::Image input_image, vk::ImageView input, vk::Format input_format,
              vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
              vk::Format output_format, vk::Extent2D output_size);
+
+struct TemporalImage {
+    vk::Image image{};
+    vk::ImageView view{};
+    vk::Format format{};
+    vk::Extent2D size{};
+};
+struct TemporalFrame {
+    u64 frame{};
+    TemporalImage color, depth, motion, output;
+    Gt7Temporal::Camera camera;
+    Gt7Temporal::Matrix previous_projection{}, previous_view{};
+    float jitter_x{}, jitter_y{}, mvec_scale=1, frame_ms=16.667f;
+    bool reset=true, hdr=false;
+};
+// Temporal SR is isolated from legacy viewport 1 and FG viewport 0. All input images
+// must be owned, shader-read-only; output is storage-capable in GENERAL.
+bool TemporalSupports(vk::Extent2D input, vk::Extent2D output);
+bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& frame);
+/// What the last temporal evaluation sent to the SDK (for the once-a-second GT7-DLSS log line).
+struct TemporalReport {
+    int mode{-1};            // sl::DLSSMode value
+    const char* mode_name{"none"};
+    int preset_requested{0}; // GPU.dlss_preset (0 = runtime default)
+    int preset_sent{0};      // the preset sent for this mode
+    bool hdr{}, auto_exposure{};
+    float pre_exposure{1}, exposure_scale{1};
+    float optimal_w{}, optimal_h{}; // the SDK's optimal render size for this mode (info only)
+};
+TemporalReport LastTemporalReport();
 
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();

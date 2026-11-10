@@ -5,12 +5,16 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
+#include <cmath>
+#include <cstring>
 
 #include "common/logging/log.h"
+#include "common/sharp_options.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/ryty_upscale.h"
@@ -541,7 +545,49 @@ bool InitUpscale() {
 
 namespace {
 
+TemporalReport g_temporal_report; // guarded by g_sl.mutex
+
+const char* ModeName(sl::DLSSMode m) {
+    switch (m) {
+    case sl::DLSSMode::eMaxPerformance: return "Performance";
+    case sl::DLSSMode::eBalanced: return "Balanced";
+    case sl::DLSSMode::eMaxQuality: return "Quality";
+    case sl::DLSSMode::eUltraPerformance: return "UltraPerformance";
+    case sl::DLSSMode::eUltraQuality: return "UltraQuality";
+    case sl::DLSSMode::eDLAA: return "DLAA";
+    default: return "Off";
+    }
+}
+sl::DLSSPreset PresetFor(const sl::DLSSOptions& o) {
+    switch (o.mode) {
+    case sl::DLSSMode::eMaxPerformance: return o.performancePreset;
+    case sl::DLSSMode::eBalanced: return o.balancedPreset;
+    case sl::DLSSMode::eMaxQuality: return o.qualityPreset;
+    case sl::DLSSMode::eUltraPerformance: return o.ultraPerformancePreset;
+    case sl::DLSSMode::eUltraQuality: return o.ultraQualityPreset;
+    case sl::DLSSMode::eDLAA: return o.dlaaPreset;
+    default: return sl::DLSSPreset::eDefault;
+    }
+}
+
 // The DLSS mode for the launcher's Upscaling quality (eOff for Auto).
+void SharpOptions(sl::DLSSOptions& options, bool temporal) {
+    const auto& c = Common::Sharp::Get();
+    // Reserved/removed model IDs must not be sent to the runtime.
+    const int p = c.preset;
+    if (p == 0 || p == 5 || p == 6 || (p >= 10 && p <= 13)) {
+        const auto preset = static_cast<sl::DLSSPreset>(p);
+        options.dlaaPreset = options.qualityPreset = options.balancedPreset = preset;
+        options.performancePreset = options.ultraPerformancePreset = options.ultraQualityPreset = preset;
+    }
+    if (temporal) {
+        if (c.hdr >= 0) options.colorBuffersHDR = c.hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        options.preExposure = c.pre_exposure;
+        options.exposureScale = c.exposure_scale;
+    }
+}
+
+
 sl::DLSSMode PreferredMode() {
     switch (RytyUpscale::GetQuality()) {
     case RytyUpscale::Quality::Native:
@@ -613,6 +659,7 @@ bool UpscaleSupports(vk::Extent2D input, vk::Extent2D output) {
                     g_sl.sr_mode < 0 ? std::string{"no DLSS mode fits; using FSR"}
                                      : fmt::format("DLSS mode {}", g_sl.sr_mode));
     }
+    Common::Sharp::SetScale(input.width, output.width, g_sl.sr_mode >= 0);
     return g_sl.sr_mode >= 0;
 }
 
@@ -705,6 +752,137 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         return false;
     }
     return true;
+}
+
+TemporalReport LastTemporalReport() {
+    std::scoped_lock lock{g_sl.mutex};
+    return g_temporal_report;
+}
+
+bool TemporalSupports(vk::Extent2D input, vk::Extent2D output) {
+    if (!Gt7Temporal::Config().enabled || !g_sl.upscale_ready || Requested() ||
+        EmulatorSettings.IsFrameGenEnabled())
+        return false;
+    std::scoped_lock lock{g_sl.mutex};
+    return input.width && input.height && FindMode(input, output) >= 0;
+}
+
+bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& f) {
+    if (!TemporalSupports(f.color.size, f.output.size))
+        return false;
+    const auto valid = [](const TemporalImage& i) {
+        return i.image && i.view && i.size.width && i.size.height;
+    };
+    if (!valid(f.color) || !valid(f.depth) || !valid(f.motion) || !valid(f.output) ||
+        f.depth.size != f.color.size || f.motion.size != f.color.size ||
+        !std::isfinite(f.jitter_x) || !std::isfinite(f.jitter_y) || !std::isfinite(f.mvec_scale) ||
+        std::abs(f.mvec_scale) > 4 || !std::isfinite(f.frame_ms) || f.frame_ms <= 0)
+        return false;
+    Gt7Temporal::Matrix inverse_projection{}, inverse_view{}, inverse_previous{}, inverse_clip{};
+    Gt7Temporal::Projection lens{};
+    if (!Gt7Temporal::Perspective(f.camera.projection, lens) ||
+        !Gt7Temporal::Invert(f.camera.projection, inverse_projection) ||
+        !Gt7Temporal::Invert(f.camera.view, inverse_view) ||
+        !Gt7Temporal::Invert(f.previous_projection, inverse_previous))
+        return false;
+    const auto clip_previous = Gt7Temporal::Multiply(
+        Gt7Temporal::Multiply(Gt7Temporal::Multiply(inverse_projection, inverse_view),
+                              f.previous_view),
+        f.previous_projection);
+    if (!Gt7Temporal::Invert(clip_previous, inverse_clip))
+        return false;
+    std::scoped_lock lock{g_sl.mutex};
+    const sl::ViewportHandle viewport{2u};
+    const int mode = FindMode(f.color.size, f.output.size);
+    if (mode < 0)
+        return false;
+    sl::DLSSOptions options{};
+    options.mode = static_cast<sl::DLSSMode>(mode);
+    options.outputWidth = f.output.size.width;
+    options.outputHeight = f.output.size.height;
+    options.colorBuffersHDR = f.hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    options.useAutoExposure = sl::Boolean::eTrue;
+    SharpOptions(options, true);
+    if (g_sl.dlss_set_options(viewport, options) != sl::Result::eOk)
+        return false;
+    {
+        // For the once-a-second GT7-DLSS line: what this evaluation really sent.
+        auto& r = g_temporal_report;
+        r.mode = mode;
+        r.mode_name = ModeName(options.mode);
+        r.preset_requested = Common::Sharp::Get().preset;
+        r.preset_sent = static_cast<int>(PresetFor(options));
+        r.hdr = options.colorBuffersHDR == sl::Boolean::eTrue;
+        r.auto_exposure = options.useAutoExposure == sl::Boolean::eTrue;
+        r.pre_exposure = options.preExposure;
+        r.exposure_scale = options.exposureScale;
+        sl::DLSSOptimalSettings optimal{};
+        if (g_sl.dlss_get_optimal(options, optimal) == sl::Result::eOk) {
+            r.optimal_w = float(optimal.optimalRenderWidth);
+            r.optimal_h = float(optimal.optimalRenderHeight);
+        }
+    }
+    sl::FrameToken* token{};
+    ++g_sl.frame_index;
+    if (g_sl.new_frame_token(token, &g_sl.frame_index) != sl::Result::eOk || !token)
+        return false;
+    sl::Constants constants{};
+    const auto matrix = [](sl::float4x4& target, const Gt7Temporal::Matrix& value) {
+        static_assert(sizeof(target) == sizeof(value));
+        std::memcpy(&target, value.data(), sizeof(target));
+    };
+    matrix(constants.cameraViewToClip, f.camera.projection);
+    matrix(constants.clipToCameraView, inverse_projection);
+    constants.clipToLensClip = Identity();
+    matrix(constants.clipToPrevClip, clip_previous);
+    matrix(constants.prevClipToClip, inverse_clip);
+    constants.jitterOffset = sl::float2(f.jitter_x, f.jitter_y);
+    // Streamline wants normalized UV, unlike the Sport NGX bridge's pixel scales.
+    constants.mvecScale = sl::float2(-.5f * f.mvec_scale, .5f * f.mvec_scale);
+    constants.cameraPinholeOffset = sl::float2(0, 0);
+    constants.cameraPos = sl::float3(inverse_view[12], inverse_view[13], inverse_view[14]);
+    constants.cameraRight = sl::float3(inverse_view[0], inverse_view[1], inverse_view[2]);
+    constants.cameraUp = sl::float3(inverse_view[4], inverse_view[5], inverse_view[6]);
+    const float forward = f.camera.projection[11];
+    constants.cameraFwd = sl::float3(forward * inverse_view[8], forward * inverse_view[9],
+                                     forward * inverse_view[10]);
+    constants.cameraNear = lens.near_plane;
+    constants.cameraFar = lens.far_plane;
+    constants.cameraFOV = lens.fov;
+    constants.cameraAspectRatio = lens.aspect;
+    constants.depthInverted = lens.inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    constants.cameraMotionIncluded = sl::Boolean::eTrue;
+    constants.motionVectors3D = sl::Boolean::eFalse;
+    constants.motionVectorsJittered = sl::Boolean::eFalse;
+    constants.reset = f.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    if (g_sl.set_constants(constants, *token, viewport) != sl::Result::eOk)
+        return false;
+    const auto resource = [](const TemporalImage& i, bool output) {
+        return Texture(i.image, i.view,
+                       output ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+                       i.size, i.format,
+                       output ? vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled
+                              : vk::ImageUsageFlags{vk::ImageUsageFlagBits::eSampled});
+    };
+    auto color = resource(f.color, false), depth = resource(f.depth, false),
+         motion = resource(f.motion, false), output = resource(f.output, true);
+    const sl::Extent in{0, 0, f.color.size.width, f.color.size.height},
+        out{0, 0, f.output.size.width, f.output.size.height};
+    const sl::ResourceTag tags[]{
+        {&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &in},
+        {&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &in},
+        {&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &in},
+        {&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate,
+         &out}};
+    auto* command = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(cmd));
+    if (g_sl.set_tag(*token, viewport, tags, u32(std::size(tags)), command) != sl::Result::eOk)
+        return false;
+    const sl::BaseStructure* inputs[]{&viewport};
+    const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *token, inputs, 1, command);
+    if (result != sl::Result::eOk)
+        LOG_WARNING(Render_Vulkan, "GT7-DLSS backend frame={} token={} result={}", f.frame,
+                    g_sl.frame_index, int(result));
+    return result == sl::Result::eOk;
 }
 
 void PresentStart() {
