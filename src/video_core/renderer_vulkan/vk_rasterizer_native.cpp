@@ -566,6 +566,27 @@ void NativeRenderer::DrawBindings::Clear() {
     diag_records = 0;
 }
 
+// PERF-GT7-130: whether the range is not imported yet and starts in a guest mapping of at most
+// RYGT_UPLOAD_COPY_KB (default 1024; 0 turns the copies off): GT7's streamed textures, in
+// 64 KB mappings that would each be imported as a view of their own.
+static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAddr address,
+                                     u64 size) {
+    static const u64 copy_below = [] {
+        const char* env = std::getenv("RYGT_UPLOAD_COPY_KB");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : 1024) << 10;
+    }();
+    if (copy_below == 0 ||
+        direct.ForEachPart(address, size, [](const VideoCore::Buffer&, u64, u64, u64) {})) {
+        return false;
+    }
+    const VAddr mapping = VideoCore::GuestViewBase(address);
+    if (mapping == 0) {
+        return false;
+    }
+    const VAddr mapping_end = VideoCore::GuestViewEnd(mapping, copy_below);
+    return mapping_end > address && mapping_end - mapping <= copy_below;
+}
+
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     device = Native::Rhi::CreateVulkanDevice(r.instance);
     ASSERT_MSG(device, "NAT-100: no native device");
@@ -637,17 +658,8 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         // into upload memory instead (a few microseconds per 64 KB) and uploaded from there.
         // The copy is taken now, not when the GPU gets there; GPU-written memory is in a
         // region and was handled above.
-        static const u64 copy_below = [] {
-            const char* env = std::getenv("RYGT_UPLOAD_COPY_KB");
-            return (env && *env ? std::strtoull(env, nullptr, 10) : 1024) << 10;
-        }();
-        if (copy_below != 0 && size <= 64_MB &&
-            !direct->ForEachPart(address, size,
-                                 [](const VideoCore::Buffer&, u64, u64, u64) {})) {
-            const VAddr mapping = VideoCore::GuestViewBase(address);
-            const VAddr mapping_end =
-                mapping != 0 ? VideoCore::GuestViewEnd(mapping, copy_below) : 0;
-            if (mapping != 0 && mapping_end > address && mapping_end - mapping <= copy_below) {
+        if (size <= 64_MB) {
+            if (InSmallUnimportedMapping(*direct, address, size)) {
                 auto copy = device->CreateBuffer({.size = size,
                                                   .usage = Native::Rhi::BufferUsageStorage |
                                                            Native::Rhi::BufferUsageTransferSrc |
@@ -2236,7 +2248,18 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
-    const bool imported = direct->EnsureImported(begin, end - begin);
+    // PERF-GT7-131 (RYGT_REGION_COPY=0 off): a region over small mappings not imported yet (a
+    // streamed texture's memory that a shader also writes) takes its first bytes from a copy,
+    // as one over memory that cannot be imported does: these were two thirds of the imports
+    // left in a driven race after PERF-GT7-130 (~0.2 ms each, hundreds in one frame).
+    static const bool region_copy = [] {
+        const char* env = std::getenv("RYGT_REGION_COPY");
+        return !(env && env[0] == '0');
+    }();
+    const bool imported =
+        !(region_copy && end - begin <= 64_MB &&
+          InSmallUnimportedMapping(*direct, begin, end - begin)) &&
+        direct->EnsureImported(begin, end - begin);
     Region region;
     region.begin = begin;
     region.end = end;
