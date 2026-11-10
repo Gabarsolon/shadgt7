@@ -19,6 +19,7 @@
 #include <cwctype>
 #include <iterator>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -35,6 +36,8 @@
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "input/trigger_feedback.h"
+#include "ryty_gpu/native/entry_hook.h"
+#include "ryty_gpu/ryty_ui_cache_hires.h"
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -1942,6 +1945,7 @@ void InstallFatalErrorDiag(u8* base) {
 
 namespace {
 #include "ryty_gpu/ryty_hd_ui_assets.inl"
+#include "ryty_gpu/ryty_ui_cache_hires.inl"
 } // namespace
 
 
@@ -2400,6 +2404,7 @@ void RytyApplyGamePatches() {
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallHdUiAssetsGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    PavilionCache::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
