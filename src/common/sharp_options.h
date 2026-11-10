@@ -93,6 +93,15 @@ struct Settings {
     bool dlss_log = Flag("dlss_log", "RYGT_DLSS_LOG", false);
 };
 
+// Opt-in investigation of unsupported scene shapes and a bounded, timeline-retired dump.
+inline bool Diagnostics() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_DLSS_DIAG");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 inline const Settings& Get() {
     static const Settings settings;
     return settings;

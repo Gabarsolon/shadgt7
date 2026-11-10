@@ -48,6 +48,9 @@ public:
     void Invalidate(const char* reason);
     void NoteWrite(const void* identity, u64 ps = 0);
     void Poll();
+    // RYGT_DLSS_DIAG=1 + user/log/dlss.now: one scene, even without an admitted TAA pass.
+    void DiagnosticImage(vk::CommandBuffer, u64 frame, Input image, const char* role);
+
     void NotePresentation(u64 frame, bool temporal, bool spatial);
     void Fallback(u64 frame, const char* reason, bool invalidate = true);
     std::string_view QualificationReason() const;

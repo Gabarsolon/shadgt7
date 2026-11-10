@@ -444,6 +444,8 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     // The claim epoch of a frame that has no draw with a TAA scene (presentation only).
     if (temporal) {
         RytyDlss::BeginNativeFrame(frame);
+        if (allow_dlss) temporal->DiagnosticImage(cmd, frame,
+            {image, format, proxy.native}, "presentation-native");
     }
     auto result = Gt7DlssPass::Result::Unavailable;
     if (allow_dlss && temporal && proxy.dlss_failed && proxy.dlss_retry_after &&
@@ -476,6 +478,8 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
             proxy.dlss_used = true;
             temporal->NotePresentation(frame, true, false);
             SharpenScene(instance, cmd, proxy);
+            temporal->DiagnosticImage(cmd, frame, {proxy.image, proxy.present_format, proxy.size},
+                                      "presentation-scaled");
             proxy.phase = Phase::Ui;
             return;
         }
@@ -519,6 +523,8 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     ProxyBarrier(cmd, proxy, vk::ImageLayout::eGeneral, DrawStages, DrawAccess);
     if (allow_dlss) {
         SharpenScene(instance, cmd, proxy);
+        if (temporal) temporal->DiagnosticImage(cmd, frame,
+            {proxy.image, proxy.present_format, proxy.size}, "presentation-scaled");
     }
     proxy.phase = Phase::Ui;
     proxy.native_dirty = false;

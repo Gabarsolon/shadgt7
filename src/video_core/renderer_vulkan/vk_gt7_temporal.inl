@@ -102,7 +102,34 @@ void NativeRenderer::CaptureTemporalInputs(const AmdGpu::Regs& regs,
     const auto* vs = pipeline.GetStages()[u32(Shader::SwStage::Vertex)];
     if (!fs || !Gt7Temporal::TaaHash(fs->pgm_hash))
         return;
-    const auto fail = [&](const char* reason) { temporal_dlss->Fallback(frame, reason); };
+    const auto fail = [&](const char* reason) {
+        temporal_dlss->Fallback(frame, reason);
+        if (Common::Sharp::Get().dlss_log || Common::Sharp::Diagnostics()) {
+            const auto& vp = regs.viewports[0];
+            const std::string key = fmt::format(
+                "ps={:#x} vs={:#x} raster={}x{} viewport=({},{} {}x{}) MRT={} "
+                "depth={} images={} indices={} instances={} cb={} reason={}",
+                fs->pgm_hash, vs ? vs->pgm_hash : 0, targets.state.width, targets.state.height,
+                vp.xoffset-std::abs(vp.xscale), vp.yoffset-std::abs(vp.yscale),
+                std::abs(vp.xscale*2), std::abs(vp.yscale*2),
+                targets.state.num_color_attachments, bool(targets.depth), fs->images.size(),
+                regs.num_indices, regs.num_instances.NumInstances(),
+                b.temporal ? b.temporal->bytes.size() : 0, reason);
+            static std::set<std::string> reported;
+            if (reported.size() < 64 && reported.emplace(key).second) {
+                std::string inputs;
+                for (const auto* image : b.sampled) {
+                    if (!image) continue;
+                    inputs += fmt::format(" {:#x}:{}x{}:{}:writeFrame{}:version{}",
+                        image->info.guest_address, image->info.size.width, image->info.size.height,
+                        vk::to_string(image->info.pixel_format), image->written_frame.load(),
+                        image->write_version.load());
+                }
+                LOG_WARNING(Render_Vulkan, "GT7-DLSS shape: frame={} {} inputs=[{}]",
+                            frame, key, inputs);
+            }
+        }
+    };
     if (!vs || vs->pgm_hash != 0x3863962b || !Gt7Temporal::ProvenSchema(fs->pgm_hash)) {
         fail("unverified-TAA-variant");
         return;
