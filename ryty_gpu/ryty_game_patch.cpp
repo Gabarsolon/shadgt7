@@ -1853,21 +1853,23 @@ void InstallTriggerTelemetryGt7(u8* base) {
     std::fprintf(stderr, "[triggers] GT7 adaptive triggers on (telemetry hook installed)\n");
 }
 
-// FIX-GT7-BLUR: GT7 draws its scene motion blur in replays and not while driving. One rule of the
-// game's own code stops it in a race: the default onboard graphics preset (mode 0, in the base and
-// the Neo high presets) has the scene-blur veto bit 0x08 in its effect mask (0x18). With
-// GPU.motion_blur_gameplay (default off; RYGT_MOTION_BLUR_GAMEPLAY=1/0 overrides the setting) the
-// veto bit is cleared in the two preset constructors; the other disable bit 0x10 stays. Camera,
-// photo, debug and VR exclusions, the explicit disable_motionblur effect setting and the game's
-// shutter policy are left as they are.
+// FIX-GT7-BLUR: GT7 draws its scene motion blur in replays and not while driving. Two rules of the
+// game's own code stop it in a race: the default onboard graphics preset (mode 0, in the base and
+// the Neo high presets) has the scene-blur veto bit 0x08 in its effect mask (0x18), and the blur
+// builder drops the blur enable it computed when an onboard count input is 4 or more (a vector
+// length whose meaning is not fully identified). With GPU.motion_blur_gameplay (default off;
+// RYGT_MOTION_BLUR_GAMEPLAY=1/0 overrides the setting) the veto bit is cleared in the two preset
+// constructors (the other disable bit 0x10 stays) and the cmovge that discards the enable becomes
+// nops. Camera, photo, debug and VR exclusions, the explicit disable_motionblur effect setting and
+// the game's shutter policy are left as they are.
 //
 // Safety: nothing is written unless the setting is on and every site matches. A site is a fixed
 // converter RVA of GT7 CUSA24769 (the executable they were read from has SHA-256
 // e18ac63e07db83f61a63c866ee466a0e3a90c52e3b19ae06b0d60a9281e57832). The game's bytes are
-// compared over whole instructions around the change (51 bytes); with any difference, or a
+// compared over whole instructions around the change (51 to 65 bytes); with any difference, or a
 // page that cannot be read, no site is touched and one line says so. The change itself is one
-// byte (0x18 to 0x10) for each preset. Pages are made writable together and restored; if one
-// cannot be, nothing is changed.
+// byte (0x18 to 0x10) for each preset and four nops for the limit. Pages are made writable
+// together and restored; if one cannot be, nothing is changed.
 struct BlurSite {
     u64 rva;                      // where the compared bytes start
     std::vector<u8> expected;     // the game's bytes there, whole instructions
@@ -1902,6 +1904,16 @@ void InstallMotionBlurGameplayGt7(u8* base) {
             0x00, 0x48, 0xc7, 0x83, 0xa8, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
             0x00, 0x89, 0x8b, 0xb0, 0x00, 0x00, 0x00},
          23 + 7, {0x10}, "GT7-BLUR onboard preset (base)"},
+        // cmp [rsp+0x190], 4 ... cmovge r14d, eax: the last four bytes are the cmovge.
+        {0x1c11391 - 24,
+         {
+            0x8b, 0x4c, 0x24, 0x20, 0xc5, 0xfb, 0x10, 0x84, 0xc1, 0x34, 0x04,
+            0x00, 0x00, 0xc5, 0xf8, 0x29, 0x84, 0x24, 0x10, 0x01, 0x00, 0x00,
+            0x31, 0xc0, 0x83, 0xbc, 0x24, 0x90, 0x01, 0x00, 0x00, 0x04, 0x48,
+            0x8b, 0x5c, 0x24, 0x20, 0x4c, 0x8b, 0xa4, 0x24, 0xa0, 0x00, 0x00,
+            0x00, 0x45, 0x0f, 0xb6, 0xf6, 0x44, 0x0f, 0x4d, 0xf0, 0xe9, 0x2e,
+            0xd9, 0xff, 0xff, 0x8b, 0x48, 0x3c, 0x48, 0x8b, 0x40, 0x48},
+         24 + 25, {0x90, 0x90, 0x90, 0x90}, "GT7-BLUR onboard count limit"},
     };
     for (const auto& site : sites) {
         if (!ReadableRange(base + site.rva, site.expected.size()) ||
