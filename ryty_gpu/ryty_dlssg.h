@@ -73,6 +73,7 @@ bool TemporalSupports(vk::Extent2D input, vk::Extent2D output);
 bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& frame);
 /// What the last temporal evaluation sent to the SDK (for the once-a-second GT7-DLSS log line).
 struct TemporalReport {
+    u64 budget_warnings{}; // successful evaluations carrying eWarnOutOfVRAM
     int mode{-1};            // sl::DLSSMode value
     const char* mode_name{"none"};
     int preset_requested{0}; // GPU.dlss_preset (0 = runtime default)

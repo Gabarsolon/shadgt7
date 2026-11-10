@@ -51,6 +51,18 @@ struct Texture {
     vk::ImageAspectFlags aspects{vk::ImageAspectFlagBits::eColor};
     vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     bool usage_storage{};
+    // These are private frame-ring images. On a retired slot, release them to the driver,
+    // rather than moving their memory into the unrelated global image recycler.
+    void Release() {
+        view.reset();
+        if (image.image) {
+            vmaDestroyImage(image.allocator, image.image, image.allocation);
+            image.image = vk::Image{};
+            image.allocation = VK_NULL_HANDLE;
+            image.size_bytes = 0;
+        }
+    }
+    ~Texture() { Release(); }
     RytyDlssG::TemporalImage Descriptor() const {
         return {image, *view, format, size};
     }
@@ -62,8 +74,7 @@ struct Texture {
                 vk::ImageAspectFlags aspect, vk::ImageUsageFlags extra = {}) {
         if (image && format == fmt && size == extent && aspects == aspect)
             return true;
-        view.reset();
-        image.Destroy();
+        Release();
         image = VideoCore::UniqueImage{gpu.GetDevice(), gpu.GetAllocator()};
         image.device = gpu.GetDevice();
         const vk::ImageCreateInfo info{.imageType = vk::ImageType::e2D,
@@ -96,7 +107,7 @@ struct Texture {
                                  .levelCount = 1,
                                  .layerCount = 1}});
         if (v.result != vk::Result::eSuccess) {
-            image.Destroy();
+            Release();
             return false;
         }
         view = std::move(v.value);
@@ -190,10 +201,44 @@ struct Gt7DlssPass::Impl {
         Texture color, depth, motion, branch, output, scene, ref;
         vk::UniqueImageView color_read, scene_read;
         std::vector<vk::UniqueImageView> merge_views; // native views of this frame's resyncs
-        u64 tick{}, frame = ~u64{};
+        u64 tick{}, frame = ~u64{}, epoch{};
+        std::chrono::steady_clock::time_point used = std::chrono::steady_clock::now();
+        u64 Bytes() const {
+            u64 bytes = 0;
+            for (const auto* texture : {&color, &depth, &motion, &branch, &output, &scene, &ref}) {
+                if (texture->image) bytes += texture->image.size_bytes;
+            }
+            return bytes;
+        }
     };
     std::vector<std::unique_ptr<Slot>> slots;
     Slot* current{};
+    static constexpr u64 MaxTemporalBytes = 512ull << 20;
+    u64 memory_refusals{}, slots_trimmed{}, logged_budget_warnings{};
+    u64 OwnedBytes() const {
+        u64 bytes = 0;
+        for (const auto& slot : slots) bytes += slot->Bytes();
+        return bytes;
+    }
+    void TrimSlots() {
+        const auto now = std::chrono::steady_clock::now();
+        const bool inactive = !scene_identity && !branch_ready;
+        if (inactive && current && now - current->used > std::chrono::seconds(2) &&
+            scheduler.IsFree(current->tick)) current = nullptr;
+        size_t remaining = slots.size();
+        std::erase_if(slots, [&](const auto& slot) {
+            if (slot.get() == current || !scheduler.IsFree(slot->tick)) return false;
+            const bool old_scene = slot->epoch != epoch;
+            const bool idle = now - slot->used > std::chrono::seconds(2);
+            if (old_scene || (remaining > 2 && idle) || (inactive && idle)) {
+                --remaining;
+                ++slots_trimmed;
+                return true;
+            }
+            return false;
+        });
+        Common::Sharp::temporal_image_bytes.store(OwnedBytes(), std::memory_order_relaxed);
+    }
     std::vector<std::unique_ptr<Probe>> probes;
     std::vector<std::unique_ptr<SharpReadback>> sharp_readbacks;
     bool dump_armed{};
@@ -804,6 +849,27 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
             slot = candidate.get();
             break;
         }
+    const auto color_bytes = sources[2].format == vk::Format::eR16G16B16A16Sfloat ? 8ull : 4ull;
+    const auto depth_bytes = sources[0].format == vk::Format::eD32SfloatS8Uint ? 8ull : 4ull;
+    const u64 estimate = u64(p.input.width) * p.input.height * (2 * color_bytes + depth_bytes + 4) +
+                         u64(p.output.width) * p.output.height * (color_bytes + 12);
+    const u64 required = estimate + estimate / 16; // allow for allocation alignment
+    const bool grows = !slot || slot->color.format != sources[2].format ||
+        slot->depth.format != sources[0].format || slot->color.size != p.input ||
+        slot->output.size != p.output;
+    if (grows) {
+        const u64 old_bytes = slot ? slot->Bytes() : 0;
+        const u64 total = p.OwnedBytes() - old_bytes + required;
+        const u64 extra = required > old_bytes ? required - old_bytes : 0;
+        const u64 ui = Common::Sharp::ui_image_bytes.load(std::memory_order_relaxed);
+        const bool driver_room = !p.gpu.CanReportMemoryUsage() ||
+            p.gpu.GetDeviceMemoryUsage() + extra <= p.gpu.GetTotalMemoryBudget();
+        if (total > Impl::MaxTemporalBytes || total + ui > (1ull << 30) || !driver_room) {
+            ++p.memory_refusals;
+            Fallback(frame, "owned-image-budget", false);
+            return;
+        }
+    }
     if (!slot && p.slots.size() < 8) {
         p.slots.push_back(std::make_unique<Impl::Slot>());
         slot = p.slots.back().get();
@@ -854,7 +920,10 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
     const auto previous_mapping = p.native_scene.mapping;
     p.current = slot;
     slot->frame = frame;
+    slot->epoch = p.epoch;
+    slot->used = std::chrono::steady_clock::now();
     slot->tick = p.scheduler.CurrentTick();
+    Common::Sharp::temporal_image_bytes.store(p.OwnedBytes(), std::memory_order_relaxed);
     p.constants = m.words;
     p.camera = camera.value_or(Camera{});
     p.captured = frame;
@@ -1309,6 +1378,7 @@ void Gt7DlssPass::DiagnosticImage(vk::CommandBuffer cmd, u64 frame, Input image,
 void Gt7DlssPass::Poll() {
     auto& p = *impl;
     p.CollectTime();
+    p.TrimSlots();
     if (Common::Sharp::Diagnostics()) {
         static auto next = std::chrono::steady_clock::time_point{};
         const auto now = std::chrono::steady_clock::now();
@@ -1434,11 +1504,23 @@ void Gt7DlssPass::Poll() {
             if (delta) reasons += fmt::format("{}{}:{}", reasons.empty() ? "" : ",", reason, delta);
             p.logged_fallback_frames[reason] = count;
         }
+        VmaBudget heaps[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(p.gpu.GetAllocator(), heaps);
+        u64 device_used = 0, device_budget = 0;
+        const auto& memory = p.gpu.GetMemoryProperties();
+        for (u32 i = 0; i < memory.memoryHeapCount; ++i) {
+            if (memory.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                device_used += heaps[i].usage;
+                device_budget += heaps[i].budget;
+            }
+        }
         LOG_WARNING(Render_Vulkan,
                  "GT7-DLSS 1s: eval={}/{} captures={} fallbacks={} reason={} render={}x{} "
                  "out={}x{} mode={} preset={}->{} gpuMs={:.2f} (max {:.2f}) mip={:.2f} "
                  "sharpen={:.0f}% resync merge={} replace={} present temporal={} spatial={} "
-                 "native={} reuse={} TAAseen={} epoch={} resets={} flips={} fallbackFrames=[{}]",
+                 "native={} reuse={} TAAseen={} epoch={} resets={} flips={} fallbackFrames=[{}] "
+                 "warn39={}/{} privateMiB={} uiEstMiB={} recycleMiB={} deviceMiB={}/{} "
+                 "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={}",
                  successes, evaluations, captures, falls, p.qualification_reason, p.input.width,
                  p.input.height, p.output.width, p.output.height, report.mode_name,
                  report.preset_requested, report.preset_sent, mean_ms, p.eval_ms_max,
@@ -1446,7 +1528,13 @@ void Gt7DlssPass::Poll() {
                  replaced, paths[0], paths[1], paths[2],
                  p.unchanged_reuse - p.logged_unchanged_reuse, p.taa_draws, p.epoch,
                  p.reset_requests - p.logged_reset_requests,
-                 p.present_flips - p.logged_present_flips, reasons.empty() ? "none" : reasons);
+                 p.present_flips - p.logged_present_flips, reasons.empty() ? "none" : reasons,
+                 report.budget_warnings - p.logged_budget_warnings, report.budget_warnings,
+                 p.OwnedBytes() >> 20, Common::Sharp::ui_image_bytes.load() >> 20,
+                 VideoCore::RecycledImageBytes() >> 20, device_used >> 20, device_budget >> 20,
+                 p.gpu.GetTotalMemoryBudget() >> 20, p.gpu.CanReportMemoryUsage(),
+                 p.slots.size(), p.slots_trimmed, p.memory_refusals);
+        p.logged_budget_warnings = report.budget_warnings;
         p.logged_reset_requests = p.reset_requests;
         p.logged_present_flips = p.present_flips;
         p.logged_unchanged_reuse = p.unchanged_reuse;

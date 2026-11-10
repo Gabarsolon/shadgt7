@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "common/hd_ui_options.h"
+#include "common/sharp_options.h"
 #include "common/logging/log.h"
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_gt7_dlss.h"
@@ -218,12 +219,15 @@ inline u64 TotalBytes() {
         total += Footprint(old.size, old.format, bool(old.image), bool(old.scaled),
                            bool(old.scene_sharpen), old.depth.get(), old.auxiliary);
     }
+    Common::Sharp::ui_image_bytes.store(total, std::memory_order_relaxed);
     return total;
 }
 
 /// Whether `bytes` more fit in MaxProxyBytes. With State::mutex held.
 inline bool WithinBudget(u64 bytes) {
-    if (TotalBytes() + bytes <= MaxProxyBytes) {
+    const u64 temporal = Gt7Temporal::Config().enabled
+        ? Common::Sharp::temporal_image_bytes.load(std::memory_order_relaxed) : 0;
+    if (TotalBytes() + bytes + temporal <= MaxProxyBytes) {
         return true;
     }
     static std::atomic<bool> logged{};
@@ -495,7 +499,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
                                                     proxy.scaled, *proxy.scaled_view, proxy.size);
     if (dlss && !scaled) {
         proxy.dlss_failed = true;
-        if (temporal) proxy.dlss_retry_after = 120;
+        if (temporal) proxy.dlss_retry_after = 1;
         NativeBarrier(cmd, image, input_layout, vk::ImageLayout::eTransferSrcOptimal);
     }
     proxy.dlss_used = scaled;
@@ -615,6 +619,7 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
         proxy.native = native;
         proxy.dlss_failed = false;
     }
+    Common::Sharp::ui_image_bytes.store(TotalBytes(), std::memory_order_relaxed);
     return shown;
 }
 

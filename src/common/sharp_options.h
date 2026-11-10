@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <string>
 #include <nlohmann/json.hpp>
 
@@ -109,6 +110,9 @@ inline const Settings& Get() {
 
 /// log2(render / display) while a DLSS scale is active, 0 otherwise.
 inline std::atomic<float> resolution_bias{0.0f};
+// UI pixel-footprint estimate and actual private temporal allocations. Retired images count.
+inline std::atomic<std::uint64_t> ui_image_bytes{0}, temporal_image_bytes{0};
+
 
 /// Set once temporal reconstruction has succeeded, and kept: the bias must not follow a
 /// momentary presentation gap (menus), or the samplers would change every second.

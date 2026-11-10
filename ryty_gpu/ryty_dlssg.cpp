@@ -124,6 +124,16 @@ std::wstring LogDir() {
 }
 
 void SlLog(sl::LogType type, const char* message) {
+    // This warning may be emitted on every successful evaluation. Count it via the
+    // return value; rate-limit only this exact SDK message, keeping real errors visible.
+    if (type == sl::LogType::eWarn && message && std::strstr(message, "Exceeded VRAM budget")) {
+        static std::atomic<int64_t> last{};
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto previous = last.load(std::memory_order_relaxed);
+        if (now - previous < 5000 ||
+            !last.compare_exchange_strong(previous, now, std::memory_order_relaxed)) return;
+    }
     if (type == sl::LogType::eError) {
         LOG_ERROR(Render_Vulkan, "Streamline: {}", message ? message : "");
     } else if (type == sl::LogType::eWarn) {
@@ -610,6 +620,7 @@ sl::DLSSMode PreferredMode() {
 // and resource transitions are valid; treating it as an error disables SR until a resize.
 bool EvaluationSucceeded(sl::Result result) {
     if (result == sl::Result::eWarnOutOfVRAM) {
+        ++g_temporal_report.budget_warnings;
         static auto next = std::chrono::steady_clock::time_point{};
         const auto now = std::chrono::steady_clock::now();
         if (now >= next) {
