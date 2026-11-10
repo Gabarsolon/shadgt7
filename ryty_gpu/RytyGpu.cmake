@@ -8,6 +8,14 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(RYTY_GPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ryty_gpu")
 
+option(RYGT_PGO_TRAIN "Write the LLVM instrumentation profile before terminating the game" OFF)
+if (RYGT_PGO_TRAIN)
+    if (NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR NOT CMAKE_CXX_FLAGS MATCHES "fprofile-generate")
+        message(FATAL_ERROR "RYGT_PGO_TRAIN requires Clang with -fprofile-generate")
+    endif()
+    set_property(SOURCE ryty_gpu/ryty_entry.cpp APPEND PROPERTY COMPILE_DEFINITIONS RYGT_PGO_TRAIN=1)
+endif()
+
 # Emulator-core pieces every library needs, with Ryty stand-ins for the rest.
 set(RYTY_COMMON_SOURCES
     ${COMMON}

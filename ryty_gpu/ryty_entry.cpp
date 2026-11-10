@@ -53,6 +53,11 @@
 #include <chrono>
 #include <cmath>
 
+#ifdef RYGT_PGO_TRAIN
+// The game deliberately uses TerminateProcess, which skips LLVM's atexit writer.
+extern "C" int __llvm_profile_write_file();
+#endif
+
 namespace Libraries::SystemService {
 void NoteGameDrew(); // ryty_stubs.cpp: the splash screen ends at the game's first drawn frame
 }
@@ -120,6 +125,10 @@ void RunWindowThread() {
                                                 std::chrono::steady_clock::now() - save_start)
                                                 .count()));
     }
+#ifdef RYGT_PGO_TRAIN
+    const int profile_result = __llvm_profile_write_file();
+    std::fprintf(stderr, "[window] PGO profile write result: %d\n", profile_result);
+#endif
     std::fprintf(stderr, "[window] closed: the game ends\n");
     std::fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
