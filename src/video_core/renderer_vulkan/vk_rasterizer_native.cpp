@@ -7711,7 +7711,14 @@ struct SameTexelProgram {
     u32 fetch_image; ///< the descriptor read with texelFetch at the texel stored
     u32 store_image;
 };
-constexpr SameTexelProgram SameTexelPrograms[] = {{0xa8d4b6cd, 65, 66, 67, 6, 3, 4}};
+// PERF-GT7-121: 0x6cb79b73 is the same filter with three more words of user data before the mip,
+// face and probe words (68, 69, 70): ~65 dispatches a frame in a rainy 20-car race at
+// the Nurburgring, each alone between two global barriers (Nsight GPU trace of
+// 2026-11-10: 2.4 of 31 ms of GPU work a frame). All its stored variants fetch cs_img3 at
+// (x, y, [69] + 6 * [70]) of mip [68] and store that texel of cs_img4[[68]]; cs_img0 to 2 are
+// sampled with textureLod; no buffer write, no atomic. The run rules above apply unchanged.
+constexpr SameTexelProgram SameTexelPrograms[] = {{0xa8d4b6cd, 65, 66, 67, 6, 3, 4},
+                                                  {0x6cb79b73, 68, 69, 70, 6, 3, 4}};
 
 bool IsSameTexelProgram(u64 program) {
     return std::ranges::find(SameTexelPrograms, program, &SameTexelProgram::program) !=
