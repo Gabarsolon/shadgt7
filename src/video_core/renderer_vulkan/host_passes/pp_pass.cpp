@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 
 #include "common/assert.h"
+#include "common/hdr_settings.h"
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/post_process_frag.h"
@@ -16,6 +17,18 @@
 #include <vk_mem_alloc.h>
 
 namespace Vulkan::HostPasses {
+
+namespace {
+struct PostProcessingConstants {
+    PostProcessingPass::Settings settings;
+    float hdr_gain = 1.0f;
+    float hdr_peak_nits = 0.0f;
+};
+static_assert(sizeof(PostProcessingPass::Settings) == 24);
+static_assert(offsetof(PostProcessingConstants, hdr_gain) == 24);
+static_assert(offsetof(PostProcessingConstants, hdr_peak_nits) == 28);
+static_assert(sizeof(PostProcessingConstants) == 32);
+} // namespace
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 4> bindings{
@@ -57,7 +70,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     const vk::PushConstantRange push_constants{
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .offset = 0,
-        .size = sizeof(Settings),
+        .size = sizeof(PostProcessingConstants),
     };
 
     const auto& vs_module = CompileSPV(FS_TRI_VERT, device);
@@ -351,8 +364,10 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                          });
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
-    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
-                         &settings);
+    const auto hdr = settings.hdr ? Common::Hdr::ReadOutputSettings() : Common::Hdr::OutputSettings{};
+    const PostProcessingConstants constants{settings, hdr.gain, hdr.peak_nits};
+    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants),
+                         &constants);
 
     cmdbuf.beginRendering(rendering_info);
     cmdbuf.draw(3, 1, 0, 0);

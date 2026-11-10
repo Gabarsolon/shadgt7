@@ -27,7 +27,24 @@ layout (push_constant) uniform settings {
     bool hud;
     float hud_x0;
     float hud_x1;
+    float hdr_gain;
+    float hdr_peak_nits;
 } pp;
+
+// SMPTE ST 2084. The game's HDR display image is already PQ encoded; controls
+// adjust absolute luminance here, after its tone mapping, without another gamma.
+vec3 pq_to_nits(vec3 e) {
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    vec3 p = pow(clamp(e, 0.0, 1.0), vec3(1.0 / m2));
+    vec3 num = max(p - c1, 0.0);
+    vec3 den = c2 - c3 * p;
+    return pow(num / den, vec3(1.0 / m1)) * 10000.0;
+}
+vec3 nits_to_pq(vec3 nits) {
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
+}
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
 vec3 gamma(vec3 rgb) {
@@ -88,6 +105,13 @@ void main() {
         }
     }
     if (pp.hdr) {
+        if (pp.hdr_gain != 1.0 || pp.hdr_peak_nits > 0.0) {
+            vec3 nits = pq_to_nits(color_linear.rgb) * pp.hdr_gain;
+            if (pp.hdr_peak_nits > 0.0) {
+                nits = min(nits, vec3(pp.hdr_peak_nits));
+            }
+            color_linear.rgb = nits_to_pq(nits);
+        }
         color = color_linear;
     } else {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
