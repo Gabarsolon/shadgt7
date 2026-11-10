@@ -642,7 +642,28 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // GT-FF: until the next vblank, frames are shown as they arrive, no closer together
             // than the flip rate allows (the timer below keeps the vblank period exact).
             const auto flip_interval = vblank_period * (flip_rate + 1) - std::chrono::milliseconds(1);
-            const auto deadline = tick_start + vblank_period - std::chrono::microseconds(500);
+            // FIX-GT7-139: the wait ends on the vblank schedule, not a period after this tick's
+            // start. A tick that ran late (a slow flip or present) left the timer behind, and the
+            // next tick still waited a whole period, so that time was never made up: vblanks came
+            // at 55-57 Hz instead of 60, and GT7, which counts them as its clock, ran 5-8% slow
+            // (its race clock gained 9.3 s in 10 s at 1080p, 8.5-8.8 s in the PS4 Pro mode).
+            // At most MaxCatchUp periods are made up: a longer stall (a present or driver hitch, a
+            // flip blocked behind a compile hold) is not, so that no burst of vblanks tells the
+            // game that time passed while the emulator, not the game, was stuck.
+            // RYGT_VBLANK_CATCHUP=0: as before.
+            static const bool catch_up = [] {
+                const char* env = std::getenv("RYGT_VBLANK_CATCHUP");
+                return !(env && env[0] == '0');
+            }();
+            constexpr int MaxCatchUp = 6; // ~100 ms at 60 Hz: a 3-vblank frame at 20 fps and more
+            if (catch_up) {
+                timer.LimitDebt(vblank_period * MaxCatchUp);
+            }
+            const auto behind = catch_up
+                                    ? std::min(timer.GetTotalWait(), std::chrono::nanoseconds{0})
+                                    : std::chrono::nanoseconds{0};
+            const auto deadline =
+                tick_start + vblank_period + behind - std::chrono::microseconds(500);
             while (!token.stop_requested() && std::chrono::steady_clock::now() < deadline) {
                 {
                     std::unique_lock lk{mutex};
