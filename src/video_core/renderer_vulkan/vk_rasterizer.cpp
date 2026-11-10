@@ -40,6 +40,7 @@
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/shadow.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/vk_ui_hires.h"
 #endif
 #include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -6348,6 +6349,9 @@ void Rasterizer::UpdateViewportScissorState() const {
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
             .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
         });
+#ifdef RYTY_GPU
+        UiHires::ScaleViewport(viewports.back(), scissors.back()); // GPU.hd_ui
+#endif
     }
 
     if (viewports.empty()) {
