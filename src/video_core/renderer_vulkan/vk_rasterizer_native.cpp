@@ -14,6 +14,7 @@
 
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
 
@@ -565,6 +566,27 @@ void NativeRenderer::DrawBindings::Clear() {
     diag_records = 0;
 }
 
+// PERF-GT7-130: whether the range is not imported yet and starts in a guest mapping of at most
+// RYGT_UPLOAD_COPY_KB (default 1024; 0 turns the copies off): GT7's streamed textures, in
+// 64 KB mappings that would each be imported as a view of their own.
+static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAddr address,
+                                     u64 size) {
+    static const u64 copy_below = [] {
+        const char* env = std::getenv("RYGT_UPLOAD_COPY_KB");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : 1024) << 10;
+    }();
+    if (copy_below == 0 ||
+        direct.ForEachPart(address, size, [](const VideoCore::Buffer&, u64, u64, u64) {})) {
+        return false;
+    }
+    const VAddr mapping = VideoCore::GuestViewBase(address);
+    if (mapping == 0) {
+        return false;
+    }
+    const VAddr mapping_end = VideoCore::GuestViewEnd(mapping, copy_below);
+    return mapping_end > address && mapping_end - mapping <= copy_below;
+}
+
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     device = Native::Rhi::CreateVulkanDevice(r.instance);
     ASSERT_MSG(device, "NAT-100: no native device");
@@ -627,6 +649,45 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             source.kind = 1;
             source.keep.push_back(std::move(wrapped));
             return source;
+        }
+        // PERF-GT7-130 (RYGT_UPLOAD_COPY_KB=0 off; default 1024): GT7 streams a track's textures
+        // into 64 KB mappings, and each mapping was imported as a view of its own for this one
+        // upload: ~0.13 ms a view in the driver, 250 to 720 views in one frame while driving
+        // (frames of 50 to 150 ms), and as many releases when the game unmaps them. A texture
+        // not imported yet whose memory starts in a mapping of at most that size is copied
+        // into upload memory instead (a few microseconds per 64 KB) and uploaded from there.
+        // The copy is taken now, not when the GPU gets there; GPU-written memory is in a
+        // region and was handled above.
+        if (size <= 64_MB) {
+            if (InSmallUnimportedMapping(*direct, address, size)) {
+                auto copy = device->CreateBuffer({.size = size,
+                                                  .usage = Native::Rhi::BufferUsageStorage |
+                                                           Native::Rhi::BufferUsageTransferSrc |
+                                                           Native::Rhi::BufferUsageTransferDst,
+                                                  .memory = Native::Rhi::MemoryKind::Upload,
+                                                  .name = "native upload copy"});
+                if (copy && copy->Mapped() &&
+                    Core::RytyMemory::GuardedCopy(copy->Mapped(),
+                                                  reinterpret_cast<const void*>(address), size)) {
+                    static u64 copies = 0, copied_bytes = 0;
+                    static auto since = std::chrono::steady_clock::now();
+                    ++copies;
+                    copied_bytes += size;
+                    if (const auto now = std::chrono::steady_clock::now();
+                        now - since >= std::chrono::seconds{10}) {
+                        LOG_INFO(Render_Vulkan,
+                                 "PERF-GT7-130 (10 s): {} textures uploaded from a copy ({} KB)",
+                                 copies, copied_bytes >> 10);
+                        copies = copied_bytes = 0;
+                        since = now;
+                    }
+                    source.buffer = copy.get();
+                    source.offset = 0;
+                    source.kind = 5;
+                    source.keep.push_back(std::move(copy));
+                    return source;
+                }
+            }
         }
         if (!direct->EnsureImported(address, size)) {
             return source;
@@ -2187,7 +2248,18 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
-    const bool imported = direct->EnsureImported(begin, end - begin);
+    // PERF-GT7-131 (RYGT_REGION_COPY=0 off): a region over small mappings not imported yet (a
+    // streamed texture's memory that a shader also writes) takes its first bytes from a copy,
+    // as one over memory that cannot be imported does: these were two thirds of the imports
+    // left in a driven race after PERF-GT7-130 (~0.2 ms each, hundreds in one frame).
+    static const bool region_copy = [] {
+        const char* env = std::getenv("RYGT_REGION_COPY");
+        return !(env && env[0] == '0');
+    }();
+    const bool imported =
+        !(region_copy && end - begin <= 64_MB &&
+          InSmallUnimportedMapping(*direct, begin, end - begin)) &&
+        direct->EnsureImported(begin, end - begin);
     Region region;
     region.begin = begin;
     region.end = end;
