@@ -30,6 +30,7 @@
 #include "common/hd_ui_options.h"
 #include "common/logging/log.h"
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_ui_cache_hires.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/image.h"
@@ -524,6 +525,7 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
                         std::abs(s64(output.width) * native.height -
                                  s64(output.height) * native.width) <= s64(native.height);
     const vk::Extent2D size = wanted ? output : vk::Extent2D{};
+    Ryty::UiCache::Output(native.width, native.height, output.width, output.height);
     if (proxy.size != size || proxy.native != native || proxy.present_format != view_format) {
         Retire(state, proxy);
         proxy.present_format = view_format;
