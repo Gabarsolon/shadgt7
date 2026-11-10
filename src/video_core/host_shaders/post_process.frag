@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout (location = 0) in vec2 uv;
 layout (location = 0) out vec4 color;
@@ -27,7 +28,33 @@ layout (push_constant) uniform settings {
     bool hud;
     float hud_x0;
     float hud_x1;
+    float dlss_sharpening; // the RCAS gain (0..1) of the scene pass
+    bool scene_output;     // the scene pass: RCAS only, stored as it was read
+    bool scene_srgb;       // the scene was read through an sRGB view: linear samples
 } pp;
+
+// AMD RCAS after DLSS (GPU.dlss_sharpening), the function FSR 1 uses. It works on perceptual
+// values: PQ and gamma-encoded buffers are, an sRGB view decodes on fetch, so encode for the
+// filter and decode its result.
+#define A_GPU 1
+#define A_GLSL 1
+#include "fsr/ffx_a.h"
+#define FSR_RCAS_F 1
+vec3 rcas_encode(vec3 v) {
+    return mix(1.055 * pow(max(v, vec3(0)), vec3(1.0 / 2.4)) - 0.055, 12.92 * v,
+               lessThanEqual(v, vec3(0.0031308)));
+}
+vec3 rcas_decode(vec3 v) {
+    return mix(pow(max((v + 0.055) / 1.055, vec3(0)), vec3(2.4)), v / 12.92,
+               lessThanEqual(v, vec3(0.04045)));
+}
+AF4 FsrRcasLoadF(ASU2 p) {
+    vec4 v = texelFetch(texSampler, clamp(p, ivec2(0), textureSize(texSampler, 0) - 1), 0);
+    if (pp.scene_srgb) v.rgb = rcas_encode(v.rgb);
+    return v;
+}
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) { }
+#include "fsr/ffx_fsr1.h"
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
 vec3 gamma(vec3 rgb) {
@@ -53,6 +80,17 @@ bool inside(vec2 p, vec4 rect) {
 }
 
 void main() {
+    if (pp.scene_output) {
+        ivec2 pixel = clamp(ivec2(uv * textureSize(texSampler, 0)), ivec2(0),
+                            textureSize(texSampler, 0) - 1);
+        vec4 scene = texelFetch(texSampler, pixel, 0);
+        vec3 sharpened;
+        FsrRcasF(sharpened.r, sharpened.g, sharpened.b, uvec2(pixel),
+                 uvec4(floatBitsToUint(pp.dlss_sharpening), 0u, 0u, 0u));
+        sharpened = max(sharpened, vec3(0));
+        color = vec4(pp.scene_srgb ? rcas_decode(sharpened) : sharpened, scene.a);
+        return;
+    }
     vec4 color_linear = texture(texSampler, uv);
     if (pp.hud) {
         // Where on the 16:9 HUD this pixel shows: a placed piece's, else the centred HUD's

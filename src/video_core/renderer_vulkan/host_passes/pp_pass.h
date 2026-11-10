@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <span>
 
 #include "common/types.h"
@@ -13,9 +14,14 @@ typedef struct VmaAllocation_T* VmaAllocation;
 
 namespace Vulkan {
 class Frame;
+class Instance;
 }
 
 namespace Vulkan::HostPasses {
+
+/// GPU.dlss_sharpening (0..100 percent, 0 = off) as a gain of 0..1. It is read again every two
+/// seconds, so it can be tuned while playing; RYGT_DLSS_SHARPENING overrides it.
+float ReadSharpeningGain();
 
 class PostProcessingPass {
 public:
@@ -48,9 +54,14 @@ public:
     /// GT7-UW: the buffer the HUD layout goes to the shader in.
     void CreateHudBuffer(VmaAllocator allocator);
 
+    /// With `scene_gain` >= 0 the pass is the scene's sharpening: RCAS with that gain and
+    /// nothing else (no gamma, no HDR gain or peak, no HUD), stored in the input's encoding.
     void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
                 Frame& output, Settings settings, vk::ImageView hud_black = {},
-                vk::ImageView hud_white = {}, std::span<const HudWidget> hud_widgets = {});
+                vk::ImageView hud_white = {}, std::span<const HudWidget> hud_widgets = {},
+                float scene_gain = -1.0f);
+    /// The HUD buffer of a pass that does not live as long as the renderer.
+    void DestroyHudBuffer();
 
 private:
     vk::UniquePipeline pipeline{};
@@ -66,6 +77,23 @@ private:
     VmaAllocation hud_allocation{};
     u8* hud_mapped = nullptr;
     u32 hud_slot = 0;
+};
+
+/// GPU.dlss_sharpening: sharpens the scene a HD UI proxy holds after DLSS scaled it, before the
+/// UI is drawn over it, so the interface is not sharpened. One per proxy; it keeps its own
+/// scratch image and retires with the proxy.
+class SceneSharpenPass {
+public:
+    SceneSharpenPass(const Instance& instance, vk::Image input, vk::Format format,
+                     vk::Extent2D size);
+    ~SceneSharpenPass();
+    /// `input` is in the general layout and stays there.
+    void Render(vk::CommandBuffer cmd, float gain);
+
+private:
+    struct Resources;
+    std::unique_ptr<Resources> resources;
+    PostProcessingPass pass;
 };
 
 } // namespace Vulkan::HostPasses

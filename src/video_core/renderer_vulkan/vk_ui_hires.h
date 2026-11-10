@@ -32,6 +32,7 @@
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_gt7_dlss.h"
 #include "ryty_gpu/ryty_ui_cache_hires.h"
+#include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/image.h"
@@ -93,6 +94,7 @@ struct Proxy {
     Phase phase = Phase::Idle;
     bool dlss_failed = false;
     bool dlss_used = false;
+    std::shared_ptr<HostPasses::SceneSharpenPass> scene_sharpen; ///< GPU.dlss_sharpening
     bool native_stale = false; ///< the proxy got draws the display buffer has not
     bool native_dirty = false; ///< native draws must be copied back to the proxy
     std::shared_ptr<DepthProxy> depth;
@@ -107,6 +109,7 @@ struct Retired {
     u64 frame = 0;
     vk::Extent2D size{};
     vk::Format format{};
+    std::shared_ptr<HostPasses::SceneSharpenPass> scene_sharpen;
     std::shared_ptr<DepthProxy> depth;
     std::array<std::shared_ptr<AuxiliaryProxy>, 8> auxiliary;
 };
@@ -182,9 +185,12 @@ inline u64 ImageBytes(vk::Extent2D size, vk::Format format) {
 }
 
 inline u64 Footprint(vk::Extent2D size, vk::Format format, bool image, bool scaled,
-                     const DepthProxy* depth,
+                     bool sharpened, const DepthProxy* depth,
                      const std::array<std::shared_ptr<AuxiliaryProxy>, 8>& auxiliary) {
     u64 bytes = image ? ImageBytes(size, format) : 0;
+    if (sharpened) {
+        bytes += ImageBytes(size, format); // the scratch image of the scene sharpening
+    }
     if (scaled) {
         bytes += ImageBytes(size, vk::Format::eR16G16B16A16Sfloat);
     }
@@ -205,11 +211,11 @@ inline u64 TotalBytes() {
     u64 total = 0;
     for (const auto& [address, proxy] : state.proxies) {
         total += Footprint(proxy.size, proxy.format, bool(proxy.image), bool(proxy.scaled),
-                           proxy.depth.get(), proxy.auxiliary);
+                           bool(proxy.scene_sharpen), proxy.depth.get(), proxy.auxiliary);
     }
     for (const auto& old : state.retired) {
         total += Footprint(old.size, old.format, bool(old.image), bool(old.scaled),
-                           old.depth.get(), old.auxiliary);
+                           bool(old.scene_sharpen), old.depth.get(), old.auxiliary);
     }
     return total;
 }
@@ -251,7 +257,8 @@ inline void Retire(State& state, Proxy& proxy) {
     }
     state.retired.push_back(Retired{std::move(proxy.image), std::move(proxy.scaled),
                                     std::move(proxy.scaled_view), std::move(proxy.views),
-                                    state.frames, proxy.size, proxy.format, std::move(proxy.depth),
+                                    state.frames, proxy.size, proxy.format,
+                                    std::move(proxy.scene_sharpen), std::move(proxy.depth),
                                     std::move(proxy.auxiliary)});
     proxy.views.clear();
     proxy.layout = vk::ImageLayout::eUndefined;
@@ -408,6 +415,24 @@ inline vk::ImageBlit2 NativeBlit(vk::Extent2D from, vk::Extent2D to) {
     };
 }
 
+/// GPU.dlss_sharpening: RCAS on the scene a proxy holds after DLSS scaled it, before the UI is
+/// drawn over it. Nothing at 0 or when DLSS did not scale. With State::mutex held.
+inline void SharpenScene(const Instance& instance, vk::CommandBuffer cmd, Proxy& proxy) {
+    const float gain = HostPasses::ReadSharpeningGain();
+    if (!proxy.dlss_used || gain <= 0.0f) {
+        return;
+    }
+    if (!proxy.scene_sharpen) {
+        if (!WithinBudget(ImageBytes(proxy.size, proxy.present_format))) {
+            return;
+        }
+        proxy.scene_sharpen = std::make_shared<HostPasses::SceneSharpenPass>(
+            instance, proxy.image, proxy.present_format, proxy.size);
+    }
+    proxy.scene_sharpen->Render(cmd, gain);
+    MarkStale(proxy, true); // the display buffer does not have the sharpened picture
+}
+
 /// The scene composite in the native display image (general layout) becomes the proxy's
 /// picture: the game's reconstructed scene (GPU.temporal_dlss, `temporal`), else DLSS to the
 /// output size, else a linear blit. `allow_dlss` is off for a picture that has UI in it already.
@@ -445,6 +470,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
             ProxyBarrier(cmd, proxy, vk::ImageLayout::eGeneral, DrawStages, DrawAccess);
             proxy.dlss_used = true;
             temporal->NotePresentation(frame, true, false);
+            SharpenScene(instance, cmd, proxy);
             proxy.phase = Phase::Ui;
             return;
         }
@@ -485,6 +511,9 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     NativeBarrier(cmd, image, scaled ? input_layout : vk::ImageLayout::eTransferSrcOptimal,
                   vk::ImageLayout::eGeneral);
     ProxyBarrier(cmd, proxy, vk::ImageLayout::eGeneral, DrawStages, DrawAccess);
+    if (allow_dlss) {
+        SharpenScene(instance, cmd, proxy);
+    }
     proxy.phase = Phase::Ui;
     proxy.native_dirty = false;
 }

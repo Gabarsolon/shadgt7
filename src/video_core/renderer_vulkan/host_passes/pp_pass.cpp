@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 
 #include "common/assert.h"
+#include "common/sharp_options.h"
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/post_process_frag.h"
@@ -12,10 +13,85 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <boost/container/static_vector.hpp>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vk_mem_alloc.h>
 
+#include "video_core/renderer_vulkan/vk_ui_hires.h"
+
 namespace Vulkan::HostPasses {
+
+namespace {
+struct PostProcessingConstants {
+    PostProcessingPass::Settings settings;
+    float dlss_sharpening = 0.0f; // the RCAS gain of the scene pass; 0 = off
+    u32 scene_output = 0; // the scene pass: RCAS only, stored as it was read
+    u32 scene_srgb = 0;   // the scene was read through an sRGB view (linear samples)
+};
+static_assert(sizeof(PostProcessingPass::Settings) == 24);
+static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 24);
+static_assert(offsetof(PostProcessingConstants, scene_output) == 28);
+static_assert(offsetof(PostProcessingConstants, scene_srgb) == 32);
+static_assert(sizeof(PostProcessingConstants) == 36);
+} // namespace
+
+namespace {
+// A number in the config, or a string holding one; the fallback for anything else.
+double ConfigNumber(const nlohmann::json& object, const char* key, double fallback) {
+    const auto it = object.find(key);
+    if (it == object.end()) {
+        return fallback;
+    }
+    double value = fallback;
+    if (it->is_number()) {
+        value = it->get<double>();
+    } else if (it->is_string()) {
+        const auto& text = it->get_ref<const std::string&>();
+        char* end{};
+        value = std::strtod(text.c_str(), &end);
+        if (end == text.c_str() || *end != 0) {
+            return fallback;
+        }
+    } else {
+        return fallback;
+    }
+    return std::isfinite(value) ? value : fallback;
+}
+} // namespace
+
+float ReadSharpeningGain() {
+    static std::mutex mutex;
+    std::scoped_lock lock{mutex};
+    static float gain = 0.0f;
+    static auto next_read = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_read) {
+        return gain;
+    }
+    next_read = now + std::chrono::seconds(2);
+    double percent = 0.0;
+#if defined(RYTY_GPU) && defined(_WIN32)
+    const auto document = nlohmann::json::parse(Common::RytyReadGameConfig(), nullptr, false);
+    if (document.is_object() && document.contains("GPU") && document["GPU"].is_object()) {
+        percent = ConfigNumber(document["GPU"], "dlss_sharpening", 0.0);
+    }
+#endif
+    if (const char* env = std::getenv("RYGT_DLSS_SHARPENING"); env && *env) {
+        char* end{};
+        const double value = std::strtod(env, &end);
+        if (end != env && *end == 0 && std::isfinite(value)) {
+            percent = value;
+        }
+    }
+    percent = std::clamp(percent, 0.0, 100.0);
+    gain = static_cast<float>(percent / 100.0);
+    Common::Sharp::sharpen_percent.store(static_cast<float>(percent), std::memory_order_relaxed);
+    return gain;
+}
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 4> bindings{
@@ -57,7 +133,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     const vk::PushConstantRange push_constants{
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .offset = 0,
-        .size = sizeof(Settings),
+        .size = sizeof(PostProcessingConstants),
     };
 
     const auto& vs_module = CompileSPV(FS_TRI_VERT, device);
@@ -239,7 +315,7 @@ void PostProcessingPass::CreateHudBuffer(VmaAllocator allocator) {
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings,
                                 vk::ImageView hud_black, vk::ImageView hud_white,
-                                std::span<const HudWidget> hud_widgets) {
+                                std::span<const HudWidget> hud_widgets, float scene_gain) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -367,8 +443,11 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                          });
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
-    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
-                         &settings);
+    const bool scene = scene_gain >= 0.0f;
+    const PostProcessingConstants constants{settings, scene ? scene_gain : 0.0f, scene ? 1u : 0u,
+                                            scene && settings.srgb_input ? 1u : 0u};
+    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants),
+                         &constants);
 
     cmdbuf.beginRendering(rendering_info);
     cmdbuf.draw(3, 1, 0, 0);
@@ -393,6 +472,90 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
+}
+
+void PostProcessingPass::DestroyHudBuffer() {
+    if (hud_buffer) {
+        vmaDestroyBuffer(hud_allocator, hud_buffer, hud_allocation);
+        hud_buffer = vk::Buffer{};
+    }
+}
+
+struct SceneSharpenPass::Resources {
+    vk::Image input;
+    vk::Extent2D size;
+    bool srgb = false;
+    VideoCore::UniqueImage scratch;
+    vk::UniqueImageView input_view;
+    vk::UniqueImageView scratch_view;
+};
+
+SceneSharpenPass::SceneSharpenPass(const Instance& instance, vk::Image input, vk::Format format,
+                                   vk::Extent2D size)
+    : resources{std::make_unique<Resources>()} {
+    auto& r = *resources;
+    r.input = input;
+    r.size = size;
+    r.srgb = format == vk::Format::eR8G8B8A8Srgb || format == vk::Format::eB8G8R8A8Srgb;
+    const auto device = instance.GetDevice();
+    r.scratch = VideoCore::UniqueImage(device, instance.GetAllocator());
+    r.scratch.Create(vk::ImageCreateInfo{
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {size.width, size.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferSrc,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    });
+    const auto view = [&](vk::Image image) {
+        return Check<"create scene RCAS view">(device.createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange = UiHires::ColorRange,
+        }));
+    };
+    r.input_view = view(input);
+    r.scratch_view = view(r.scratch);
+    pass.Create(device, format);
+    pass.CreateHudBuffer(instance.GetAllocator());
+}
+
+SceneSharpenPass::~SceneSharpenPass() {
+    pass.DestroyHudBuffer();
+}
+
+void SceneSharpenPass::Render(vk::CommandBuffer cmd, float gain) {
+    auto& r = *resources;
+    UiHires::NativeBarrier(cmd, r.input, vk::ImageLayout::eGeneral,
+                           vk::ImageLayout::eShaderReadOnlyOptimal);
+    // Last frame's scratch is discarded; NativeBarrier also orders the earlier transfer reads.
+    UiHires::NativeBarrier(cmd, r.scratch, vk::ImageLayout::eUndefined,
+                           vk::ImageLayout::eColorAttachmentOptimal);
+    Frame frame{};
+    frame.width = r.size.width;
+    frame.height = r.size.height;
+    frame.image = r.scratch;
+    frame.image_view = *r.scratch_view;
+    PostProcessingPass::Settings settings{};
+    settings.srgb_input = r.srgb;
+    pass.Render(cmd, *r.input_view, r.size, frame, settings, {}, {}, {}, gain);
+    UiHires::NativeBarrier(cmd, r.scratch, vk::ImageLayout::eGeneral,
+                           vk::ImageLayout::eTransferSrcOptimal);
+    UiHires::NativeBarrier(cmd, r.input, vk::ImageLayout::eShaderReadOnlyOptimal,
+                           vk::ImageLayout::eTransferDstOptimal);
+    const vk::ImageCopy copy{
+        .srcSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+        .dstSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+        .extent = {r.size.width, r.size.height, 1},
+    };
+    // A raw copy keeps the sRGB or PQ storage; the gamma and the HDR gain run at the present.
+    cmd.copyImage(r.scratch, vk::ImageLayout::eTransferSrcOptimal, r.input,
+                  vk::ImageLayout::eTransferDstOptimal, copy);
+    UiHires::NativeBarrier(cmd, r.input, vk::ImageLayout::eTransferDstOptimal,
+                           vk::ImageLayout::eGeneral);
 }
 
 } // namespace Vulkan::HostPasses
