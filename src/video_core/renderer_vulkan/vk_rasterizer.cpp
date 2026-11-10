@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 #include <filesystem>
 #include <array>
 #include <map>
@@ -1061,6 +1064,25 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // PERF-065: moved, not copied; the selection is recycled after the draw and keeps
             // the shadow's old buffer (its capacity).
             std::swap(info.flattened_ud_buf, selected.flattened);
+            // PERF-GT7-122 (RYGT_FLAT_PREFETCH=0 off): the command thread wrote these dwords on
+            // another core a moment ago, and the first read of each stage's buffer descriptors
+            // was 40% of BindBuffers' own time in a 20-car race (profile by line, 2026-11-10):
+            // Asked for now, their cache lines arrive while the targets are resolved.
+            static const bool prefetch = [] {
+                const char* env = std::getenv("RYGT_FLAT_PREFETCH");
+                return !(env && env[0] == '0');
+            }();
+#if defined(_M_X64) || defined(__x86_64__)
+            if (prefetch) {
+                const char* const data = reinterpret_cast<const char*>(info.flattened_ud_buf.data());
+                const size_t bytes = std::min<size_t>(info.flattened_ud_buf.size() * sizeof(u32), 1024);
+                for (size_t at = 0; at < bytes; at += 64) {
+                    _mm_prefetch(data + at, _MM_HINT_T0);
+                }
+            }
+#else
+            static_cast<void>(prefetch);
+#endif
             // PERF-GT7-016 (C): in native mode only diagnostics read where the dwords came from
             // (zeros here anyway), so the zero fill at every draw is left out while the size holds.
             bool keep_sources = false;
