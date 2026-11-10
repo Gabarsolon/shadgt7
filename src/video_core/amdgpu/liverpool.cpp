@@ -764,7 +764,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     }
     // PERF-047: the pipeline is selected now, on this thread, from these registers; the
     // recorder checks the selection against the memory it sees before using it.
-    std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
+    Vulkan::Rasterizer::SelectedPipelinePtr selected; // PERF-GT7-125
     bool prepared_draw = false;
 #ifdef RYTY_GPU
     // OPT-012: a draw a game job thread prepared is selected there (the recorder installs
@@ -801,12 +801,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             .is_indirect = true,
         };
         selected = rasterizer->SelectPipelineAhead(&params);
-        indirect_selected = selected.has_value();
+        indirect_selected = selected != nullptr;
     }
 #ifdef RYTY_GPU
     if (!compute && !indirect_selected && Native::ShadowComparing()) {
         // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
-        Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected.has_value());
+        Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected != nullptr);
     }
 #endif
     // PERF-062: the upload epoch this draw is decoded in; its pages are hashed now, on this
@@ -851,7 +851,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // PERF-067: with the buffer stage, the selection and the buffers obtained for it are shared
     // by the stage's work and the recorder's.
     struct StagedDraw {
-        std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
+        Vulkan::Rasterizer::SelectedPipelinePtr selected;
         Vulkan::Rasterizer::BufferPlan plan;
     };
     std::shared_ptr<StagedDraw> staged;
@@ -896,7 +896,13 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     if (staged) {
         order = [this, staged] { rasterizer->OrderBuffersAhead(*staged->selected, staged->plan); };
     }
-    draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
+    // PERF-GT7-126: what the job reads first through its pointers, for the recorder to ask for
+    // one job ahead: the selection's stages and the register delta.
+    const void* const selection_hint = staged ? static_cast<const void*>(staged->selected.get())
+                                              : static_cast<const void*>(selected.get());
+    const void* const delta_hint = delta.data();
+    const size_t delta_hint_bytes = std::min<size_t>(delta.size() * sizeof(u32), 512);
+    DrawPipe::Work job{[this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
                      decode_epoch, capture = std::move(capture), staged,
@@ -913,7 +919,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         if (expected) {
             VerifyRecorderRegs(*expected);
         }
-        rasterizer->SetSelectedPipeline(sel ? &*sel : nullptr);
+        rasterizer->SetSelectedPipeline(sel.get());
         rasterizer->SetDrawEpoch(sel && !indirect_selected ? decode_epoch : 0);
         rasterizer->SetReadCapture(capture.get());
         rasterizer->SetBufferPlan(staged ? &staged->plan : nullptr);
@@ -924,9 +930,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         rasterizer->SetSelectedPipeline(nullptr);
         delta_recycler.Give(std::move(delta));
         if (sel) {
-            rasterizer->RecycleSelectedPipeline(std::move(*sel));
+            rasterizer->RecycleSelectedPipeline(std::move(sel));
         }
-    }, kind, std::move(prepare), std::move(order));
+    }};
+    job.SetPrefetchHint(0, selection_hint, selection_hint ? 960 : 0);
+    job.SetPrefetchHint(1, delta_hint, delta_hint_bytes);
+    draw_pipe->Push(std::move(job), kind, std::move(prepare), std::move(order));
     if (read_ahead_states && !compute) {
         OfferDrawState();
     }

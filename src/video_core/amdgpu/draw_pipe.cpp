@@ -598,6 +598,26 @@ void DrawPipe::Run(std::stop_token stop) {
         while (!batch.empty()) {
             Work work = std::move(batch.front());
             batch.pop_front();
+            // PERF-GT7-124 (RYGT_JOB_PREFETCH=0 off): the next job's captures were written by the
+            // command thread on another core: the register delta, the extents and the selected
+            // pipeline with each stage's user data, about 1 KB. Asked for now, they arrive
+            // while this job is recorded; their first reads were ~8% of the recorder's busy
+            // time in a 20-car race (the job itself, InstallDrawStages and the selection's move).
+            static const bool prefetch_next = [] {
+                const char* env = std::getenv("RYGT_JOB_PREFETCH");
+                return !(env && env[0] == '0');
+            }();
+            // PERF-GT7-126: the job after it gets its captures asked for too, so that by the
+            // time it is next, its hints (the selection and the register delta, behind
+            // pointers since PERF-GT7-125) can be read and asked for in turn.
+            if (prefetch_next && !batch.empty()) {
+                if (batch.size() > 1) {
+                    batch[1].Prefetch(512);
+                } else {
+                    batch.front().Prefetch(512);
+                }
+                batch.front().PrefetchHints();
+            }
             work();
             ++ran;
             if (const int fast = Common::CurrentCoreIsFast(); fast >= 0) {

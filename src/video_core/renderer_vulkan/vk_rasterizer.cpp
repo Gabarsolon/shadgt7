@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 #include <filesystem>
 #include <array>
 #include <map>
@@ -242,7 +245,7 @@ void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTy
     }
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
+Rasterizer::SelectedPipelinePtr Rasterizer::SelectPipelineAhead(
     const DrawIndirectParams* indirect) {
     // The command thread's registers are those of the draw it is decoding.
     const auto& regs = liverpool->DrawRegs();
@@ -257,10 +260,14 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
     static const bool select_quads = Common::PerfFeatureEnabled(75);
     if (ClassifyDraw(regs, depth_copy, stencil_copy) != DrawFilter::Draw ||
         (quad_list && !select_quads)) {
-        return std::nullopt;
+        return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
-    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
+    if (!snapshot) {
+        snapshot = std::make_unique<SelectedPipeline>();
+    }
+    SelectedPipeline& selected = *snapshot;
     selected.is_compute = false;
     selected.compute = nullptr;
     selected.is_quad_list = quad_list;
@@ -288,7 +295,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
             CopySelectedStages(selected.quad_tess_stages);
         }
     }
-    return selected;
+    return snapshot;
 }
 
 void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageTypes>& out) {
@@ -368,15 +375,19 @@ u64 Rasterizer::JobSharpsHash() {
     return SharpsHash(PipelineCache::JobInfos());
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhead() {
+Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
     // PERF-055: as SelectPipelineAhead, for a direct dispatch. -DisablePerf 66 looks every
     // compute pipeline up on the recorder, under the lookup lock, as before.
     static const bool enabled = Common::PerfFeatureEnabled(66);
     if (!enabled) {
-        return std::nullopt;
+        return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
-    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
+    if (!snapshot) {
+        snapshot = std::make_unique<SelectedPipeline>();
+    }
+    SelectedPipeline& selected = *snapshot;
     selected.pipeline = nullptr;
     selected.indirect = false; // PERF-GT7-031
     selected.is_compute = true;
@@ -385,7 +396,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
     if (selected.compute) {
         CopyComputeStage(selected.stages);
     }
-    return selected;
+    return snapshot;
 }
 
 const ComputePipeline* Rasterizer::AcquireComputePipeline() {
@@ -1061,6 +1072,25 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // PERF-065: moved, not copied; the selection is recycled after the draw and keeps
             // the shadow's old buffer (its capacity).
             std::swap(info.flattened_ud_buf, selected.flattened);
+            // PERF-GT7-122 (RYGT_FLAT_PREFETCH=0 off): the command thread wrote these dwords on
+            // another core a moment ago, and the first read of each stage's buffer descriptors
+            // was 40% of BindBuffers' own time in a 20-car race (profile by line, 2026-11-10):
+            // Asked for now, their cache lines arrive while the targets are resolved.
+            static const bool prefetch = [] {
+                const char* env = std::getenv("RYGT_FLAT_PREFETCH");
+                return !(env && env[0] == '0');
+            }();
+#if defined(_M_X64) || defined(__x86_64__)
+            if (prefetch) {
+                const char* const data = reinterpret_cast<const char*>(info.flattened_ud_buf.data());
+                const size_t bytes = std::min<size_t>(info.flattened_ud_buf.size() * sizeof(u32), 1024);
+                for (size_t at = 0; at < bytes; at += 64) {
+                    _mm_prefetch(data + at, _MM_HINT_T0);
+                }
+            }
+#else
+            static_cast<void>(prefetch);
+#endif
             // PERF-GT7-016 (C): in native mode only diagnostics read where the dwords came from
             // (zeros here anyway), so the zero fill at every draw is left out while the size holds.
             bool keep_sources = false;
