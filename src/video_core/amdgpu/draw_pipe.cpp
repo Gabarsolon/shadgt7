@@ -607,8 +607,16 @@ void DrawPipe::Run(std::stop_token stop) {
                 const char* env = std::getenv("RYGT_JOB_PREFETCH");
                 return !(env && env[0] == '0');
             }();
+            // PERF-GT7-126: the job after it gets its captures asked for too, so that by the
+            // time it is next, its hints (the selection and the register delta, behind
+            // pointers since PERF-GT7-125) can be read and asked for in turn.
             if (prefetch_next && !batch.empty()) {
-                batch.front().Prefetch(1024);
+                if (batch.size() > 1) {
+                    batch[1].Prefetch(512);
+                } else {
+                    batch.front().Prefetch(512);
+                }
+                batch.front().PrefetchHints();
             }
             work();
             ++ran;

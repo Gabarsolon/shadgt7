@@ -896,7 +896,13 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     if (staged) {
         order = [this, staged] { rasterizer->OrderBuffersAhead(*staged->selected, staged->plan); };
     }
-    draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
+    // PERF-GT7-126: what the job reads first through its pointers, for the recorder to ask for
+    // one job ahead: the selection's stages and the register delta.
+    const void* const selection_hint = staged ? static_cast<const void*>(staged->selected.get())
+                                              : static_cast<const void*>(selected.get());
+    const void* const delta_hint = delta.data();
+    const size_t delta_hint_bytes = std::min<size_t>(delta.size() * sizeof(u32), 512);
+    DrawPipe::Work job{[this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
                      decode_epoch, capture = std::move(capture), staged,
@@ -926,7 +932,10 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         if (sel) {
             rasterizer->RecycleSelectedPipeline(std::move(sel));
         }
-    }, kind, std::move(prepare), std::move(order));
+    }};
+    job.SetPrefetchHint(0, selection_hint, selection_hint ? 960 : 0);
+    job.SetPrefetchHint(1, delta_hint, delta_hint_bytes);
+    draw_pipe->Push(std::move(job), kind, std::move(prepare), std::move(order));
     if (read_ahead_states && !compute) {
         OfferDrawState();
     }
