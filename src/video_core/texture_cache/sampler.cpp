@@ -2,14 +2,33 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include "common/sharp_options.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
 
 namespace VideoCore {
 
+namespace {
+// A sampler of a material texture: filtered linearly with a mip chain. Shadow compares, point
+// samplers and single-level samplers keep the game's bias.
+bool MaterialSampler(const AmdGpu::Sampler& sampler, bool is_depth) {
+    const auto linear = [](AmdGpu::Filter f) {
+        return f == AmdGpu::Filter::Bilinear || f == AmdGpu::Filter::AnisoLinear;
+    };
+    return !is_depth && sampler.mip_filter != AmdGpu::MipFilter::None &&
+           sampler.MaxLod() > sampler.MinLod() && linear(sampler.xy_min_filter) &&
+           linear(sampler.xy_mag_filter) && sampler.filter_mode == AmdGpu::FilterMode::Blend;
+}
+} // namespace
+
+float Sampler::AutoBias(const AmdGpu::Sampler& sampler, bool is_depth) {
+    return MaterialSampler(sampler, is_depth) ? Common::Sharp::ResolutionBias() : 0.0f;
+}
+
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
-                 const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth) {
+                 const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth,
+                 float resolution_bias) {
     using namespace Vulkan;
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
                                    (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
@@ -51,7 +70,10 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
-        .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
+        .mipLodBias = resolution_bias == 0.0f
+                          ? std::min(sampler.LodBias(), instance.MaxSamplerLodBias())
+                          : std::clamp(sampler.LodBias() + resolution_bias,
+                                       -instance.MaxSamplerLodBias(), instance.MaxSamplerLodBias()),
         .anisotropyEnable = anisotropy_enable,
         .maxAnisotropy = max_anisotropy,
         // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.

@@ -17,7 +17,10 @@ namespace VideoCore {
 class Sampler : public Common::LRUNode<> {
 public:
     explicit Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
-                     const AmdGpu::BorderColorBuffer border_color_base, bool is_depth);
+                     const AmdGpu::BorderColorBuffer border_color_base, bool is_depth,
+                     float resolution_bias = 0.0f);
+    /// The LOD bias temporal DLSS adds to a guest sampler (0 for samplers it does not apply to).
+    static float AutoBias(const AmdGpu::Sampler& sampler, bool is_depth);
     ~Sampler();
 
     Sampler(const Sampler&) = delete;

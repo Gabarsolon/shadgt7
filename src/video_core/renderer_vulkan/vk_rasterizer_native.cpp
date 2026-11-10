@@ -1222,7 +1222,11 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
         std::array<u64, 2> sharp;
         u64 extra;
         vk::Sampler sampler;
+        float resolution_bias{};
+        const NativeRenderer* owner{};
     };
+    // GPU.temporal_dlss: the bias a material sampler gets once temporal DLSS has succeeded.
+    const float resolution_bias = VideoCore::Sampler::AutoBias(sharp, is_depth);
     static thread_local std::array<CachedSampler, 256> cached{};
     static_assert(sizeof(AmdGpu::Sampler) == sizeof(std::array<u64, 2>));
     CachedSampler* cache = nullptr;
@@ -1232,13 +1236,14 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
     if (NextOn()) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
-        if (cache->sampler && cache->sharp == raw && cache->extra == extra) {
+        if (cache->sampler && cache->sharp == raw && cache->extra == extra &&
+            cache->resolution_bias == resolution_bias && cache->owner == this) {
             return cache->sampler;
         }
     }
     const vk::Sampler sampler = MakeSampler(sharp, border, is_depth);
     if (cache) {
-        *cache = {raw, extra, sampler};
+        *cache = {raw, extra, sampler, resolution_bias, this};
     }
     return sampler;
 }
@@ -1246,7 +1251,9 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
 vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
                                         AmdGpu::BorderColorBuffer border, bool is_depth) {
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
+    const float resolution_bias = VideoCore::Sampler::AutoBias(sharp, is_depth);
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
+                     (u64(std::bit_cast<u32>(resolution_bias)) << 16) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
                      (custom ? u64(border.Address()) << 1 : 0);
     std::scoped_lock lock{sampler_mutex};
@@ -1313,8 +1320,10 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         AmdGpu::Sampler state;
         std::array<float, 4> color;
         u64 depth;
+        float resolution_bias;
+        u32 reserved;
     };
-    const Key key{state, custom_color, is_depth ? 1u : 0u};
+    const Key key{state, custom_color, is_depth ? 1u : 0u, resolution_bias, 0};
     const u64 state_hash = XXH3_64bits(&key, sizeof(key));
     auto& slot = samplers[state_hash];
     if (!slot) {
@@ -1328,7 +1337,8 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
             samplers.erase(state_hash);
             return last_sampler;
         }
-        slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
+        slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth,
+                                                    resolution_bias);
         last_sampler = slot->Handle();
     }
     if (sampler_lookup.size() > (1u << 20)) {
