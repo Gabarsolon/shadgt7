@@ -33,6 +33,9 @@ struct Plugin {
 // Upscaling through Streamline's sl.dlss.dll (ryty_dlssg.cpp) instead of the plugin.
 bool g_streamline{};
 Plugin g_plugin;
+// The device and allocator ScaleInto hands to Streamline (set by Pass::Create).
+vk::Device g_device{};
+VmaAllocator g_allocator{};
 
 std::string LastError() {
     return g_plugin.last_error ? g_plugin.last_error() : std::string{"(no plugin)"};
@@ -168,9 +171,89 @@ void Shutdown() {
     }
 }
 
+bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size) {
+    if (g_streamline) {
+        return RytyDlssG::UpscaleSupports(input_size, output_size);
+    }
+    return g_plugin.ready && g_plugin.supports(input_size.width, input_size.height,
+                                               output_size.width, output_size.height) != 0;
+}
+
+bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
+               vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
+               vk::ImageView output, vk::Extent2D output_size) {
+    if (!CanScale(input_size, output_size) || (g_streamline && !g_device)) {
+        return false;
+    }
+    const vk::MemoryBarrier2 input_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    };
+    const vk::ImageMemoryBarrier2 output_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = output_image,
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &input_barrier,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &output_barrier,
+    });
+    bool ok = false;
+    if (g_streamline) {
+        ok = RytyDlssG::Upscale(g_device, g_allocator, cmdbuf, input_image, input, input_format,
+                                input_size, output_image, output,
+                                vk::Format::eR16G16B16A16Sfloat, output_size);
+    } else {
+        const RygtDlssImage in{
+            .image = static_cast<VkImage>(input_image),
+            .view = static_cast<VkImageView>(input),
+            .format = static_cast<VkFormat>(input_format),
+            .width = input_size.width,
+            .height = input_size.height,
+        };
+        const RygtDlssImage out{
+            .image = static_cast<VkImage>(output_image),
+            .view = static_cast<VkImageView>(output),
+            .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+            .width = output_size.width,
+            .height = output_size.height,
+        };
+        ok = g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) == 0;
+    }
+    if (!ok) {
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS (UI at the window size): {}",
+                  g_streamline ? std::string{"Streamline's DLSS failed"} : LastError());
+        return false;
+    }
+    static vk::Extent2D logged_in{};
+    static vk::Extent2D logged_out{};
+    if (input_size != logged_in || output_size != logged_out) {
+        logged_in = input_size;
+        logged_out = output_size;
+        LOG_INFO(Render_Vulkan, "ryGT DLSS: scene {}x{} to {}x{} under the UI", input_size.width,
+                 input_size.height, output_size.width, output_size.height);
+    }
+    return true;
+}
+
 void Pass::Create(vk::Device device_, VmaAllocator allocator_, u32 num_images) {
     device = device_;
     allocator = allocator_;
+    g_device = device_;
+    g_allocator = allocator_;
     available_imgs.resize(num_images);
     for (u32 i = 0; i < num_images; ++i) {
         available_imgs[i].id = static_cast<u8>(i);

@@ -35,6 +35,16 @@ bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device 
 /// Releases DLSS; the device must be idle.
 void Shutdown();
 
+/// Whether DLSS can scale input_size to output_size now.
+bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size);
+
+/// GPU.hd_ui: scales the game picture (readable by shaders, in the shader-read layout) into an
+/// R16G16B16A16 output image with storage usage, left in the general layout. False when DLSS is
+/// off or failed.
+bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
+               vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
+               vk::ImageView output, vk::Extent2D output_size);
+
 /// Scales the game picture into an output image at the window size, like the FSR pass.
 class Pass {
 public:
