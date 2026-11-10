@@ -1852,6 +1852,96 @@ void InstallTriggerTelemetryGt7(u8* base) {
     VirtualProtect(slot, sizeof(*slot), protection, &ignored);
     std::fprintf(stderr, "[triggers] GT7 adaptive triggers on (telemetry hook installed)\n");
 }
+
+// FIX-GT7-BLUR: GT7 draws its scene motion blur in replays and not while driving. One rule of the
+// game's own code stops it in a race: the default onboard graphics preset (mode 0, in the base and
+// the Neo high presets) has the scene-blur veto bit 0x08 in its effect mask (0x18). With
+// GPU.motion_blur_gameplay (default off; RYGT_MOTION_BLUR_GAMEPLAY=1/0 overrides the setting) the
+// veto bit is cleared in the two preset constructors; the other disable bit 0x10 stays. Camera,
+// photo, debug and VR exclusions, the explicit disable_motionblur effect setting and the game's
+// shutter policy are left as they are.
+//
+// Safety: nothing is written unless the setting is on and every site matches. A site is a fixed
+// converter RVA of GT7 CUSA24769 (the executable they were read from has SHA-256
+// e18ac63e07db83f61a63c866ee466a0e3a90c52e3b19ae06b0d60a9281e57832). The game's bytes are
+// compared over whole instructions around the change (51 bytes); with any difference, or a
+// page that cannot be read, no site is touched and one line says so. The change itself is one
+// byte (0x18 to 0x10) for each preset. Pages are made writable together and restored; if one
+// cannot be, nothing is changed.
+struct BlurSite {
+    u64 rva;                      // where the compared bytes start
+    std::vector<u8> expected;     // the game's bytes there, whole instructions
+    size_t write_at;              // where in them the change starts
+    std::vector<u8> replacement;  // what replaces expected[write_at ...]
+    const char* name;
+};
+
+void InstallMotionBlurGameplayGt7(u8* base) {
+    bool wanted = ConfigFlag("motion_blur_gameplay", false);
+    if (const char* env = std::getenv("RYGT_MOTION_BLUR_GAMEPLAY"); env && env[0]) {
+        wanted = env[0] == '1';
+    }
+    if (!wanted) {
+        return;
+    }
+    // mov qword [rbx+0x98], 0x18 in the preset constructors: the mode-0 effect mask.
+    const BlurSite sites[] = {
+        {0x1bcc831 - 23,
+         {
+            0xc5, 0xf8, 0x13, 0x43, 0x18, 0xc7, 0x43, 0x20, 0x00, 0x00, 0x80,
+            0x3f, 0x48, 0xc7, 0x43, 0x48, 0x01, 0x00, 0x00, 0x00, 0x89, 0x43,
+            0x50, 0x48, 0xc7, 0x83, 0x98, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
+            0x00, 0x48, 0xc7, 0x83, 0xa8, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x89, 0x83, 0xb0, 0x00, 0x00, 0x00},
+         23 + 7, {0x10}, "GT7-BLUR onboard preset (Neo high)"},
+        {0x1bccae0 - 23,
+         {
+            0xc5, 0xf8, 0x13, 0x43, 0x18, 0xc7, 0x43, 0x20, 0x00, 0x00, 0x80,
+            0x3f, 0x48, 0xc7, 0x43, 0x48, 0x01, 0x00, 0x00, 0x00, 0x89, 0x4b,
+            0x50, 0x48, 0xc7, 0x83, 0x98, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00,
+            0x00, 0x48, 0xc7, 0x83, 0xa8, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x89, 0x8b, 0xb0, 0x00, 0x00, 0x00},
+         23 + 7, {0x10}, "GT7-BLUR onboard preset (base)"},
+    };
+    for (const auto& site : sites) {
+        if (!ReadableRange(base + site.rva, site.expected.size()) ||
+            std::memcmp(base + site.rva, site.expected.data(), site.expected.size()) != 0) {
+            std::fprintf(stderr, "[patch] GT7-BLUR: the game's bytes at %#llx differ or cannot be "
+                         "read (not GT7 CUSA24769 as the patch knows it), nothing applied\n",
+                         static_cast<unsigned long long>(site.rva));
+            return;
+        }
+    }
+    DWORD protections[std::size(sites)]{};
+    size_t unlocked = 0;
+    for (; unlocked < std::size(sites); ++unlocked) {
+        const auto& site = sites[unlocked];
+        if (!VirtualProtect(base + site.rva + site.write_at, site.replacement.size(),
+                            PAGE_EXECUTE_READWRITE, &protections[unlocked])) {
+            break;
+        }
+    }
+    const bool all_unlocked = unlocked == std::size(sites);
+    if (all_unlocked) {
+        for (const auto& site : sites) {
+            u8* target = base + site.rva + site.write_at;
+            std::memcpy(target, site.replacement.data(), site.replacement.size());
+            FlushInstructionCache(GetCurrentProcess(), target, site.replacement.size());
+            std::fprintf(stderr, "[patch] %s applied at %#llx\n", site.name,
+                         static_cast<unsigned long long>(site.rva + site.write_at));
+        }
+    } else {
+        std::fprintf(stderr, "[patch] GT7-BLUR: could not make the code writable, "
+                     "nothing applied\n");
+    }
+    // Last site first, so a page shared by two sites ends with its first protection.
+    while (unlocked) {
+        const size_t i = --unlocked;
+        DWORD ignored = 0;
+        VirtualProtect(base + sites[i].rva + sites[i].write_at, sites[i].replacement.size(),
+                       protections[i], &ignored);
+    }
+}
 } // namespace
 
 namespace {
@@ -2393,6 +2483,7 @@ void RytyApplyGamePatches() {
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallMotionBlurGameplayGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-GT7-BLUR
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
