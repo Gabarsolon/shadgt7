@@ -944,10 +944,11 @@ bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& f) {
         return false;
     const sl::BaseStructure* inputs[]{&viewport};
     const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *token, inputs, 1, command);
-    if (!EvaluationSucceeded(result))
+    const bool succeeded = EvaluationSucceeded(result);
+    if (!succeeded)
         LOG_WARNING(Render_Vulkan, "GT7-DLSS backend frame={} token={} result={}", f.frame,
                     g_sl.frame_index, int(result));
-    return result == sl::Result::eOk;
+    return succeeded;
 }
 
 void PresentStart() {
