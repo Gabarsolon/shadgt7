@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <memory>
 
 #include "common/recycling_pool.h"
 
@@ -72,6 +73,9 @@ public:
         std::shared_ptr<const Shader::Info> seed;
     };
     struct SelectedPipeline {
+        SelectedPipeline() = default;
+        SelectedPipeline(const SelectedPipeline&) = delete;
+        SelectedPipeline& operator=(const SelectedPipeline&) = delete;
         const GraphicsPipeline* pipeline{};
         /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
         bool is_compute{};
@@ -88,16 +92,20 @@ public:
         u16 vertex_sgpr_offset{};
         u32 instance_sgpr_offset{};
     };
+    /// PERF-GT7-125: a selection stays where it was made (about 1.4 KB of stage arrays); the
+    /// command thread, the draw's job and the recycler pass its pointer. By value it was moved
+    /// whole four times a draw, twice on each thread.
+    using SelectedPipelinePtr = std::unique_ptr<SelectedPipeline>;
     /// PERF-047: whether pipelines are selected on the command thread (draw pipe on and
     /// -DisablePerf 59 not given).
     bool SelectsPipelinesAhead() const;
     /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
     /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
     /// PERF-GT7-031: `indirect`: for an indirect draw, with its parameters.
-    std::optional<SelectedPipeline> SelectPipelineAhead(
+    SelectedPipelinePtr SelectPipelineAhead(
         const DrawIndirectParams* indirect = nullptr);
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
-    std::optional<SelectedPipeline> SelectComputePipelineAhead();
+    SelectedPipelinePtr SelectComputePipelineAhead();
     /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
     /// the built pipeline of its draw, or nullptr (special draws, quad lists, not built yet).
     const GraphicsPipeline* LookupJobPipeline(const char** miss = nullptr);
@@ -213,7 +221,7 @@ public:
         selected_pipeline = selected;
     }
     /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
-    void RecycleSelectedPipeline(SelectedPipeline&& selected) {
+    void RecycleSelectedPipeline(SelectedPipelinePtr selected) {
         selected_recycler.Give(std::move(selected));
     }
 
@@ -490,7 +498,7 @@ private:
         std::chrono::steady_clock::time_point since;
     } select_stats{};
     u64 select_verify_count{};
-    Common::Recycler<SelectedPipeline, 4096> selected_recycler;
+    Common::Recycler<SelectedPipelinePtr, 4096> selected_recycler;
     const Common::ReadCapture* read_capture{}; // PERF-063
     const char* capture_failure{};
     std::vector<std::pair<VAddr, u64>> capture_writes; // PERF-070

@@ -245,7 +245,7 @@ void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTy
     }
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
+Rasterizer::SelectedPipelinePtr Rasterizer::SelectPipelineAhead(
     const DrawIndirectParams* indirect) {
     // The command thread's registers are those of the draw it is decoding.
     const auto& regs = liverpool->DrawRegs();
@@ -260,10 +260,14 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
     static const bool select_quads = Common::PerfFeatureEnabled(75);
     if (ClassifyDraw(regs, depth_copy, stencil_copy) != DrawFilter::Draw ||
         (quad_list && !select_quads)) {
-        return std::nullopt;
+        return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
-    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
+    if (!snapshot) {
+        snapshot = std::make_unique<SelectedPipeline>();
+    }
+    SelectedPipeline& selected = *snapshot;
     selected.is_compute = false;
     selected.compute = nullptr;
     selected.is_quad_list = quad_list;
@@ -291,7 +295,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
             CopySelectedStages(selected.quad_tess_stages);
         }
     }
-    return selected;
+    return snapshot;
 }
 
 void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageTypes>& out) {
@@ -371,15 +375,19 @@ u64 Rasterizer::JobSharpsHash() {
     return SharpsHash(PipelineCache::JobInfos());
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhead() {
+Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
     // PERF-055: as SelectPipelineAhead, for a direct dispatch. -DisablePerf 66 looks every
     // compute pipeline up on the recorder, under the lookup lock, as before.
     static const bool enabled = Common::PerfFeatureEnabled(66);
     if (!enabled) {
-        return std::nullopt;
+        return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
-    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
+    if (!snapshot) {
+        snapshot = std::make_unique<SelectedPipeline>();
+    }
+    SelectedPipeline& selected = *snapshot;
     selected.pipeline = nullptr;
     selected.indirect = false; // PERF-GT7-031
     selected.is_compute = true;
@@ -388,7 +396,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
     if (selected.compute) {
         CopyComputeStage(selected.stages);
     }
-    return selected;
+    return snapshot;
 }
 
 const ComputePipeline* Rasterizer::AcquireComputePipeline() {

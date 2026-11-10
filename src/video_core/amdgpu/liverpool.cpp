@@ -764,7 +764,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     }
     // PERF-047: the pipeline is selected now, on this thread, from these registers; the
     // recorder checks the selection against the memory it sees before using it.
-    std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
+    Vulkan::Rasterizer::SelectedPipelinePtr selected; // PERF-GT7-125
     bool prepared_draw = false;
 #ifdef RYTY_GPU
     // OPT-012: a draw a game job thread prepared is selected there (the recorder installs
@@ -801,12 +801,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             .is_indirect = true,
         };
         selected = rasterizer->SelectPipelineAhead(&params);
-        indirect_selected = selected.has_value();
+        indirect_selected = selected != nullptr;
     }
 #ifdef RYTY_GPU
     if (!compute && !indirect_selected && Native::ShadowComparing()) {
         // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
-        Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected.has_value());
+        Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected != nullptr);
     }
 #endif
     // PERF-062: the upload epoch this draw is decoded in; its pages are hashed now, on this
@@ -851,7 +851,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // PERF-067: with the buffer stage, the selection and the buffers obtained for it are shared
     // by the stage's work and the recorder's.
     struct StagedDraw {
-        std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
+        Vulkan::Rasterizer::SelectedPipelinePtr selected;
         Vulkan::Rasterizer::BufferPlan plan;
     };
     std::shared_ptr<StagedDraw> staged;
@@ -913,7 +913,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         if (expected) {
             VerifyRecorderRegs(*expected);
         }
-        rasterizer->SetSelectedPipeline(sel ? &*sel : nullptr);
+        rasterizer->SetSelectedPipeline(sel.get());
         rasterizer->SetDrawEpoch(sel && !indirect_selected ? decode_epoch : 0);
         rasterizer->SetReadCapture(capture.get());
         rasterizer->SetBufferPlan(staged ? &staged->plan : nullptr);
@@ -924,7 +924,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         rasterizer->SetSelectedPipeline(nullptr);
         delta_recycler.Give(std::move(delta));
         if (sel) {
-            rasterizer->RecycleSelectedPipeline(std::move(*sel));
+            rasterizer->RecycleSelectedPipeline(std::move(sel));
         }
     }, kind, std::move(prepare), std::move(order));
     if (read_ahead_states && !compute) {
