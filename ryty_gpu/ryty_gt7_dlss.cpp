@@ -199,6 +199,9 @@ struct Gt7DlssPass::Impl {
     bool dump_armed{};
     unsigned dump_id{};
     u64 dump_frame = ~u64{}, dump_bytes{}, dump_resync = ~u64{};
+    u64 dump_trace_frame = ~u64{}, dump_draws{}, dump_geometry{}, dump_missing_motion{};
+    std::string dump_draw_state;
+
 
     unsigned fallback_lines{};
     u64 scene_key{}, epoch{}, last_taa = ~u64{}, taa_draws{},
@@ -847,6 +850,8 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
         p.history.Invalidate("input-format-change");
         SceneEpoch("input-format-change");
     }
+    auto* previous_slot = p.current;
+    const auto previous_mapping = p.native_scene.mapping;
     p.current = slot;
     slot->frame = frame;
     slot->tick = p.scheduler.CurrentTick();
@@ -871,7 +876,15 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
     DiagnosticImage(cmd, frame, sources[2], "color-in");
     DiagnosticImage(cmd, frame, sources[0], "depth");
     DiagnosticImage(cmd, frame, sources[1], "motion-raw");
-    DiagnosticImage(cmd, frame, scene_output, "native-taa");
+    DiagnosticImage(cmd, frame, scene_output, "taa-native");
+    if (p.dump_frame == frame && previous_slot && previous_slot->frame + 1 == frame &&
+        previous_slot->color.size == p.input && previous_slot->color.format == slot->color.format &&
+        previous_mapping == sources[2].mapping) {
+        p.QueueDump(cmd, frame, "previous-color-in", previous_slot->color.image,
+            previous_slot->color.aspects, previous_slot->color.layout, previous_slot->color.format,
+            p.input, "adjacent previous frame, identical extent/format/view mapping");
+        previous_slot->tick = std::max(previous_slot->tick, p.scheduler.CurrentTick());
+    }
     if (p.numeric_valid)
         ++p.qualified_draws;
     p.qualification_reason = p.numeric_valid ? "qualified" : "waiting-for-input-probe";
@@ -1047,6 +1060,10 @@ vk::ImageView Gt7DlssPass::ColorView() const {
 void Gt7DlssPass::FinishBranch(vk::CommandBuffer cmd, u64 frame) {
     if (impl->captured == frame) {
         impl->branch_ready = true;
+        if (impl->dump_frame == frame) impl->QueueDump(impl->scheduler.DirectCommandBuffer(), frame,
+            "post-chain", impl->current->branch.image, impl->current->branch.aspects,
+            impl->current->branch.layout, impl->current->branch.format,
+            impl->output, "game post chain, display encoded, before sharpening/UI");
         ++impl->composites;
         if (Common::Sharp::Get().dlss_log && (impl->composites <= 16 || frame % 240 == 0))
             LOG_INFO(Render_Vulkan, "GT7-DLSS scene-composite frame={} output={}x{}", frame,
@@ -1109,6 +1126,9 @@ Gt7DlssPass::Result Gt7DlssPass::Reconstruct(vk::CommandBuffer cmd, u64 frame) {
         Fallback(frame, "motion-normalization-pipeline");
         return Result::Unavailable;
     }
+    if (p.dump_frame == frame) p.QueueDump(cmd, frame, "motion-corrected", p.current->motion.image,
+        p.current->motion.aspects, p.current->motion.layout, p.current->motion.format,
+        p.input, "exact motion vectors tagged to DLSS after sentinel/jitter normalization");
     const auto now = std::chrono::steady_clock::now();
     const float ms = p.last_success.time_since_epoch().count()
                          ? std::chrono::duration<float, std::milli>(now - p.last_success).count()
@@ -1210,33 +1230,80 @@ void Gt7DlssPass::NotePresentation(u64 frame, bool temporal, bool spatial) {
     ++p.present_frames[mode];
 }
 
+bool Gt7DlssPass::WantsDiagnosticDraws(u64 frame) const {
+    return Common::Sharp::Diagnostics() && (impl->dump_armed || impl->dump_frame == frame);
+}
+
+void Gt7DlssPass::DiagnosticDraw(u64 frame, const std::string& state, bool geometry, bool motion) {
+    if (!WantsDiagnosticDraws(frame)) return;
+    auto& p = *impl;
+    if (p.dump_trace_frame != frame) {
+        p.dump_trace_frame = frame;
+        p.dump_draw_state.clear();
+        p.dump_draws = p.dump_geometry = p.dump_missing_motion = 0;
+    }
+    ++p.dump_draws;
+    if (geometry) {
+        ++p.dump_geometry;
+        p.dump_missing_motion += !motion;
+    }
+    if (p.dump_draw_state.size() + state.size() + 40 <= 2 * 1024 * 1024) {
+        p.dump_draw_state += fmt::format("draw={} {}\n", p.dump_draws, state);
+    }
+}
+
 void Gt7DlssPass::DiagnosticImage(vk::CommandBuffer cmd, u64 frame, Input image,
                                       const char* role) {
     if (!Common::Sharp::Diagnostics()) return;
     auto& p = *impl;
-    if (p.dump_armed) {
+    const bool starting = p.dump_armed;
+    if (starting) {
         p.dump_armed = false;
         p.dump_frame = frame;
         p.dump_bytes = 0;
         ++p.dump_id;
-        const nlohmann::json metadata{
-            {"frame", frame}, {"capturedFrame", p.captured}, {"lastTaa", p.last_taa},
-            {"reason", p.qualification_reason}, {"numericValid", p.numeric_valid},
-            {"reconstructed", Reconstructed(frame)}, {"constants", p.constants},
-            {"jitter", RasterJitter(p.constants)}, {"projection", p.camera.projection},
-            {"view", p.camera.view}, {"mip", Common::Sharp::ResolutionBias()},
-            {"displayPQ", p.display_hdr}, {"historyPending", p.history.pending}};
-        std::error_code error;
-        std::filesystem::create_directories(DiagnosticDirectory(), error);
-        std::ofstream(DiagnosticDirectory() / fmt::format("dlss-{:02}-f{}-state.json", p.dump_id, frame))
-            << metadata.dump(2);
         LOG_WARNING(Render_Vulkan, "GT7-DLSS dump: bundle={} frame={} dir={}",
                     p.dump_id, frame, DiagnosticDirectory().string());
     }
-    if (p.dump_frame == frame) {
-        p.QueueDump(cmd, frame, role, image.image, image.aspects, vk::ImageLayout::eGeneral,
-                    image.format, image.size, "raw storage channels; native scene before UI");
+    if (p.dump_frame != frame) return;
+    if (starting || std::string_view(role) == "final-scene") {
+        const nlohmann::json metadata{
+            {"bundle", p.dump_id}, {"frame", frame}, {"capturedFrame", p.captured},
+            {"evaluatedFrame", p.evaluated}, {"lastTaa", p.last_taa},
+            {"reason", p.qualification_reason}, {"numericValid", p.numeric_valid},
+            {"reconstructed", Reconstructed(frame)},
+            {"sdkSuccess", p.last_eval.frame == frame && p.last_eval.ok},
+            {"temporalCapturedThisFrame", p.captured == frame},
+            {"temporalEvaluatedThisFrame", p.last_eval.frame == frame},
+            {"presentationPath", p.present_frame != frame ? "pending" :
+                p.present_mode == 0 ? "temporal" : p.present_mode == 1 ? "spatial" : "native"},
+            {"sdkFrame", p.last_eval.frame}, {"constants", p.constants},
+            {"jitterPixels", RasterJitter(p.constants)},
+            {"mvecScale", {-.5f * Config().mvec_scale, .5f * Config().mvec_scale}},
+            {"projection", p.camera.projection}, {"view", p.camera.view},
+            {"mip", Common::Sharp::ResolutionBias()}, {"displayPQ", p.display_hdr},
+            {"historyPending", p.history.pending}, {"depthInverted", p.camera.lens.inverted},
+            {"preExposure", Common::Sharp::Get().pre_exposure},
+            {"exposureScale", Common::Sharp::Get().exposure_scale}, {"autoExposure", true},
+            {"colorViewSwizzle", {int(p.native_scene.mapping.r), int(p.native_scene.mapping.g),
+                                  int(p.native_scene.mapping.b), int(p.native_scene.mapping.a)}},
+            {"draws", p.dump_draws}, {"geometryDepthDraws", p.dump_geometry},
+            {"geometryWithoutMotionTarget", p.dump_missing_motion}};
+        std::error_code error;
+        std::filesystem::create_directories(DiagnosticDirectory(), error);
+        std::ofstream(DiagnosticDirectory() / fmt::format("dlss-{:02}-f{}-frame.json", p.dump_id, frame))
+            << metadata.dump(2);
+        if (p.dump_trace_frame == frame) {
+            std::ofstream(DiagnosticDirectory() / fmt::format("dlss-{:02}-f{}-draws.txt", p.dump_id, frame))
+                << p.dump_draw_state;
+        }
+        if (!starting) LOG_WARNING(Render_Vulkan,
+            "GT7-DLSS cockpit-evidence: frame={} draws={} geometry={} withoutMotionTarget={} "
+            "(not proof of missing per-pixel velocity)", frame, p.dump_draws,
+            p.dump_geometry, p.dump_missing_motion);
     }
+    p.QueueDump(cmd, frame, role, image.image, image.aspects, vk::ImageLayout::eGeneral,
+                image.format, image.size, "raw storage channels; scene before UI");
 }
 
 void Gt7DlssPass::Poll() {

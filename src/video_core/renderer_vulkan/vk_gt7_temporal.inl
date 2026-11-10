@@ -25,6 +25,40 @@ void NativeRenderer::NoteTemporalDraw(const AmdGpu::Regs& regs, const GraphicsPi
         if (const auto* f = selected[u32(Shader::SwStage::Fragment)])
             ps = f->pgm_hash;
     }
+    if (temporal_dlss->WantsDiagnosticDraws(frame)) {
+        const auto* vs = pipeline ? pipeline->GetStages()[u32(Shader::SwStage::Vertex)] : nullptr;
+        const auto* color = targets ? targets->colors[0] : nullptr;
+        const auto* motion = targets ? targets->colors[1] : nullptr;
+        const auto* depth = targets ? targets->depth : nullptr;
+        const bool geometry = depth && color && targets->state.width == 1920 &&
+                              targets->state.height == 1080 && std::string_view(status) == "executed";
+        const bool has_motion = motion && motion->info.pixel_format == vk::Format::eR16G16Sfloat &&
+                                (regs.color_target_mask.raw & 0xf0) != 0;
+        std::string images;
+        if (b) for (const auto* image : b->sampled) {
+            if (image && images.size() < 2048) images += fmt::format(" {:#x}:{}x{}:{}",
+                image->info.guest_address, image->info.size.width, image->info.size.height,
+                vk::to_string(image->info.pixel_format));
+        }
+        temporal_dlss->DiagnosticDraw(frame, fmt::format(
+            "status={} ps={:#x} vs={:#x} raster={}x{} viewport={}x{} indices={} instances={} "
+            "color={:#x}:{} MRT1={:#x}:{} depth={:#x}:{} depthWrite={} zscale={} zoffset={} guestMask={:#x} "
+            "shaderMask={:#x} afterReconstruction={} TAA={} sampled=[{}]",
+            status, ps, vs ? vs->pgm_hash : 0, targets ? targets->state.width : 0,
+            targets ? targets->state.height : 0, std::abs(regs.viewports[0].xscale*2),
+            std::abs(regs.viewports[0].yscale*2), regs.num_indices,
+            regs.num_instances.NumInstances(), color ? color->info.guest_address : 0,
+            vk::to_string(color ? color->info.pixel_format : vk::Format::eUndefined),
+            motion ? motion->info.guest_address : 0,
+            vk::to_string(motion ? motion->info.pixel_format : vk::Format::eUndefined),
+            depth ? depth->info.guest_address : 0,
+            vk::to_string(depth ? depth->info.pixel_format : vk::Format::eUndefined),
+            bool(regs.depth_control.depth_write_enable), regs.viewports[0].zscale,
+            regs.viewports[0].zoffset, regs.color_target_mask.raw,
+            pipeline ? pipeline->GetGraphicsKey().mrt_mask : 0,
+            temporal_dlss->Reconstructed(frame), Gt7Temporal::TaaHash(ps), images),
+            geometry, has_motion);
+    }
     const bool taa = Gt7Temporal::TaaHash(ps), initialize = Gt7Temporal::InitializeHash(ps);
     if (initialize && std::string_view(status) == "executed" && targets &&
         targets->state.width == 1920 && targets->state.height == 1080 &&

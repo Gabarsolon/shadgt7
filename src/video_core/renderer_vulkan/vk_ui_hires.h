@@ -445,7 +445,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     if (temporal) {
         RytyDlss::BeginNativeFrame(frame);
         if (allow_dlss) temporal->DiagnosticImage(cmd, frame,
-            {image, format, proxy.native}, "presentation-native");
+            {image, format, proxy.native}, "presentation-in");
     }
     auto result = Gt7DlssPass::Result::Unavailable;
     if (allow_dlss && temporal && proxy.dlss_failed && proxy.dlss_retry_after &&
@@ -479,7 +479,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
             temporal->NotePresentation(frame, true, false);
             SharpenScene(instance, cmd, proxy);
             temporal->DiagnosticImage(cmd, frame, {proxy.image, proxy.present_format, proxy.size},
-                                      "presentation-scaled");
+                                      "final-scene");
             proxy.phase = Phase::Ui;
             return;
         }
@@ -524,7 +524,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     if (allow_dlss) {
         SharpenScene(instance, cmd, proxy);
         if (temporal) temporal->DiagnosticImage(cmd, frame,
-            {proxy.image, proxy.present_format, proxy.size}, "presentation-scaled");
+            {proxy.image, proxy.present_format, proxy.size}, "final-scene");
     }
     proxy.phase = Phase::Ui;
     proxy.native_dirty = false;
