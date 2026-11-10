@@ -3,11 +3,16 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <type_traits>
 #include <utility>
 
 #include "common/recycling_pool.h"
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 namespace Common {
 
@@ -81,6 +86,20 @@ public:
 
     explicit operator bool() const noexcept {
         return static_cast<bool>(callable);
+    }
+
+    /// PERF-GT7-124: asks for the first `bytes` of the callable (its captures) to be brought into
+    /// the cache, without waiting for them. For a consumer about to run a callable another
+    /// thread made. Nothing on processors other than x86-64.
+    void Prefetch(std::size_t bytes) const noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+        const char* const at = reinterpret_cast<const char*>(callable.get());
+        for (std::size_t offset = 0; at && offset < bytes; offset += 64) {
+            _mm_prefetch(at + offset, _MM_HINT_T0);
+        }
+#else
+        static_cast<void>(bytes);
+#endif
     }
 
 private:
