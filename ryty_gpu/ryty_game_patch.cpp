@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <array>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -30,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
+#include "common/hd_ui_options.h"
 #include "common/ryty_config.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -1946,6 +1948,10 @@ void InstallFatalErrorDiag(u8* base) {
 }
 } // namespace
 
+namespace {
+#include "ryty_gpu/ryty_hd_ui_assets.inl"
+} // namespace
+
 
 // PERF-GT7-113: GT7's file cipher. The game decrypts what it reads (ChaCha20: 20 rounds, a 32-bit
 // block counter in state word 12, 16 state words at +8 of the cipher object) one 64-byte block at
@@ -2581,6 +2587,7 @@ void RytyApplyGamePatches() {
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallHdUiAssetsGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
