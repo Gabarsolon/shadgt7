@@ -25,6 +25,7 @@
 #include "common/guest_clock.h"
 #include "common/nvtx.h"
 #include "common/hash.h"
+#include "common/hd_ui_options.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
@@ -613,6 +614,10 @@ private:
             return !(env && env[0] == '0');
         }();
         if (!enabled || !IsCompleteSpirv(words)) {
+            return;
+        }
+        // GPU.hd_ui: LoadStoredModule checks this too, and a prefetched module bypasses it.
+        if (Common::HdUiRequested() && NeedsNativeFragCoordScale(words)) {
             return;
         }
         if (const auto emulation = FindFloatAtomicEmulation(words);
@@ -4915,6 +4920,11 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
                         "it again",
                         pgm_hash, perm_idx);
         }
+        return {};
+    }
+    // GPU.hd_ui: a stored fragment shader from before the setting was on has no scale for the
+    // fragment coordinate: translated again.
+    if (Common::HdUiRequested() && NeedsNativeFragCoordScale(spv)) {
         return {};
     }
     // FIX-GT7-011: FIX-226 changed how float atomic min/max are made without
