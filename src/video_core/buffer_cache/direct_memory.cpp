@@ -77,6 +77,16 @@ thread_local u32 t_recent_next = 0;
 // GT7's busy scenes bind thousands of ranges a frame over more views than the eight above hold,
 // and each miss walked the view map page by page under the lock.
 thread_local std::array<RecentView, 256> t_recent_ranges{};
+// PERF-GT7-127: the view FindBuffer found for an address lately, by the address's 2 MB chunk
+// (the size GT7's memory is imported in). Valid while no view was unmapped since, as D7's: a
+// view only goes at an unmap, which moves the generation on under the map's lock.
+struct RecentFind {
+    u64 generation;
+    VAddr begin;
+    VAddr end;
+    const Buffer* buffer;
+};
+thread_local std::array<RecentFind, 64> t_recent_finds{};
 
 } // namespace
 
@@ -96,7 +106,11 @@ DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler&
                 l1->BufferDeviceAddress());
 }
 
-DirectMemory::~DirectMemory() = default;
+DirectMemory::~DirectMemory() {
+    // PERF-GT7-127: the views go with this object; finds other threads remember of them must
+    // not be taken by a DirectMemory made later.
+    g_unmap_generation.fetch_add(1, std::memory_order_acq_rel);
+}
 
 bool DirectMemory::Enabled() {
     // D11: the direct renderer is the renderer (GPU.direct_renderer from older launchers is
@@ -209,6 +223,19 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
+    // PERF-GT7-127 (RYGT_DIRECT_FIND_RECENT=0 off): in a 20-car race the recorder asked for a
+    // view ~10,000 times a frame, each time under the lock and down the map (2.5% of its busy
+    // time in the map walk alone), almost always for one of a few dozen views.
+    static const bool recent_on = [] {
+        const char* env = std::getenv("RYGT_DIRECT_FIND_RECENT");
+        return !(env && env[0] == '0');
+    }();
+    RecentFind& recent = t_recent_finds[(address >> 21) % t_recent_finds.size()];
+    if (recent_on && recent.buffer &&
+        recent.generation == g_unmap_generation.load(std::memory_order_acquire) &&
+        address >= recent.begin && address + size <= recent.end) {
+        return std::make_pair(recent.buffer, address - recent.begin);
+    }
     std::scoped_lock lk{mutex};
     auto it = views.upper_bound(address);
     if (it == views.begin()) {
@@ -218,6 +245,9 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
     if (address < view.begin || address + size > view.end || !view.wrapper) {
         return std::nullopt;
     }
+    // Under the lock an unmap holds while it moves the generation on and drops its views.
+    recent = {g_unmap_generation.load(std::memory_order_acquire), view.begin, view.end,
+              view.wrapper.get()};
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
