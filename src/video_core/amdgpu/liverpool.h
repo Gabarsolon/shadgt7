@@ -144,7 +144,8 @@ public:
     void OnGpuThreadFault();
 
     bool IsGpuIdle() const {
-        return num_submits == 0;
+        // FIX-GT7-147: with retire_on_gpu, also once the GPU has finished the submissions.
+        return num_submits == 0 && unretired == 0;
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -156,9 +157,7 @@ public:
         return rasterizer;
     }
 
-    void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
-    }
+    void BindRasterizer(Vulkan::Rasterizer* rasterizer_);
 
     /// PERF-050: a CPU fault's flush from a game thread; returns once it ran. With the draw pipe
     /// it runs as soon as the caches are free instead of behind all decoded work
@@ -683,6 +682,11 @@ private:
     // Submissions the guest made that are not finished: the recorder thread finishes them when
     // the draw pipe runs. num_tasks counts the ones the command thread has not decoded yet.
     std::atomic<u32> num_submits{};
+    /// FIX-GT7-147 (retire_on_gpu): submissions the GPU has yet to finish, and those recorded
+    /// since the last flush that counts them.
+    bool retire_on_gpu{};
+    std::atomic<u32> unretired{};
+    std::atomic<u32> recorded_unretired{};
     std::atomic<u32> num_tasks{};
     u32 gfx_packets_since_yield{};
     std::atomic<u32> num_commands{};

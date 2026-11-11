@@ -350,6 +350,16 @@ public:
                driver_info.find("LLPC") == std::string::npos;
     }
 
+    /// FIX-GT7-147: a GCN Radeon (R7/R9, RX 400/500/600 three-digit models, Vega, Radeon VII)
+    /// on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
+    bool IsAmdGcn() const;
+
+    /// DIAG-243: RYGT_DEVICE_FAULT=1: the device
+    /// fault extension is enabled and the renderer notes its last draws.
+    bool NotesDrawsForFault() const {
+        return note_fault_draws;
+    }
+
     /// AMD-313: a Radeon RX 7000 on AMD's driver.
     bool IsAmdRx7000() const {
         return driver_id == vk::DriverId::eAmdProprietary &&
@@ -676,6 +686,7 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool device_fault{}; // DIAG-243
+    bool note_fault_draws{}; ///< DIAG-243: RYGT_DEVICE_FAULT=1
     bool quad_control{};       ///< AMD-306
     bool vertex_order_check{}; ///< AMD-307
     bool supports_memory_budget{};
