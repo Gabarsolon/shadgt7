@@ -34,7 +34,11 @@ static bool GameSupportsHdr() {
     if (presenter->IsHDRSupported()) {
         static const bool supported = [&] {
             PSF param_sfo;
-            if (param_sfo.Open(game_info.GetGameFolder() / "sce_sys" / "param.sfo")) {
+            // FIX-GT7-146: GT7 only. Any other title with the HDR bit in its param.sfo (GT
+            // Sport has HDR on a console) would be offered HDR10 with nothing of this path
+            // tried on it.
+            if (param_sfo.Open(game_info.GetGameFolder() / "sce_sys" / "param.sfo") &&
+                param_sfo.GetString("TITLE_ID") == "CUSA24769") {
                 if (const auto attributes = param_sfo.GetInteger("ATTRIBUTE")) {
                     Common::PSFAttributes game_attributes{};
                     game_attributes.raw = static_cast<u32>(*attributes);

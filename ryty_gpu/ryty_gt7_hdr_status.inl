@@ -50,9 +50,11 @@ void Install(u8* base) {
     }
     PSF sfo;
     const auto path = std::filesystem::path(Common::RytyExeDirW()) / "app0" / "sce_sys" / "param.sfo";
-    if (!sfo.Open(path) ||
-        sfo.GetString("TITLE_ID") != "CUSA24769" || sfo.GetString("APP_VER") != "01.00") {
-        std::fprintf(stderr, "HDRSTATUS: title/version not CUSA24769 01.00; not applied\n");
+    // FIX-GT7-146: the title only. APP_VER does not name the build (a 1.71 game installed over
+    // its 1.00 base says 01.00, the same game dumped merged says 01.71): the bytes checked
+    // below do.
+    if (!sfo.Open(path) || sfo.GetString("TITLE_ID") != "CUSA24769") {
+        std::fprintf(stderr, "HDRSTATUS: title not CUSA24769; not applied\n");
         return;
     }
     constexpr u64 start = 0x1eed374;
@@ -91,6 +93,7 @@ void Install(u8* base) {
         const auto distance = reinterpret_cast<intptr_t>(stub + i * 16) -
                               reinterpret_cast<intptr_t>(base + start + offset + 5);
         if (distance < INT32_MIN || distance > INT32_MAX) {
+            std::fprintf(stderr, "HDRSTATUS: stub out of a call's reach; not applied\n");
             VirtualFree(stub, 0, MEM_RELEASE);
             return;
         }
@@ -99,6 +102,7 @@ void Install(u8* base) {
     }
     DWORD previous = 0;
     if (!VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &previous)) {
+        std::fprintf(stderr, "HDRSTATUS: stub could not be made executable; not applied\n");
         VirtualFree(stub, 0, MEM_RELEASE);
         return;
     }
@@ -107,7 +111,7 @@ void Install(u8* base) {
         VirtualFree(stub, 0, MEM_RELEASE);
         return;
     }
-    std::fprintf(stderr, "HDRSTATUS: CUSA24769 01.00 hooks installed before guest start; "
+    std::fprintf(stderr, "HDRSTATUS: CUSA24769 hooks installed before guest start; "
                          "inactive until host/title HDR capability is confirmed\n");
 }
 
