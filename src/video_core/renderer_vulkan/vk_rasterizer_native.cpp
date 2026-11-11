@@ -10455,6 +10455,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             temporal_write_ps = 0;
             temporal_dlss->SceneVersion(targets.colors[0]->write_version.load());
         }
+        if (temporal_scene_binding && !temporal_full_scissor) {
+            temporal_dlss->NoteCompositeReject(frame, "scissor-not-full", 0);
+        }
         if (temporal_scene_binding && temporal_full_scissor) {
             Splice();
             r.scheduler.EndRendering();

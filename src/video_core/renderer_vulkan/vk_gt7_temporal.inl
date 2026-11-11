@@ -334,17 +334,44 @@ vk::DescriptorImageInfo* NativeRenderer::TemporalSceneBinding(const AmdGpu::Regs
                                                               const GraphicsPipeline& pipeline,
                                                               const Targets& targets,
                                                               DrawBindings& b) {
-    if (!Gt7Temporal::Config().enabled || regs.num_indices > 6 ||
-        regs.num_instances.NumInstances() != 1 || targets.state.num_color_attachments != 1 ||
-        targets.depth || !targets.colors[0] || regs.blend_control[0].enable ||
-        (regs.color_target_mask.raw & 7) != 7 || b.writes_buffers || !b.stored.empty() ||
+    if (!Gt7Temporal::Config().enabled || !targets.colors[0] ||
         !IsDisplayAddress(targets.colors[0]->info.guest_address))
         return nullptr;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto* vs = pipeline.GetStages()[u32(Shader::SwStage::Vertex)];
-    if (!fs || !vs || fs->loads.GetAny(Shader::IR::Attribute::FragCoord) ||
-        (vs->pgm_hash != 0x3863962b && vs->pgm_hash != 0xc830abbf))
+    // A draw that samples the reconstructed scene into a display image is a candidate for the
+    // final scene composite; when it is turned down the reason goes to the once-a-second line
+    // (compositeRejects), with the pixel shader hash for the shader whitelist below.
+    bool candidate = false;
+    if (temporal_dlss->Reconstructed(frame)) {
+        for (const auto* sampled : b.sampled) {
+            candidate |= sampled && temporal_dlss->OwnsScene(frame, sampled);
+        }
+    }
+    const u64 ps_hash = fs ? fs->pgm_hash : 0;
+    const auto reject = [&](const char* reason) -> vk::DescriptorImageInfo* {
+        if (candidate) {
+            temporal_dlss->NoteCompositeReject(frame, reason, ps_hash);
+        }
         return nullptr;
+    };
+    if (regs.num_indices > 6 || regs.num_instances.NumInstances() != 1 ||
+        targets.state.num_color_attachments != 1 || targets.depth || regs.blend_control[0].enable ||
+        (regs.color_target_mask.raw & 7) != 7 || b.writes_buffers || !b.stored.empty())
+        return reject("draw-shape");
+    if (!fs || !vs || fs->loads.GetAny(Shader::IR::Attribute::FragCoord) ||
+        (vs->pgm_hash != 0x3863962b && vs->pgm_hash != 0xc830abbf)) {
+        if (candidate) {
+            // The vertex shader's hash is the one to look at when it is the one turned down.
+            const bool vs_only = fs && vs && !fs->loads.GetAny(Shader::IR::Attribute::FragCoord);
+            temporal_dlss->NoteCompositeReject(
+                frame, !fs || !vs ? "no-stage"
+                       : vs_only  ? "vertex-shader-not-listed"
+                                  : "ps-reads-fragcoord",
+                vs_only ? vs->pgm_hash : ps_hash);
+        }
+        return nullptr;
+    }
     // Executed final scene composites. Their ordinary draw keeps the native
     // scene route current; the replay samples the reconstructed post-FX scene.
     switch (fs->pgm_hash) {
@@ -365,14 +392,14 @@ vk::DescriptorImageInfo* NativeRenderer::TemporalSceneBinding(const AmdGpu::Regs
     case 0x4f794c7e:
         break;
     default:
-        return nullptr;
+        return reject("pixel-shader-not-listed");
     }
     const auto& e = *targets.colors[0];
     const auto& vp = regs.viewports[0];
     if (std::abs(vp.xscale * 2) != e.info.size.width ||
         std::abs(vp.yscale * 2) != e.info.size.height || vp.xoffset != e.info.size.width * .5f ||
         vp.yoffset != e.info.size.height * .5f)
-        return nullptr;
+        return reject("viewport-not-full-target");
     const auto plan =
         PlanStageResourceBindings(*fs, Shader::Backend::StageStart(u32(fs->sw_stage)));
     u32 unified = plan.textures.unified;
@@ -386,7 +413,7 @@ vk::DescriptorImageInfo* NativeRenderer::TemporalSceneBinding(const AmdGpu::Regs
                     !temporal_dlss->HasScene(frame, sampled, sampled->write_version.load()))
                     continue;
                 if (sharp.width + 1 != e.info.size.width || sharp.height + 1 != e.info.size.height)
-                    return nullptr;
+                    return reject("scene-size-differs-from-target");
                 for (size_t i = 0; i < b.writes.size(); ++i) {
                     auto& write = b.writes[i];
                     if (b.write_sets[i] == Shader::Backend::StageSet(u32(fs->sw_stage)) &&
@@ -394,12 +421,12 @@ vk::DescriptorImageInfo* NativeRenderer::TemporalSceneBinding(const AmdGpu::Regs
                         write.descriptorType == vk::DescriptorType::eSampledImage &&
                         write.descriptorCount == 1) {
                         if (found)
-                            return nullptr;
+                            return reject("scene-bound-twice");
                         const auto m = sharp.DstSelect();
                         using S = AmdGpu::CompSwizzle;
                         if (m.g != S::Green || !((m.r == S::Red && m.b == S::Blue) ||
                                                  (m.r == S::Blue && m.b == S::Red)))
-                            return nullptr;
+                            return reject("scene-channel-selector");
                         // Raw pre-TAA storage equals MRT1 storage (proved at capture).
                         // Preserve this consumer's view, including its alpha selector.
                         temporal_dlss->ConsumerMapping(LiverpoolToVK::ComponentMapping(m));
@@ -409,6 +436,9 @@ vk::DescriptorImageInfo* NativeRenderer::TemporalSceneBinding(const AmdGpu::Regs
             }
         }
         unified += binding.NumBindings(*fs);
+    }
+    if (!found) {
+        return reject("scene-not-bound-as-one-sampled-image");
     }
     return found;
 }

@@ -57,6 +57,10 @@ public:
 
 
     void NotePresentation(u64 frame, bool temporal, bool spatial);
+    /// Why a draw that samples the reconstructed scene at a display target was not taken as the
+    /// final scene composite (once per frame and reason; `ps` 0 when no shader applies). Shown in
+    /// the once-a-second line as compositeRejects=[reason:count] and rejectPs=[0xhash:reason:count].
+    void NoteCompositeReject(u64 frame, const char* reason, u64 ps);
     void Fallback(u64 frame, const char* reason, bool invalidate = true);
     std::string_view QualificationReason() const;
     // Scene epochs: a new full-scene TAA draw, a changed resource set or a gap starts a new epoch.

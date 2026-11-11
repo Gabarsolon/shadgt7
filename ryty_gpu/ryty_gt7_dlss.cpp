@@ -297,6 +297,8 @@ struct Gt7DlssPass::Impl {
     std::string qualification_reason = "no-full-scene-TAA", epoch_reason = "first-scene";
     std::map<std::string, u64> fallbacks, resets;
     std::map<std::string, u64> fallback_frames, fallback_last_frame, logged_fallback_frames;
+    // Why no draw was taken as the final scene composite (NoteCompositeReject).
+    std::map<std::string, u64> reject_frames, reject_last_frame, logged_reject_frames;
     std::array<u64, 3> present_frames{}, logged_present_frames{};
     u64 present_frame = ~u64{}, present_flips{}, logged_present_flips{};
     u64 reset_requests{}, logged_reset_requests{}, unchanged_reuse{}, logged_unchanged_reuse{};
@@ -746,6 +748,15 @@ void Gt7DlssPass::Invalidate(const char* reason) {
     impl->branch_ready = false;
     impl->scene_identity = nullptr;
 }
+void Gt7DlssPass::NoteCompositeReject(u64 frame, const char* reason, u64 ps) {
+    auto& p = *impl;
+    std::string key = ps ? fmt::format("{:#x}:{}", ps, reason) : std::string{reason};
+    const auto last = p.reject_last_frame.find(key);
+    if (last == p.reject_last_frame.end() || last->second != frame) {
+        p.reject_last_frame[key] = frame;
+        ++p.reject_frames[key];
+    }
+}
 void Gt7DlssPass::Fallback(u64 frame, const char* reason, bool invalidate) {
     if (invalidate)
         Invalidate(reason);
@@ -1182,8 +1193,15 @@ vk::ImageView Gt7DlssPass::BeginBranch(vk::CommandBuffer cmd, u64 frame, VAddr d
     auto& p = *impl;
     if (!Reconstructed(frame) || p.scene_dirty || p.branch_ready ||
         (format != vk::Format::eA2B10G10R10UnormPack32 && format != vk::Format::eR8G8B8A8Unorm &&
-         format != vk::Format::eB8G8R8A8Unorm))
+         format != vk::Format::eB8G8R8A8Unorm)) {
+        // A second composite after the first one worked is not a failure; the rest are.
+        if (!p.branch_ready)
+            NoteCompositeReject(frame, !Reconstructed(frame) ? "branch:not-reconstructed"
+                                       : p.scene_dirty       ? "branch:scene-dirty"
+                                                             : "branch:target-format",
+                                0);
         return {};
+    }
     if (!p.current->branch.Create(p.gpu, format, p.output, vk::ImageAspectFlagBits::eColor,
                                   vk::ImageUsageFlagBits::eColorAttachment)) {
         Fallback(frame, "scene-branch-allocation");
@@ -1689,6 +1707,12 @@ void Gt7DlssPass::Poll(u64 frame) {
             if (delta) reasons += fmt::format("{}{}:{}", reasons.empty() ? "" : ",", reason, delta);
             p.logged_fallback_frames[reason] = count;
         }
+        std::string rejects;
+        for (const auto& [key, count] : p.reject_frames) {
+            const auto delta = count - p.logged_reject_frames[key];
+            if (delta) rejects += fmt::format("{}{}:{}", rejects.empty() ? "" : ",", key, delta);
+            p.logged_reject_frames[key] = count;
+        }
         VmaBudget heaps[VK_MAX_MEMORY_HEAPS]{};
         vmaGetHeapBudgets(p.gpu.GetAllocator(), heaps);
         u64 device_used = 0, device_budget = 0;
@@ -1704,6 +1728,7 @@ void Gt7DlssPass::Poll(u64 frame) {
                  "out={}x{} mode={} preset={}->{} gpuMs={:.2f} (max {:.2f}) mip={:.2f} "
                  "sharpen={:.0f}% resync merge={} replace={} present temporal={} spatial={} "
                  "native={} reuse={} TAAseen={} epoch={} resets={} flips={} fallbackFrames=[{}] "
+                 "compositeRejects=[{}] "
                  "warn39={}/{} privateMiB={} uiEstMiB={} recycleMiB={} deviceMiB={}/{} "
                  "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={}",
                  successes, evaluations, captures, falls, p.qualification_reason, p.input.width,
@@ -1714,6 +1739,7 @@ void Gt7DlssPass::Poll(u64 frame) {
                  p.unchanged_reuse - p.logged_unchanged_reuse, p.taa_draws, p.epoch,
                  p.reset_requests - p.logged_reset_requests,
                  p.present_flips - p.logged_present_flips, reasons.empty() ? "none" : reasons,
+                 rejects.empty() ? "none" : rejects,
                  report.budget_warnings - p.logged_budget_warnings, report.budget_warnings,
                  p.OwnedBytes() >> 20, Common::Sharp::ui_image_bytes.load() >> 20,
                  VideoCore::RecycledImageBytes() >> 20, device_used >> 20, device_budget >> 20,
