@@ -98,9 +98,8 @@ std::string GetReadableVersion(u32 version) {
 
 // AMD-300 (SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2): the device reports only what an older Radeon's
 // Windows driver offers (gpuinfo.org: RX 580/RX Vega 2.0.283, RX 5700 XT/RX 6800 2.0.353), so a
-// newer card exercises the paths those cards take. It cannot change the hardware's wave size.
-// Nor the vendor ID: on a non-AMD card rdna1|rdna2 keep shader objects on, while a real Radeon
-// draws pipelines by default (FIX-GT7-136); add RYGT_SHADER_OBJECT=0 to mimic one.
+// newer card exercises the paths those cards take. It cannot change the hardware's wave size
+// nor the vendor ID.
 enum class SimulatedGpu { None, Gcn, Rdna1, Rdna2 };
 
 SimulatedGpu GetSimulatedGpu() {
@@ -443,17 +442,17 @@ bool Instance::CreateDevice() {
     // with vertex and fragment shader objects and dynamic state instead of a compiled pipeline: no
     // driver pipeline compile for them. Needs the dynamic states of extended_dynamic_state3 that
     // those pipelines otherwise fix.
-    // FIX-GT7-136: off by default on AMD GPUs (crashes reported with shader objects on AMD), on
-    // by default elsewhere. RYGT_SHADER_OBJECT=1 turns them on, =0 off, on any GPU; any other
-    // value keeps the GPU's default.
+    // FIX-GT7-136 turned them off by default on AMD GPUs (crashes reported there).
+    // FIX-GT7-147: off by default on every GPU. On an RTX 4070 the small icons of GT7's car
+    // interiors (garage) lost pieces with shader objects and were whole with pipelines, on three
+    // renderers (f26615ed, a283e27e, 422deef9). RYGT_SHADER_OBJECT=1 turns them on, on any GPU;
+    // =0 and any other value leave them off.
     // SO-012: a start that wants shader objects after a lost device with shader objects on uses
     // pipelines once (the marker is removed, so the next start that wants them tries them again).
     // A start that doesn't want them leaves the marker for that next one.
     const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
     const char shader_object_forced = shader_object_env ? shader_object_env[0] : '\0';
-    const bool amd_gpu = properties.vendorID == 0x1002;
-    const bool shader_object_asked =
-        shader_object_forced == '1' || (shader_object_forced != '0' && !amd_gpu);
+    const bool shader_object_asked = shader_object_forced == '1';
     bool after_loss = false;
     if (shader_object_asked) {
         const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -468,8 +467,8 @@ bool Instance::CreateDevice() {
     } else if (shader_object_forced == '0') {
         LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (RYGT_SHADER_OBJECT=0)");
     } else {
-        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (FIX-GT7-136: off by default on "
-                                   "AMD GPUs, RYGT_SHADER_OBJECT=1 turns them on)");
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (FIX-GT7-147: off by default, "
+                                   "RYGT_SHADER_OBJECT=1 turns them on)");
     }
     if (shader_object_asked && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
@@ -492,8 +491,8 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // SO-011: whenever shader objects are on (on AMD only with RYGT_SHADER_OBJECT=1 since
-        // FIX-GT7-136), tessellated pipelines are shader objects too, now that shader objects are
+        // SO-011: whenever shader objects are on (only with RYGT_SHADER_OBJECT=1 since
+        // FIX-GT7-147), tessellated pipelines are shader objects too, now that shader objects are
         // linked, cached on disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them
         // pipelines.
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
@@ -515,9 +514,9 @@ bool Instance::CreateDevice() {
         shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
         LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
                     shader_independent_sets ? "yes" : "no (using pipelines)");
-        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {} ({}); tessellated pipelines {}",
+        LOG_WARNING(Render_Vulkan,
+                    "SO-001: shader objects {} (RYGT_SHADER_OBJECT=1); tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
-                    shader_object_forced == '1' ? "RYGT_SHADER_OBJECT=1" : "default on this GPU",
                     shader_object_tessellation ? "too (SO-003)" : "as pipelines");
     }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
