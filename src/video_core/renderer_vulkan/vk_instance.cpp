@@ -634,15 +634,9 @@ bool Instance::CreateDevice() {
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     // DIAG-243: RYGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
     // faulting address and the driver's description, and the renderer notes its last draws.
-    // On by default for GCN Radeons (RX 400/500, Vega) on AMD's driver: an RX 480 drew GT7
-    // right only with it on. RYGT_DEVICE_FAULT=0 turns it off there.
     {
         const char* env = std::getenv("RYGT_DEVICE_FAULT");
-        note_fault_draws = env ? env[0] == '1' : IsAmdGcn();
-        if (!env && note_fault_draws) {
-            LOG_INFO(Render_Vulkan, "DIAG-243: on by default for this GCN Radeon ({})",
-                     GetModelName());
-        }
+        note_fault_draws = env && env[0] == '1';
     }
     if (note_fault_draws) {
         const auto fault_chain =
