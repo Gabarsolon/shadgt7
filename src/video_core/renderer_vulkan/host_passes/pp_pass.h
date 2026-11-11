@@ -38,6 +38,12 @@ public:
         float hud_x1 = 1.0f;
     };
 
+    /// FIX-GT7-145: the format of a frame shown on an HDR10 output, the swapchain's own 10 bits.
+    /// The surface's 8-bit format cut the PQ picture to 256 levels a channel before the 10-bit
+    /// swapchain (measured: 85 to 94% of the window's pixels on the 8-bit grid, 22 to 25% in
+    /// the game's picture, which is chance).
+    static constexpr vk::Format HdrFrameFormat = vk::Format::eA2B10G10R10UnormPack32;
+
     void Create(vk::Device device, vk::Format surface_format);
     /// GT7-UW: the buffer the HUD layout goes to the shader in.
     void CreateHudBuffer(VmaAllocator allocator);
@@ -48,6 +54,7 @@ public:
 
 private:
     vk::UniquePipeline pipeline{};
+    vk::UniquePipeline hdr_pipeline{}; // FIX-GT7-145: for HdrFrameFormat
     vk::UniquePipelineLayout pipeline_layout{};
     vk::UniqueDescriptorSetLayout desc_set_layout{};
     vk::UniqueSampler sampler{};
