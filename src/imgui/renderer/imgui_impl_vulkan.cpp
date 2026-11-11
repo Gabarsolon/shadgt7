@@ -64,6 +64,8 @@ struct VkData {
     vk::ShaderModule shader_module_frag{};
     // FIX-GT7-142: on an HDR10 output, sRGB colours are placed at hdr_white_nits (imgui_hdr.frag).
     vk::ShaderModule shader_module_frag_hdr{};
+    // FIX-GT7-144: the colour format the pipeline is made for, kept here (see Init).
+    vk::Format color_format{};
     bool hdr_output{false};
     float hdr_white_nits{203.0f};
 
@@ -1274,6 +1276,14 @@ bool Init(InitInfo info) {
 
     // Setup backend capabilities flags
     auto* bd = IM_NEW(VkData)(info);
+    // FIX-GT7-144: the caller hands the colour format by pointer, to an argument of
+    // ImGui::Core::Initialize that is gone once it returns. OnSurfaceFormatChange compared with
+    // that dead stack slot, wrote the new format into it and built the pipeline from it: on the
+    // stack of whichever game thread had made the renderer's first call. An HDR switch is the
+    // first format change GT7 ever made. The format now lives in the backend's data.
+    bd->color_format = *info.pipeline_rendering_create_info.pColorAttachmentFormats;
+    const_cast<InitInfo&>(bd->init_info).pipeline_rendering_create_info.pColorAttachmentFormats =
+        &bd->color_format;
     io.BackendRendererUserData = (void*)bd;
     io.BackendRendererName = "imgui_impl_vulkan_shadps4";
     // We can honor the ImDrawCmd::VtxOffset field, allowing for large meshes.
@@ -1302,8 +1312,7 @@ void Shutdown() {
 void OnSurfaceFormatChange(vk::Format surface_format, bool hdr) {
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
-    auto& pl_format = const_cast<vk::Format&>(
-        bd->init_info.pipeline_rendering_create_info.pColorAttachmentFormats[0]);
+    auto& pl_format = bd->color_format; // FIX-GT7-144: where the pipeline's format points
     // FIX-GT7-142: the fragment shader follows the output's encoding as well as its format.
     // RYGT_HDR_OVERLAY_NITS: the nits of the emulator's white on an HDR output (203 unless set;
     // 0 leaves its colours as they are, as before).
