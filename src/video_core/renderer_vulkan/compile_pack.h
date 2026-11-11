@@ -10,9 +10,9 @@
 // background at start, on every core below normal priority, so a track already in the pack starts
 // with its shader objects ready: after a driver update (the driver's caches start empty), or with a
 // pack made on another PC with the same GPU. RYGT_PACK_RECORD=0: no recipes are kept.
-// FIX-GT7-136: recording and the start-up compile need shader objects (off by default on AMD,
-// RYGT_SHADER_OBJECT=1 turns them on): without them no SPIR-V is kept, so there is no recipe to
-// keep or compile.
+// FIX-GT7-136: recording and the start-up compile need shader objects (off by default since
+// FIX-GT7-147, RYGT_SHADER_OBJECT=1 turns them on): without them no SPIR-V is kept, so there is
+// no recipe to keep or compile.
 
 #include <atomic>
 #include <cstdint>
