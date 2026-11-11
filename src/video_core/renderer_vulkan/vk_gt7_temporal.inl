@@ -38,6 +38,9 @@ void NativeRenderer::NoteTemporalDraw(const AmdGpu::Regs& regs, const GraphicsPi
             const bool has_motion = motion &&
                                     motion->info.pixel_format == vk::Format::eR16G16Sfloat &&
                                     (regs.color_target_mask.raw & 0xf0) != 0;
+            const u32 shader_mask = pipeline ? pipeline->GetGraphicsKey().mrt_mask : 0;
+            const bool motion_export = has_motion && (shader_mask & 2) &&
+                                       (regs.color_target_mask.raw & 0x30) == 0x30;
             std::string images;
             if (b)
                 for (const auto* image : b->sampled) {
@@ -53,7 +56,8 @@ void NativeRenderer::NoteTemporalDraw(const AmdGpu::Regs& regs, const GraphicsPi
                     "instances={} "
                     "color={:#x}:{} MRT1={:#x}:{} depth={:#x}:{} depthWrite={} zscale={} "
                     "zoffset={} guestMask={:#x} "
-                    "shaderMask={:#x} afterReconstruction={} TAA={} sampled=[{}]",
+                    "shaderMask={:#x} afterReconstruction={} TAA={} depthTest={} depthCompare={} "
+                    "stencil={} viewportOffset=({}, {}) motionXYExport={} sampled=[{}]",
                     status, ps, vs ? vs->pgm_hash : 0, targets ? targets->state.width : 0,
                     targets ? targets->state.height : 0, std::abs(regs.viewports[0].xscale * 2),
                     std::abs(regs.viewports[0].yscale * 2), regs.num_indices,
@@ -66,8 +70,11 @@ void NativeRenderer::NoteTemporalDraw(const AmdGpu::Regs& regs, const GraphicsPi
                     bool(regs.depth_control.depth_write_enable), regs.viewports[0].zscale,
                     regs.viewports[0].zoffset, regs.color_target_mask.raw,
                     pipeline ? pipeline->GetGraphicsKey().mrt_mask : 0,
-                    temporal_dlss->Reconstructed(frame), Gt7Temporal::TaaHash(ps), images),
-                geometry, has_motion);
+                    temporal_dlss->Reconstructed(frame), Gt7Temporal::TaaHash(ps),
+                    bool(regs.depth_control.depth_enable), u32(regs.depth_control.depth_func),
+                    bool(regs.depth_control.stencil_enable), regs.viewports[0].xoffset,
+                    regs.viewports[0].yoffset, motion_export, images),
+                geometry, has_motion, motion_export);
         } catch (...) {
             temporal_dlss->AbortDiagnostic("draw state formatting");
         }

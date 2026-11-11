@@ -22,6 +22,28 @@ namespace Vulkan::Gt7Diagnostic {
 
 constexpr std::uint64_t MaxBundleBytes = 256ull << 20;
 
+// Poll can run at the TAA draw or the final scene handoff. Start on the next frame
+// so the trace includes the scene's geometry and motion producers.
+struct CaptureRequest {
+    std::uint64_t earliest_frame{};
+    bool armed{};
+
+    void Arm(std::uint64_t observed_frame) noexcept {
+        earliest_frame = observed_frame + 1;
+        armed = true;
+    }
+
+    bool Ready(std::uint64_t frame) const noexcept { return armed && frame >= earliest_frame; }
+
+    bool Take(std::uint64_t frame) noexcept {
+        if (!Ready(frame)) {
+            return false;
+        }
+        armed = false;
+        return true;
+    }
+};
+
 inline std::optional<std::uint64_t> ReadbackBytes(unsigned width, unsigned height, unsigned texel,
                                                   std::uint64_t remaining) noexcept {
     if (!width || !height || width > 8192 || height > 8192 || !texel || texel > 16) {

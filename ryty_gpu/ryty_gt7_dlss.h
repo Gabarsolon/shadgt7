@@ -47,12 +47,13 @@ public:
     RytyDlssG::TemporalImage OutputForPresent(vk::CommandBuffer);
     void Invalidate(const char* reason);
     void NoteWrite(const void* identity, u64 ps = 0);
-    void Poll();
+    void Poll(u64 frame);
     // RYGT_DLSS_DIAG=1 + user/log/dlss.now: one scene, even without an admitted TAA pass.
     void DiagnosticImage(vk::CommandBuffer, u64 frame, Input image, const char* role);
     bool WantsDiagnosticDraws(u64 frame) const;
     void AbortDiagnostic(const char* reason) noexcept;
-    void DiagnosticDraw(u64 frame, const std::string& state, bool geometry, bool motion);
+    void DiagnosticDraw(u64 frame, const std::string& state, bool geometry, bool motion,
+                        bool motion_export);
 
 
     void NotePresentation(u64 frame, bool temporal, bool spatial);

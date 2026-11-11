@@ -13580,7 +13580,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     const auto temporal_target = RytyUpscale::Target({display.width, display.height}, window);
     if (temporal_dlss) {
         RytyDlss::BeginNativeFrame(frame - 1);
-        temporal_dlss->Poll();
+        temporal_dlss->Poll(frame - 1);
         // A scene with no UI drawn over it: the game's post chain already ran on the owned scene,
         // so the proxy shows the reconstruction like any other frame.
         auto& ui = UiHires::Get();
