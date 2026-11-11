@@ -14,12 +14,48 @@
 #include "core/platform.h"
 #include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#ifdef RYTY_GPU
+#include "core/file_format/psf.h"
+#include "ryty_gpu/ryty_gt7_hdr_status.h"
+#endif
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 
 namespace Libraries::VideoOut {
 
 static std::unique_ptr<VideoOutDriver> driver;
+
+static bool GameSupportsHdr() {
+    const auto& game_info = Common::ElfInfo::Instance();
+#ifdef RYTY_GPU
+    // The converted-title shim retains Sport's hardcoded attributes. Only query
+    // the real title's HDR bit after the host has offered HDR; do not change Neo
+    // or any other title attribute, or the SDR-only host path.
+    if (presenter->IsHDRSupported()) {
+        static const bool supported = [&] {
+            PSF param_sfo;
+            // FIX-GT7-146: GT7 only. Any other title with the HDR bit in its param.sfo (GT
+            // Sport has HDR on a console) would be offered HDR10 with nothing of this path
+            // tried on it.
+            if (param_sfo.Open(game_info.GetGameFolder() / "sce_sys" / "param.sfo") &&
+                param_sfo.GetString("TITLE_ID") == "CUSA24769") {
+                if (const auto attributes = param_sfo.GetInteger("ATTRIBUTE")) {
+                    Common::PSFAttributes game_attributes{};
+                    game_attributes.raw = static_cast<u32>(*attributes);
+                    return game_attributes.support_hdr.Value() != 0;
+                }
+            }
+            return game_info.GetPSFAttributes().support_hdr.Value() != 0;
+        }();
+        RytySetGt7HdrStatusCompatibility(supported);
+        return supported;
+    }
+#endif
+#ifdef RYTY_GPU
+    RytySetGt7HdrStatusCompatibility(false);
+#endif
+    return game_info.GetPSFAttributes().support_hdr.Value() != 0;
+}
 
 void PS4_SYSV_ABI sceVideoOutSetBufferAttribute(BufferAttribute* attribute, PixelFormat pixelFormat,
                                                 u32 tilingMode, u32 aspectRatio, u32 width,
@@ -376,9 +412,14 @@ void PaceFlipSubmit() {
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
     s32 handle, SceVideoOutDeviceCapabilityInfo* pDeviceCapabilityInfo) {
     pDeviceCapabilityInfo->capability = 0;
-    if (presenter->IsHDRSupported()) {
-        auto& game_info = Common::ElfInfo::Instance();
-        if (game_info.GetPSFAttributes().support_hdr) {
+    const bool hdr_available = presenter->IsHDRSupported();
+#ifdef RYTY_GPU
+    if (!hdr_available) {
+        RytySetGt7HdrStatusCompatibility(false);
+    }
+#endif
+    if (hdr_available) {
+        if (GameSupportsHdr()) {
             pDeviceCapabilityInfo->capability |= ORBIS_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ;
         }
     }
@@ -452,7 +493,7 @@ s32 PS4_SYSV_ABI sceVideoOutConfigureOutputMode_(s32 handle, u32 reserved, const
         port->is_hdr = false;
         break;
     case OrbisVideoOutColorimetry::Bt2020PQ:
-        if (Common::ElfInfo::Instance().GetPSFAttributes().support_hdr) {
+        if (GameSupportsHdr()) {
             port->is_hdr = true;
         }
         break;

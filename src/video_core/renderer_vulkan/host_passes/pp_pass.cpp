@@ -186,6 +186,19 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     pipeline = Check<"create post process pipeline">(device.createGraphicsPipelineUnique(
         /*pipeline_cache*/ {}, pipeline_info));
 
+    // FIX-GT7-145: the same pipeline for the frames of an HDR10 output.
+    const std::array hdr_color_formats{
+        HdrFrameFormat,
+    };
+    const vk::PipelineRenderingCreateInfo hdr_rendering_ci{
+        .colorAttachmentCount = hdr_color_formats.size(),
+        .pColorAttachmentFormats = hdr_color_formats.data(),
+    };
+    auto hdr_pipeline_info = pipeline_info;
+    hdr_pipeline_info.pNext = &hdr_rendering_ci;
+    hdr_pipeline = Check<"create HDR post process pipeline">(
+        device.createGraphicsPipelineUnique(/*pipeline_cache*/ {}, hdr_pipeline_info));
+
     // Once pipeline is compiled, we don't need the shader module anymore
     device.destroyShaderModule(vs_module);
     device.destroyShaderModule(fs_module);
@@ -331,7 +344,10 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         },
     };
 
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+    // FIX-GT7-145: by the frame's own format, not the pass's setting: the two change at
+    // different moments around an HDR switch.
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                        frame.is_hdr ? *hdr_pipeline : *pipeline);
 
     const std::array viewports = {
         vk::Viewport{

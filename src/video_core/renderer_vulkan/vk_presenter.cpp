@@ -938,7 +938,15 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
 
-    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    // FIX-GT7-145: 10 bits for a frame shown on an HDR10 output. RYGT_HDR_FRAME_8BIT=1: the
+    // surface's format as before.
+    static const bool hdr_frame_8bit = [] {
+        const char* env = std::getenv("RYGT_HDR_FRAME_8BIT");
+        return env != nullptr && env[0] == '1';
+    }();
+    const bool hdr_frame = swapchain.GetHDR() && !hdr_frame_8bit;
+    const vk::Format format = hdr_frame ? HostPasses::PostProcessingPass::HdrFrameFormat
+                                        : swapchain.GetSurfaceFormat().format;
     const vk::ImageCreateInfo image_info = {
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
@@ -991,6 +999,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->height = height;
 
     frame->imgui_texture = ImGui::Vulkan::AddTexture(view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    frame->imgui_texture->display_encoded = true; // FIX-GT7-142
     frame->is_hdr = swapchain.GetHDR();
 }
 

@@ -308,8 +308,20 @@ void ReportFlipStats() {
 } // namespace
 
 void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting.
-    presenter->SetHDR(req.port->is_hdr);
+    // Blank flips during GT7's display transaction do not carry a new encoding.
+    // A real buffer must agree with the requested mode before selecting HDR10.
+    if (!presenter->IsHDRSupported()) {
+        presenter->SetHDR(req.port->is_hdr); // retain the SDR-only path
+    } else if (req.index >= 0) {
+        const auto& slot = req.port->buffer_slots[req.index];
+        if (slot.group_index >= 0) {
+            const bool buffer_hdr = req.port->groups[slot.group_index].attrib.pixel_format ==
+                                    PixelFormat::A2R10G10B10Bt2020Pq;
+            presenter->SetHDR(buffer_hdr && req.port->is_hdr);
+        } else {
+            presenter->SetHDR(req.port->is_hdr);
+        }
+    }
     // FIX-193: the game learns of the flip once the GPU has drawn the frame.
     const auto wait_start = std::chrono::steady_clock::now(); // DIAG-GT7-007
     if (req.index != -1) {
