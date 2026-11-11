@@ -13,6 +13,9 @@ struct ImDrawData;
 namespace ImGui {
 struct Texture {
     vk::DescriptorSet descriptor_set{nullptr};
+    // FIX-GT7-142: already in the output's encoding (the game's picture): drawn as it is on an
+    // HDR output, where everything else is converted from sRGB.
+    bool display_encoded{false};
 };
 } // namespace ImGui
 
@@ -70,6 +73,6 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
                     vk::Pipeline pipeline = VK_NULL_HANDLE);
 
 void SetBlendEnabled(bool enabled);
-void OnSurfaceFormatChange(vk::Format surface_format);
+void OnSurfaceFormatChange(vk::Format surface_format, bool hdr);
 
 } // namespace ImGui::Vulkan

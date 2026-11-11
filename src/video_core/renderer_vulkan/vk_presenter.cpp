@@ -991,6 +991,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->height = height;
 
     frame->imgui_texture = ImGui::Vulkan::AddTexture(view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    frame->imgui_texture->display_encoded = true; // FIX-GT7-142
     frame->is_hdr = swapchain.GetHDR();
 }
 

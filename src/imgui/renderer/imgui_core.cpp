@@ -152,8 +152,8 @@ void OnResize() {
     Sdl::OnResize();
 }
 
-void OnSurfaceFormatChange(vk::Format surface_format) {
-    Vulkan::OnSurfaceFormatChange(surface_format);
+void OnSurfaceFormatChange(vk::Format surface_format, bool hdr) {
+    Vulkan::OnSurfaceFormatChange(surface_format, hdr);
 }
 
 void Shutdown(const vk::Device& device) {

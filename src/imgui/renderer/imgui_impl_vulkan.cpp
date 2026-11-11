@@ -4,11 +4,13 @@
 // Based on imgui_impl_vulkan.cpp from Dear ImGui repository
 
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 #include <imgui.h>
 
 #include "imgui_impl_vulkan.h"
+#include "video_core/host_shaders/imgui_hdr_frag.h"
 
 #ifndef IM_MAX
 #define IM_MAX(A, B) (((A) >= (B)) ? (A) : (B))
@@ -60,6 +62,10 @@ struct VkData {
     vk::Pipeline pipeline{};
     vk::ShaderModule shader_module_vert{};
     vk::ShaderModule shader_module_frag{};
+    // FIX-GT7-142: on an HDR10 output, sRGB colours are placed at hdr_white_nits (imgui_hdr.frag).
+    vk::ShaderModule shader_module_frag_hdr{};
+    bool hdr_output{false};
+    float hdr_white_nits{203.0f};
 
     std::mutex command_pool_mutex;
     vk::CommandPool command_pool{};
@@ -630,6 +636,10 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
         v.device.unmapMemory(frb.index.buffer_memory);
     }
 
+    // FIX-GT7-142: only the backend's own pipeline on an HDR output has the HDR fragment shader.
+    const bool hdr_convert =
+        bd->hdr_output && bd->hdr_white_nits > 0.0f && pipeline == bd->pipeline;
+
     // Setup desired Vulkan state
     SetupRenderState(draw_data, pipeline, command_buffer, frb, fb_width, fb_height);
 
@@ -695,6 +705,14 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
 
                 // Bind DescriptorSet with font or user texture
                 vk::DescriptorSet desc_set[1]{pcmd->GetTexID()->descriptor_set};
+                if (hdr_convert) {
+                    // FIX-GT7-142: the game's picture as it is, the rest from sRGB.
+                    const float white_nits =
+                        pcmd->GetTexID()->display_encoded ? 0.0f : bd->hdr_white_nits;
+                    command_buffer.pushConstants(bd->pipeline_layout,
+                                                 vk::ShaderStageFlagBits::eFragment,
+                                                 sizeof(float) * 4, sizeof(float), &white_nits);
+                }
                 command_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
                                                   bd->pipeline_layout, 0, {desc_set}, {});
 
@@ -947,6 +965,14 @@ static void CreateShaderModules(vk::Device device, const vk::AllocationCallbacks
         };
         bd->shader_module_frag = CheckVkResult(device.createShaderModule(frag_info, allocator));
     }
+    if (bd->shader_module_frag_hdr == VK_NULL_HANDLE) {
+        vk::ShaderModuleCreateInfo frag_info{
+            .codeSize = sizeof(IMGUI_HDR_FRAG),
+            .pCode = IMGUI_HDR_FRAG,
+        };
+        bd->shader_module_frag_hdr =
+            CheckVkResult(device.createShaderModule(frag_info, allocator));
+    }
 }
 
 static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* allocator,
@@ -965,7 +991,8 @@ static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* all
         },
         {
             .stage = vk::ShaderStageFlagBits::eFragment,
-            .module = bd->shader_module_frag,
+            .module = bd->hdr_output && bd->hdr_white_nits > 0.0f ? bd->shader_module_frag_hdr
+                                                                   : bd->shader_module_frag,
             .pName = "main",
         },
     };
@@ -1127,18 +1154,24 @@ bool CreateDeviceObjects() {
     if (!bd->pipeline_layout) {
         // Constants: we are using 'vec2 offset' and 'vec2 scale' instead of a full 3d projection
         // matrix
-        vk::PushConstantRange push_constants[1]{
+        // FIX-GT7-142: and, for the HDR fragment shader, the nits of white after them.
+        vk::PushConstantRange push_constants[2]{
             {
                 .stageFlags = vk::ShaderStageFlagBits::eVertex,
                 .offset = sizeof(float) * 0,
                 .size = sizeof(float) * 4,
+            },
+            {
+                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+                .offset = sizeof(float) * 4,
+                .size = sizeof(float) * 1,
             },
         };
         vk::DescriptorSetLayout set_layout[1] = {bd->descriptor_set_layout};
         vk::PipelineLayoutCreateInfo layout_info{
             .setLayoutCount = 1,
             .pSetLayouts = set_layout,
-            .pushConstantRangeCount = 1,
+            .pushConstantRangeCount = 2,
             .pPushConstantRanges = push_constants,
         };
         bd->pipeline_layout =
@@ -1197,6 +1230,10 @@ void ImGuiImplVulkanDestroyDeviceObjects() {
     if (bd->shader_module_vert) {
         v.device.destroyShaderModule(bd->shader_module_vert, v.allocator);
         bd->shader_module_vert = VK_NULL_HANDLE;
+    }
+    if (bd->shader_module_frag_hdr) {
+        v.device.destroyShaderModule(bd->shader_module_frag_hdr, v.allocator);
+        bd->shader_module_frag_hdr = VK_NULL_HANDLE;
     }
     if (bd->shader_module_frag) {
         v.device.destroyShaderModule(bd->shader_module_frag, v.allocator);
@@ -1262,12 +1299,25 @@ void Shutdown() {
     IM_DELETE(bd);
 }
 
-void OnSurfaceFormatChange(vk::Format surface_format) {
+void OnSurfaceFormatChange(vk::Format surface_format, bool hdr) {
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
     auto& pl_format = const_cast<vk::Format&>(
         bd->init_info.pipeline_rendering_create_info.pColorAttachmentFormats[0]);
-    if (pl_format != surface_format) {
+    // FIX-GT7-142: the fragment shader follows the output's encoding as well as its format.
+    // RYGT_HDR_OVERLAY_NITS: the nits of the emulator's white on an HDR output (203 unless set;
+    // 0 leaves its colours as they are, as before).
+    static const float white_nits = [] {
+        const char* text = std::getenv("RYGT_HDR_OVERLAY_NITS");
+        if (text == nullptr || text[0] == 0) {
+            return 203.0f;
+        }
+        const float value = std::strtof(text, nullptr);
+        return value >= 0.0f && value <= 10000.0f ? value : 203.0f;
+    }();
+    bd->hdr_white_nits = white_nits;
+    if (pl_format != surface_format || bd->hdr_output != hdr) {
+        bd->hdr_output = hdr;
         pl_format = surface_format;
         if (bd->pipeline) {
             v.device.destroyPipeline(bd->pipeline, v.allocator);
