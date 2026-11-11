@@ -85,6 +85,9 @@ struct Settings {
     float pre_exposure = Number("tdlss_pre_exposure", "RYGT_TDLSS_PRE_EXPOSURE", 1, .001f, 1000);
     float exposure_scale = Number("tdlss_exposure_scale", "RYGT_TDLSS_EXPOSURE_SCALE", 1, .001f,
                                   1000);
+    /// GPU.tdlss_auto_exposure: DLSS estimates the exposure itself (default on, as before). Off:
+    /// the exposure scale above is used as it is; a test switch for the road's brightness.
+    bool auto_exposure = Flag("tdlss_auto_exposure", "RYGT_TDLSS_AUTO_EXPOSURE", true);
     /// An unreplayed native writer: apply only what it changed on top of the reconstructed scene
     /// (true), or replace the reconstructed scene with the upscaled native one.
     bool resync_merge = Flag("tdlss_resync_merge", "RYGT_TDLSS_RESYNC_MERGE", true);

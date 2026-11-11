@@ -877,7 +877,8 @@ bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& f) {
     options.outputWidth = f.output.size.width;
     options.outputHeight = f.output.size.height;
     options.colorBuffersHDR = f.hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-    options.useAutoExposure = sl::Boolean::eTrue;
+    options.useAutoExposure =
+        Common::Sharp::Get().auto_exposure ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     SharpOptions(options, true);
     if (g_sl.dlss_set_options(viewport, options) != sl::Result::eOk)
         return false;
