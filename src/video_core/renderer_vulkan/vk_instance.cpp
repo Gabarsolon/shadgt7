@@ -633,8 +633,18 @@ bool Instance::CreateDevice() {
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     // DIAG-243: RYGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
-    // faulting address and the driver's description.
-    if (const char* env = std::getenv("RYGT_DEVICE_FAULT"); env && env[0] == '1') {
+    // faulting address and the driver's description, and the renderer notes its last draws.
+    // On by default for GCN Radeons (RX 400/500, Vega) on AMD's driver: an RX 480 drew GT7
+    // right only with it on. RYGT_DEVICE_FAULT=0 turns it off there.
+    {
+        const char* env = std::getenv("RYGT_DEVICE_FAULT");
+        note_fault_draws = env ? env[0] == '1' : IsAmdGcn();
+        if (!env && note_fault_draws) {
+            LOG_INFO(Render_Vulkan, "DIAG-243: on by default for this GCN Radeon ({})",
+                     GetModelName());
+        }
+    }
+    if (note_fault_draws) {
         const auto fault_chain =
             physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                          vk::PhysicalDeviceFaultFeaturesEXT>();
@@ -682,7 +692,9 @@ bool Instance::CreateDevice() {
                                      ? "RDNA1 (RX 5000)"
                                  : has("Vega") ? "GCN 5 (Vega)"
                                  : has("Radeon RX 4") || has("Radeon RX 5") ? "GCN 4 (RX 400/500)"
-                                                                            : "other Radeon";
+                                 // "Radeon (TM) RX 480 Graphics" has "(TM)" in the middle.
+                                 : IsAmdGcn() ? "GCN"
+                                              : "other Radeon";
         const bool legacy = IsAmdLegacyShaderCompiler();
         LOG_INFO(Render_Vulkan,
                  "AMD-316: {} on driver {} ({}), shader compiler {}; quad control {}, vertex "
@@ -1301,6 +1313,29 @@ constexpr u32 FaultRingSize = 64;
 std::array<FaultDraw, FaultRingSize> g_fault_draws;
 std::atomic<u64> g_fault_serial{};
 } // namespace
+
+bool Instance::IsAmdGcn() const {
+    if (driver_id != vk::DriverId::eAmdProprietary) {
+        return false;
+    }
+    const std::string_view model = GetModelName();
+    if (model.find("Vega") != std::string_view::npos ||
+        model.find("Radeon VII") != std::string_view::npos ||
+        model.find("R9 ") != std::string_view::npos ||
+        model.find("R7 ") != std::string_view::npos) {
+        return true;
+    }
+    // RX 460 ... RX 590, RX 640: three digits. RX 5300 and newer: four digits (RDNA).
+    const auto rx = model.find("RX ");
+    if (rx == std::string_view::npos) {
+        return false;
+    }
+    std::size_t digits = 0;
+    for (std::size_t i = rx + 3; i < model.size() && model[i] >= '0' && model[i] <= '9'; ++i) {
+        ++digits;
+    }
+    return digits == 3;
+}
 
 void NoteDrawForFault(u64 pipeline_hash, u32 info) {
     const u64 serial = g_fault_serial.fetch_add(1, std::memory_order_relaxed);
