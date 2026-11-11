@@ -1417,7 +1417,11 @@ void Gt7DlssPass::DiagnosticDraw(u64 frame, const std::string& state, bool geome
             ++p.dump_geometry;
             p.dump_missing_motion += !motion;
         }
-        if (p.dump_draw_state.size() + state.size() + 40 <= 2 * 1024 * 1024) {
+        // A whole frame (shadow cascades, probes, post chain) can exceed 2 MiB before the main
+        // pass. Full-resolution depth-tested geometry, which holds the cockpit hands and wheel,
+        // keeps its own headroom so the decisive draws are never the ones dropped.
+        const std::size_t limit = geometry ? 6 * 1024 * 1024 : 2 * 1024 * 1024;
+        if (p.dump_draw_state.size() + state.size() + 40 <= limit) {
             p.dump_draw_state += fmt::format("draw={} {}\n", p.dump_draws, state);
         } else {
             ++p.dump_trace_dropped;
