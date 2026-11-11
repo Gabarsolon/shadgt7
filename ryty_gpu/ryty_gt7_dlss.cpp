@@ -299,6 +299,10 @@ struct Gt7DlssPass::Impl {
     std::map<std::string, u64> fallback_frames, fallback_last_frame, logged_fallback_frames;
     // Why no draw was taken as the final scene composite (NoteCompositeReject).
     std::map<std::string, u64> reject_frames, reject_last_frame, logged_reject_frames;
+    // Why the unchanged-scene reuse in Evaluate did not hold (first failing term, once per frame),
+    // and the frames that kept the last reconstructed scene without a new one (CarryScene).
+    std::map<std::string, u64> reuse_reject_frames, reuse_reject_last_frame, logged_reuse_rejects;
+    u64 carried{}, logged_carried{}, carried_frame = ~u64{};
     std::array<u64, 3> present_frames{}, logged_present_frames{};
     u64 present_frame = ~u64{}, present_flips{}, logged_present_flips{};
     u64 reset_requests{}, logged_reset_requests{}, unchanged_reuse{}, logged_unchanged_reuse{};
@@ -757,6 +761,22 @@ void Gt7DlssPass::NoteCompositeReject(u64 frame, const char* reason, u64 ps) {
         ++p.reject_frames[key];
     }
 }
+bool Gt7DlssPass::CarryScene(u64 frame, const void* identity, u64 version) {
+    auto& p = *impl;
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_DLSS_CARRY_SCENE");
+        return !(value && value[0] == '0');
+    }();
+    if (!enabled || !Config().enabled || !p.current || !p.reconstructed || p.captured == ~u64{} ||
+        p.captured >= frame || !p.scene_identity || p.scene_identity != identity || p.scene_dirty ||
+        p.scene_version != version)
+        return false;
+    p.captured = frame;
+    p.carried_frame = frame;
+    p.branch_ready = false;
+    ++p.carried;
+    return true;
+}
 void Gt7DlssPass::Fallback(u64 frame, const char* reason, bool invalidate) {
     if (invalidate)
         Invalidate(reason);
@@ -872,7 +892,7 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
     if (!Config().enabled)
         return;
     Poll(frame); // retire asynchronous validation before this frame's reconstruction
-    if (p.captured == frame) {
+    if (p.captured == frame && p.carried_frame != frame) {
         Fallback(frame, "multiple-main-TAA-draws");
         return;
     }
@@ -1265,6 +1285,27 @@ Gt7DlssPass::Result Gt7DlssPass::Evaluate(vk::CommandBuffer cmd, u64 frame, VAdd
         ++p.unchanged_reuse;
         return Result::Success;
     }
+    if (p.captured != frame) {
+        // A frame without a scene of its own that could not reuse the last one: the first term of
+        // the reuse predicate above that failed.
+        const char* why = !reuse_unchanged                ? "reuse-switched-off"
+                          : !p.current                    ? "no-owned-slot"
+                          : !p.branch_ready               ? "no-branch-image"
+                          : !p.reconstructed              ? "not-reconstructed"
+                          : p.captured == ~u64{} || p.captured >= frame ? "no-older-scene"
+                          : !p.scene_identity             ? "no-scene-identity"
+                          : p.scene_dirty                 ? "scene-dirty"
+                          : p.history.pending             ? "history-pending"
+                          : p.display_address != display  ? "display-address-differs"
+                          : p.display_version != version  ? "display-version-changed"
+                          : p.output != output            ? "output-differs"
+                                                          : "other";
+        const auto last = p.reuse_reject_last_frame.find(why);
+        if (last == p.reuse_reject_last_frame.end() || last->second != frame) {
+            p.reuse_reject_last_frame[why] = frame;
+            ++p.reuse_reject_frames[why];
+        }
+    }
     // Presentation failure cannot invalidate a successfully evaluated history:
     // its reconstructed scene was already consumed by the native post graph.
     Fallback(frame, p.attempted && p.captured == frame ? "post-scene-composite-unavailable"
@@ -1273,8 +1314,10 @@ Gt7DlssPass::Result Gt7DlssPass::Evaluate(vk::CommandBuffer cmd, u64 frame, VAdd
     // Viewport 1 can reconstruct the final native scene when viewport 2 succeeded
     // but its high-resolution composite was unavailable. A failed SDK evaluation
     // may have recorded partial commands: retain the native fallback in that case.
+    // (A carried frame did not evaluate this frame: its last evaluation's result stands.)
     const bool sdk_failed = p.attempted && p.captured == frame &&
-                            (p.last_eval.frame != frame || !p.last_eval.ok);
+                            ((p.last_eval.frame != frame && p.carried_frame != frame) ||
+                             !p.last_eval.ok);
     if (!sdk_failed && p.attempted && p.captured == frame && p.last_eval.ok) {
         if (RytyDlss::PermitSpatialFallback(frame)) ++p.spatial_grants;
         else ++p.spatial_denials;
@@ -1713,6 +1756,15 @@ void Gt7DlssPass::Poll(u64 frame) {
             if (delta) rejects += fmt::format("{}{}:{}", rejects.empty() ? "" : ",", key, delta);
             p.logged_reject_frames[key] = count;
         }
+        std::string reuse_rejects;
+        for (const auto& [key, count] : p.reuse_reject_frames) {
+            const auto delta = count - p.logged_reuse_rejects[key];
+            if (delta)
+                reuse_rejects += fmt::format("{}{}:{}", reuse_rejects.empty() ? "" : ",", key, delta);
+            p.logged_reuse_rejects[key] = count;
+        }
+        const u64 carried_now = p.carried - p.logged_carried;
+        p.logged_carried = p.carried;
         VmaBudget heaps[VK_MAX_MEMORY_HEAPS]{};
         vmaGetHeapBudgets(p.gpu.GetAllocator(), heaps);
         u64 device_used = 0, device_budget = 0;
@@ -1728,7 +1780,7 @@ void Gt7DlssPass::Poll(u64 frame) {
                  "out={}x{} mode={} preset={}->{} gpuMs={:.2f} (max {:.2f}) mip={:.2f} "
                  "sharpen={:.0f}% resync merge={} replace={} present temporal={} spatial={} "
                  "native={} reuse={} TAAseen={} epoch={} resets={} flips={} fallbackFrames=[{}] "
-                 "compositeRejects=[{}] "
+                 "compositeRejects=[{}] reuseRejects=[{}] sceneCarried={} "
                  "warn39={}/{} privateMiB={} uiEstMiB={} recycleMiB={} deviceMiB={}/{} "
                  "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={}",
                  successes, evaluations, captures, falls, p.qualification_reason, p.input.width,
@@ -1739,7 +1791,8 @@ void Gt7DlssPass::Poll(u64 frame) {
                  p.unchanged_reuse - p.logged_unchanged_reuse, p.taa_draws, p.epoch,
                  p.reset_requests - p.logged_reset_requests,
                  p.present_flips - p.logged_present_flips, reasons.empty() ? "none" : reasons,
-                 rejects.empty() ? "none" : rejects,
+                 rejects.empty() ? "none" : rejects, reuse_rejects.empty() ? "none" : reuse_rejects,
+                 carried_now,
                  report.budget_warnings - p.logged_budget_warnings, report.budget_warnings,
                  p.OwnedBytes() >> 20, Common::Sharp::ui_image_bytes.load() >> 20,
                  VideoCore::RecycledImageBytes() >> 20, device_used >> 20, device_budget >> 20,

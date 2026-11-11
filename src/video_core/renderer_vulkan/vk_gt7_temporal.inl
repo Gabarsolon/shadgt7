@@ -409,8 +409,14 @@ vk::DescriptorImageInfo* NativeRenderer::TemporalSceneBinding(const AmdGpu::Regs
         if (!binding.is_written && binding.NumBindings(*fs) == 1 && sharp.base_level == 0 &&
             sharp.base_array == 0) {
             for (const auto* sampled : b.sampled) {
-                if (sampled->info.guest_address != sharp.Address() ||
-                    !temporal_dlss->HasScene(frame, sampled, sampled->write_version.load()))
+                if (sampled->info.guest_address != sharp.Address())
+                    continue;
+                // A frame without a 3D scene of its own (paused replay, photo mode, a menu over a
+                // frozen scene) composes the same, unwritten scene image again: it keeps the last
+                // reconstruction (CarryScene); a frame with a scene of its own never does.
+                if (!temporal_dlss->HasScene(frame, sampled, sampled->write_version.load()) &&
+                    !(temporal_dlss->CarryScene(frame, sampled, sampled->write_version.load()) &&
+                      temporal_dlss->HasScene(frame, sampled, sampled->write_version.load())))
                     continue;
                 if (sharp.width + 1 != e.info.size.width || sharp.height + 1 != e.info.size.height)
                     return reject("scene-size-differs-from-target");

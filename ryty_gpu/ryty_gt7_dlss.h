@@ -61,6 +61,13 @@ public:
     /// final scene composite (once per frame and reason; `ps` 0 when no shader applies). Shown in
     /// the once-a-second line as compositeRejects=[reason:count] and rejectPs=[0xhash:reason:count].
     void NoteCompositeReject(u64 frame, const char* reason, u64 ps);
+    /// A frame in which the game drew no new 3D scene (a paused replay, photo mode, a menu over a
+    /// frozen scene) still draws its final composite from the same scene image. When that image
+    /// is the one the last reconstruction owns, nobody wrote it since (same version, not dirty)
+    /// and the last evaluation worked, the owned scene is current for this frame too: the frame
+    /// then takes the ordinary composite path (the game's post chain replayed at the output size)
+    /// instead of the spatial upscale. False for any frame with a scene of its own.
+    bool CarryScene(u64 frame, const void* identity, u64 version);
     void Fallback(u64 frame, const char* reason, bool invalidate = true);
     std::string_view QualificationReason() const;
     // Scene epochs: a new full-scene TAA draw, a changed resource set or a gap starts a new epoch.
