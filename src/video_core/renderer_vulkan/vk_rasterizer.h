@@ -280,6 +280,11 @@ public:
     void OnSubmit();
     /// DIAG-051: runs func once the GPU has finished everything recorded so far.
     void WhenGpuDone(Common::UniqueFunction<void>&& func);
+    /// FIX-GT7-147: func runs once the GPU has finished `tick` (a value Flush returned).
+    void WhenTickDone(u64 tick, Common::UniqueFunction<void>&& func);
+    /// FIX-GT7-147: the guest is told the GPU is idle only once the GPU has finished its work
+    /// (default on GCN Radeons; RYGT_GPU_IDLE_RETIRE=0/1 overrides).
+    bool RetiresSubmitsOnGpu() const;
     [[nodiscard]] bool HasPendingAsyncReadbacks() const {
         return buffer_cache.HasPendingAsyncReadbacks();
     }
