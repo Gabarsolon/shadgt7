@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdlib>
+#include <string_view>
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -526,11 +528,17 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     // NEO-GT7-001: in the PS4 Pro mode (RYGT_NEO=1 in libkernel.prx) the port reports a 2160p TV,
     // as a Pro on a 4K set does: GT7 picks its 3200x1800 (or 2160p=1: 3840x2160) picture from the
     // TV height. The base mode keeps the configured port.
+    // NEO-GT7-013: RYGT_NEO_TV=1080 reports a 1080p TV instead, as a Pro on a 1080p set: GT7 then
+    // draws 1920x1080 without its checkerboard and takes its third preset, GT7_PS4Pro_2K (60 fps
+    // replays and photo mode, motion blur in the race; see NEO-GT7-014 in ryty_game_patch.cpp).
     if (Libraries::Kernel::sceKernelIsNeoMode()) {
-        port_width = 3840;
-        port_height = 2160;
-        LOG_WARNING(Lib_VideoOut, "NEO-GT7-001: video port {}x{} (PS4 Pro on a 2160p TV)",
-                    port_width, port_height);
+        const char* tv = std::getenv("RYGT_NEO_TV");
+        const bool tv_1080 = tv && std::string_view{tv} == "1080";
+        port_width = tv_1080 ? 1920 : 3840;
+        port_height = tv_1080 ? 1080 : 2160;
+        LOG_WARNING(Lib_VideoOut, "{}: video port {}x{} (PS4 Pro on a {} TV)",
+                    tv_1080 ? "NEO-GT7-013" : "NEO-GT7-001", port_width, port_height,
+                    tv_1080 ? "1080p" : "2160p");
     }
     driver = std::make_unique<VideoOutDriver>(port_width, port_height);
 
