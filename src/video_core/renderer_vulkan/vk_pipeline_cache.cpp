@@ -2214,7 +2214,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     // Port of xacidr4inx's reflection fix (RyGT 0066): fragment cube samples filter across faces.
-    profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
+    // FIX-GT7-151: an RX 480 drew GT7 right only with the legacy 2D-array sampling path, so GCN
+    // Radeons take it by default. RYGT_NATIVE_CUBE=0 picks the legacy path on any GPU, =1 the
+    // native one.
+    {
+        const char* native_cube_env = std::getenv("RYGT_NATIVE_CUBE");
+        const bool native_cube = native_cube_env && *native_cube_env ? native_cube_env[0] != '0'
+                                                                     : !instance.IsAmdGcn();
+        profile.native_cube_sampling =
+            NativeModeRequested() && instance.IsImageCubeArraySupported() && native_cube;
+        LOG_INFO(Render_Vulkan, "FIX-GT7-151: native cube sampling {}{}",
+                 profile.native_cube_sampling ? "on" : "off",
+                 native_cube_env && *native_cube_env ? " (RYGT_NATIVE_CUBE)"
+                 : instance.IsAmdGcn()              ? " (GCN Radeon)"
+                                                    : "");
+    }
     SetNativeCubeCacheEnabled(profile.native_cube_sampling); // FIX-GT7-083
     if (SingleSampleBarycentricRequested() && instance.GetVendorID() == 0x1002) {
         LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample interpolation on; KHR {}",
