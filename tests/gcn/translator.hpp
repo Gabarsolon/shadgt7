@@ -12,6 +12,9 @@ std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst);
 std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts);
 std::vector<u32> TranslateFragmentFrontFaceToSpirv(bool front_face_all_bits);
 std::vector<u32> TranslateFragmentPullModelToSpirv(bool use_amd_barycentrics);
+// NEO-GT7-005: a pixel shader reading its sample index and per-sample barycentrics, translated
+// to run once per pixel (pixel_rate) or once per sample.
+std::vector<u32> TranslateFragmentSampleReadsToSpirv(bool pixel_rate);
 
 struct FragmentInterpMovInfo {
     std::vector<u32> attribute_indices;

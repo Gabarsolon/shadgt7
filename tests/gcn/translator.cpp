@@ -189,6 +189,53 @@ std::vector<u32> TranslateFragmentPullModelToSpirv(bool use_amd_barycentrics) {
     return Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings);
 }
 
+std::vector<u32> TranslateFragmentSampleReadsToSpirv(bool pixel_rate) {
+    Shader::Info info{};
+    info.hw_stage = HwStage::Fragment;
+    info.sw_stage = SwStage::Fragment;
+
+    IR::Program program{info};
+    Pools pools{};
+    IR::Block* block = pools.block_pool.Create(pools.inst_pool);
+    program.blocks.push_back(block);
+    program.syntax_list.emplace_back();
+    program.syntax_list.back().type = IR::AbstractSyntaxNode::Type::Block;
+    program.syntax_list.back().data.block = block;
+    program.syntax_list.emplace_back();
+    program.syntax_list.back().type = IR::AbstractSyntaxNode::Type::Return;
+    program.post_order_blocks = IR::PostOrder(block);
+
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.supports_fragment_shader_barycentric = true;
+
+    RuntimeInfo runtime_info{};
+    runtime_info.Initialize(HwStage::Fragment, SwStage::Fragment);
+    runtime_info.hw.fs.addr_flags.persp_sample_ena = 1;
+    runtime_info.hw.fs.color_buffers[0].num_format = AmdGpu::NumberFormat::Float;
+    if (pixel_rate) {
+        runtime_info.hw.fs.mrtz_mask |= HwFragmentRuntimeInfo::MrtzPixelRate;
+    }
+    // One parameter interpolated per sample: the Sample decoration's case.
+    runtime_info.hw.fs.num_inputs = 1;
+    runtime_info.hw.fs.inputs[0] = {.param_index = 0, .is_default = false, .is_flat = false};
+
+    IR::IREmitter ir{*block};
+    ir.Prologue();
+    IR::F32 sum{ir.ConvertUToF(32, 32, ir.GetAttributeU32(IR::Attribute::SampleIndex))};
+    for (u32 comp = 0; comp < 2; ++comp) {
+        sum = ir.FPAdd(sum, ir.GetAttribute(IR::Attribute::BaryCoordSmoothSample, comp));
+    }
+    sum = ir.FPAdd(sum, ir.GetAttribute(IR::Attribute::Param0, 0));
+    ir.SetAttribute(IR::Attribute::RenderTarget0, sum);
+    ir.Epilogue();
+
+    Optimization::CollectShaderInfoPass(program, profile);
+    info.fs_interpolation[0] = {Qualifier::Smooth, Qualifier::Sample};
+    Backend::Bindings bindings{};
+    return Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings);
+}
+
 FragmentInterpMovInfo TranslateFragmentInterpMovSelector(u32 src_select, bool flat_shade,
                                                          bool offset5) {
     Shader::Info info{};
