@@ -2926,6 +2926,32 @@ constexpr u32 OneOffSafeCount = 8;
 // At one address, 4 (the per-frame targets there come back at the same address run after run).
 constexpr u32 OneOffPlaceSafeCount = 4;
 
+// FIX-GT7-149 (RYGT_ONE_OFF_KEPT_RULE=0: as before): which pictures FIX-GT7-121 waits for without
+// a deadline. "Sampled in a later frame before any redraw" counted as harmful at once, and one
+// such sighting made a kind wait for ever. A picture sampled the frame after its draw and drawn
+// again the frame after that fell in it: skipped, it is wrong for a frame or two, as any skipped
+// draw. On the PC measured, 115 of 306 kinds were marked, full-screen colour targets among them
+// (1920x1088: safe 2,914 times, harmful twice), and on a cold Nurburgring race start 27.0 of
+// the 27.2 s of waits without a deadline were for pictures drawn again within 4 frames (RTX
+// 4070, 16 threads, one run); the pictures really kept (shadow maps) cost next to nothing.
+// Now a picture is harmful when sampled and not drawn again within OneOffRedrawGrace frames,
+// and a kind waits without a deadline when seen harmful more often than safe; a place (its
+// address) still does after one sighting. The rule learns in a file of its own (the old rule's
+// is left as it is, and RYGT_ONE_OFF_KEPT_RULE=0 goes on with it), started from the old one:
+// kinds as they are (the old sightings outnumbered no longer count), places seen safe at
+// least as often as harmful without their harmful count, and one safe sighting short of
+// PERF-GT7-023's exemption, so that none is skipped outright on the old rule's word.
+bool OneOffKeptRule() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_KEPT_RULE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+// Frames after its draw in which a redraw still makes a sampled picture harmless: skipped, it
+// would have been wrong that long at most.
+constexpr u64 OneOffRedrawGrace = 4;
+
 bool OneOffKindExempt(u32 safe, u32 harmful) {
     return harmful == 0 && safe >= OneOffSafeCount;
 }
@@ -2941,10 +2967,11 @@ Kind FamilyOf(Kind kind) {
     return kind;
 }
 
-std::filesystem::path OneOffKindsPath() {
+std::filesystem::path OneOffKindsPath(bool kept_rule) {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    // FIX-GT7-149: the kept rule's file is another one.
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           fmt::format("{}.one_off_kinds.txt", serial);
+           fmt::format("{}.one_off_kinds{}.txt", serial, kept_rule ? "2" : "");
 }
 } // namespace
 
@@ -3006,7 +3033,9 @@ bool NativeRenderer::OneOffKnownHarmful() const {
     for (const OneOffHit& hit : one_off_hits) {
         const OneOffKind kind = KindOf(hit);
         if (const auto it = one_off_kinds.find(kind);
-            it != one_off_kinds.end() && it->second.harmful != 0) {
+            it != one_off_kinds.end() &&
+            (OneOffKeptRule() ? it->second.harmful > it->second.safe // FIX-GT7-149
+                              : it->second.harmful != 0)) {
             return true;
         }
         if (const auto it = one_off_places.find({hit.address, kind});
@@ -3025,10 +3054,15 @@ void NativeRenderer::LoadOneOffKinds() {
     if (!OneOffLearnOn()) {
         return;
     }
-    std::ifstream file{OneOffKindsPath()};
+    // FIX-GT7-149: the kept rule's own file, or at its first start the old rule's, taken over.
+    std::error_code exists_ec;
+    const bool take_over = OneOffKeptRule() &&
+                           !std::filesystem::exists(OneOffKindsPath(true), exists_ec);
+    std::ifstream file{OneOffKindsPath(OneOffKeptRule() && !take_over)};
     std::string line;
     u32 exempt = 0;
     u32 places_exempt = 0;
+    u32 cleared = 0;
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#') {
             continue;
@@ -3053,6 +3087,14 @@ void NativeRenderer::LoadOneOffKinds() {
             continue;
         }
         kind.depth = what == "depth";
+        one_off_kinds_changed |= take_over; // written to the kept rule's file
+        if (take_over && address != 0 && seen.harmful != 0 && seen.harmful <= seen.safe) {
+            // The old rule's sightings, outnumbered: waits with the frame's budget again,
+            // until the kept rule has seen it for itself.
+            seen.harmful = 0;
+            seen.safe = std::min(seen.safe, OneOffPlaceSafeCount - 1);
+            ++cleared;
+        }
         if (address != 0) {
             one_off_places[{address, kind}] = seen;
             places_exempt += OneOffPlaceExempt(seen.safe, seen.harmful) ? 1 : 0;
@@ -3065,6 +3107,12 @@ void NativeRenderer::LoadOneOffKinds() {
              "PERF-GT7-023: {} kinds of one-off pictures known, {} of them no longer waited for; "
              "{} places, {} of them no longer waited for",
              one_off_kinds.size(), exempt, one_off_places.size(), places_exempt);
+    if (cleared != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-GT7-149: the old rule's file taken over; the harmful counts of {} places "
+                    "are dropped (seen safe at least as often)",
+                    cleared);
+    }
 }
 
 void NativeRenderer::SaveOneOffKinds(bool wait) {
@@ -3086,7 +3134,7 @@ void NativeRenderer::SaveOneOffKinds(bool wait) {
     for (const auto& [place, seen] : one_off_places) {
         text += fmt::format("at {:#x} ", place.address) + kind_text(place.kind, seen);
     }
-    auto write = [path = OneOffKindsPath(), text = std::move(text)] {
+    auto write = [path = OneOffKindsPath(OneOffKeptRule()), text = std::move(text)] {
         static std::mutex write_mutex;
         std::scoped_lock lk{write_mutex};
         auto temp = path;
@@ -3155,6 +3203,9 @@ void NativeRenderer::CheckOneOffs() {
             const u64 after = written - watch.frame;
             outcome = after <= 1 ? 0 : after <= 4 ? 1 : after <= 16 ? 2 : after <= 64 ? 3 : 4;
         } else if (sampled > watch.frame) {
+            if (OneOffKeptRule() && frame - watch.frame <= OneOffRedrawGrace) {
+                return false; // FIX-GT7-149: still watched, a redraw within the grace clears it
+            }
             outcome = 5;
         } else if (frame - watch.frame > 300) {
             outcome = 6;
