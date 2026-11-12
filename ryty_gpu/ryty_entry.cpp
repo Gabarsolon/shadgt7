@@ -723,6 +723,13 @@ extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
     return Common::GuestClock::ReadTsc();
 }
 
+// NEO-GT7-015: this renderer draws the PS4 Pro mode (NEO-GT7-001 to 014). Ryty's libkernel asks
+// for it before RYGT_NEO=1 answers sceKernelIsNeoMode with 1: a renderer without the Pro mode
+// (an older package) keeps the base PS4 mode instead of a black screen and a lost GPU.
+extern "C" __declspec(dllexport) int RytyGpuNeoSupported() {
+    return 1;
+}
+
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {
