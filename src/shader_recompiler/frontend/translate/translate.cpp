@@ -17,7 +17,10 @@
 #include "video_core/amdgpu/resource.h"
 
 #include <algorithm>
+#include <atomic>
 #include <numbers>
+#include <optional>
+#include <utility>
 #include <magic_enum/magic_enum.hpp>
 
 namespace Shader::Gcn {
@@ -338,6 +341,53 @@ IR::VectorReg Translator::GetScratchVgpr(u32 offset) {
     return it->second;
 }
 
+namespace {
+/// NEO-GT7-007: the bits (offset, count) an SDWA byte or word selection covers. Only PS4 Pro
+/// (Neo) code has SDWA; other operands keep SdwaSelector::Invalid, and DWORD covers everything.
+std::optional<std::pair<u32, u32>> SdwaField(SdwaSelector sel) {
+    switch (sel) {
+    case SdwaSelector::Byte0:
+        return std::pair{0u, 8u};
+    case SdwaSelector::Byte1:
+        return std::pair{8u, 8u};
+    case SdwaSelector::Byte2:
+        return std::pair{16u, 8u};
+    case SdwaSelector::Byte3:
+        return std::pair{24u, 8u};
+    case SdwaSelector::Word0:
+        return std::pair{0u, 16u};
+    case SdwaSelector::Word1:
+        return std::pair{16u, 16u};
+    default:
+        return std::nullopt;
+    }
+}
+
+/// NEO-GT7-007: a selection a reader doesn't apply (GetSrc16 takes WORD_0 and WORD_1, GetSrc64
+/// and GetSrcPk none), so the value read is the whole register. No PS4 Pro program GT7 runs is
+/// known to have one: logged once, so a game that does shows it.
+void NoteUnappliedSdwa(SdwaSelector sel, const char* reader) {
+    static std::atomic<bool> logged{};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        LOG_WARNING(Render_Recompiler, "NEO-GT7-007: SDWA selection {} not applied by {}",
+                    static_cast<u32>(sel), reader);
+    }
+}
+} // Anonymous namespace
+
+IR::U32 Translator::SdwaDstBits(const InstOperand& operand, const IR::U32& bits) {
+    // NEO-GT7-007: an SDWA result goes to the selected byte or word of its VGPR; the other bits
+    // are kept (PRESERVE), zeroed (PAD) or filled with the result's sign (SEXT).
+    const auto [offset, count] = *SdwaField(operand.sdwa_sel);
+    if (operand.sdwa_dst == SdwaDstUnused::Preserve) {
+        const auto prev = ir.GetVectorReg<IR::U32>(IR::VectorReg(operand.code));
+        return IR::U32{ir.BitFieldInsert(prev, bits, ir.Imm32(offset), ir.Imm32(count))};
+    }
+    const bool sext = operand.sdwa_dst == SdwaDstUnused::Sext;
+    const auto field = ir.BitFieldExtract(bits, ir.Imm32(0u), ir.Imm32(count), sext);
+    return IR::U32{ir.ShiftLeftLogical(field, ir.Imm32(offset))};
+}
+
 template <typename T>
 T Translator::GetSrc(const InstOperand& operand) {
     constexpr bool is_float = std::is_same_v<T, IR::F32>;
@@ -449,6 +499,24 @@ T Translator::GetSrc(const InstOperand& operand) {
         UNREACHABLE_MSG("Unexpected operand: {}", std::to_underlying(operand.field));
     }
 
+    // NEO-GT7-007: an SDWA source is the selected byte or word, zero- or sign-extended (sext),
+    // before the operation reads it.
+    if (const auto field = SdwaField(operand.sdwa_sel)) {
+        IR::U32 bits;
+        if constexpr (is_float) {
+            bits = ir.BitCast<IR::U32>(value);
+        } else {
+            bits = value;
+        }
+        bits = ir.BitFieldExtract(bits, ir.Imm32(field->first), ir.Imm32(field->second),
+                                  operand.input_modifier.sext);
+        if constexpr (is_float) {
+            value = ir.BitCast<IR::F32>(bits);
+        } else {
+            value = bits;
+        }
+    }
+
     if constexpr (is_float) {
         if (operand.input_modifier.abs) {
             value = ir.FPAbs(value);
@@ -507,7 +575,11 @@ T Translator::GetSrc16(const InstOperand& operand) {
         }
     };
 
-    const auto op_sel = operand.op_sel.op_sel;
+    // NEO-GT7-007: an SDWA WORD_1 selection reads the high half, like op_sel.
+    const bool op_sel = operand.op_sel.op_sel || operand.sdwa_sel == SdwaSelector::Word1;
+    if (operand.sdwa_sel <= SdwaSelector::Byte3) {
+        NoteUnappliedSdwa(operand.sdwa_sel, "GetSrc16");
+    }
 
     T value{};
     switch (operand.field) {
@@ -725,6 +797,9 @@ T Translator::GetSrc64(const InstOperand& operand) {
             return ir.Imm64(std::bit_cast<u64>(value));
         }
     };
+    if (operand.sdwa_sel < SdwaSelector::Dword) {
+        NoteUnappliedSdwa(operand.sdwa_sel, "GetSrc64");
+    }
 
     T value{};
     switch (operand.field) {
@@ -860,6 +935,9 @@ pk_type<T> Translator::GetSrcPk(const InstOperand& operand) {
             return AmdGpu::NumberFormat::Uint;
         }
     }();
+    if (operand.sdwa_sel < SdwaSelector::Dword) {
+        NoteUnappliedSdwa(operand.sdwa_sel, "GetSrcPk");
+    }
 
     const auto cast = [&](auto value) -> T {
         if constexpr (is_float) {
@@ -978,6 +1056,13 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
         }
     }
 
+    if (operand.field == OperandField::VectorGPR && SdwaField(operand.sdwa_sel)) {
+        // NEO-GT7-007: an SDWA result written to a byte or word of its VGPR.
+        const IR::U32 bits = result.Type() == IR::Type::F32 ? ir.BitCast<IR::U32>(IR::F32{result})
+                                                            : IR::U32{result};
+        return ir.SetVectorReg(IR::VectorReg(operand.code), SdwaDstBits(operand, bits));
+    }
+
     switch (operand.field) {
     case OperandField::ScalarGPR:
         return ir.SetScalarReg(IR::ScalarReg(operand.code), result);
@@ -1035,6 +1120,11 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
         return ir.SetScalarReg(IR::ScalarReg(operand.code), new_dst);
     }
     case OperandField::VectorGPR: {
+        if (SdwaField(operand.sdwa_sel)) {
+            // NEO-GT7-007: the SDWA destination selection places the 16-bit result.
+            return ir.SetVectorReg(IR::VectorReg(operand.code),
+                                   SdwaDstBits(operand, cast(result)));
+        }
         const auto prev_dst = ir.GetVectorReg<IR::U32>(IR::VectorReg(operand.code));
         const auto result_16 = cast(result);
         const auto new_dst =

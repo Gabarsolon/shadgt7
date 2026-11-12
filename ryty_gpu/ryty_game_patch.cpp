@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <windows.h>
 #include <intrin.h>
@@ -36,6 +37,7 @@
 #include "core/memory.h"
 #include "core/file_format/psf.h"
 #include "input/trigger_feedback.h"
+#include "ryty_gpu/gt7_preset_options.h"
 #include "ryty_gpu/ryty_gt7_hdr_status.h"
 
 namespace Vulkan {
@@ -2399,8 +2401,183 @@ void RytySetGt7HdrStatusCompatibility(bool available) {
     Gt7HdrStatus::g_available.store(available, std::memory_order_relaxed);
 }
 
+// NEO-GT7-014: GT7's graphics presets, option by option. GT7 fills its preset in one function
+// (GT7.exe+0x1bcc7c0: GT7_PS4, GT7_PS4Pro_4K for a Pro on a TV above 1080p, GT7_PS4Pro_2K for a
+// Pro on a 1080p TV) and copies it into GTRender::GraphicsConfig (+0x1bccba0, called from
+// +0x1bcc4bd and +0x173149c). That copy is hooked: with RYGT_NEO_EXTRAS set, five values the Pro
+// presets differ on are forced in whichever preset the game picked, each on or off on its own:
+//   blur        motion blur in races (race effect flags 0x08, motion blur off, and 0x10, a
+//               second blur off, cleared; off: both set, as in the PS4 and Pro 4K presets)
+//   replays60   replays and photo mode at 60 fps (frame divisor 1 for modes 1, 3 and 6; off: 2)
+//   replayblur  the second blur in replays and photo mode (flag 0x10 cleared in modes 1, 2, 3
+//               and 6; off: set)
+//   garage60    the high-quality garage scenes (mode 5) at 60 fps (divisor 1; off: 2)
+//   lod         level of detail kept 1.3 times farther (the preset's detail scale 1.3; off: 1.0)
+// RYGT_NEO_EXTRAS=blur,lod turns those two on and the three others off; "all" and "none" too
+// (gt7_preset_options.h). Unset: the game's presets as they are (the Pro 1080p one has all five,
+// the others none). Preset layout (0x350 bytes, read from +0x1bcc7c0 and +0x1bccba0): +0x18
+// detail scale (float), mode m at 0x48 + 0x60 m with its frame divisor at +0 (u32) and effect
+// flags at +0x50 (u64), preset number at +0x348. Modes: 0 race, 1 and 3 replay, 2 replay
+// variant, 4 garage, 5 high-quality garage, 6 photo, 7 Scapes. Every option on costs GPU time;
+// checked in play on an RTX 4070 only, with GT7.exe 01.00 (the one this file's RVAs are from).
+namespace Gt7Presets {
+
+using namespace Gt7PresetOptions;
+
+constexpr u64 kPresetCopy = 0x1bccba0; // GT7.exe RVA (the PE's own, no kTextRvaShift)
+// mov eax, [rsi + 0x348]; xor edx, edx; mov [rdi + 0x4a4], eax: 14 bytes that don't depend on
+// where they run, then xor eax, eax at +0xe. They hold the offsets of the preset's number and of
+// its copy in the config, and appear once in GT7.exe 01.00.
+constexpr u8 kPresetCopyStart[14] = {0x8b, 0x86, 0x48, 0x03, 0x00, 0x00, 0x31,
+                                     0xd2, 0x89, 0x87, 0xa4, 0x04, 0x00, 0x00};
+
+using PresetCopyFn = void(PS4_SYSV_ABI*)(u8*, u8*);
+PresetCopyFn g_copy = nullptr;
+u32 g_on = 0;
+
+u8* Mode(u8* preset, int mode) {
+    return preset + 0x48 + 0x60 * mode;
+}
+
+void SetFlag(u8* preset, int mode, u64 flags, bool set) {
+    u64 value = 0;
+    std::memcpy(&value, Mode(preset, mode) + 0x50, 8);
+    value = set ? (value | flags) : (value & ~flags);
+    std::memcpy(Mode(preset, mode) + 0x50, &value, 8);
+}
+
+void SetDivisor(u8* preset, int mode, u32 divisor) {
+    std::memcpy(Mode(preset, mode), &divisor, 4);
+}
+
+const char* OnOff(u32 bit) {
+    return (g_on & bit) ? "on" : "off";
+}
+
+void PS4_SYSV_ABI PresetCopyHook(u8* config, u8* preset) {
+    SetFlag(preset, 0, 0x18, (g_on & Blur) == 0);
+    for (const int mode : {1, 3, 6}) {
+        SetDivisor(preset, mode, (g_on & Replays60) ? 1 : 2);
+    }
+    for (const int mode : {1, 2, 3, 6}) {
+        SetFlag(preset, mode, 0x10, (g_on & ReplayBlur) == 0);
+    }
+    SetDivisor(preset, 5, (g_on & Garage60) ? 1 : 2);
+    const float scale = (g_on & Lod) ? 1.3f : 1.0f;
+    std::memcpy(preset + 0x18, &scale, 4);
+    s32 number = 0;
+    std::memcpy(&number, preset + 0x348, 4);
+    std::fprintf(stderr,
+                 "[patch] NEO-GT7-014: preset %d: blur %s, replays60 %s, replayblur %s, "
+                 "garage60 %s, lod %s\n",
+                 number, OnOff(Blur), OnOff(Replays60), OnOff(ReplayBlur), OnOff(Garage60),
+                 OnOff(Lod));
+    g_copy(config, preset);
+}
+
+// The game's code (.elf0) as [begin, end), when all of it is committed and readable; else empty.
+std::pair<u8*, u8*> GameCode(u8* base) {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (u32 i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, ".elf0", 6) != 0) {
+            continue;
+        }
+        u8* const begin = base + section->VirtualAddress;
+        u8* const end = begin + section->Misc.VirtualSize;
+        for (u8* at = begin; at < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(at, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+                (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+                return {};
+            }
+            at = reinterpret_cast<u8*>(info.BaseAddress) + info.RegionSize;
+        }
+        return {begin, end};
+    }
+    return {};
+}
+
+// The copy at its RVA in GT7.exe 01.00; in another version, the one place in the game's code
+// (.elf0) that starts a function (16-byte aligned) with these 14 bytes. None or several, or no
+// readable .elf0 (another program): null.
+u8* FindPresetCopy(u8* base) {
+    const auto [begin, end] = GameCode(base);
+    if (!begin || end - begin < static_cast<std::ptrdiff_t>(sizeof(kPresetCopyStart))) {
+        return nullptr;
+    }
+    u8* const known = base + kPresetCopy;
+    if (known >= begin && known + sizeof(kPresetCopyStart) <= end &&
+        std::memcmp(known, kPresetCopyStart, sizeof(kPresetCopyStart)) == 0) {
+        return known;
+    }
+    u8* found = nullptr;
+    for (u8* at = begin; at + sizeof(kPresetCopyStart) <= end; at += 16) {
+        if (std::memcmp(at, kPresetCopyStart, sizeof(kPresetCopyStart)) == 0) {
+            if (found) {
+                return nullptr;
+            }
+            found = at;
+        }
+    }
+    return found;
+}
+
+void Install(u8* base) {
+    const char* env = std::getenv("RYGT_NEO_EXTRAS");
+    if (!env || !*env) {
+        return;
+    }
+    const u32 on = Parse(env, [](std::string_view item) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: unknown option '%.*s' in RYGT_NEO_EXTRAS, "
+                             "ignored\n",
+                     static_cast<int>(item.size()), item.data());
+    });
+    u8* const copy = FindPresetCopy(base);
+    if (!copy) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: preset copy not found (another GT7 version), "
+                             "RYGT_NEO_EXTRAS not applied\n");
+        return;
+    }
+    if (copy != base + kPresetCopy) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: preset copy found at GT7.exe+%#llx\n",
+                     static_cast<unsigned long long>(copy - base));
+    }
+    u8* const trampoline = AllocNear(base);
+    if (!trampoline) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: no memory near the game's code for the hook\n");
+        return;
+    }
+    // The copy's first instructions move to the trampoline, then jump back after them.
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    std::memcpy(trampoline, copy, sizeof(kPresetCopyStart));
+    std::memcpy(trampoline + sizeof(kPresetCopyStart), jump, 6);
+    const u8* const resume = copy + sizeof(kPresetCopyStart);
+    std::memcpy(trampoline + sizeof(kPresetCopyStart) + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, sizeof(kPresetCopyStart) + 14);
+    g_on = on;
+    g_copy = reinterpret_cast<PresetCopyFn>(trampoline);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(copy, sizeof(kPresetCopyStart), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: code not writable (error %lu), not applied\n",
+                     GetLastError());
+        return;
+    }
+    const void* const hook = reinterpret_cast<void*>(&PresetCopyHook);
+    std::memcpy(copy, jump, 6);
+    std::memcpy(copy + 6, &hook, 8);
+    DWORD ignored = 0;
+    VirtualProtect(copy, sizeof(kPresetCopyStart), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), copy, sizeof(kPresetCopyStart));
+    std::fprintf(stderr, "[patch] NEO-GT7-014 preset options applied (RYGT_NEO_EXTRAS=%s)\n", env);
+}
+
+} // namespace Gt7Presets
+
 void RytyApplyGamePatches() {
     Gt7HdrStatus::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    Gt7Presets::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GT7-014
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));

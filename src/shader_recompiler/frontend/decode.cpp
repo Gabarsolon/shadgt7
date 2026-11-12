@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -459,8 +460,19 @@ void GcnDecodeContext::decodeSubDwordAddressing(InstEncoding encoding, GcnCodeSl
             m_instruction.src[1].input_modifier.abs = sdwa.src1_abs;
             m_instruction.src[1].input_modifier.sext = sdwa.src1_sext;
 
-            m_instruction.dst[0].field = sdwa.sd ? OperandField::ScalarGPR : OperandField::VccLo;
-            m_instruction.dst[0].code = sdwa.sdst;
+            // NEO-GT7-007 (shadPS4 #5535): with sd set the compare's lane mask goes to the SGPR
+            // pair sdst. Compares write dst[1] (vector_alu.cpp; VCC by default), so a mask put in
+            // dst[0] was lost: VCC took it and the pair kept its old bits, which the PS4 Pro
+            // checkerboard resolve then used as its exec mask (no store at all).
+            // RYGT_NEO_SDWA_CMP=0: as before, in a shader store of its own (cache_storage.cpp).
+            static const bool sdwa_to_sgpr = [] {
+                const char* env = std::getenv("RYGT_NEO_SDWA_CMP");
+                return !(env && env[0] == '0');
+            }();
+            if (sdwa.sd && sdwa_to_sgpr) {
+                m_instruction.dst[1].field = getOperandField(sdwa.sdst);
+                m_instruction.dst[1].code = sdwa.sdst;
+            }
 
         } else if (encoding == InstEncoding::VOP1 || encoding == InstEncoding::VOP2) {
             SdwaVop12 sdwa = *reinterpret_cast<SdwaVop12*>(&m_instruction.src[0].code);

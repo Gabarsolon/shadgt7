@@ -835,3 +835,278 @@ TEST_F(GcnTest, floor_f64_literal_is_high_dword) {
     EXPECT_EQ(*result_lo, 0U);
     EXPECT_EQ(*result_hi, 0xc0080000U);
 }
+
+// NEO-GT7-007: PS4 Pro (Neo) SDWA. The second dword of a VOP1/VOP2: src0 [7:0], dst_sel [10:8],
+// dst_unused [12:11], src0_sel [18:16], src0_sext [19], s0 [23], src1_sel [26:24], s1 [31]; of a
+// VOPC: src0 [7:0], sdst [14:8], sd [15], then the same source fields.
+namespace {
+constexpr u32 SdwaByte1 = 1;
+constexpr u32 SdwaWord1 = 5;
+constexpr u32 SdwaDword = 6;
+constexpr u32 SdwaPad = 0;
+constexpr u32 SdwaPreserve = 2;
+
+u64 SdwaMovV0(u32 src_vgpr, u32 src_sel, bool sext, u32 dst_sel, u32 dst_unused) {
+    const u64 first = VOP1(OpcodeVOP1::V_MOV_B32, VOperand8::V0, SOperand9::Sdwa).Get();
+    const u32 sdwa = src_vgpr | (dst_sel << 8) | (dst_unused << 11) | (src_sel << 16) |
+                     (u32(sext) << 19) | (SdwaDword << 24);
+    return (first & 0xFFFFFFFFull) | (u64{sdwa} << 32);
+}
+} // Anonymous namespace
+
+TEST_F(GcnTest, sdwa_compare_writes_its_sgpr_pair) {
+    auto runner = gcn_test::Runner::instance().value();
+    // v_cmp_eq_u32_sdwa s[2:3], v0, v1 (sd set), then v_cndmask_b32 v0, 0, 1, s[2:3]. Before the
+    // fix the mask went to VCC and s[2:3] kept the input's bits.
+    const u32 cmp = (0b0111110u << 25) | (u32(Shader::Gcn::OpcodeVOPC::V_CMP_EQ_U32) << 17) |
+                    (1u << 9) | 0xF9u;
+    const u32 cmp_sdwa = 0u | (2u << 8) | (1u << 15) | (SdwaDword << 16) | (SdwaDword << 24);
+    const std::array<u64, 2> instructions{
+        u64{cmp} | (u64{cmp_sdwa} << 32),
+        VOP3A(OpcodeVOP3::V_CNDMASK_B32, VOperand8::V0, SOperand9::Const0, SOperand9::Const1,
+              SOperand9::S2)
+            .Get(),
+    };
+    const auto spirv = TranslateToSpirv(instructions);
+
+    const auto equal = runner->run<u32>(spirv, std::array{5U, 5U, 0U, 0U});
+    ASSERT_TRUE(equal.has_value());
+    EXPECT_EQ(*equal, 1U);
+
+    const auto different = runner->run<u32>(spirv, std::array{5U, 6U, 0xFFFFFFFFU, 0xFFFFFFFFU});
+    ASSERT_TRUE(different.has_value());
+    EXPECT_EQ(*different, 0U);
+}
+
+TEST_F(GcnTest, sdwa_source_word1) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(SdwaMovV0(1, SdwaWord1, false, SdwaDword, SdwaPad));
+    const auto result = runner->run<u32>(spirv, std::array{0U, 0xABCD1234U, 0U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0xABCDU);
+}
+
+TEST_F(GcnTest, sdwa_source_byte1_sign_extended) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(SdwaMovV0(1, SdwaByte1, true, SdwaDword, SdwaPad));
+    const auto result = runner->run<u32>(spirv, std::array{0U, 0x00008000U, 0U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0xFFFFFF80U);
+}
+
+TEST_F(GcnTest, sdwa_destination_word1_preserve_and_pad) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto preserve =
+        runner->run<u32>(TranslateToSpirv(SdwaMovV0(1, SdwaDword, false, SdwaWord1, SdwaPreserve)),
+                         std::array{0x11112222U, 0x00003333U, 0U, 0U});
+    ASSERT_TRUE(preserve.has_value());
+    EXPECT_EQ(*preserve, 0x33332222U);
+
+    const auto pad =
+        runner->run<u32>(TranslateToSpirv(SdwaMovV0(1, SdwaDword, false, SdwaWord1, SdwaPad)),
+                         std::array{0x11112222U, 0x00003333U, 0U, 0U});
+    ASSERT_TRUE(pad.has_value());
+    EXPECT_EQ(*pad, 0x33330000U);
+}
+
+// NEO-GT7-007, more SDWA forms.
+namespace {
+constexpr u32 SdwaByte0 = 0;
+constexpr u32 SdwaByte2 = 2;
+constexpr u32 SdwaWord0 = 4;
+constexpr u32 SdwaSext = 1;
+
+// A VOP2 with src0 = v<src0_vgpr> and vsrc1 = v2, both through SDWA selections, into v0.
+u64 SdwaVop2V0(OpcodeVOP2 op, u32 src0_vgpr, u32 src0_sel, u32 src1_sel) {
+    const u64 first = VOP2(op, VOperand8::V0, SOperand9::Sdwa, VOperand8::V2).Get();
+    const u32 sdwa = src0_vgpr | (SdwaDword << 8) | (SdwaPad << 11) | (src0_sel << 16) |
+                     (src1_sel << 24);
+    return (first & 0xFFFFFFFFull) | (u64{sdwa} << 32);
+}
+
+// A VOPC of v0 against v1 through SDWA: the mask to sdst when sd is set, else to VCC.
+u64 SdwaCompareV0V1(Shader::Gcn::OpcodeVOPC op, u32 sdst, bool sd) {
+    const u32 cmp = (0b0111110u << 25) | (u32(op) << 17) | (1u << 9) | 0xF9u;
+    const u32 sdwa = 0u | (sdst << 8) | (u32(sd) << 15) | (SdwaDword << 16) | (SdwaDword << 24);
+    return u64{cmp} | (u64{sdwa} << 32);
+}
+
+// v_cndmask_b32 v0, 0, 1, <mask>: 1 where the mask's lane is set.
+u64 SelectOneWhere(SOperand9 mask) {
+    return VOP3A(OpcodeVOP3::V_CNDMASK_B32, VOperand8::V0, SOperand9::Const0, SOperand9::Const1,
+                 mask)
+        .Get();
+}
+
+auto RunCompareThenSelect(Shader::Gcn::OpcodeVOPC op, u32 sdst, bool sd, SOperand9 mask,
+                          std::array<u32, 4> inputs) {
+    auto runner = gcn_test::Runner::instance().value();
+    const std::array<u64, 2> instructions{SdwaCompareV0V1(op, sdst, sd), SelectOneWhere(mask)};
+    return runner->run<u32>(TranslateToSpirv(instructions), inputs);
+}
+
+// The compare, then s_mov_b64 s[4:5], exec (EXEC as the compare left it), s_mov_b64 exec, -1 (so
+// the select and the store run even where the compare cleared EXEC), then the select on mask.
+auto RunCompareRestoreExecThenSelect(Shader::Gcn::OpcodeVOPC op, u32 sdst, bool sd,
+                                     SOperand9 mask, std::array<u32, 4> inputs) {
+    auto runner = gcn_test::Runner::instance().value();
+    const std::array<u64, 4> instructions{
+        SdwaCompareV0V1(op, sdst, sd),
+        SOP1(OpcodeSOP1::S_MOV_B64, SOperand7::S4, SOperand8::ExecLo).Get(),
+        SOP1(OpcodeSOP1::S_MOV_B64, SOperand7::ExecLo, SOperand8::ConstNeg1).Get(),
+        SelectOneWhere(mask),
+    };
+    return runner->run<u32>(TranslateToSpirv(instructions), inputs);
+}
+} // Anonymous namespace
+
+TEST_F(GcnTest, sdwa_destination_byte0_sign_extended) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(SdwaMovV0(1, SdwaDword, false, SdwaByte0, SdwaSext));
+    const auto negative = runner->run<u32>(spirv, std::array{0U, 0x12345680U, 0U, 0U});
+    ASSERT_TRUE(negative.has_value());
+    EXPECT_EQ(*negative, 0xFFFFFF80U);
+    const auto positive = runner->run<u32>(spirv, std::array{0U, 0x1234567FU, 0U, 0U});
+    ASSERT_TRUE(positive.has_value());
+    EXPECT_EQ(*positive, 0x7FU);
+}
+
+TEST_F(GcnTest, sdwa_destination_word0_sign_extended) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(SdwaMovV0(1, SdwaDword, false, SdwaWord0, SdwaSext));
+    const auto result = runner->run<u32>(spirv, std::array{0U, 0x00018001U, 0U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0xFFFF8001U);
+}
+
+TEST_F(GcnTest, sdwa_vop2_byte_selections_on_both_sources) {
+    auto runner = gcn_test::Runner::instance().value();
+    // v_add_i32_sdwa v0, v1 (byte 1), v2 (byte 2): 0xAB + 0xCD.
+    const auto spirv = TranslateToSpirv(SdwaVop2V0(OpcodeVOP2::V_ADD_I32, 1, SdwaByte1, SdwaByte2));
+    const auto result = runner->run<u32>(spirv, std::array{0U, 0x7700AB11U, 0x00CD2233U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0xABU + 0xCDU);
+}
+
+TEST_F(GcnTest, sdwa_compare_without_sd_writes_vcc_and_keeps_the_pair) {
+    using Shader::Gcn::OpcodeVOPC;
+    // sd clear: the mask goes to VCC, whatever sdst holds (here s[2:3]).
+    const auto equal = RunCompareThenSelect(OpcodeVOPC::V_CMP_EQ_U32, 2, false, SOperand9::VccLo,
+                                            {5U, 5U, 0U, 0U});
+    ASSERT_TRUE(equal.has_value());
+    EXPECT_EQ(*equal, 1U);
+    const auto different = RunCompareThenSelect(OpcodeVOPC::V_CMP_EQ_U32, 2, false,
+                                                SOperand9::VccLo, {5U, 6U, 0U, 0U});
+    ASSERT_TRUE(different.has_value());
+    EXPECT_EQ(*different, 0U);
+    // s[2:3] keeps its input: all ones, so its lane is set although the compare failed.
+    const auto pair = RunCompareThenSelect(OpcodeVOPC::V_CMP_EQ_U32, 2, false, SOperand9::S2,
+                                           {5U, 6U, 0xFFFFFFFFU, 0xFFFFFFFFU});
+    ASSERT_TRUE(pair.has_value());
+    EXPECT_EQ(*pair, 1U);
+}
+
+TEST_F(GcnTest, sdwa_compare_to_vcc_as_sdst) {
+    using Shader::Gcn::OpcodeVOPC;
+    const auto equal = RunCompareThenSelect(OpcodeVOPC::V_CMP_EQ_U32, 106, true, SOperand9::VccLo,
+                                            {5U, 5U, 0U, 0U});
+    ASSERT_TRUE(equal.has_value());
+    EXPECT_EQ(*equal, 1U);
+    const auto different = RunCompareThenSelect(OpcodeVOPC::V_CMP_EQ_U32, 106, true,
+                                                SOperand9::VccLo, {5U, 6U, 0U, 0U});
+    ASSERT_TRUE(different.has_value());
+    EXPECT_EQ(*different, 0U);
+}
+
+TEST_F(GcnTest, sdwa_compare_to_exec_as_sdst) {
+    using Shader::Gcn::OpcodeVOPC;
+    const auto equal = RunCompareThenSelect(OpcodeVOPC::V_CMP_EQ_U32, 126, true, SOperand9::ExecLo,
+                                            {5U, 5U, 0U, 0U});
+    ASSERT_TRUE(equal.has_value());
+    EXPECT_EQ(*equal, 1U);
+    const auto different = RunCompareThenSelect(OpcodeVOPC::V_CMP_EQ_U32, 126, true,
+                                                SOperand9::ExecLo, {5U, 6U, 0U, 0U});
+    ASSERT_TRUE(different.has_value());
+    EXPECT_EQ(*different, 0U);
+}
+
+TEST_F(GcnTest, sdwa_cmpx_writes_exec_and_its_pair) {
+    using Shader::Gcn::OpcodeVOPC;
+    // EXEC is set back to all lanes before the select, so a failed compare still reaches the
+    // store: the pair, all ones before, must read 0, and so must the EXEC the compare left.
+    const auto pair_equal = RunCompareRestoreExecThenSelect(OpcodeVOPC::V_CMPX_EQ_U32, 2, true,
+                                                            SOperand9::S2, {5U, 5U, 0U, 0U});
+    ASSERT_TRUE(pair_equal.has_value());
+    EXPECT_EQ(*pair_equal, 1U);
+    const auto pair_different = RunCompareRestoreExecThenSelect(
+        OpcodeVOPC::V_CMPX_EQ_U32, 2, true, SOperand9::S2, {5U, 6U, 0xFFFFFFFFU, 0xFFFFFFFFU});
+    ASSERT_TRUE(pair_different.has_value());
+    EXPECT_EQ(*pair_different, 0U);
+    const auto exec_equal = RunCompareRestoreExecThenSelect(OpcodeVOPC::V_CMPX_EQ_U32, 2, true,
+                                                            SOperand9::S4, {5U, 5U, 0U, 0U});
+    ASSERT_TRUE(exec_equal.has_value());
+    EXPECT_EQ(*exec_equal, 1U);
+    const auto exec_different = RunCompareRestoreExecThenSelect(
+        OpcodeVOPC::V_CMPX_EQ_U32, 2, true, SOperand9::S4, {5U, 6U, 0U, 0U});
+    ASSERT_TRUE(exec_different.has_value());
+    EXPECT_EQ(*exec_different, 0U);
+}
+
+TEST_F(GcnTest, sdwa_f16_source_word1) {
+    auto runner = gcn_test::Runner::instance().value();
+    // v_add_f16_sdwa v0, v1 (word 1: 3.0), v2 (1.0 in the low half is ignored; 2.0): 5.0.
+    const auto spirv = TranslateToSpirv(SdwaVop2V0(OpcodeVOP2::V_ADD_F16, 1, SdwaWord1, SdwaDword));
+    const auto result = runner->run<u32>(spirv, std::array{0U, 0x42003C00U, 0x00004000U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result & 0xFFFFU, 0x4500U); // the low half (1.0) would give 3.0, 0x4200
+}
+
+// NEO-GT7-005: once per pixel, a pixel shader declares no per-sample input: no SampleId, no
+// Sample decoration on its sample-interpolated parameter, no SampleRateShading. Once per sample,
+// it has all three (the inspection's control).
+namespace {
+struct SampleRateSpirvInfo {
+    bool sample_rate_shading{};
+    bool sample_id{};
+    bool sample_decoration{};
+};
+
+SampleRateSpirvInfo InspectSampleRateSpirv(const std::vector<u32>& spirv) {
+    SampleRateSpirvInfo info{};
+    for (size_t offset = 5; offset < spirv.size();) {
+        const u32 word_count = spirv[offset] >> 16;
+        const auto opcode = static_cast<spv::Op>(spirv[offset] & 0xffffU);
+        if (word_count == 0U || offset + word_count > spirv.size()) {
+            ADD_FAILURE() << "Malformed SPIR-V instruction at word " << offset;
+            return info;
+        }
+        if (opcode == spv::Op::OpCapability && word_count >= 2U &&
+            spirv[offset + 1] == static_cast<u32>(spv::Capability::SampleRateShading)) {
+            info.sample_rate_shading = true;
+        } else if (opcode == spv::Op::OpDecorate && word_count >= 3U) {
+            const u32 decoration = spirv[offset + 2];
+            if (decoration == static_cast<u32>(spv::Decoration::Sample)) {
+                info.sample_decoration = true;
+            } else if (decoration == static_cast<u32>(spv::Decoration::BuiltIn) &&
+                       word_count >= 4U &&
+                       spirv[offset + 3] == static_cast<u32>(spv::BuiltIn::SampleId)) {
+                info.sample_id = true;
+            }
+        }
+        offset += word_count;
+    }
+    return info;
+}
+} // Anonymous namespace
+
+TEST(GcnFragment, pixel_rate_declares_no_per_sample_input) {
+    const auto pixel = InspectSampleRateSpirv(TranslateFragmentSampleReadsToSpirv(true));
+    EXPECT_FALSE(pixel.sample_rate_shading);
+    EXPECT_FALSE(pixel.sample_id);
+    EXPECT_FALSE(pixel.sample_decoration);
+
+    const auto sample = InspectSampleRateSpirv(TranslateFragmentSampleReadsToSpirv(false));
+    EXPECT_TRUE(sample.sample_rate_shading);
+    EXPECT_TRUE(sample.sample_id);
+    EXPECT_TRUE(sample.sample_decoration);
+}

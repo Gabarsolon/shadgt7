@@ -551,8 +551,10 @@ GraphicsPipeline::GraphicsPipeline(
     sdata.multisampling = {
         .rasterizationSamples = LiverpoolToVK::NumSamples(
             key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
+        // NEO-GT7-005: a pixel shader translated to run once per pixel (mixed samples) has none.
         .sampleShadingEnable =
-            fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
+            (fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena) &&
+            !(fragment_stage && fs_info.PixelRate()),
         .alphaToCoverageEnable = key.alpha_to_coverage && writes_coverage_alpha,
     };
 

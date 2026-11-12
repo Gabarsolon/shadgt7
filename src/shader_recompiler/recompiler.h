@@ -39,6 +39,19 @@ struct Pools {
 /// branch). On hosts with 32-wide subgroups, translations before FIX-020 left those reads 32-wide
 /// in compute shaders with more than 32 invocations per workgroup.
 [[nodiscard]] bool HasLaneReads(std::span<const u32> code);
+
+/// NEO-GT7-007/008: what PS4 Pro (Neo) encodings a program uses. sdwa_* are translated since
+/// NEO-GT7-007 (a store made before needs them again); dpp and the MIMG G16/A16/D16 bits are
+/// still ignored by the translator, so a program using them may be drawn wrong.
+struct NeoCodeUse {
+    u32 sdwa_compares_to_sgpr = 0; ///< VOPC SDWA with sd: its mask goes to an SGPR pair
+    u32 sdwa_selects = 0;          ///< SDWA byte/word source or destination selections
+    u32 dpp = 0;
+    u32 mimg_g16 = 0; ///< opcode MSB (bit 0): the 16-bit-gradient variants
+    u32 mimg_a16 = 0; ///< 16-bit addresses (bit 62)
+    u32 mimg_d16 = 0; ///< 16-bit data (bit 63)
+};
+[[nodiscard]] NeoCodeUse NeoCodeCensus(std::span<const u32> code);
 [[nodiscard]] bool HasLaneReadsAndLoop(std::span<const u32> code);
 
 /// FIX-190: true when a branch body turns every lane on (a wave-wide sum, see

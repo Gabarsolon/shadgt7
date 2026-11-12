@@ -164,9 +164,13 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
             return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
         }
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
+            // (NEO-GT7-005: once per pixel, bary_coord_smooth_sample is the centre's.)
             return ctx.OpLoad(
                 ctx.F32[1],
                 ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample, ctx.ConstU32(comp)));
+        } else if (ctx.runtime_info.hw.fs.PixelRate()) {
+            // NEO-GT7-005: once per pixel, the sample's barycentrics are the centre's.
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
         } else {
             return ctx.OpCompositeExtract(
                 ctx.F32[1],
@@ -239,6 +243,10 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
     case IR::Attribute::LocalInvocationIndex:
         return ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index);
     case IR::Attribute::SampleIndex:
+        // NEO-GT7-005: a shader that runs once per pixel is sample 0.
+        if (ctx.runtime_info.hw.fs.PixelRate()) {
+            return ctx.u32_zero_value;
+        }
         return ctx.OpLoad(ctx.U32[1], ctx.sample_index);
     case IR::Attribute::SampleMask: {
         const Id mask = ctx.OpLoad(

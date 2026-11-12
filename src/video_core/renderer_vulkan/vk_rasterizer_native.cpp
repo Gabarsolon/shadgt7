@@ -48,6 +48,7 @@
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
 #undef near
 #undef far
+#include "core/libraries/kernel/process.h"
 #include "core/debug_state.h"
 #include "video_core/renderdoc.h"
 #include "core/guest_hash.h"
@@ -12037,7 +12038,22 @@ void NativeRenderer::EvictImages() {
         if (entry.kept.load(std::memory_order_relaxed)) {
             return true;
         }
-        if (entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60 ||
+        // NEO-GT7-010: a volume (a 3D picture) the GPU baked stays whatever its time in use: GT7
+        // bakes its 64x64x64 colour-grading LUT once (cs 0x5da04de1, at 0x1009c00000) in the
+        // menus, samples it for under a second, then draws no 3D scene for two seconds; it was
+        // dropped, the tonemap read the guest memory's bytes instead and the PS4 Pro mode's scene
+        // stayed black for the rest of the session. Scratch-pool pictures are 2D. In the PS4 Pro
+        // mode only, so the base PS4 mode keeps its behaviour: RYGT_NATIVE_KEEP_VOLUMES=1 keeps
+        // them in every mode, =0 in none (as before).
+        static const bool keep_volumes = [] {
+            const char* env = std::getenv("RYGT_NATIVE_KEEP_VOLUMES");
+            if (env && env[0] == '0') {
+                return false;
+            }
+            return (env && env[0] == '1') || Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        }();
+        const bool volume = keep_volumes && entry.info.type == AmdGpu::ImageType::Color3D;
+        if ((!volume && entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60) ||
             kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
             return false;
         }
@@ -12598,9 +12614,41 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                    candidate.info.size.height == info.size.height &&
                    candidate.info.num_bits == info.num_bits;
         });
+    // NEO-GT7-006: in the PS4 Pro mode GT7 draws its 3200x1800 picture into the top left corner of
+    // a 3840x2160 surface, registered as 3200x1800 with a pitch of 3840: the display shows that
+    // corner, copied below into an image of the display's size each frame. A lookup by the
+    // registered size found nothing and showed guest memory the GPU never wrote: a black screen.
+    // RYGT_NEO_DISPLAY_CROP=0: as before.
+    static const bool neo_display_crop = [] {
+        const char* env = std::getenv("RYGT_NEO_DISPLAY_CROP");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+    }();
+    Native::ImageEntry* corner_of = nullptr;
+    if (neo_display_crop) {
+        corner_of =
+            registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
+                return !candidate.from_cpu && !candidate.info.props.is_depth && candidate.image &&
+                       candidate.info.num_bits == info.num_bits &&
+                       candidate.info.num_samples == 1 &&
+                       candidate.info.size.width >= info.size.width &&
+                       candidate.info.size.height >= info.size.height &&
+                       (candidate.info.size.width > info.size.width ||
+                        candidate.info.size.height > info.size.height);
+            });
+        // NEO-GT7-009: an image of the display's size at the address (the copy's destination
+        // below, a render target since the first copy) is shown as it is only when it holds a
+        // newer picture than the larger one. Looked up only when none existed, the corner was
+        // copied until that destination was in use again; then the last copied frame stayed on
+        // screen: the race ran behind the frozen loading screen. Write versions share one clock.
+        if (corner_of && entry &&
+            entry->write_version.load(std::memory_order_relaxed) >=
+                corner_of->write_version.load(std::memory_order_relaxed)) {
+            corner_of = nullptr;
+        }
+    }
     if (!entry) {
         static std::atomic<u32> logged{};
-        if (Sample(logged)) {
+        if (!corner_of && Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
                         "NAT-103: nothing drew the display buffer {:#x} ({}x{}, {} bits) yet",
                         info.guest_address, info.size.width, info.size.height, info.num_bits);
@@ -12609,6 +12657,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     if (!entry || !entry->image) {
         return std::nullopt;
+    }
+    if (entry == corner_of) {
+        corner_of = nullptr;
     }
     VideoCore::ImageViewInfo view_info{};
     view_info.format = view_format;
@@ -12621,6 +12672,34 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     if (device->PendingImageInit()) {
         Begin();
         PrepareImages();
+    }
+    if (corner_of) { // NEO-GT7-006
+        Begin();
+        GlobalBarrier();
+        const vk::ImageSubresourceLayers layer{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        stream.cmd.copyImage(vk::Image{Handle<VkImage_T>(corner_of->image->NativeHandle())},
+                             vk::ImageLayout::eGeneral,
+                             vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                             vk::ImageLayout::eGeneral,
+                             vk::ImageCopy{.srcSubresource = layer,
+                                           .dstSubresource = layer,
+                                           .extent = {info.size.width, info.size.height, 1}});
+        GlobalBarrier();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+            LOG_WARNING(Render_Vulkan,
+                        "NEO-GT7-006: display {:#x} shows the {}x{} corner of the {}x{} picture "
+                        "drawn there ({} into {})",
+                        info.guest_address, info.size.width, info.size.height,
+                        corner_of->info.size.width, corner_of->info.size.height,
+                        vk::to_string(corner_of->info.pixel_format),
+                        vk::to_string(entry->info.pixel_format));
+        }
     }
     ProbeDisplay(*entry); // FIX-175 (diagnosis)
     if (capture_frame != ~u64{0} && capture_frame + 1 == frame) {
