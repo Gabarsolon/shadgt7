@@ -158,6 +158,19 @@ bool ComputePipeline::SaveRecipe(const std::filesystem::path& file,
     }
     words.push_back(u32(spirv.size()));
     words.insert(words.end(), spirv.begin(), spirv.end());
+    {
+        // FIX-GT7-150: a recipe that already says this is left as it is (false: nothing kept).
+        std::error_code size_ec;
+        const auto size = std::filesystem::file_size(file, size_ec);
+        if (!size_ec && size == words.size() * sizeof(u32)) {
+            std::vector<u32> have(words.size());
+            std::ifstream in{file, std::ios::binary};
+            in.read(reinterpret_cast<char*>(have.data()), std::streamsize(size));
+            if (in && have == words) {
+                return false;
+            }
+        }
+    }
     // Beside the file and renamed, so a cut write never leaves half a recipe.
     auto temp = file;
     temp += ".tmp";

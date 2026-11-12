@@ -3770,10 +3770,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                 instance, scheduler, desc_heap, profile, *pipeline_cache, compute_key,
                 *S().infos[0], S().modules[0], sdata);
         }
-        if (const double ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - build_start)
-                                  .count();
-            ms >= 50.0) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - build_start)
+                              .count();
+        if (ms >= 50.0) {
             LOG_INFO(Render_Vulkan, "PERF-GT7-032: compute pipeline {:#x} built in {:.0f} ms{}",
                      pipeline_hash, ms, foreground_on ? ", the other compiles set aside" : "");
         }
@@ -3784,7 +3784,21 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             const auto dir = WarmComputeDir();
             const auto file = dir / fmt::format("{:#018x}.bin", pipeline_hash);
             std::error_code ec;
-            if (!std::filesystem::exists(file, ec)) {
+            // FIX-GT7-150 (RYGT_WARM_COMPUTE_REFRESH=0: as before): a recipe was written once and
+            // never again, so once a renderer update changed a program's translation the warm-up
+            // went on building the old code at every start while the pipeline of the new code was
+            // built here, the game waiting: on a PC whose recipes were five days old, the same 16
+            // of 335 were built here in every session the driver lacked them (60 ms to 1.6 s
+            // each, 8-10 s in all; the SPIR-V of all 16 differed from their recipe's). A build
+            // that took long although its recipe was there has a recipe that did not serve: it is
+            // compared with this pipeline's code and written again when different (a recipe the
+            // warm-up had not reached yet is the same, and left alone).
+            static const bool refresh = [] {
+                const char* env = std::getenv("RYGT_WARM_COMPUTE_REFRESH");
+                return !(env && env[0] == '0');
+            }();
+            const bool known = std::filesystem::exists(file, ec);
+            if (!known || (refresh && ms >= 50.0)) {
                 std::optional<size_t> perm;
                 if (const auto prog = program_cache.find(info->pgm_hash);
                     prog != program_cache.end()) {
@@ -3806,8 +3820,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                 if (IsCompleteSpirv(spirv) && it->second->SaveRecipe(file, spirv)) {
                     LOG_INFO(Render_Vulkan,
                              "PERF-GT7-037: compute pipeline {:#x} kept, to be built ahead at "
-                             "the next start",
-                             pipeline_hash);
+                             "the next start{}",
+                             pipeline_hash,
+                             known ? " (FIX-GT7-150: its recipe held other code)" : "");
                 }
             }
         }
