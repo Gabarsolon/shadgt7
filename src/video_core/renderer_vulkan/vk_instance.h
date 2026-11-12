@@ -350,7 +350,7 @@ public:
                driver_info.find("LLPC") == std::string::npos;
     }
 
-    /// FIX-GT7-147: a GCN Radeon (R7/R9, RX 400/500/600 three-digit models, Vega, Radeon VII)
+    /// FIX-GT7-151: a GCN Radeon (R7/R9, RX 400/500/600 three-digit models, Vega, Radeon VII)
     /// on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
     bool IsAmdGcn() const;
 
