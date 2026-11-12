@@ -204,6 +204,12 @@ target_compile_features(shadgt_gt7_preset_options_test PRIVATE cxx_std_23)
 target_link_libraries(shadgt_gt7_preset_options_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadgt_gt7_preset_options_test)
 
+add_executable(shadgt_coverage_reduction_test test_coverage_reduction.cpp)
+target_include_directories(shadgt_coverage_reduction_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_coverage_reduction_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_coverage_reduction_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_coverage_reduction_test)
+
 add_executable(shadgt_unique_function_test test_unique_function.cpp)
 target_include_directories(shadgt_unique_function_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadgt_unique_function_test PRIVATE cxx_std_23)
