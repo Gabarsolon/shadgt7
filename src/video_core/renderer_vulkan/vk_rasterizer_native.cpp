@@ -14,6 +14,7 @@
 
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/tess_scratch.h"
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
@@ -9434,8 +9435,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     const u32 lds_mode = pipeline->LdsEmulation();
     u64 lds_address = 0, lds_bytes = 0, lds_patches = 0;
     u32 lds_num_cp = 0, lds_vertex_bytes = 0;
-    if (lds_mode != 0 && !indirect && b.push.quad_sample_mask[0] == ~0u &&
-        b.push.quad_sample_mask[1] == ~0u) {
+    if (lds_mode != 0 && !indirect &&
+        TessScratchAvailable(b.push.quad_sample_mask[0], b.push.quad_sample_mask[1])) {
         lds_num_cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
         lds_patches = u64(regs.num_indices / lds_num_cp) * regs.num_instances.NumInstances();
         Shader::TessellationDataConstantBuffer tess_constants{};

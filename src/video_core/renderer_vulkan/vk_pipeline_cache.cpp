@@ -50,6 +50,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
 #include "video_core/renderer_vulkan/spirv_check.h"
+#include "video_core/renderer_vulkan/tess_scratch.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -77,6 +78,21 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) {
+        return 0;
+    }
+    // The recorder does not allocate LDS scratch for masked draws. In that case
+    // these push words are PA_SC_AA_MASK, not an address/writer flag. Compiling
+    // FIX-227 anyway interpreted cccc9999 as writer=true and culled ghost wheels.
+    if (!TessScratchAvailable(regs.reg_array[0xa30e], regs.reg_array[0xa30f])) {
+        static std::atomic<u32> reports{};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "GHOST6: masked hull uses native patch inputs; no LDS scratch "
+                        "mask={:08x}/{:08x} cp={} patches={} requestedMode={}",
+                        regs.reg_array[0xa30e], regs.reg_array[0xa30f],
+                        u32(regs.ls_hs_config.hs_input_control_points),
+                        u32(regs.ls_hs_config.num_patches), mode);
+        }
         return 0;
     }
     return mode;
