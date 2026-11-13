@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 RyGT Team
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// FEAT-GT7-151: what each RYGT_* and SHADGT_* switch does, for the ryGT7 launcher's Advanced page
+// FEAT-GT7-152: what each RYGT_* and SHADGT_* switch does, for the ryGT7 launcher's Advanced page
 // (ported from shadGT's table, FEAT-GTS-437/443, and checked against this renderer's own code).
 //
 // The launcher never loads this DLL: it reads libs\libSceVideoOut.prx as a file, lists every
@@ -80,6 +80,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NATIVE_TEXTURE_LEVEL_WAIT|flag|Shader compiling|on|0 = off|Draws into never-drawn texture mip levels wait for their pipeline (GT7 Scapes brightness, FIX-GT7-135). 0 = as before.",
     "RYGTSW1|RYGT_NATIVE_WAIT_AFTER_FILL|flag|Shader compiling|on|0 = off|A draw into a picture just filled whole waits for its pipeline (black first Scapes photo, FIX-GT7-130). 0 = as before.",
     "RYGTSW1|RYGT_NATIVE_WAIT_ONE_OFF|flag|Shader compiling|on|0 = off|In keep-going compile mode, draws into draw-once pictures wait for their pipeline (FIX-198). 0 skips them too.",
+    "RYGTSW1|RYGT_NEO_SDWA_CMP|flag|Shader compiling|on|0 = the old translation (to VCC), kept in a shader store of its own|Translates SDWA compares to their SGPR pair, as the PS4 Pro's checkerboard resolve needs; 0 brings back the old, broken translation (NEO-GT7-007).",
     "RYGTSW1|RYGT_ONE_OFF_BUDGET_MS|int|Shader compiling|40|milliseconds per frame at loads; 0 = unbounded|Max time a loading frame waits for one-off pipelines (FIX-GT7-102). 0 = no limit (very long frames possible).",
     "RYGTSW1|RYGT_ONE_OFF_HARMFUL_WAIT|flag|Shader compiling|on|0 = off|Draws of kinds learned as harmful to skip always wait for their pipeline (car shadows, FIX-GT7-121). 0 = deadline for all.",
     "RYGTSW1|RYGT_ONE_OFF_KEPT_RULE|flag|Shader compiling|on|0 = the old rule and its learning file|A draw-once picture counts as harmful to skip only if sampled and not redrawn within 4 frames (FIX-GT7-149), cutting long waits.",
@@ -105,7 +106,6 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_DIRECT_FIND_RECENT|flag|Native recorder & sync|on|0 = off|Each thread remembers recently found direct-memory views to skip the locked map lookup (PERF-GT7-127); 0 turns it off.",
     "RYGTSW1|RYGT_FLAT_PREFETCH|flag|Native recorder & sync|on|0 = off|Prefetches each stage's shader user data into cache before binding buffers (PERF-GT7-122); 0 turns it off.",
     "RYGTSW1|RYGT_GFX_YIELD_PACKETS|int|Native recorder & sync|32|graphics packets between yields; 0 = never yield|Lets compute submissions decode after every N graphics packets (PERF-GT7-052); 0 never yields.",
-    "RYGTSW1|RYGT_GPU_IDLE_RETIRE|flag|Native recorder & sync|on for GCN Radeon GPUs, off elsewhere|1 = on, any other non-empty value = off, on any GPU|Reports GPU idle to the game only once the GPU finished the work, not when recorded (FIX-GT7-147: rainbow/dark screens on GCN).",
     "RYGTSW1|RYGT_INDIRECT_AHEAD|flag|Native recorder & sync|on|0 = off|Selects indirect draws' pipelines ahead on the command thread too (PERF-GT7-031); 0 lets the recorder select them as before.",
     "RYGTSW1|RYGT_JOB_PREFETCH|flag|Native recorder & sync|on|0 = off|The native recorder prefetches the next jobs' captured data into cache while recording the current one (PERF-GT7-124); 0 off.",
     "RYGTSW1|RYGT_NATIVE|flag|Native recorder & sync|launcher setting (GT7 always on)|1 = native renderer on, 0 = off; overrides GPU.native_renderer|Turns the native renderer on or off, overriding the launcher's renderer choice. GT7 needs it on to boot.",
@@ -165,6 +165,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NATIVE_INPLACE_FROM|hex|Memory & VRAM|f000000000|hex guest address; ffffffffffffffff = every written range gets a region|Guest address above which GPU-written buffers stay in guest memory for CPU readback (FIX-150).",
     "RYGTSW1|RYGT_NATIVE_INPLACE_RANGES|string|Memory & VRAM|unset (none; GT7's launcher sets it)|'<hex addr>+<hex size>,...'|Guest ranges (GT7 per-frame memory) whose GPU writes stay in guest memory. Normally set by the launcher.",
     "RYGTSW1|RYGT_NATIVE_KEEP_TEXTURES_MB|int|Memory & VRAM|half the video memory setting (at least 1 GB counted), max 2048|MB|Video memory (MB) kept for idle game textures so they need no re-upload. Lower it if VRAM runs out.",
+    "RYGTSW1|RYGT_NATIVE_KEEP_VOLUMES|flag|Memory & VRAM|on in the PS4 Pro mode, off in the base mode|1 = in every mode, 0 = in none (as before)|Keeps 3D textures the GPU baked, such as GT7's colour-grading table, instead of dropping them; without it the Pro mode scene went black (NEO-GT7-009/010).",
     "RYGTSW1|RYGT_NATIVE_LAZY_UPLOADS|flag|Memory & VRAM|on|0 = off (uploaded as soon as marked stale)|Uploads a CPU-changed texture only when work next uses it, not after every write (PERF-109: ~5,000 uploads a second in GT7).",
     "RYGTSW1|RYGT_NATIVE_MIRRORS|string|Memory & VRAM|on|0 = off; v = vertex ranges only; i = index ranges only|Device-local mirrors of vertex/index data. 0 turns them off; v or i mirrors only one kind (diagnosis).",
     "RYGTSW1|RYGT_NATIVE_MIRROR_MB|int|Memory & VRAM|1024|MB|Budget in MB for vertex/index buffer mirrors in video memory.",
@@ -259,6 +260,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NATIVE_UPLOAD_BARRIER|flag|Rendering workarounds|on|0 = off (as before, for diagnosis)|Adds a barrier so CPU bytes just copied into a region land before an upload reads them, against stale textures (FIX-196).",
     "RYGTSW1|RYGT_NATIVE_WHOLE_SOURCES|flag|Rendering workarounds|off|1 = on|A target made of targets counts as new as its newest part (FIX-207). Off: did not help and could pick older data.",
     "RYGTSW1|RYGT_NATIVE_WRITEBACK_CPU|flag|Rendering workarounds|on|0 = off|Writes larger pictures in CPU-read memory back before the fence (GT7 car thumbnails/photos, FIX-GT7-041). 0 = as before.",
+    "RYGTSW1|RYGT_NEO_DISPLAY_CROP|flag|Rendering workarounds|on in the PS4 Pro mode|0 = off, as before (a black screen in the Pro mode)|In the PS4 Pro mode, shows the 3200x1800 corner GT7 draws into its 3840x2160 surface; without it the screen stays black (NEO-GT7-006).",
     "RYGTSW1|RYGT_NULL_UNKNOWN_BUFFER_FORMAT|flag|Rendering workarounds|on|0 = translation fails|An unknown buffer data format reads as a null buffer instead of failing the whole shader translation (FIX-GT7-126).",
     "RYGTSW1|RYGT_TEXTURE_LOD_BIAS|float|Rendering workarounds|0|mip levels; negative = sharper|Adds a LOD bias to every non-depth sampler (launcher Texture sharpness). Negative values give sharper textures.",
     "RYGTSW1|RYGT_UNNORMALIZED_MIP|flag|Rendering workarounds|on|0 = as before|Correct mip scaling for unnormalized texture coordinates in hull shaders, fixing culled car patches (FIX-228); 0 as before.",
@@ -271,6 +273,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC|flag|AMD|off|1, true, on or yes = on; other values off|AMD Graphics Fix: interpolation fix for flat grey surfaces with dark triangles on RX 7600. One RX 6600 XT failed to build shaders with it.",
     "RYGTSW1|RYGT_ANTI_LAG|flag|AMD|off|exactly 1 = on, when the driver offers VK_AMD_anti_lag|Turns on AMD Anti-Lag when the driver supports it (PERF-210); the log says whether it took effect.",
     "RYGTSW1|RYGT_DISCARD_KILL|flag|AMD|on (AMD proprietary driver), off elsewhere|1 = on, 0 = off|Discarded pixels end their shader at once (FIX-223). Default follows the driver: on with AMD's proprietary driver.",
+    "RYGTSW1|RYGT_NATIVE_CUBE|flag|AMD|on, except the legacy path on GCN Radeons (RX 400/500)|1 = native cube sampling, 0 = the legacy 2D-array path on any GPU|Native cube-map sampling, which filters across faces; GCN Radeons use the legacy 2D-array path by default, which draws GT7 right there (FIX-GT7-151).",
     "RYGTSW1|SHADGT_AMD_NAN_RULES|flag|AMD|auto (on, except RX 7000)|0 = off, any other value = on, for any GPU; part of the shader store key|Forces AMD's MED3/MIN3/MAX3 NaN rules (FIX-215/216) on or off; by default only RX 7000 leaves them out. Changes translated shaders.",
     "RYGTSW1|SHADGT_AMD_VERTEX_ORDER|int|AMD|0|0-5 (first digit); each order gets its own shader store version|Picks the vertex order (0-5) of AMD per-vertex shader reads (AMD-311); 0 is the RX 7600's order. Changes translated shaders.",
     "RYGTSW1|SHADGT_FP32_IMAGE_ATOMICS|flag|AMD|native, except AMD's older shader compiler (RX 6000 and older)|0 = from integer atomics, any other value = native; part of the shader store key|Image float min/max atomics native or made from integer atomics (AMD-308, default on RX 6000 and older). Changes translated shaders.",
@@ -282,6 +285,8 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // NVIDIA
     "RYGTSW1|RYGT_DLSSG_FRAMES|int|NVIDIA|1|1..5 generated frames (2x to 6x); multi-frame needs an RTX 50; falls back to 1 if refused|NVIDIA DLSS frame generation: how many frames are generated between game frames (GT-MFG).",
     "RYGTSW1|RYGT_DLSS_STREAMLINE|flag|NVIDIA|on (when sl.dlss.dll is present)|0 = off|DLSS upscaling goes through Streamline's sl.dlss.dll. 0 keeps it on the self-built ryGT_dlss.dll plugin.",
+    "RYGTSW1|RYGT_NEO_COVERAGE_TRUNCATE|flag|NVIDIA|on in the PS4 Pro mode on NVIDIA|0 = MERGE, as before|In the PS4 Pro mode on NVIDIA, mixed-sample pipelines use TRUNCATE coverage like the console, which removes a light wireframe on car windows (NEO-GT7-016).",
+    "RYGTSW1|RYGT_NEO_PIXEL_RATE|flag|NVIDIA|on in the PS4 Pro mode|0 = off, as before|In the PS4 Pro mode, a draw with more depth samples than colour samples runs its pixel shader per pixel on NVIDIA, which avoids a GPU loss (NEO-GT7-005).",
     // Runtime
     "RYGTSW1|RYGT_ADAPTIVE_TRIGGERS|flag|Runtime|on while the launcher's trigger strength slider is above 0%|0 = off; 1 = on even with the slider at 0%|GT7 adaptive trigger effects from telemetry, scaled by the launcher's trigger strength slider; 0 turns them off, 1 forces them on at 0%.",
     "RYGTSW1|RYGT_ADAPTIVE_TRIGGERS_REPLAY|flag|Runtime|off|1 = on|Adaptive trigger effects also run in replays and demos, to check them without driving. For testing.",
@@ -383,6 +388,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NATIVE_WATCH_RECT|string|Diagnostics & tracing|off|'x,y,w,h'. Diagnostics builds only (Common::DiagEnv).|Diagnosis: probe only that rectangle of a watched packed-float picture (FIX-171).",
     "RYGTSW1|RYGT_NATIVE_WATCH_TEXTURE|hex|Diagnostics & tracing|unset (nothing watched)|comma-separated hex guest addresses. Diagnostics builds only (Common::DiagEnv: Debug/RelWithDebInfo, or -DSHADGT_DIAGNOSTICS=ON)|Diagnosis: logs every GPU fill, copy or storage write over the textures at these addresses. Adds log volume.",
     "RYGTSW1|RYGT_NATIVE_ZERO_NEW_TARGETS|string|Diagnostics & tracing|off (new targets start with what memory holds)|1 = all new targets start as zeros; <hex lo>-<hex hi> = only targets starting in that range|Diagnosis: new render targets start as zeros instead of guest memory contents (NAT-127). Can darken the picture.",
+    "RYGTSW1|RYGT_NEO_CENSUS|flag|Diagnostics & tracing|off|1 = on, in the PS4 Pro mode only|Logs which PS4 Pro shader encodings (SDWA, DPP, MIMG G16/A16/D16) each program uses, at its first use (NEO-GT7-008). Diagnosis only.",
     "RYGTSW1|RYGT_PEEK|string|Diagnostics & tracing|off|<hex address>[,<hex address>...]. Diagnostics builds only (Common::DiagEnv: Debug/RelWithDebInfo, or -DSHADGT_DIAGNOSTICS=ON)|Logs the first eight floats at each guest address for 240 flips, starting at RYGT_PEEK_AT seconds (FIX-158). For diagnosis only.",
     "RYGTSW1|RYGT_PEEK_AT|float|Diagnostics & tracing|200|seconds after start when RYGT_PEEK begins|Start time in seconds for the RYGT_PEEK memory logging. For diagnosis only.",
     "RYGTSW1|RYGT_PROBE_AFTER|int|Diagnostics & tracing|0|seconds after start. Diagnostics builds only (Common::DiagEnv).|Diagnosis: delays DIAG-169/170 probes until N seconds after start.",
