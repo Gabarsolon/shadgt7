@@ -1305,17 +1305,22 @@ void Instance::CollectToolingInfo() const {
 }
 
 u64 Instance::GetDeviceMemoryUsage() const {
+    return GetCurrentMemoryBudget().usage;
+}
+
+Instance::MemoryBudget Instance::GetCurrentMemoryBudget() const {
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
     vk::PhysicalDeviceMemoryProperties2 props = {
         .pNext = &memory_budget_props,
     };
     physical_device.getMemoryProperties2(&props);
 
-    u64 total_usage = 0;
+    MemoryBudget result{};
     for (const size_t heap : valid_heaps) {
-        total_usage += memory_budget_props.heapUsage[heap];
+        result.usage += memory_budget_props.heapUsage[heap];
+        result.budget += memory_budget_props.heapBudget[heap];
     }
-    return total_usage;
+    return result;
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

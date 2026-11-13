@@ -12,6 +12,7 @@
 // barrier, and around dispatches and copies. Later versions record the game's render jobs on its
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
+#include "common/dlss_memory.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -12932,7 +12933,9 @@ void NativeRenderer::EvictImages() {
         return entry.sources.empty();
     };
     std::unordered_set<const Native::ImageEntry*> kept_textures;
-    if (texture_budget != 0) {
+    // Under temporal allocation pressure, keep the existing eviction guards but stop
+    // protecting the optional cache of idle, CPU-reloadable textures for ten seconds.
+    if (texture_budget != 0 && !Common::DlssMemory::Pressure()) {
         std::vector<Native::ImageEntry*> idle;
         registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
             if (entry.from_cpu && entry.image &&

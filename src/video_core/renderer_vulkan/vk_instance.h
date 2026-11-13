@@ -601,6 +601,11 @@ public:
 
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
+    struct MemoryBudget {
+        u64 usage{}, budget{};
+    };
+    // The current driver heap limit, rather than the startup texture-cache target.
+    [[nodiscard]] MemoryBudget GetCurrentMemoryBudget() const;
 
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {

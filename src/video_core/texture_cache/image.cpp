@@ -327,7 +327,7 @@ u64 RecycledImageBytes() {
     return g_recycled_bytes;
 }
 
-void TrimUnusedRecycledImages(VmaAllocator allocator) {
+void TrimUnusedRecycledImages(VmaAllocator allocator, bool force) {
     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
     std::scoped_lock lk{g_recycle_mutex};
     while (!g_recycle_order.empty()) {
@@ -340,7 +340,7 @@ void TrimUnusedRecycledImages(VmaAllocator allocator) {
         auto& images = bucket->second;
         const auto it = std::ranges::find(images, seq, &RecycledImage::seq);
         if (it != images.end()) {
-            if (it->unused_since > cutoff) break;
+            if (!force && it->unused_since > cutoff) break;
             // Images enter this pool only after their GPU completion callback.
             vmaDestroyImage(allocator, it->image, it->allocation);
             g_recycled_bytes -= it->size_bytes;

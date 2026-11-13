@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "common/dlss_memory.h"
+#include "ryty_gpu/ryty_dlss_budget.h"
 #include "ryty_gpu/ryty_gt7_dlss.h"
 #include "ryty_gpu/ryty_gt7_dlss_diagnostic.h"
 
@@ -230,24 +232,29 @@ struct Gt7DlssPass::Impl {
     };
     std::vector<std::unique_ptr<Slot>> slots;
     Slot* current{};
-    static constexpr u64 MaxTemporalBytes = 512ull << 20;
+    std::int64_t retry_after{};
+    u64 budget_recoveries{}, budget_trims{};
+    bool budget_was_refused{};
+    const char* budget_reason = "ready";
+    std::chrono::steady_clock::time_point housekeeping_last{};
     u64 memory_refusals{}, slots_trimmed{}, logged_budget_warnings{};
     u64 OwnedBytes() const {
         u64 bytes = 0;
         for (const auto& slot : slots) bytes += slot->Bytes();
         return bytes;
     }
-    void TrimSlots() {
+    void TrimSlots(bool pressure = false, const Slot* preserve = nullptr) {
         const auto now = std::chrono::steady_clock::now();
         const bool inactive = !scene_identity && !branch_ready;
         if (inactive && current && now - current->used > std::chrono::seconds(2) &&
             scheduler.IsFree(current->tick)) current = nullptr;
         size_t remaining = slots.size();
         std::erase_if(slots, [&](const auto& slot) {
-            if (slot.get() == current || !scheduler.IsFree(slot->tick)) return false;
+            if (slot.get() == current || slot.get() == preserve ||
+                !scheduler.IsFree(slot->tick)) return false;
             const bool old_scene = slot->epoch != epoch;
             const bool idle = now - slot->used > std::chrono::seconds(2);
-            if (old_scene || (remaining > 2 && idle) || (inactive && idle)) {
+            if (pressure || old_scene || (remaining > 2 && idle) || (inactive && idle)) {
                 --remaining;
                 ++slots_trimmed;
                 return true;
@@ -965,17 +972,42 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
         slot->depth.format != sources[0].format || slot->color.size != p.input ||
         slot->output.size != p.output;
     if (grows) {
-        const u64 old_bytes = slot ? slot->Bytes() : 0;
-        const u64 total = p.OwnedBytes() - old_bytes + required;
-        const u64 extra = required > old_bytes ? required - old_bytes : 0;
-        const u64 ui = Common::Sharp::ui_image_bytes.load(std::memory_order_relaxed);
-        const bool driver_room = !p.gpu.CanReportMemoryUsage() ||
-            p.gpu.GetDeviceMemoryUsage() + extra <= p.gpu.GetTotalMemoryBudget();
-        if (total > Impl::MaxTemporalBytes || total + ui > (1ull << 30) || !driver_room) {
+        const auto now = Common::DlssMemory::Milliseconds();
+        if (!RytyDlssG::Budget::Retry(now, p.retry_after)) {
             ++p.memory_refusals;
             Fallback(frame, "owned-image-budget", false);
             return;
         }
+        const auto decide = [&] {
+            const u64 old_bytes = slot ? slot->Bytes() : 0;
+            const u64 total = p.OwnedBytes() - old_bytes + required;
+            const u64 extra = required > old_bytes ? required - old_bytes : 0;
+            const u64 ui = Common::Sharp::ui_image_bytes.load(std::memory_order_relaxed);
+            const auto heap = p.gpu.CanReportMemoryUsage()
+                ? p.gpu.GetCurrentMemoryBudget() : Instance::MemoryBudget{};
+            return RytyDlssG::Budget::Check(total, ui, extra, heap.usage, heap.budget);
+        };
+        auto decision = decide();
+        if (!decision.allowed) {
+            Common::DlssMemory::RequestTrim();
+            // Preserve the displayed scene and this retry candidate. Spare slots and
+            // recycled images are destroyed only after their GPU ticks have retired.
+            p.TrimSlots(true, slot);
+            VideoCore::TrimUnusedRecycledImages(p.gpu.GetAllocator(), true);
+            Vulkan::TrimEmptyVmaBlocks(p.gpu.GetAllocator());
+            ++p.budget_trims;
+            decision = decide();
+        }
+        if (!decision.allowed) {
+            ++p.memory_refusals;
+            p.budget_reason = decision.reason;
+            p.budget_was_refused = true;
+            p.retry_after = now + 250;
+            Fallback(frame, "owned-image-budget", false);
+            return;
+        }
+        p.retry_after = 0;
+        p.budget_reason = "ready";
     }
     if (!slot && p.slots.size() < 8) {
         p.slots.push_back(std::make_unique<Impl::Slot>());
@@ -985,6 +1017,19 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
         Fallback(frame, "owned-frame-ring-busy");
         return;
     }
+    const auto allocation_failed = [&](const char* reason) {
+        ++p.memory_refusals;
+        p.budget_was_refused = true;
+        p.budget_reason = reason;
+        p.retry_after = Common::DlssMemory::Milliseconds() + 250;
+        Common::DlssMemory::RequestTrim();
+        // No commands have referenced this candidate during this allocation attempt.
+        std::erase_if(p.slots, [&](const auto& candidate) {
+            return candidate.get() == slot && candidate.get() != p.current &&
+                   p.scheduler.IsFree(candidate->tick);
+        });
+        Fallback(frame, reason, false);
+    };
     slot->scene_read.reset();
     slot->color_read.reset(); // the slot's previous timeline tick has retired
     slot->merge_views.clear();
@@ -994,7 +1039,7 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
                              vk::ImageUsageFlagBits::eStorage) ||
         !slot->output.Create(p.gpu, vk::Format::eR16G16B16A16Sfloat, p.output,
                              vk::ImageAspectFlagBits::eColor, vk::ImageUsageFlagBits::eStorage)) {
-        Fallback(frame, "owned-image-allocation");
+        allocation_failed("owned-image-allocation");
         return;
     }
     vk::ImageUsageFlags scene_usage = vk::ImageUsageFlagBits::eColorAttachment;
@@ -1005,7 +1050,7 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
         scene_usage |= vk::ImageUsageFlagBits::eStorage; // MergeScene reads and writes it
     if (!slot->scene.Create(p.gpu, scene_output.format, p.output,
                             vk::ImageAspectFlagBits::eColor, scene_usage)) {
-        Fallback(frame, "owned-HDR-scene-allocation");
+        allocation_failed("owned-HDR-scene-allocation");
         return;
     }
     // DLSS sees semantic RGB, while the scene proxy keeps the game's MRT storage mapping.
@@ -1014,7 +1059,7 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
         .format = slot->color.format, .components = sources[2].mapping,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
     if (input_view.result != vk::Result::eSuccess) {
-        Fallback(frame, "HDR-input-view-allocation");
+        allocation_failed("HDR-input-view-allocation");
         return;
     }
     slot->color_read = std::move(input_view.value);
@@ -1026,6 +1071,11 @@ void Gt7DlssPass::Capture(u64 frame, u64 ps, const Metadata& m, const std::array
     auto* previous_slot = p.current;
     const auto previous_mapping = p.native_scene.mapping;
     p.current = slot;
+    if (p.budget_was_refused) {
+        ++p.budget_recoveries;
+        p.budget_was_refused = false;
+    }
+    p.budget_reason = "ready";
     slot->frame = frame;
     slot->epoch = p.epoch;
     slot->used = std::chrono::steady_clock::now();
@@ -1595,6 +1645,19 @@ void Gt7DlssPass::Poll(u64 frame) {
     auto& p = *impl;
     p.CollectTime();
     p.TrimSlots();
+    const auto memory_now = std::chrono::steady_clock::now();
+    if (Config().enabled && memory_now - p.housekeeping_last >= std::chrono::seconds{1}) {
+        p.housekeeping_last = memory_now;
+        const auto heap = p.gpu.CanReportMemoryUsage()
+            ? p.gpu.GetCurrentMemoryBudget() : Instance::MemoryBudget{};
+        const auto threshold = heap.budget
+            ? std::min(p.gpu.GetTotalMemoryBudget(), heap.budget - heap.budget / 8) : 0;
+        if (threshold && heap.usage >= threshold) {
+            Common::DlssMemory::RequestTrim();
+            VideoCore::TrimUnusedRecycledImages(p.gpu.GetAllocator(), true);
+            Vulkan::TrimEmptyVmaBlocks(p.gpu.GetAllocator());
+        }
+    }
     if (Common::Sharp::Diagnostics()) {
         try {
             if (!p.dump_io_tried) {
@@ -1782,7 +1845,7 @@ void Gt7DlssPass::Poll(u64 frame) {
                  "native={} reuse={} TAAseen={} epoch={} resets={} flips={} fallbackFrames=[{}] "
                  "compositeRejects=[{}] reuseRejects=[{}] sceneCarried={} "
                  "warn39={}/{} privateMiB={} uiEstMiB={} recycleMiB={} deviceMiB={}/{} "
-                 "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={}",
+                 "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={} budgetReason={} recovered={} budgetTrims={}",
                  successes, evaluations, captures, falls, p.qualification_reason, p.input.width,
                  p.input.height, p.output.width, p.output.height, report.mode_name,
                  report.preset_requested, report.preset_sent, mean_ms, p.eval_ms_max,
@@ -1797,7 +1860,8 @@ void Gt7DlssPass::Poll(u64 frame) {
                  p.OwnedBytes() >> 20, Common::Sharp::ui_image_bytes.load() >> 20,
                  VideoCore::RecycledImageBytes() >> 20, device_used >> 20, device_budget >> 20,
                  p.gpu.GetTotalMemoryBudget() >> 20, p.gpu.CanReportMemoryUsage(),
-                 p.slots.size(), p.slots_trimmed, p.memory_refusals);
+                 p.slots.size(), p.slots_trimmed, p.memory_refusals, p.budget_reason,
+                  p.budget_recoveries, p.budget_trims);
         p.logged_budget_warnings = report.budget_warnings;
         p.logged_reset_requests = p.reset_requests;
         p.logged_present_flips = p.present_flips;
