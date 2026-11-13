@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "ryty_gpu/ryty_dlss_budget.h"
 #include <windows.h>
 
 #include <array>
@@ -838,14 +839,17 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
 
 bool ReleaseIdleTemporal(u64 completed_tick) {
     std::scoped_lock lock{g_sl.mutex};
-    if (!g_sl.free_resources || !g_sl.temporal_resources || !g_sl.temporal_tick ||
-        completed_tick < g_sl.temporal_tick ||
-        std::chrono::steady_clock::now() - g_sl.temporal_last_use < std::chrono::seconds{2})
+    const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - g_sl.temporal_last_use)
+                             .count();
+    if (!g_sl.free_resources ||
+        !Budget::CanRelease(g_sl.temporal_resources, g_sl.temporal_tick, completed_tick, idle_ms))
         return false;
     if (g_sl.free_resources(sl::kFeatureDLSS, sl::ViewportHandle{2u}) != sl::Result::eOk)
         return false;
     g_sl.temporal_resources = false;
-    // Options are sent on every evaluation; no cached option state needs resetting.
+    // Options are sent on every evaluation; no cached option state needs
+    // resetting.
     return true;
 }
 

@@ -12,15 +12,15 @@
 // barrier, and around dispatches and copies. Later versions record the game's render jobs on its
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
-#include "common/dlss_memory.h"
-#include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
-#include "video_core/buffer_cache/proto_import.h"
-#include "video_core/renderer_vulkan/upload_memory_recovery.h"
-#include "video_core/renderer_vulkan/vk_ui_hires_depth.h"
+#include "common/dlss_memory.h"
 #include "ryty_gpu/ryty_gt7_dlss.h"
 #include "ryty_gpu/ryty_upscale.h"
+#include "video_core/buffer_cache/proto_import.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
+#include "video_core/renderer_vulkan/build_queue.h"
+#include "video_core/renderer_vulkan/upload_memory_recovery.h"
+#include "video_core/renderer_vulkan/vk_ui_hires_depth.h"
 
 #include <algorithm>
 #include <bit>

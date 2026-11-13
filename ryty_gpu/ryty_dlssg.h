@@ -64,8 +64,8 @@ struct TemporalFrame {
     TemporalImage color, depth, motion, output;
     Gt7Temporal::Camera camera;
     Gt7Temporal::Matrix previous_projection{}, previous_view{};
-    float jitter_x{}, jitter_y{}, mvec_scale=1, frame_ms=16.667f;
-    bool reset=true, hdr=false;
+    float jitter_x{}, jitter_y{}, mvec_scale = 1, frame_ms = 16.667f;
+    bool reset = true, hdr = false;
 };
 // Temporal SR is isolated from legacy viewport 1 and FG viewport 0. All input images
 // must be owned, shader-read-only; output is storage-capable in GENERAL.
@@ -83,7 +83,8 @@ struct TemporalReport {
     float optimal_w{}, optimal_h{}; // the SDK's optimal render size for this mode (info only)
 };
 TemporalReport LastTemporalReport();
-// Free viewport 2 only after both the last SDK use and its GPU tick have retired.
+// Free viewport 2 only after both the last SDK use and its GPU tick have
+// retired.
 bool ReleaseIdleTemporal(u64 completed_tick);
 
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).

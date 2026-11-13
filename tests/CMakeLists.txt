@@ -637,3 +637,7 @@ foreach(property INCLUDE_DIRECTORIES COMPILE_FEATURES COMPILE_DEFINITIONS LINK_L
     endif()
 endforeach()
 add_test(NAME wave64_guard_regression COMMAND shadgt_wave64_guard_regression)
+
+add_executable(shadps4_gt7_dlss_recovery_test test_gt7_dlss_recovery.cpp)
+target_include_directories(shadps4_gt7_dlss_recovery_test PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME gt7_dlss_recovery COMMAND shadps4_gt7_dlss_recovery_test)

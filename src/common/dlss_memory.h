@@ -11,7 +11,8 @@ namespace Common::DlssMemory {
 inline std::atomic<std::int64_t> pressure_until{};
 inline std::int64_t Milliseconds() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch()).count();
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 inline void RequestTrim() { pressure_until.store(Milliseconds() + 10000); }
 inline bool Pressure() { return Milliseconds() < pressure_until.load(); }

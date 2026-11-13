@@ -340,7 +340,8 @@ void TrimUnusedRecycledImages(VmaAllocator allocator, bool force) {
         auto& images = bucket->second;
         const auto it = std::ranges::find(images, seq, &RecycledImage::seq);
         if (it != images.end()) {
-            if (!force && it->unused_since > cutoff) break;
+            if (!force && it->unused_since > cutoff)
+                break;
             // Images enter this pool only after their GPU completion callback.
             vmaDestroyImage(allocator, it->image, it->allocation);
             g_recycled_bytes -= it->size_bytes;

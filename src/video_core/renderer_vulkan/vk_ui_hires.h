@@ -20,8 +20,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <deque>
-#include <mutex>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -496,9 +496,9 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     if (native_filter) {
         Common::Sharp::SetScale(proxy.native.width, proxy.size.width, true);
     }
-    const bool dlss = !native_filter && allow_dlss &&
-                      result != Gt7DlssPass::Result::Failed && !proxy.dlss_failed &&
-                      RytyDlss::CanScale(proxy.native, proxy.size) && CreateScaled(instance, proxy);
+    const bool dlss = !native_filter && allow_dlss && result != Gt7DlssPass::Result::Failed &&
+                      !proxy.dlss_failed && RytyDlss::CanScale(proxy.native, proxy.size) &&
+                      CreateScaled(instance, proxy);
     const auto input_layout =
         dlss ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eTransferSrcOptimal;
     NativeBarrier(cmd, image, vk::ImageLayout::eGeneral, input_layout);
@@ -512,8 +512,7 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     proxy.dlss_used = scaled;
     if (allow_dlss && temporal) {
         temporal->NotePresentation(frame, false, true);
-        temporal->NoteSpatialSource(frame, proxy.native,
-                                    scaled ? "DLSS-reset" : "linear-native");
+        temporal->NoteSpatialSource(frame, proxy.native, scaled ? "DLSS-reset" : "linear-native");
     }
     ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferDstOptimal,
                  vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);

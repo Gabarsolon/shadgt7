@@ -1304,9 +1304,7 @@ void Instance::CollectToolingInfo() const {
     }
 }
 
-u64 Instance::GetDeviceMemoryUsage() const {
-    return GetCurrentMemoryBudget().usage;
-}
+u64 Instance::GetDeviceMemoryUsage() const { return GetCurrentMemoryBudget().usage; }
 
 Instance::MemoryBudget Instance::GetCurrentMemoryBudget() const {
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};

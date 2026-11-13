@@ -35,6 +35,50 @@ RYGT_SWITCH_EXPORT extern const char* const RyGT_SwitchDescriptions[];
 RYGT_SWITCH_EXPORT extern const std::size_t RyGT_SwitchDescriptionCount;
 
 RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
+    // HD UI and temporal DLSS environment overrides.
+    "RYGTSW1|RYGT_DLSS_AUTO_MIP_BIAS|flag|Diagnostics & tracing|on|0 or 1|Apply the render-to-"
+    "display mip ratio once temporal DLSS has reconstructed a scene.",
+    "RYGTSW1|RYGT_DLSS_CARRY_SCENE|flag|Diagnostics & tracing|on|0 disables|Reuse the reconstr"
+    "ucted scene only when its source identity and version prove unchanged.",
+    "RYGTSW1|RYGT_DLSS_DIAG|flag|Diagnostics & tracing|off|0 or 1|Enable bounded diagnostic im"
+    "age capture with dlss.now; writes large files.",
+    "RYGTSW1|RYGT_DLSS_LOG|flag|Diagnostics & tracing|off|0 or 1|Log temporal reconstruction, "
+    "presentation and memory counters once per second.",
+    "RYGTSW1|RYGT_DLSS_MIP_EXTRA|float|Diagnostics & tracing|-1 with temporal DLSS|-2 to 0|Ext"
+    "ra material mip bias for temporal reconstruction; restart to compare.",
+    "RYGTSW1|RYGT_DLSS_PRESET|int|Diagnostics & tracing|0|0 to 13; 0 runtime default|Raw SDK p"
+    "reset override for integration diagnosis; unsupported presets depend on the installed SDK"
+    ".",
+    "RYGTSW1|RYGT_DLSS_REUSE_UNCHANGED|flag|Diagnostics & tracing|on|0 disables|Reuse a qualif"
+    "ied reconstruction when the scene proof is unchanged.",
+    "RYGTSW1|RYGT_DLSS_SHARPENING|int|Diagnostics & tracing|0|0 to 100|Scene-only DLSS sharpen"
+    "ing strength; the UI is unchanged.",
+    "RYGTSW1|RYGT_HD_UI|flag|Diagnostics & tracing|off|0 or 1|Render the UI and icon caches at"
+    " window density above 1080p.",
+    "RYGTSW1|RYGT_TDLSS_AUTO_EXPOSURE|flag|Diagnostics & tracing|on|0 or 1|Let DLSS estimate e"
+    "xposure; disable only to diagnose exposure assumptions.",
+    "RYGTSW1|RYGT_TDLSS_EXPOSURE_SCALE|float|Diagnostics & tracing|1|0.001 to 1000|Override th"
+    "e SDK exposure scale for integration diagnosis.",
+    "RYGTSW1|RYGT_TDLSS_HDR|int|Diagnostics & tracing|-1|-1 scene encoding; 0 SDR; 1 HDR|Overr"
+    "ide the SDK colour encoding flag for diagnosis; normally follow the scene.",
+    "RYGTSW1|RYGT_TDLSS_JITTER_SIGN_X|float|Diagnostics & tracing|-1|-1 to 1|Horizontal jitter"
+    " sign for integration diagnosis; retain the validated default.",
+    "RYGTSW1|RYGT_TDLSS_JITTER_SIGN_Y|float|Diagnostics & tracing|-1|-1 to 1|Vertical jitter s"
+    "ign for integration diagnosis; retain the validated default.",
+    "RYGTSW1|RYGT_TDLSS_MERGE_HI|float|Diagnostics & tracing|0.9|0.01 to 16|Upper native-delta"
+    " threshold for resync diagnosis; restart after changes.",
+    "RYGTSW1|RYGT_TDLSS_MERGE_LO|float|Diagnostics & tracing|0.25|0 to 8|Lower native-delta th"
+    "reshold for resync diagnosis; restart after changes.",
+    "RYGTSW1|RYGT_TDLSS_MOTION_JITTER|float|Diagnostics & tracing|1|-2 to 2|Motion-jitter corr"
+    "ection multiplier for diagnosis; retain the validated default.",
+    "RYGTSW1|RYGT_TDLSS_MVEC_SCALE|float|Diagnostics & tracing|1|-4 to 4|Motion-vector multipl"
+    "ier for diagnosis; retain the validated default.",
+    "RYGTSW1|RYGT_TDLSS_PRE_EXPOSURE|float|Diagnostics & tracing|1|0.001 to 1000|Override the "
+    "SDK pre-exposure multiplier for integration diagnosis.",
+    "RYGTSW1|RYGT_TDLSS_RESYNC_MERGE|flag|Diagnostics & tracing|on|0 or 1|Preserve reconstruct"
+    "ed scene detail when applying later native scene writes.",
+    "RYGTSW1|RYGT_TEMPORAL_DLSS|flag|Diagnostics & tracing|off|0 or 1|Reconstruct the jittered"
+    " GT7 scene with DLSS; requires HD UI and no frame generation.",
     // Shader objects & caches
     "RYGTSW1|RYGT_COMPILE_PACK|flag|Shader objects & caches|off|1 = on (needs shader objects and RYGT_SO_CACHE on)|At start, compiles in the background the compile-pack recipes missing from this driver's cache, e.g. after a driver update. Uses all cores.",
     "RYGTSW1|RYGT_DRIVER_CACHE|flag|Shader objects & caches|on|0 = off|Keeps the driver's pipeline cache file between runs; 0 turns it off so every start compiles again.",
