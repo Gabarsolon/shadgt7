@@ -13,6 +13,7 @@
 // their own (vk_ui_hires_depth.h). The proxies are only made when the output is bigger than the
 // display buffer, and only while their memory stays within MaxProxyBytes.
 
+#include "ryty_gpu/ryty_gt7_spatial_policy.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -488,9 +489,15 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
             return;
         }
     }
-    // A failed SDK evaluation keeps the native scale. A successful temporal evaluation whose
-    // final composite is not available may use the independent spatial context.
-    const bool dlss = allow_dlss && result != Gt7DlssPass::Result::Failed && !proxy.dlss_failed &&
+    // A temporal scene without a presentable reconstruction uses the native linear filter.
+    // The successful branch above and legacy spatial DLSS with temporal off stay unchanged.
+    const bool native_filter =
+        Gt7Spatial::PreferNativeFilter(temporal != nullptr, allow_dlss, false);
+    if (native_filter) {
+        Common::Sharp::SetScale(proxy.native.width, proxy.size.width, true);
+    }
+    const bool dlss = !native_filter && allow_dlss &&
+                      result != Gt7DlssPass::Result::Failed && !proxy.dlss_failed &&
                       RytyDlss::CanScale(proxy.native, proxy.size) && CreateScaled(instance, proxy);
     const auto input_layout =
         dlss ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eTransferSrcOptimal;
@@ -504,7 +511,9 @@ inline void UpscaleNative(const Instance& instance, vk::CommandBuffer cmd, vk::I
     }
     proxy.dlss_used = scaled;
     if (allow_dlss && temporal) {
-        temporal->NotePresentation(frame, false, scaled);
+        temporal->NotePresentation(frame, false, true);
+        temporal->NoteSpatialSource(frame, proxy.native,
+                                    scaled ? "DLSS-reset" : "linear-native");
     }
     ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferDstOptimal,
                  vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);

@@ -315,6 +315,10 @@ struct Gt7DlssPass::Impl {
     u64 present_frame = ~u64{}, present_flips{}, logged_present_flips{};
     u64 reset_requests{}, logged_reset_requests{}, unchanged_reuse{}, logged_unchanged_reuse{};
     int present_mode = -1;
+    vk::Extent2D spatial_source{};
+    const char* spatial_filter = "none";
+    u64 spatial_source_frame = ~u64{};
+    std::array<u64, 2> spatial_filters{}, logged_spatial_filters{};
     u64 spatial_grants{}, spatial_denials{}, logged_spatial_grants{}, logged_spatial_denials{};
     vk::ComponentMapping consumer_mapping{};
     struct BufferWrite {
@@ -1487,6 +1491,16 @@ void Gt7DlssPass::NoteWrite(const void* identity, u64 ps) {
 
 
 
+void Gt7DlssPass::NoteSpatialSource(u64 frame, vk::Extent2D source, const char* filter) {
+    auto& p = *impl;
+    p.spatial_source = source;
+    p.spatial_filter = filter;
+    if (p.spatial_source_frame != frame) {
+        ++p.spatial_filters[std::string_view(filter) == "DLSS-reset" ? 1 : 0];
+        p.spatial_source_frame = frame;
+    }
+}
+
 void Gt7DlssPass::NotePresentation(u64 frame, bool temporal, bool spatial) {
     auto& p = *impl;
     if (p.present_frame == frame) return; // first eligible scene handoff, once per frame
@@ -1859,7 +1873,8 @@ void Gt7DlssPass::Poll(u64 frame) {
                  "native={} reuse={} TAAseen={} epoch={} resets={} flips={} fallbackFrames=[{}] "
                  "compositeRejects=[{}] reuseRejects=[{}] sceneCarried={} "
                  "warn39={}/{} privateMiB={} uiEstMiB={} recycleMiB={} deviceMiB={}/{} "
-                 "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={} budgetReason={} recovered={} budgetTrims={} sdkReleased={}",
+                 "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={} budgetReason={} recovered={} budgetTrims={} sdkReleased={} "
+                 "spatialSource={}x{} spatialFilter={} spatialFrames={}/{}",
                  successes, evaluations, captures, falls, p.qualification_reason, p.input.width,
                  p.input.height, p.output.width, p.output.height, report.mode_name,
                  report.preset_requested, report.preset_sent, mean_ms, p.eval_ms_max,
@@ -1875,7 +1890,11 @@ void Gt7DlssPass::Poll(u64 frame) {
                  VideoCore::RecycledImageBytes() >> 20, device_used >> 20, device_budget >> 20,
                  p.gpu.GetTotalMemoryBudget() >> 20, p.gpu.CanReportMemoryUsage(),
                  p.slots.size(), p.slots_trimmed, p.memory_refusals, p.budget_reason,
-                  p.budget_recoveries, p.budget_trims, p.sdk_releases);
+                  p.budget_recoveries, p.budget_trims, p.sdk_releases,
+                  p.spatial_source.width, p.spatial_source.height, p.spatial_filter,
+                  p.spatial_filters[0] - p.logged_spatial_filters[0],
+                  p.spatial_filters[1] - p.logged_spatial_filters[1]);
+        p.logged_spatial_filters = p.spatial_filters;
         p.logged_budget_warnings = report.budget_warnings;
         p.logged_reset_requests = p.reset_requests;
         p.logged_present_flips = p.present_flips;

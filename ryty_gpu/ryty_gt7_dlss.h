@@ -57,6 +57,7 @@ public:
 
 
     void NotePresentation(u64 frame, bool temporal, bool spatial);
+    void NoteSpatialSource(u64 frame, vk::Extent2D source, const char* filter);
     /// Why a draw that samples the reconstructed scene at a display target was not taken as the
     /// final scene composite (once per frame and reason; `ps` 0 when no shader applies). Shown in
     /// the once-a-second line as compositeRejects=[reason:count] and rejectPs=[0xhash:reason:count].
