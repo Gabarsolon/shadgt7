@@ -91,6 +91,13 @@ inline constexpr float Abs(float v) {
 inline constexpr bool Finite(float v) {
     return v == v && v <= 3.402823466e38f && v >= -3.402823466e38f;
 }
+// A Vulkan scissor can extend beyond the attachment. Such a rectangle still covers
+// the whole scene; exact extent equality incorrectly rejects the native post composite.
+inline constexpr bool CoversScene(int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                  uint32_t scene_width, uint32_t scene_height) {
+    return scene_width && scene_height && x == 0 && y == 0 && width >= scene_width &&
+           height >= scene_height;
+}
 // The alias need not have an own write. The recorded complete copy must hold
 // exactly the version proved fresh at its producer, newer than foreign writes.
 inline constexpr bool FreshInputCopy(uint64_t own, uint64_t foreign, uint64_t held,

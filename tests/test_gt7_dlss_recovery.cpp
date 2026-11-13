@@ -3,6 +3,7 @@
 
 #include "ryty_gpu/ryty_dlss_budget.h"
 #include "ryty_gpu/ryty_gt7_spatial_policy.h"
+#include "ryty_gpu/ryty_gt7_dlss_policy.h"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,32 @@ int main() {
         const bool temporal = bits & 1, scene = bits & 2, reconstructed = bits & 4;
         check(Vulkan::Gt7Spatial::PreferNativeFilter(temporal, scene, reconstructed) ==
               (temporal && scene && !reconstructed));
+    }
+    using Vulkan::Gt7Temporal::CoversScene;
+    check(CoversScene(0, 0, 1920, 1080, 1920, 1080));
+    check(CoversScene(0, 0, 8192, 8192, 1920, 1080)); // same rendered pixels as exact clip
+    check(CoversScene(0, 0, 2560, 1440, 1920, 1080));
+    check(!CoversScene(1, 0, 8192, 8192, 1920, 1080)); // cropped left edge
+    check(!CoversScene(0, 1, 8192, 8192, 1920, 1080));
+    check(!CoversScene(0, 0, 1919, 1080, 1920, 1080));
+    check(!CoversScene(0, 0, 1920, 1079, 1920, 1080));
+    check(!CoversScene(0, 0, 0, 0, 0, 0));
+    for (unsigned width : {0u, 1u, 1919u, 1920u, 2560u, 8192u, ~0u}) {
+        for (unsigned height : {0u, 1u, 1079u, 1080u, 1440u, 8192u, ~0u}) {
+            for (int x : {0, 1, 128}) {
+                for (int y : {0, 1, 128}) {
+                    // The four attachment corners must all survive the scissor intersection.
+                    const auto inside = [&](unsigned px, unsigned py) {
+                        return int64_t(px) >= x && int64_t(py) >= y &&
+                            int64_t(px) < int64_t(x) + width &&
+                            int64_t(py) < int64_t(y) + height;
+                    };
+                    const bool covers = inside(0, 0) && inside(1919, 0) &&
+                                        inside(0, 1079) && inside(1919, 1079);
+                    check(CoversScene(x, y, width, height, 1920, 1080) == covers);
+                }
+            }
+        }
     }
     std::printf("PASS %u production policy checks\n", checks);
 }

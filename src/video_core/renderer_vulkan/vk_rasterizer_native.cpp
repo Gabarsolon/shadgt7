@@ -9844,6 +9844,29 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages(b); // PERF-109
     }
+    // GPU.temporal_dlss: reconcile the native scene's versions after uploads, copies and unknown
+    // writers. Most post passes read the 1080p copy, which was reconstructed before the blur;
+    // the final tonemap samples the owned output-size scene instead.
+    if (temporal_dlss) {
+        RytyDlss::BeginNativeFrame(frame);
+        if (temporal_dlss->Reconstructed(frame)) {
+            for (const auto* sampled : b.sampled) {
+                if (sampled && sampled->image && !sampled->reused.load() &&
+                    temporal_dlss->OwnsScene(frame, sampled) &&
+                    !temporal_dlss->HasScene(frame, sampled, sampled->write_version.load())) {
+                    Splice();
+                    r.scheduler.EndRendering();
+                    temporal_dlss->SyncScene(r.scheduler.DirectCommandBuffer(), frame,
+                                             TemporalNativeImage(*sampled, registry->Generation()));
+                }
+            }
+        }
+    }
+    vk::DescriptorImageInfo* temporal_scene_binding =
+        temporal_dlss && !indirect && !hud_black_state
+            ? TemporalSceneBinding(regs, *pipeline, targets, b)
+            : nullptr;
+    int temporal_composite_phase = -1;
     // GPU.hd_ui: a draw after the scene composite renders into the display buffer's proxy. It
     // may end the open list (the scene is scaled in the scheduler's command buffer).
     if (UiHires::Enabled()) {
@@ -9878,7 +9901,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             targets.ui_depth_feedback = std::ranges::any_of(b.sampled, aliases) ||
                                         std::ranges::any_of(b.stored, aliases);
         }
-        PrepareUiTarget(targets, *pipeline, regs);
+        if (temporal_scene_binding) {
+            // A display may receive a clear/another draw before its final scene composite.
+            // Keep this proved scene consumer native until its SR branch is complete; otherwise
+            // PrepareUiTarget presents too early and scales its dynamic scissor into UI space.
+            const auto address = targets.colors[0]->info.guest_address;
+            ResolveUiDisplay(address, true); // preserve any earlier proxy writes before this draw
+            auto& ui = UiHires::Get();
+            std::scoped_lock lock{ui.mutex};
+            ui.scale = 0.0f;
+            if (const auto it = ui.proxies.find(address); it != ui.proxies.end()) {
+                temporal_composite_phase = int(it->second.phase);
+                it->second.phase = UiHires::Phase::Scene;
+                it->second.native_dirty = false;
+                UiHires::MarkStale(it->second, false);
+            }
+        } else {
+            PrepareUiTarget(targets, *pipeline, regs);
+        }
         PrepareMapIcons(targets, *pipeline, regs, b);
         // Bindings may have been prepared or reused before the target was redirected: assign the
         // coordinate scale on every draw. Native and offscreen draws keep the identity.
@@ -9887,28 +9927,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         b.push.native_frag_coord_scale = {inv_scale, inv_scale};
         Begin();
     }
-    // GPU.temporal_dlss: reconcile the native scene's versions after uploads, copies and unknown
-    // writers. Most post passes read the 1080p copy, which was reconstructed before the blur;
-    // the final tonemap samples the owned output-size scene instead.
-    if (temporal_dlss) {
-        RytyDlss::BeginNativeFrame(frame);
-        if (temporal_dlss->Reconstructed(frame)) {
-            for (const auto* sampled : b.sampled) {
-                if (sampled && sampled->image && !sampled->reused.load() &&
-                    temporal_dlss->OwnsScene(frame, sampled) &&
-                    !temporal_dlss->HasScene(frame, sampled, sampled->write_version.load())) {
-                    Splice();
-                    r.scheduler.EndRendering();
-                    temporal_dlss->SyncScene(r.scheduler.DirectCommandBuffer(), frame,
-                                             TemporalNativeImage(*sampled, registry->Generation()));
-                }
-            }
-        }
-    }
-    vk::DescriptorImageInfo* temporal_scene_binding =
-        temporal_dlss && !indirect && !hud_black_state
-            ? TemporalSceneBinding(regs, *pipeline, targets, b)
-            : nullptr;
     // Replay full-size scene writes with unchanged shaders, resources and blending. Interpolated
     // game pixel coordinates survive the viewport scaling. FragCoord, side effects, indirect
     // draws and unknown vertex conventions are rejected.
@@ -10413,9 +10431,33 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         NoteTemporalDraw(regs, pipeline, &targets, &b, "executed");
         const bool temporal_full_scissor =
             targets.colors[0] && s.dynamic.scissors.size() == 1 &&
-            s.dynamic.scissors[0].offset == vk::Offset2D{0, 0} &&
-            s.dynamic.scissors[0].extent == vk::Extent2D{targets.colors[0]->info.size.width,
-                                                        targets.colors[0]->info.size.height};
+            Gt7Temporal::CoversScene(s.dynamic.scissors[0].offset.x,
+                                    s.dynamic.scissors[0].offset.y,
+                                    s.dynamic.scissors[0].extent.width,
+                                    s.dynamic.scissors[0].extent.height,
+                                    targets.colors[0]->info.size.width,
+                                    targets.colors[0]->info.size.height);
+        if (temporal_scene_binding &&
+            (Common::Sharp::Get().dlss_log || Common::Sharp::Diagnostics())) {
+            const auto clip = s.dynamic.scissors.empty() ? vk::Rect2D{} : s.dynamic.scissors[0];
+            const bool exact = s.dynamic.scissors.size() == 1 &&
+                clip.offset == vk::Offset2D{0, 0} &&
+                clip.extent == vk::Extent2D{targets.colors[0]->info.size.width,
+                                           targets.colors[0]->info.size.height};
+            static bool reported = false;
+            if (!reported && (!exact || temporal_composite_phase > int(UiHires::Phase::Idle))) {
+                reported = true;
+                const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                LOG_WARNING(Render_Vulkan,
+                            "GT7-DLSS composite: f={} ps={:#x} dst={:#x} native={}x{} "
+                            "raster={}x{} scissor={}:[{},{} {}x{}] covers={} priorUiPhase={}",
+                            frame, fs ? fs->pgm_hash : 0, targets.colors[0]->info.guest_address,
+                            targets.colors[0]->info.size.width, targets.colors[0]->info.size.height,
+                            targets.state.width, targets.state.height, s.dynamic.scissors.size(),
+                            clip.offset.x, clip.offset.y, clip.extent.width, clip.extent.height,
+                            temporal_full_scissor, temporal_composite_phase);
+            }
+        }
         const auto replay_scaled = [&](auto replay) {
             const auto extent = temporal_dlss->SceneExtent();
             replay.width = extent.width;
