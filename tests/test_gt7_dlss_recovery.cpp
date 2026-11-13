@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 int main() {
     using namespace Vulkan::RytyDlssG::Budget;
@@ -71,5 +72,27 @@ int main() {
             }
         }
     }
+    struct Clip {
+        struct { int32_t x{}, y{}; } offset;
+        struct { uint32_t width{}, height{}; } extent;
+    };
+    using Vulkan::Gt7Temporal::CoversSceneViewportZero;
+    const Clip full{{0, 0}, {1920, 1080}}, empty{}, partial{{0, 0}, {960, 1080}};
+    check(!CoversSceneViewportZero(std::vector<Clip>{}, true, 1920, 1080));
+    check(CoversSceneViewportZero(std::vector{full}, true, 1920, 1080));
+    for (const auto extra : {empty, partial, full, Clip{{128, 64}, {12, 20}}}) {
+        check(CoversSceneViewportZero(std::vector{full, extra}, true, 1920, 1080));
+        check(!CoversSceneViewportZero(std::vector{empty, extra}, true, 1920, 1080));
+        check(!CoversSceneViewportZero(std::vector{partial, extra}, true, 1920, 1080));
+        check(!CoversSceneViewportZero(std::vector{full, extra}, false, 1920, 1080));
+    }
+    std::vector<Clip> bound(16, empty);
+    bound[0] = full;
+    check(CoversSceneViewportZero(bound, true, 1920, 1080));
+    bound[0].offset.x = 1;
+    check(!CoversSceneViewportZero(bound, true, 1920, 1080));
+    bound[0] = {{0, 0}, {8192, 8192}};
+    check(CoversSceneViewportZero(bound, true, 1920, 1080));
+    check(!CoversSceneViewportZero(bound, false, 1920, 1080));
     std::printf("PASS %u production policy checks\n", checks);
 }

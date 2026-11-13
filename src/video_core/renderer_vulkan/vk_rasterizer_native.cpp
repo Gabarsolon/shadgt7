@@ -10429,33 +10429,43 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     if (temporal_dlss) {
         NoteTemporalDraw(regs, pipeline, &targets, &b, "executed");
-        const bool temporal_full_scissor =
-            targets.colors[0] && s.dynamic.scissors.size() == 1 &&
-            Gt7Temporal::CoversScene(s.dynamic.scissors[0].offset.x,
-                                    s.dynamic.scissors[0].offset.y,
-                                    s.dynamic.scissors[0].extent.width,
-                                    s.dynamic.scissors[0].extent.height,
-                                    targets.colors[0]->info.size.width,
-                                    targets.colors[0]->info.size.height);
+        // The rasterizer binds a pair for every guest viewport with nonzero xscale.
+        // That count is not the number used by this draw: absent ViewportIndex, Vulkan
+        // selects index 0. Reject unknown indexed selection rather than guessing its value.
+        const bool temporal_viewport_zero = !s.dynamic.viewports.empty() &&
+            std::ranges::none_of(pipeline->GetStages(), [](const auto* stage) {
+                return stage && stage->sw_stage != Shader::SwStage::Fragment &&
+                       stage->stores.GetAny(Shader::IR::Attribute::ViewportIndex);
+            });
+        const bool temporal_full_scissor = targets.colors[0] &&
+            Gt7Temporal::CoversSceneViewportZero(s.dynamic.scissors, temporal_viewport_zero,
+                                                targets.colors[0]->info.size.width,
+                                                targets.colors[0]->info.size.height);
         if (temporal_scene_binding &&
             (Common::Sharp::Get().dlss_log || Common::Sharp::Diagnostics())) {
-            const auto clip = s.dynamic.scissors.empty() ? vk::Rect2D{} : s.dynamic.scissors[0];
-            const bool exact = s.dynamic.scissors.size() == 1 &&
-                clip.offset == vk::Offset2D{0, 0} &&
-                clip.extent == vk::Extent2D{targets.colors[0]->info.size.width,
-                                           targets.colors[0]->info.size.height};
-            static bool reported = false;
-            if (!reported && (!exact || temporal_composite_phase > int(UiHires::Phase::Idle))) {
-                reported = true;
+            // At most eight distinct shader/clip/selection signatures for this process.
+            // Frames and rotating display addresses deliberately do not create signatures.
+            static std::set<std::string> reported;
+            if (reported.size() < 8) {
+                std::string clips;
+                for (const auto& clip : s.dynamic.scissors) {
+                    clips += fmt::format("{}[{},{} {}x{}]", clips.empty() ? "" : ",",
+                                         clip.offset.x, clip.offset.y, clip.extent.width,
+                                         clip.extent.height);
+                }
                 const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
-                LOG_WARNING(Render_Vulkan,
-                            "GT7-DLSS composite: f={} ps={:#x} dst={:#x} native={}x{} "
-                            "raster={}x{} scissor={}:[{},{} {}x{}] covers={} priorUiPhase={}",
-                            frame, fs ? fs->pgm_hash : 0, targets.colors[0]->info.guest_address,
-                            targets.colors[0]->info.size.width, targets.colors[0]->info.size.height,
-                            targets.state.width, targets.state.height, s.dynamic.scissors.size(),
-                            clip.offset.x, clip.offset.y, clip.extent.width, clip.extent.height,
-                            temporal_full_scissor, temporal_composite_phase);
+                const auto signature = fmt::format("ps={:#x} viewport0={} scissor={}:{} covers={}",
+                    fs ? fs->pgm_hash : 0, temporal_viewport_zero, s.dynamic.scissors.size(),
+                    clips, temporal_full_scissor);
+                if (reported.emplace(signature).second) {
+                    LOG_WARNING(Render_Vulkan,
+                                "GT7-DLSS composite: f={} {} dst={:#x} native={}x{} "
+                                "raster={}x{} priorUiPhase={}",
+                                frame, signature, targets.colors[0]->info.guest_address,
+                                targets.colors[0]->info.size.width,
+                                targets.colors[0]->info.size.height, targets.state.width,
+                                targets.state.height, temporal_composite_phase);
+                }
             }
         }
         const auto replay_scaled = [&](auto replay) {
