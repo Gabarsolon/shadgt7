@@ -60,7 +60,7 @@ struct TemporalImage {
     vk::Extent2D size{};
 };
 struct TemporalFrame {
-    u64 frame{};
+    u64 frame{}, tick{};
     TemporalImage color, depth, motion, output;
     Gt7Temporal::Camera camera;
     Gt7Temporal::Matrix previous_projection{}, previous_view{};
@@ -83,6 +83,8 @@ struct TemporalReport {
     float optimal_w{}, optimal_h{}; // the SDK's optimal render size for this mode (info only)
 };
 TemporalReport LastTemporalReport();
+// Free viewport 2 only after both the last SDK use and its GPU tick have retired.
+bool ReleaseIdleTemporal(u64 completed_tick);
 
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();

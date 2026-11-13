@@ -40,6 +40,7 @@ namespace {
 
 using PFunInit = sl::Result (*)(const sl::Preferences&, uint64_t);
 using PFunShutdown = sl::Result (*)();
+using PFunFreeResources = sl::Result (*)(sl::Feature, const sl::ViewportHandle&);
 using PFunIsFeatureSupported = sl::Result (*)(sl::Feature, const sl::AdapterInfo&);
 using PFunSetTagForFrame = sl::Result (*)(const sl::FrameToken&, const sl::ViewportHandle&,
                                           const sl::ResourceTag*, uint32_t, sl::CommandBuffer*);
@@ -74,6 +75,10 @@ struct Streamline {
     HMODULE module{};
     PFunInit init{};
     PFunShutdown shutdown{};
+    PFunFreeResources free_resources{};
+    bool temporal_resources{};
+    u64 temporal_tick{};
+    std::chrono::steady_clock::time_point temporal_last_use{};
     PFunIsFeatureSupported is_supported{};
     PFunSetTagForFrame set_tag{};
     PFunSetConstants set_constants{};
@@ -358,6 +363,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     const auto get = [&](const char* name) { return GetProcAddress(module, name); };
     g_sl.init = reinterpret_cast<PFunInit>(get("slInit"));
     g_sl.shutdown = reinterpret_cast<PFunShutdown>(get("slShutdown"));
+    g_sl.free_resources = reinterpret_cast<PFunFreeResources>(get("slFreeResources"));
     g_sl.is_supported = reinterpret_cast<PFunIsFeatureSupported>(get("slIsFeatureSupported"));
     g_sl.set_tag = reinterpret_cast<PFunSetTagForFrame>(get("slSetTagForFrame"));
     g_sl.set_constants = reinterpret_cast<PFunSetConstants>(get("slSetConstants"));
@@ -830,6 +836,19 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     return true;
 }
 
+bool ReleaseIdleTemporal(u64 completed_tick) {
+    std::scoped_lock lock{g_sl.mutex};
+    if (!g_sl.free_resources || !g_sl.temporal_resources || !g_sl.temporal_tick ||
+        completed_tick < g_sl.temporal_tick ||
+        std::chrono::steady_clock::now() - g_sl.temporal_last_use < std::chrono::seconds{2})
+        return false;
+    if (g_sl.free_resources(sl::kFeatureDLSS, sl::ViewportHandle{2u}) != sl::Result::eOk)
+        return false;
+    g_sl.temporal_resources = false;
+    // Options are sent on every evaluation; no cached option state needs resetting.
+    return true;
+}
+
 TemporalReport LastTemporalReport() {
     std::scoped_lock lock{g_sl.mutex};
     return g_temporal_report;
@@ -955,6 +974,9 @@ bool EvaluateTemporal(vk::CommandBuffer cmd, const TemporalFrame& f) {
     if (g_sl.set_tag(*token, viewport, tags, u32(std::size(tags)), command) != sl::Result::eOk)
         return false;
     const sl::BaseStructure* inputs[]{&viewport};
+    g_sl.temporal_tick = f.tick;
+    g_sl.temporal_last_use = std::chrono::steady_clock::now();
+    g_sl.temporal_resources = true;
     const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *token, inputs, 1, command);
     const bool succeeded = EvaluationSucceeded(result);
     if (!succeeded)

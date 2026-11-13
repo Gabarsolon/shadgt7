@@ -236,7 +236,8 @@ struct Gt7DlssPass::Impl {
     u64 budget_recoveries{}, budget_trims{};
     bool budget_was_refused{};
     const char* budget_reason = "ready";
-    std::chrono::steady_clock::time_point housekeeping_last{};
+    std::chrono::steady_clock::time_point housekeeping_last{}, inactive_since{};
+    u64 sdk_releases{};
     u64 memory_refusals{}, slots_trimmed{}, logged_budget_warnings{};
     u64 OwnedBytes() const {
         u64 bytes = 0;
@@ -1406,6 +1407,7 @@ Gt7DlssPass::Result Gt7DlssPass::Reconstruct(vk::CommandBuffer cmd, u64 frame) {
     const auto& cfg = Config();
     const auto jitter = RasterJitter(p.constants, cfg.jitter_sign_x, cfg.jitter_sign_y);
     RytyDlssG::TemporalFrame f{.frame = frame,
+                               .tick = p.scheduler.CurrentTick(),
                                .color = p.current->color.Descriptor(),
                                .depth = p.current->depth.Descriptor(),
                                .motion = p.current->motion.Descriptor(),
@@ -1646,8 +1648,20 @@ void Gt7DlssPass::Poll(u64 frame) {
     p.CollectTime();
     p.TrimSlots();
     const auto memory_now = std::chrono::steady_clock::now();
+    if (!p.scene_identity && !p.branch_ready) {
+        if (p.inactive_since == std::chrono::steady_clock::time_point{})
+            p.inactive_since = memory_now;
+    } else {
+        p.inactive_since = {};
+    }
     if (Config().enabled && memory_now - p.housekeeping_last >= std::chrono::seconds{1}) {
         p.housekeeping_last = memory_now;
+        if (p.inactive_since != std::chrono::steady_clock::time_point{} &&
+            memory_now - p.inactive_since >= std::chrono::seconds{2} &&
+            RytyDlssG::ReleaseIdleTemporal(p.scheduler.GetWorkSemaphore()->KnownGpuTick())) {
+            ++p.sdk_releases;
+            p.history.Invalidate("SDK-idle-release");
+        }
         const auto heap = p.gpu.CanReportMemoryUsage()
             ? p.gpu.GetCurrentMemoryBudget() : Instance::MemoryBudget{};
         const auto threshold = heap.budget
@@ -1845,7 +1859,7 @@ void Gt7DlssPass::Poll(u64 frame) {
                  "native={} reuse={} TAAseen={} epoch={} resets={} flips={} fallbackFrames=[{}] "
                  "compositeRejects=[{}] reuseRejects=[{}] sceneCarried={} "
                  "warn39={}/{} privateMiB={} uiEstMiB={} recycleMiB={} deviceMiB={}/{} "
-                 "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={} budgetReason={} recovered={} budgetTrims={}",
+                 "gameBudgetMiB={} memExt={} slots={} trimmed={} allocRefused={} budgetReason={} recovered={} budgetTrims={} sdkReleased={}",
                  successes, evaluations, captures, falls, p.qualification_reason, p.input.width,
                  p.input.height, p.output.width, p.output.height, report.mode_name,
                  report.preset_requested, report.preset_sent, mean_ms, p.eval_ms_max,
@@ -1861,7 +1875,7 @@ void Gt7DlssPass::Poll(u64 frame) {
                  VideoCore::RecycledImageBytes() >> 20, device_used >> 20, device_budget >> 20,
                  p.gpu.GetTotalMemoryBudget() >> 20, p.gpu.CanReportMemoryUsage(),
                  p.slots.size(), p.slots_trimmed, p.memory_refusals, p.budget_reason,
-                  p.budget_recoveries, p.budget_trims);
+                  p.budget_recoveries, p.budget_trims, p.sdk_releases);
         p.logged_budget_warnings = report.budget_warnings;
         p.logged_reset_requests = p.reset_requests;
         p.logged_present_flips = p.present_flips;
