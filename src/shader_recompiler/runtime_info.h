@@ -256,6 +256,16 @@ struct HwFragmentRuntimeInfo {
     AmdGpu::ShaderExportFormat z_export_format;
     u8 num_samples{1};
     u8 mrtz_mask{};
+    // NEO-GT7-005: mrtz_mask's bit 7 (the export masks use bits 0-3) asks for a pixel shader
+    // that runs once per pixel: its draw rasterizes more samples than its colour targets have
+    // (the PS4 Pro's checkerboard: 2-sample depth, 1-fragment colour) under
+    // VK_NV_framebuffer_mixed_samples, where Vulkan forbids per-sample shading. It lives in a
+    // byte the comparison already covers, so stored translations keep their layout and nothing
+    // changes where the bit is never set.
+    static constexpr u8 MrtzPixelRate = 0x80;
+    bool PixelRate() const noexcept {
+        return (mrtz_mask & MrtzPixelRate) != 0;
+    }
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};

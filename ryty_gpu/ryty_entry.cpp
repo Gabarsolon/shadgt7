@@ -56,6 +56,7 @@
 #ifdef RYGT_PGO_TRAIN
 // The game deliberately uses TerminateProcess, which skips LLVM's atexit writer.
 extern "C" int __llvm_profile_write_file();
+extern "C" void __llvm_profile_initialize_file();
 #endif
 
 namespace Libraries::SystemService {
@@ -126,6 +127,9 @@ void RunWindowThread() {
                                                 .count()));
     }
 #ifdef RYGT_PGO_TRAIN
+    // The runtime's own initializer did not run in this module on 2026-11-12 ("Filename not
+    // set"): the file name is set here, from LLVM_PROFILE_FILE or the build's default.
+    __llvm_profile_initialize_file();
     const int profile_result = __llvm_profile_write_file();
     std::fprintf(stderr, "[window] PGO profile write result: %d\n", profile_result);
 #endif
@@ -721,6 +725,13 @@ extern "C" __declspec(dllexport) int RytyGpuHandleWriteFault(void* exception_poi
 // car thumbnail shot then breaks: "file_size > 10 * 1024" when a new car is bought).
 extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
     return Common::GuestClock::ReadTsc();
+}
+
+// NEO-GT7-015: this renderer draws the PS4 Pro mode (NEO-GT7-001 to 014). Ryty's libkernel asks
+// for it before RYGT_NEO=1 answers sceKernelIsNeoMode with 1: a renderer without the Pro mode
+// (an older package) keeps the base PS4 mode instead of a black screen and a lost GPU.
+extern "C" __declspec(dllexport) int RytyGpuNeoSupported() {
+    return 1;
 }
 
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest

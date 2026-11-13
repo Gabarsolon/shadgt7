@@ -497,14 +497,9 @@ public:
 
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
-        DeferPriorityOperation(std::move(func), CurrentTick());
-    }
-
-    /// FIX-GT7-147: runs func once the GPU has finished the given (already submitted) tick.
-    void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), tick);
+            priority_pending_ops.emplace(std::move(func), CurrentTick());
         }
         priority_pending_ops_cv.notify_one();
     }

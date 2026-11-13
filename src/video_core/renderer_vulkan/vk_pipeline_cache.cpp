@@ -33,6 +33,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
@@ -1255,6 +1256,36 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
+        // NEO-GT7-005: in the PS4 Pro mode, a draw rasterizing more samples (its depth's) than
+        // one of its colour targets has fragments runs its pixel shader once per pixel, where
+        // Vulkan requires it: VK_NV_framebuffer_mixed_samples (per-sample shading with fewer
+        // colour samples lost the GPU, writing to address 0). VK_AMD_mixed_attachment_samples
+        // has no such rule: AMD keeps the shader as it is. RYGT_NEO_PIXEL_RATE=0: as before.
+        static const bool neo_pixel_rate = [] {
+            const char* env = std::getenv("RYGT_NEO_PIXEL_RATE");
+            return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+        }();
+        if (neo_pixel_rate && instance.IsMixedDepthSamplesSupported() &&
+            !instance.IsMixedAnySamplesSupported()) {
+            const u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            bool fewer = false;
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    fewer |= col_buf.NumSamples() < raster;
+                }
+            }
+            if (fewer) {
+                info.hw.fs.mrtz_mask |= Shader::HwFragmentRuntimeInfo::MrtzPixelRate;
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GT7-005: pixel shader at {:#x} runs once per pixel: {} "
+                                "raster samples, fewer colour fragments (mixed samples)",
+                                regs.ps_program.Address<VAddr>(), raster);
+                }
+            }
+        }
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =
@@ -2183,7 +2214,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     // Port of xacidr4inx's reflection fix (RyGT 0066): fragment cube samples filter across faces.
-    profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
+    // FIX-GT7-151: an RX 480 drew GT7 right only with the legacy 2D-array sampling path, so GCN
+    // Radeons take it by default. RYGT_NATIVE_CUBE=0 picks the legacy path on any GPU, =1 the
+    // native one.
+    {
+        const char* native_cube_env = std::getenv("RYGT_NATIVE_CUBE");
+        const bool native_cube = native_cube_env && *native_cube_env ? native_cube_env[0] != '0'
+                                                                     : !instance.IsAmdGcn();
+        profile.native_cube_sampling =
+            NativeModeRequested() && instance.IsImageCubeArraySupported() && native_cube;
+        LOG_INFO(Render_Vulkan, "FIX-GT7-151: native cube sampling {}{}",
+                 profile.native_cube_sampling ? "on" : "off",
+                 native_cube_env && *native_cube_env ? " (RYGT_NATIVE_CUBE)"
+                 : instance.IsAmdGcn()              ? " (GCN Radeon)"
+                                                    : "");
+    }
     SetNativeCubeCacheEnabled(profile.native_cube_sampling); // FIX-GT7-083
     if (SingleSampleBarycentricRequested() && instance.GetVendorID() == 0x1002) {
         LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample interpolation on; KHR {}",
@@ -6160,6 +6205,35 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             needed_fixes |= 32u; // FIX-190
             LOG_INFO(Render_Vulkan, "FIX-190: {}_{:#x} turns every lane on inside a branch",
                      hw_stage, params.hash);
+        }
+        // NEO-GT7-007: PS4 Pro programs with SDWA compares or selections, stored before they
+        // were translated (only Pro code has SDWA, so the base mode never looks). Like the fixes
+        // above, only for a store other builds may have filled (RYGT_KEEP_SHADER_CACHE=1, builds
+        // without a commit): a player's store is cleared by SHD-010 at each new renderer.
+        static const bool neo = Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        if (neo) {
+            const auto use = Shader::NeoCodeCensus(params.code);
+            if (use.sdwa_compares_to_sgpr + use.sdwa_selects != 0) {
+                needed_fixes |= 2048u;
+            }
+        }
+    }
+    // NEO-GT7-008 (diagnosis, RYGT_NEO_CENSUS=1): the PS4 Pro encodings each program uses, at
+    // its first use; DPP and the MIMG G16/A16/D16 bits are not translated yet.
+    static const bool neo_census = [] {
+        const char* env = std::getenv("RYGT_NEO_CENSUS");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && env && env[0] == '1';
+    }();
+    if (neo_census && first_use) {
+        const auto use = Shader::NeoCodeCensus(params.code);
+        if (use.sdwa_compares_to_sgpr + use.sdwa_selects + use.dpp + use.mimg_g16 + use.mimg_a16 +
+                use.mimg_d16 !=
+            0) {
+            LOG_WARNING(Render_Vulkan,
+                        "NEO-GT7-008: {}_{:#x} uses SDWA compares to SGPRs {}, SDWA selections {}, "
+                        "DPP {}, MIMG G16 {} A16 {} D16 {}",
+                        hw_stage, params.hash, use.sdwa_compares_to_sgpr, use.sdwa_selects,
+                        use.dpp, use.mimg_g16, use.mimg_a16, use.mimg_d16);
         }
     }
     const auto known = needed_fixes != 0 ? else_scope_fixed.find(params.hash)

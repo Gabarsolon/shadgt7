@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "core/libraries/kernel/process.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 // ryGT: the size DLSS and FSR 3.1 scale the game picture to (RYGT_UPSCALE_QUALITY, set by the
@@ -68,8 +69,16 @@ inline vk::Extent2D Target(vk::Extent2D input, vk::Extent2D window) {
     if (scale == 0.0) {
         return window;
     }
-    return {static_cast<u32>(std::lround(input.width * scale)),
-            static_cast<u32>(std::lround(input.height * scale))};
+    const vk::Extent2D output{static_cast<u32>(std::lround(input.width * scale)),
+                              static_cast<u32>(std::lround(input.height * scale))};
+    // NEO-GT7-001: the PS4 Pro picture (3200x1800 or 3840x2160) is already near the window, and a
+    // quality mode made for the 1080p picture would ask for up to 11520x6480. Past the window the
+    // output is the window, or the picture itself when it is not smaller (native anti-aliasing).
+    if (Libraries::Kernel::sceKernelIsNeoMode() &&
+        (output.width > window.width || output.height > window.height)) {
+        return input.width >= window.width || input.height >= window.height ? input : window;
+    }
+    return output;
 }
 
 /// Whether the upscaler should run at the picture's own size (DLAA / FSR native AA).

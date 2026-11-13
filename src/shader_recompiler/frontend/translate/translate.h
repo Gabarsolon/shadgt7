@@ -374,6 +374,8 @@ private:
     void SetDst64(const InstOperand& operand, const IR::U64F64& value_raw);
     template <typename T = IR::U32, bool is_signed = false>
     void SetDstPk(const InstOperand& operand, const pk_type<T>& value);
+    /// NEO-GT7-007: the 32 bits an SDWA result leaves in its VGPR.
+    [[nodiscard]] IR::U32 SdwaDstBits(const InstOperand& operand, const IR::U32& bits);
 
     // Vector ALU Helpers
     IR::U32 GetCarryIn(const GcnInst& inst);

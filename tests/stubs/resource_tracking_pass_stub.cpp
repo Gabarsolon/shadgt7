@@ -176,7 +176,7 @@ public:
 
     u32 Add(const FMaskResource& desc) {
         u32 index = Add(fmask_resources, desc, [&desc](const auto& existing) {
-            return desc.sharp_idx == existing.sharp_idx;
+            return desc.sharp_fetch == existing.sharp_fetch && desc.is_r128 == existing.is_r128;
         });
         return index;
     }

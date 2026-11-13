@@ -61,9 +61,19 @@ bool KeepShaderCache() {
 
 // Tests: a store of its own for this tag. The stamp knows neither the environment's switches nor
 // changes made since the build was configured, so a test keeps one store per renderer and switches.
+// NEO-GT7-007: RYGT_NEO_SDWA_CMP=0 translates SDWA compares the old way (to VCC), which breaks the
+// PS4 Pro checkerboard resolve; those translations get a store of their own, so a session run once
+// with the switch leaves nothing wrong in the usual store. Only with the Pro mode's switch
+// (RYGT_NEO=1, read as libkernel reads it): the base mode has no SDWA, so its store stays.
 std::string StoreTag() {
     const char* env = std::getenv("RYGT_SHADER_STORE_TAG");
-    return env && *env ? std::string{"-"} + env : std::string{};
+    std::string tag = env && *env ? std::string{"-"} + env : std::string{};
+    const char* sdwa = std::getenv("RYGT_NEO_SDWA_CMP");
+    const char* neo = std::getenv("RYGT_NEO");
+    if (sdwa && sdwa[0] == '0' && neo && neo[0] == '1' && neo[1] == '\0') {
+        tag += "-sdwa-vcc";
+    }
+    return tag;
 }
 
 std::string ReadStamp(const std::filesystem::path& stamp) {

@@ -6,7 +6,9 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <vector>
 
+#include "video_core/renderer_vulkan/coverage_reduction.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
@@ -312,6 +314,16 @@ public:
         return amd_mixed_attachment_samples;
     }
 
+    /// NEO-GT7-016: VK_NV_coverage_reduction_mode is on (PS4 Pro mode, NVIDIA's mixed samples).
+    bool IsCoverageTruncateOn() const {
+        return nv_coverage_reduction;
+    }
+
+    /// NEO-GT7-016: the combinations the driver lists for VK_COVERAGE_REDUCTION_MODE_TRUNCATE_NV.
+    std::span<const CoverageReduction::Combination> GetTruncateCombinations() const {
+        return truncate_combinations;
+    }
+
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
         return features.geometryShader;
@@ -350,7 +362,7 @@ public:
                driver_info.find("LLPC") == std::string::npos;
     }
 
-    /// FIX-GT7-147: a GCN Radeon (R7/R9, RX 400/500/600 three-digit models, Vega, Radeon VII)
+    /// FIX-GT7-151: a GCN Radeon (R7/R9, RX 400/500/600 three-digit models, Vega, Radeon VII)
     /// on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
     bool IsAmdGcn() const;
 
@@ -673,6 +685,8 @@ private:
     bool amd_shader_trinary_minmax{};
     bool nv_framebuffer_mixed_samples{};
     bool amd_mixed_attachment_samples{};
+    bool nv_coverage_reduction{}; ///< NEO-GT7-016
+    std::vector<CoverageReduction::Combination> truncate_combinations; ///< NEO-GT7-016
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
